@@ -1,0 +1,692 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Equipment.View.EquipmentView_strengthen	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/03/19
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+require("EquipViewBase")
+---@class EquipmentView_strengthen:Component	装备  强化
+local EquipmentView_strengthen = _G.BaseClass("EquipmentView_strengthen", _G.Component)
+
+---类的构造函数
+function EquipmentView_strengthen:__init(obj, mParentView)
+    local tParam = _G.ConfigManager.discrete_cfg[104901][1][1]
+    ---装备强化当作材料的比例（除以10000）
+    self.expBl = tParam * 0.0001
+    -- 104902,202020100#20#1000,装备强化材料id#对应的强化经验#对应的消耗金币数
+
+    tParam = _G.ConfigManager.discrete_cfg[104902]
+    --装备强化材料 [uid]={sid=,coin=,exp=,}
+    self.MaterialDic = {}
+
+    local tMat
+    for i = 1, #tParam do
+        tMat = tParam[i]
+        local tData = {}
+        tData.sid = tMat[1]
+        tData.exp = tMat[2]
+        tData.coin = tMat[3]
+        self.MaterialDic[tData.sid] = tData
+    end
+
+    ---选则的装备uid及数量 {uid=0,}
+    self.SelectDic = {}
+
+    self.gameObject = obj
+    ---@type EquipmentView
+    self.mParentView = mParentView
+    ---当前选中装备
+    self.CurItemData = self.mParentView.CurItemData
+    self.go_table = _G.GetAutoGoTable(obj, _G.handler(self, self.OnClickBtn))
+    self.selectButton = {}
+end
+
+function EquipmentView_strengthen:Show(isShow)
+    self.isShow = isShow
+    self.CurItemData = self.mParentView.CurItemData
+    if isShow == false then
+        self:Hide()
+        return
+    end
+    self.gameObject:SetActiveE(1)
+
+    if self.go_table.ResConsume == nil then
+        ---@type Params_ConsumeCompont
+        local data = {}
+        data.showNow = true
+        data.textColorType = 4
+        self.go_table.ResConsume =
+            self:AddComponent(
+                self.go_table.obj_consume,
+                require("ConsumeCompont").New(
+                    self.go_table.obj_consume,
+                    { { _G.ResPropID.Coin, false, 0 } },
+                    nil,
+                    nil,
+                    true,
+                    data
+                )
+            )
+    end
+
+    local isMax = self.CurItemData:GetEquipNextStrengCfg() == nil
+
+    self.go_table.obj_Max:SetActiveE(isMax and 1 or 0)
+    self.go_table.scrollloopvectical_Equipment:SetActiveE(isMax == false and 1 or 0)
+    self.go_table.obj_info:SetActiveE(1)
+
+    --if isMax == true then
+    --self.go_table.obj_Noting:SetActiveE(0)
+    -- self.mParentView:ShowInfo()
+    -- return
+    --end
+
+    ---选则的装备uid及数量 {uid=0,}
+    self.SelectDic = {}
+    self.NewStrengSid = 0
+    self.SelectSum_exp = {}
+    self.SelectSum_coin = {}
+
+    self.sumExp = 0
+    self.sumCoin = 0
+
+    ----初始记录当前强化经验 --用于强化一键选择是否有选 是否选满判断
+    self.OldKeySelect = self.CurItemData.strengExp
+
+    ---@type EquipmentItem[]
+    self.ItemDataList = nil
+    self:ShowLoopItem()
+    self:CalculateRes()
+    self:UpdataRes()
+    -- ZHJH-3704 【客户端】装备强化界面优化
+    -- 第一次进入需要显示升级到下一级的属性，这里重新覆写一遍
+    self.mParentView:ShowInfo({
+        strenExp = self.sumExp,
+        strenSid = _G.math.max(self.NewStrengSidMin,
+            _G.math.min(self.NewStrengSidMax, self.NewStrengSid + 1))
+    })
+end
+
+function EquipmentView_strengthen:Hide()
+    self.gameObject:SetActiveE(0)
+end
+
+---重置选择视图
+function EquipmentView_strengthen:ResetLoopItem()
+    ---选则的装备uid及数量 {uid=0,}
+    self.SelectDic = {}
+    self.NewStrengSid = 0
+    self.SelectSum_exp = {}
+    self.SelectSum_coin = {}
+
+    self.sumExp = 0
+    self.sumCoin = 0
+    ----初始记录当前强化经验 --用于强化一键选择是否有选 是否选满判断
+    self.OldKeySelect = self.CurItemData.strengExp
+
+    ---@type EquipmentItem[]
+    self.ItemDataList = nil
+    self:ShowLoopItem()
+end
+
+function EquipmentView_strengthen:ShowLoopItem()
+    if self.isInit == nil then
+        self.go_table.scrollloopvectical_Equipment:InitItemData(0, _G.handler(self, self.RefreshList))
+        self.isInit = true
+    end
+
+    local templist = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Equipment)
+    local list = {}
+    ---@param Equ EquipmentItem
+    for key, Equ in pairs(templist) do
+        ---7以上的金色
+        if Equ.Grade <= 7 then
+            if self.grade then
+                if self.grade[Equ.Grade] then
+                    table.insert(list, Equ)
+                end
+            else
+                table.insert(list, Equ)
+            end
+        end
+    end
+
+    ---@param a EquipmentItem
+    _G.SortList(
+        list,
+        function(a)
+            --强化材料展示排序为：强化材料（低品质的在前），装备（低品质的在前，同品质未强化，没有五行属性的优先）
+            return -a.Grade, -a.streng, -a.element, -a.streng, a.uid
+        end
+    )
+
+    local matSids = table.keys(self.MaterialDic)
+    table.sort(matSids)
+    for i = #matSids, 1, -1 do
+        local Material = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Material, matSids[i])
+        if Material ~= nil then
+            table.insert(list, 1, Material)
+        end
+    end
+
+    self.ItemDataList = list
+
+    local Num = #self.ItemDataList
+    if self.OldNum ~= Num then
+        self.go_table.scrollloopvectical_Equipment:UpdateCount(Num)
+        self.OldNum = Num
+    end
+
+    local isMax = self.CurItemData:GetEquipNextStrengCfg() == nil
+
+    self.go_table.obj_Noting:SetActiveE((Num == 0 and not isMax) and 1 or 0)
+    self.go_table.scrollloopvectical_Equipment:UpdateAllItem()
+end
+
+function EquipmentView_strengthen:RefreshList(index, objGame)
+    if index < 0 then
+        return
+    end
+
+    local itemGoTable = _G.GetAutoGoTable(objGame)
+
+    itemGoTable.CardIndex = index + 1
+
+    local ItemData = self.ItemDataList[itemGoTable.CardIndex]
+    local isEqu = self:IsEquipment(ItemData)
+    itemGoTable.aorbtn_sub.LongPress = true
+    itemGoTable.aorbtn_sub.LongPress = _G.handlerbind(self, self.OnLongPress_Sub, itemGoTable)
+    if isEqu then
+        ---没生成对象
+        if itemGoTable.LuaEqu == nil then
+            ---开始生成对象 并标记
+            itemGoTable.LuaEqu = true
+
+            _G.EquipViewBase.Create(
+                ItemData,
+                itemGoTable.obj_node,
+                function(itemLua)
+                    itemGoTable.LuaEqu = itemLua
+                    self:SetLoopItem(itemGoTable, true)
+                    itemLua.go_table.aorbtn_Click.LongPress = true
+                    itemLua.go_table.aorbtn_Click.onLongPress = _G.handlerbind(self, self.OnLongPress_Add, itemGoTable)
+                end,
+                _G.handlerbind(self, self.OnClick_Item_Equipment, itemGoTable)
+            )
+        elseif itemGoTable.LuaEqu ~= true then
+            ---已生成对象
+            self:SetLoopItem(itemGoTable)
+        end
+    else
+        ---没生成对象
+        if itemGoTable.LuaMat == nil then
+            ---开始生成对象 并标记
+            itemGoTable.LuaMat = true
+
+            _G.StorageManager:GetInstance():GetItemBaseView(
+                ItemData.sid,
+                1,
+                itemGoTable.obj_node,
+                function(itemLua)
+                    itemGoTable.LuaMat = itemLua
+                    self:SetLoopItem(itemGoTable, true)
+                    itemLua.go_table.aorbtn_Click.LongPress = true
+                    itemLua.go_table.aorbtn_Click.onLongPress = _G.handlerbind(self, self.OnLongPress_Add, itemGoTable)
+                end,
+                _G.handlerbind(self, self.OnClick_Item_Material, itemGoTable)
+            )
+        elseif itemGoTable.LuaMat ~= true then
+            ---已生成对象
+            self:SetLoopItem(itemGoTable)
+        end
+    end
+
+    return objGame
+end
+
+---检测是否是装备
+function EquipmentView_strengthen:IsEquipment(ItemData)
+    return ItemData.streng ~= nil
+end
+
+---@param isInit boolean true第一次生成 Item信息已初始化
+function EquipmentView_strengthen:SetLoopItem(itemGoTable, isInit)
+    if itemGoTable == nil then
+        return
+    end
+
+    ---@type EquipmentItem
+    local ItemData = self.ItemDataList[itemGoTable.CardIndex]
+
+    local isEqu = self:IsEquipment(ItemData)
+
+    ---@type ItemEquipmentBase
+    local lua
+    if isEqu then
+        ---@type ItemEquipmentBase
+        lua = itemGoTable.LuaEqu
+        if not isInit then
+            lua:UpDataInfo(ItemData)
+        end
+    else
+        ---@type ItemViewBase
+        lua = itemGoTable.LuaMat
+        if not isInit then
+            lua:SetImage(ItemData.sid)
+        end
+    end
+
+    itemGoTable.ItemData = ItemData
+    itemGoTable.gameObject:SetName(self:GetItemUid(ItemData))
+
+    self:SetItemNum(itemGoTable)
+
+    if itemGoTable.btnSub == nil then
+        itemGoTable.aorbtn_sub.onClick:AddListener(_G.handlerbind(self, self.SubItem, itemGoTable))
+        itemGoTable.btnSub = true
+    end
+
+    if itemGoTable.LuaEqu ~= nil then
+        _G.GameUtil.SetActiveByCondition(itemGoTable.LuaEqu.gameObject, isEqu)
+    end
+    if itemGoTable.LuaMat ~= nil then
+        _G.GameUtil.SetActiveByCondition(itemGoTable.LuaMat.gameObject, not isEqu)
+    end
+end
+
+function EquipmentView_strengthen:SetItemNum(itemGoTable)
+    local num = self.SelectDic[self:GetItemUid(itemGoTable.ItemData)] or 0
+    itemGoTable.aortext_num.text = num .. "/" .. itemGoTable.ItemData.count
+    -- _G.UIUtils.SetItemNum_EquItemNum(itemGoTable, num, itemGoTable.ItemData.count)
+    itemGoTable.aorbtn_sub:SetActiveE(num > 0 and 1 or 0)
+end
+
+function EquipmentView_strengthen:OnClick_Item_Equipment(_, itemGoTable)
+    self:Click_Item(itemGoTable)
+end
+
+function EquipmentView_strengthen:OnClick_Item_Material(_, _, _, itemGoTable)
+    self:Click_Item(itemGoTable)
+end
+
+function EquipmentView_strengthen:Click_Item(itemGoTable)
+    if self.NewStrengSid >= self.NewStrengSidMax then
+        --当玩家一件填充到装备强化等级满级时，玩家点就一键填充提示：一键填充已满级
+        _G.PopWindowManager:GetInstance():ShowAllTips(120111)
+        return
+    end
+    ---@type EquipmentItem
+    local ItemData = itemGoTable.ItemData
+    local func = function()
+        self:SelectOneItem(ItemData)
+        self:SetItemNum(itemGoTable)
+        self:UpdataRes()
+    end
+    if ItemData.Grade > 6 then
+        _G.PopWindowManager:GetInstance():ShowBtnWindowByToggle(120311, func, nil, func, true)
+    else
+        func()
+    end
+end
+
+function EquipmentView_strengthen:SubItem(itemGoTable)
+    ---@type EquipmentItem
+    local ItemData = itemGoTable.ItemData
+    local num = self.SelectDic[self:GetItemUid(ItemData)]
+    if num <= 0 then
+        return
+    end
+
+    self:SelectOneItem(ItemData, -1)
+    self:SetItemNum(itemGoTable)
+    self:UpdataRes()
+end
+
+function EquipmentView_strengthen:OnLongPress_Add(tb)
+    self:Click_Item(tb)
+end
+
+function EquipmentView_strengthen:OnLongPress_Sub(tb)
+    self:SubItem(tb)
+end
+
+---选择一格装备
+------@param ItemData EquipmentItem
+---@return boolean false不能在选(for时判断换格)
+function EquipmentView_strengthen:SelectOneItem(ItemData, num)
+    local uid = self:GetItemUid(ItemData)
+    local exp, coin, nowNum
+    --判断是否存在
+    nowNum = self.SelectDic[uid]
+    if nowNum == nil then
+        nowNum = 0
+    end
+    if num ~= nil then
+        nowNum = nowNum + num
+    else
+        nowNum = nowNum + 1
+    end
+    if nowNum > ItemData.count then
+        --- 数量不可超出
+        return false
+    end
+
+    self.SelectDic[uid] = nowNum
+    if nowNum == 0 then
+        exp = 0
+        coin = 0
+    else
+        local strengExp = 0
+        --- 装备是uid 资源道具是 sid
+        if self:IsEquipment(ItemData) then
+            strengExp = ItemData.strengExp
+            if ItemData.streng > 0 then
+                --  +当前强化等级累计经验
+                local cfg = ItemData:GetEquipCurStrengCfg()
+                if cfg ~= nil then
+                    strengExp = strengExp + cfg.points_up
+                end
+            end
+            --- 当前装备强化经验*80% + 材料经验 * 堆叠数量
+            exp = strengExp * self.expBl + ItemData.cfg.decomposition * nowNum
+            coin = ItemData.cfg.coin * nowNum
+        else
+            --- 当前装备强化经验 + 材料经验 * 堆叠数量
+            exp = self.MaterialDic[uid].exp * nowNum
+            coin = self.MaterialDic[uid].coin * nowNum
+        end
+    end
+
+    self.SelectSum_exp[uid] = exp
+    self.SelectSum_coin[uid] = coin
+
+    self:CalculateRes()
+    if nowNum + 1 >= ItemData.count then
+        --- 数量不可超出
+        return false
+    end
+
+    return true
+end
+
+---计算当前经验
+function EquipmentView_strengthen:CalculateRes()
+    local exp, coin = 0, 0
+    for key, value in pairs(self.SelectSum_exp) do
+        exp = value + exp
+    end
+    for key, value in pairs(self.SelectSum_coin) do
+        coin = value + coin
+    end
+
+    self.sumCoin = coin
+    self.NewStrengSid = 0
+    --- 预计强化sid
+    ---强化sid  最小0
+    self.NewStrengSidMin = self.CurItemData:GetStrengSid(0) + 1
+    ---强化sid  最大
+    self.NewStrengSidMax = self.CurItemData:GetStrengSid(self.CurItemData.cfg.strengthen_level)
+
+    --- 当前经验= 当前剩余 + 新增
+    self.sumExp = self.CurItemData.strengExp + exp
+
+    local oldExp = 0
+    local nowcfg = self.CurItemData:GetEquipCurStrengCfg()
+    if nowcfg ~= nil then
+        oldExp = nowcfg.points_up
+    end
+    ---当前累计经验
+    local nowSumExp = self.sumExp + oldExp
+    local equipment_stren_cfgItem
+    for i = self.NewStrengSidMin, self.NewStrengSidMax do
+        equipment_stren_cfgItem = _G.ConfigManager.equipment_stren_cfg[i]
+        --- 大于该等级累计 经验
+        if nowSumExp >= equipment_stren_cfgItem.points_up then
+            self.NewStrengSid = i
+        end
+    end
+end
+
+---刷新显示
+function EquipmentView_strengthen:UpdataRes()
+    if self.go_table.ResConsume ~= nil then
+        --计算公会金币减少消耗特权加成
+        local num = self.sumCoin
+        local goldReduce = require("SociatyModel"):GetInstance():GetBuildEquipGoldReduce()
+        if goldReduce > 0 then
+            num = math.floor(num * (1 - goldReduce))
+            self.sumCoin = num
+        end
+        self.go_table.ResConsume:RestRs({ { _G.ResPropID.Coin, false, num } })
+    end
+    self:UpdataEquView()
+end
+
+function EquipmentView_strengthen:UpdataEquView()
+    self.mParentView:ShowInfo({ strenExp = self.sumExp, strenSid = self.NewStrengSid })
+end
+
+---一键选中
+function EquipmentView_strengthen:OnKeySelect()
+    if self.NewStrengSid >= self.NewStrengSidMax then
+        -- --当玩家一件填充到装备强化等级满级时，玩家点就一键填充提示：一键填充已满级
+        _G.PopWindowManager:GetInstance():ShowAllTips(120111)
+        return
+    end
+
+    --- 当前sid
+    local tStrengSid = self.NewStrengSid
+    ---缓存当前经验 判断是否选满
+    self.keySelect = self.sumExp
+
+    --- 升级 相差经验
+    local points_up = 0
+
+    ---之前经验
+    local oldExp = 0
+    local oldcfg = self.CurItemData:GetEquipCurStrengCfg()
+    if oldcfg ~= nil then
+        oldExp = oldcfg.points_up
+    end
+    ---当前等级所需累计经验
+    local cfg = _G.ConfigManager.equipment_stren_cfg[self.NewStrengSid + 1]
+    if cfg ~= nil then
+        --- 减去 之前经验  减去 当前经验
+        points_up = cfg.points_up - oldExp - self.sumExp
+    end
+
+    ---true已选择满   nil未选择 true有选择  false已选满
+    local isMax = nil
+    ---@type EquipmentItem
+    local ItemData, tSumExp, tSubNum, isSelect, isEqu, uid
+    for i = 1, #self.ItemDataList do
+        ItemData = self.ItemDataList[i]
+        isEqu = self:IsEquipment(ItemData)
+
+        ---该格剩余装备数量
+        tSubNum = ItemData.count - (self.SelectDic[self:GetItemUid(ItemData)] or 0)
+        if tSubNum > 0 and ItemData.Grade <= 6 then
+            tSumExp = 0
+            if self:IsEquipment(ItemData) then
+                tSumExp = ItemData.strengExp + ItemData.cfg.decomposition * tSubNum
+            else
+                tSumExp = self.MaterialDic[ItemData.sid].exp * tSubNum
+            end
+
+            if points_up - tSumExp > 0 then
+                isMax = true
+                self:SelectOneItem(ItemData, tSubNum)
+            else
+                for i = 1, tSubNum do
+                    isMax = true
+                    self:SelectOneItem(ItemData)
+                    if tStrengSid ~= self.NewStrengSid then
+                        isMax = false
+                        break
+                    end
+                end
+            end
+            if tStrengSid ~= self.NewStrengSid then
+                isMax = false
+                break
+            end
+        end
+    end
+
+    if self.keySelect == self.sumExp and self.keySelect ~= self.OldKeySelect then
+        ---已全部选中
+        _G.PopWindowManager:GetInstance():ShowAllTips(120113)
+    end
+
+    self.go_table.scrollloopvectical_Equipment:UpdateAllItem()
+    self:UpdataRes()
+end
+
+function EquipmentView_strengthen:GetItemUid(ItemData)
+    if self:IsEquipment(ItemData) then
+        return ItemData.uid
+    else
+        return ItemData.sid
+    end
+end
+
+function EquipmentView_strengthen:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_TianCo then
+        self:OnKeySelect()
+    elseif go == self.go_table.aorbtn_tishi then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 25)
+    elseif go == self.go_table.aorbtn_Done then
+        if _G.StorageManager:GetInstance():CheckItemNew(_G.ResPropID.Coin, self.sumCoin) == false then
+            return
+        end
+        if self.sumCoin == 0 then
+            --未选择强化材料
+            _G.PopWindowManager:GetInstance():ShowAllTips(120118)
+            return
+        end
+        local power = _G.StorageManager:GetInstance():GetPlayerPower()
+
+        ---@type equipment.c2s_equipment_up_streng
+        local data = {}
+        data.ce = {}
+        ---@type equipment.i_card_equipment
+        data.equip = {}
+        data.items = {}
+
+        data.equip.c_uid = self.CurItemData.cardUid
+        data.equip.index = self.CurItemData:GetParts()
+
+        local hasJinse = false
+        ---@type equipment.i_cs_equipment[]
+        local ce = {}
+        for uid, num in pairs(self.SelectDic) do
+            if num > 0 then
+                if self.MaterialDic[uid] ~= nil then
+                    table.insert(data.items, { k = uid, v = num })
+                else
+                    ---@type equipment.i_cs_equipment
+                    local cs_equ = {}
+                    cs_equ.num = num
+                    cs_equ.uid = uid
+                    table.insert(ce, cs_equ)
+                    if not hasJinse then
+                        local findData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Equipment, uid)
+                        if findData and findData.Grade >= 7 then
+                            hasJinse = true
+                        end
+                    end
+                end
+            end
+        end
+        data.ce = ce
+        local callbk = function()
+            self.OldItemData = _G.DeepCopy(self.CurItemData)
+            require("EquipmentModel"):GetInstance():EquipUp(
+                self.CurItemData,
+                data,
+                self.sumCoin,
+                function()
+                    -- 当前等级经验 +之前等级经验
+                    local oldExp = 0
+                    local nowcfg = self.CurItemData:GetEquipCurStrengCfg()
+                    if nowcfg ~= nil then
+                        oldExp = nowcfg.points_up
+                    end
+                    ---当前累计经验
+                    local nowSumExp = self.sumExp + oldExp
+                    self.CurItemData:Strength(nowSumExp)
+                    -- self.mParentView.go_table.obj_effqianghua:SetActiveE(0)
+                    -- self.mParentView.go_table.obj_effqianghua:SetActiveE(1)
+                    if self.mParentView.isUp then
+                        _G.UIManager:GetInstance():OpenWindow(
+                            _G.ConfigManager.ui_cfg.DecorationUpView.Name,
+                            self.OldItemData,
+                            self.CurItemData,
+                            1
+                        )
+                        local cardData = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+                            [self.CurItemData.cardUid]
+                        cardData:CalcNowSumProp(_G.AttrType.Equip)
+
+                        local offset = _G.StorageManager:GetInstance():GetPlayerPower() - power
+                        if offset > 0 then
+                            require "CommonTipManager".OpenPowerUpView(power, offset)
+                        end
+                    end
+                    self:Show(true)
+                end
+            )
+        end
+        if hasJinse then
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                120311,
+                nil,
+                callbk
+            )
+        else
+            callbk()
+        end
+    elseif go == self.go_table.aorbtn_shaixuan then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.EquipmentShaiXuan.Name,
+            function(isShow, selectButton, canSaveSelect)
+                if isShow then
+                    self.grade = {}
+                    for _, v in pairs(selectButton) do
+                        if v.isShow then
+                            self.grade[v.grade] = true
+                        end
+                    end
+                else
+                    self.grade = nil
+                end
+                self.selectButton = selectButton
+                self:Show(true)
+
+                if canSaveSelect then
+                    local cacheKey = tostring(_G.PlayerModel:GetInstance().role_uid) ..
+                        "EquipmentView_Strengthen_SelectButton"
+                    _G.PlayerPrefsManager.SetTable(cacheKey, selectButton)
+                end
+            end,
+            self:GetSelectButtonData()
+        )
+    end
+end
+
+function EquipmentView_strengthen:GetSelectButtonData()
+    if not _G.table.isEmptyOrNil(self.selectButton) then
+        return self.selectButton
+    end
+
+    local cacheKey = tostring(_G.PlayerModel:GetInstance().role_uid) .. "EquipmentView_Strengthen_SelectButton"
+    local selectButtonData = _G.PlayerPrefsManager.GetTable(cacheKey, selectButton)
+    return selectButtonData or {}
+end
+
+---类的析构函数
+function EquipmentView_strengthen:Dispose()
+end
+
+return EquipmentView_strengthen

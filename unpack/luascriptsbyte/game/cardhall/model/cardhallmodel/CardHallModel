@@ -1,0 +1,269 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.HeroicIcon.Model.CardHallModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/04/23
+-- Description: 数据类
+-----------------------------------------------------------------------
+local CardHallNet = require("CardHallNet")
+
+local base = _G.GameDataModelBase
+---@class CardHallModel : GameDataModelBase
+local CardHallModel = _G.BaseClass("CardHallModel", base)
+
+---@return CardHallModel CardHallModel
+function CardHallModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function CardHallModel:__init()
+    --self.curFunctionOpenID = _G.FunctionID.HeroicIcon
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+    self.mark_cards = self.mark_cards or {}
+end
+
+---从服务器拉取数据
+function CardHallModel:GetDataFormServer()
+    self:GetInfo(_G.handler(self, self.ParseData))
+end
+
+function CardHallModel:GetInfo(callBack)
+    CardHallNet:GetInstance():GetInfo(function(msg)
+        if callBack then
+            callBack(msg)
+        end
+        self.super.ParseData(self)
+    end)
+end
+
+function CardHallModel:UpdataTask(task)
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask:UpdataData(task)
+
+    return true
+end
+
+function CardHallModel:GetTaskByTaskid(sid)
+    if self.tasks then 
+        for i = 1, #self.tasks do
+            if sid == self.tasks[i].i_task.sid then
+                return self.tasks[i]
+            end
+        end
+    end
+
+    return nil
+end
+
+function CardHallModel:ParseData(msg)
+    --if msg.ack == 1 then
+    local tasks = msg.task_info or {}
+    self.finish_task = msg.finish_task or {}
+    self.tasks = {}
+    for i = 1, #tasks do
+        local ActiveTaskBase = require("CardHallTaskData").New(tasks[i], function(data)
+
+        end)
+
+        table.insert(self.tasks, ActiveTaskBase)
+    end
+
+    for i = 1, #self.finish_task do
+        local args = {}
+        args.sid = self.finish_task[i]
+        args.state = _G.TaskEnum.ETaskState.Completed
+        args.target = { 1 }
+        local ActiveTaskBase = require("CardHallTaskData").New(args, function(data)
+
+        end)
+
+        table.insert(self.tasks, ActiveTaskBase)
+    end
+    
+    self.mark_cards = msg.mark_cards or {}
+    self.cardDataT = {}
+    for k, v in pairs(_G.ConfigManager.card_hall_cfg) do 
+        local data = _G.StorageManager:GetInstance():GetMaxStarCardBySid(v)
+        if not data then 
+            data = _G.CardData.New()
+            data:Parse({sid = v.id})
+        end
+        data.taskLv = _G.table.ContainsValue(self.mark_cards, v.id) and 1 or 0
+        for key, value in ipairs(v.task_id) do 
+            if _G.table.ContainsValue(self.finish_task, value) then 
+                data.taskLv = data.taskLv + 1
+            end
+        end
+        self.cardDataT[v.id] = data
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.CardHallTask.id)
+end
+
+function CardHallModel:GetCardInfoBySid(sid)
+    return self.cardDataT[sid]
+end
+
+function CardHallModel:GetCardTaskShowIndex(sid)
+    local index = 0
+    for key, value in ipairs(_G.ConfigManager.card_hall_cfg[sid].task_id) do 
+        if not _G.table.ContainsValue(self.finish_task, value) then 
+            index = key - 1 
+            break
+        end
+    end 
+    return index == 0 and 0 or (index - 1)
+end
+
+function CardHallModel:CheckTaskAwardGot(sid, index)
+    if index == 0 then 
+        return _G.table.ContainsValue(self.mark_cards, sid)
+    else 
+        return _G.table.ContainsValue(self.finish_task, _G.ConfigManager.card_hall_cfg[sid].task_id[index])
+    end
+end
+
+function CardHallModel:CheckTaskAwardCanGet(sid, index)
+    if index == 0 then 
+        if not _G.table.ContainsValue(self.mark_cards, sid) then 
+            return require("IllustrationModel"):GetInstance():GetCardMaxStar(sid) > 0
+        end
+    else
+        local missionID = _G.ConfigManager.card_hall_cfg[sid].task_id[index]
+        local task = self:GetTaskByTaskid(missionID)
+        if task then 
+            return task.i_task.state == _G.TaskEnum.ETaskState.Submited
+        end
+    end
+    return false
+end
+
+function CardHallModel:FinishTask(sid, taskIndex, callback)
+    local pbData = {card_sid = sid, task_sids = {{sid = _G.ConfigManager.card_hall_cfg[sid].task_id[taskIndex], finish_type = 2}}}
+    CardHallNet:GetInstance():FinishTask(pbData, function(msg)
+        if msg.ack == 1 then
+            for k, v in ipairs(pbData.task_sids) do 
+                _G.table.insert(self.finish_task, v.sid)
+                local task = self:GetTaskByTaskid(v.sid)
+                if task then 
+                    task.i_task.state = _G.TaskEnum.ETaskState.Completed
+                end
+                self.cardDataT[sid].taskLv = self.cardDataT[sid].taskLv + 1
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.CardHallTask.id, pbData.card_sid)
+            if callback then
+                callback(msg)
+            else 
+                if msg.award then
+                    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                end
+            end
+        end
+    end)
+end
+
+function CardHallModel:SetTask(data)
+    for i = 1, #self.tasks do
+        if data[1].sid == self.tasks[i].i_task.sid then
+            self.tasks[i].i_task.state = data[1].state
+        end
+    end
+end
+
+function CardHallModel:GoLink(sid)
+
+end
+
+---激活
+function CardHallModel:Mark(pbData, callback)
+    CardHallNet:GetInstance():Mark(pbData, function(msg)
+        if msg.ack == 1 then
+            _G.table.insert(self.mark_cards, pbData.card_sid)
+            self.cardDataT[pbData.card_sid].taskLv = self.cardDataT[pbData.card_sid].taskLv + 1
+        end
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.CardHallTask.id, pbData.card_sid)
+        if callback then
+            callback(msg, pbData)
+        end
+    end)
+end
+
+function CardHallModel:GetTaskByCardSid(sid)
+    for k, v in ipairs(_G.ConfigManager.card_hall_cfg[sid].task_id) do 
+        local tasks = {
+            sid = v,
+            target = {0},
+            time = _G.TimeUtil.GetServerUnixTime(),
+            state = _G.TaskEnum.ETaskState.Claimed
+        }
+        local ActiveTaskBase = require("CardHallTaskData").New(tasks, function(data)
+
+        end)
+        self.tasks = self.tasks or {}
+        table.insert(self.tasks, ActiveTaskBase)
+    end
+end
+
+function CardHallModel:CheckRedByCardSid(sid)
+    for i = 1, 5 do 
+        if self:CheckTaskAwardCanGet(sid, i - 1) then 
+            return true
+        end
+    end
+    return false
+end
+
+function CardHallModel:GetAllAttribute()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    if not self.mark_cards or #self.mark_cards == 0 then
+        local changeAttrTypes = AttributeClassManager:GetChangeAttrTypes(attribute)
+        return attribute, changeAttrTypes
+    end
+    -- local prop = self:GetAllOtherProp()
+    -- for k, v in pairs(prop) do
+    --     attribute:AddValueByName(k, v, false, _G.AttCountType.other)
+    -- end
+    local cfg = {}
+    for k, v in ipairs(self.mark_cards) do
+        cfg = _G.ConfigManager.card_hall_cfg[v]
+        for key, value in ipairs(cfg.team_base_att) do  
+            local num = AttributeClassManager:GetValueWithName(value[1], tonumber(value[3]), tonumber(value[2]))
+            attribute:AddValueByName(value[1], num, false, tonumber(value[2]))
+        end
+    end
+    local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute)
+    return attribute, changeAttrTypes
+end
+
+function CardHallModel:GetAllAttributeShow()
+    local cfg = {}
+    local attT = {}
+    for k, v in ipairs(self.mark_cards) do
+        cfg = _G.ConfigManager.card_hall_cfg[v]
+        for key, value in ipairs(cfg.team_base_att) do  
+            attT[value[1]] = attT[value[1]] or {}
+            attT[value[1]][value[2]] = attT[value[1]][value[2]] or 0
+            attT[value[1]][value[2]] = attT[value[1]][value[2]] + tonumber(value[3])
+        end
+    end
+    return attT
+end
+
+function CardHallModel.OpenView()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CardHallView.Name)
+end
+
+---销毁对象时,析构函数
+function CardHallModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+end
+
+return CardHallModel

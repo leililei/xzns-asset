@@ -1,0 +1,721 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.DecorationBoss.Model.DecorationBossModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/09/07
+-- Description 终焉之末副本model
+-----------------------------------------------------------------------
+local DecorationBossNet = require("DecorationBossNet")
+---@class DecorationBossModel : GameDataModelBase	中文描述
+local DecorationBossModel = _G.BaseClass("DecorationBossModel", _G.GameDataModelBase)
+
+---@return DecorationBossModel DecorationBossModel
+function DecorationBossModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function DecorationBossModel:__init()
+    self.curFunctionOpenID = 259
+    ---Boss状态
+    self.bossStateEnum = {
+        NotArrived = 1, ---未降临
+        Reviving = 2,   ---复活中
+        Fighting = 3    ---战斗中
+    }
+    ---boss信息
+    self.bossInfo = {}
+    ---boss死亡列表
+    self.deathBossList = {}
+    self.initBossInfo = true
+    self.reviveCd = _G.ConfigManager.discrete_cfg[115302][1][1]
+    _G.Events:GetInstance():AddListener(
+        _G.ConfigManager.net_map.ultimate_conclusion_boss_state.Cmd,
+        self.UpdateBossState,
+        self
+    )
+end
+
+function DecorationBossModel:ReConnect(endcall)
+    self:GetDataFormServer()
+    self.super.ReConnect(self, endcall)
+end
+
+---获取服务器数据
+function DecorationBossModel:GetDataFormServer()
+    DecorationBossNet:GetInstance():GetBaseInfo(_G.handler(self, self.ParseData))
+end
+
+---监听数据更新
+function DecorationBossModel:UpdateBossState(msg)
+    if msg.state == 1 then
+        ---boss死亡
+        if self.bossInfo[msg.monster_sid] then
+            self.bossInfo[msg.monster_sid].fight_card = nil
+            self.bossInfo[msg.monster_sid].hp = 0
+            self.bossInfo[msg.monster_sid].last_end_time = msg.time
+        end
+        self:RefreshBossRevive(msg)
+        _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.BossDeath, msg.monster_sid)
+    elseif msg.state == 2 then
+        ---boss复活
+        if self.deathBossList[msg.monster_sid] then
+            self.deathBossList[msg.monster_sid] = nil
+        end
+        if self.monsterSid and self.monsterSid == msg.monster_sid and self.awardTimes then
+            for _, v in pairs(self.awardRecord) do
+                if self.awardTimes == v.index then
+                    v.is_get = 1
+                    break
+                end
+            end
+            self.monsterSid = 0
+        end
+        self:GetBossInfo({ msg.monster_sid }, function()
+            _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.BossRevive, msg.monster_sid)
+        end)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DecorationBoss.id)
+    elseif msg.state == 3 then
+        ---boss结算完成
+        if self.monsterSid and self.monsterSid == msg.monster_sid then
+            DecorationBossNet:GetInstance():GetBaseInfo(_G.handler(self, self.ParseData))
+        end
+        _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.SettleCompleted, msg.monster_sid)
+    end
+end
+
+---功能刷新计时器22点刷新
+function DecorationBossModel:SetRefreshTimer()
+    if self.refreshTimer then
+        self.refreshTimer:Stop()
+        self.refreshTimer = nil
+    end
+    local time = _G.ConfigManager.discrete_cfg[115301][1]
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local beginTime = _G.TimeUtil.GetDayBegin(serverTime)
+
+    local delay
+    if serverTime < beginTime + time[2] * 3600 then
+        delay = beginTime + time[2] * 3600
+    else
+        delay = beginTime + 86400 + time[2] * 3600
+    end
+    if delay - serverTime > 0 then
+        self.refreshTimer = _G.TimerManager:GetInstance():GetTimer(delay - serverTime, self.OnBattleTimeEnd, self, true,
+            false, true)
+        self.refreshTimer:Start()
+    end
+end
+
+function DecorationBossModel:OnBattleTimeEnd()
+    _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.BattleTimeEnd)
+    self:SetRefreshTimer()
+end
+
+---boss复活提示倒计时
+function DecorationBossModel:RefreshBossRevive(msg)
+    if self:GetLeftAwardTimes() <= 0 then
+        ---没有奖励次数
+        if self.bossReviveTimer then
+            self.bossReviveTimer:Stop()
+            self.bossReviveTimer = nil
+        end
+        return
+    end
+    local config = _G.ConfigManager.decoration_boss_cfg[msg.monster_sid]
+    self.deathBossList[msg.monster_sid] = {
+        reviviTime = msg.time + self.reviveCd,
+        level = config.boss_lv,
+        name = _G.ConfigManager.card_cfg[config.preview_monster].Name,
+        sid = msg.monster_sid,
+        preview_monster = config.preview_monster,
+        popUpTime = 0
+    }
+    if not self.bossReviveTimer then
+        self.bossReviveTimer = _G.TimerManager:GetInstance():GetTimer(60, self.UpdateBossReviveTime, self, false, false,
+            true)
+        self.bossReviveTimer:Start()
+    end
+end
+
+function DecorationBossModel:UpdateBossReviveTime()
+    if _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.EmbattleView.Name) or
+        _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.BattleView.Name) or
+        _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.ShowAwardWithButtonView.Name)
+    then
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(
+            _G.ConfigManager.ui_cfg.DecorationBossPopUpView.Name
+        )
+        if view then
+            view:Close()
+        end
+        return
+    end
+    local queneList = {}
+    ---关注列表
+    local attentionList = {}
+    for _, v in pairs(self.attention) do
+        attentionList[v] = true
+    end
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    for _, v in pairs(self.deathBossList) do
+        if attentionList[v.sid] then
+            local leftTime = _G.Mathf.Ceil((v.reviviTime - serverTime) / 60)
+            if leftTime == 5 or leftTime == 1 then
+                v.popUpTime = leftTime
+                _G.table.insert(queneList, v)
+            end
+        end
+    end
+    if not _G.table.isEmptyOrNil(queneList) then
+        _G.SortList(queneList, function(data)
+            return data.level
+        end)
+
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(
+            _G.ConfigManager.ui_cfg.DecorationBossPopUpView.Name
+        )
+        if view then
+            view:AddBossQueue(queneList)
+        else
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.DecorationBossPopUpView.Name,
+                queneList
+            )
+        end
+    end
+end
+
+---解析个人信息
+---@param data ultimate_conclusion.s2c_role_info
+---@field monsterSid number 选定挑战boss
+---@field awardTimes number 已领取奖励次数
+---@field awardRecord table 当日奖励记录
+---@field awardBox table 拥有奖励宝箱
+---@field lastFightTime number 上次战斗时间
+---@field lastTestTime number 上一次测试战斗的时间
+---@field lastGiveUp number 上次放弃boss时间
+---@field attention table 关注boss[monster_sid]
+function DecorationBossModel:ParseData(data)
+    self.monsterSid = data.monster_sid
+    self.awardTimes = data.award_times or 0
+    self.awardRecord = data.award_list or {}
+    self.awardBox = {}
+    if data.award_box then
+        for k, v in ipairs(data.award_box) do
+            self.awardBox[v.box_sid] = v
+        end
+    end
+    self.lastFightTime = data.last_fight_time
+    self.lastTestTime = data.last_test_time
+    self.lastGiveUp = data.last_give_up
+    self.attention = data.attention or {}
+    ---获取所有boss的信息
+    local bossList = {}
+    for _, v in pairs(_G.ConfigManager.decoration_boss_cfg) do
+        _G.table.insert(bossList, v.id)
+    end
+    self:GetBossInfo(bossList, function(bossInfo)
+        if self.initBossInfo then
+            self.initBossInfo = false
+            local serverTime = _G.TimeUtil.GetServerUnixTime()
+            for _, v in pairs(bossInfo) do
+                if v.last_end_time and v.last_end_time > 0 and serverTime < v.last_end_time + self.reviveCd then
+                    self:RefreshBossRevive({ monster_sid = v.monster_sid, time = v.last_end_time })
+                end
+            end
+        end
+    end)
+    self:RefreshRedPoint()
+    self:RefreshAwardRedPoint()
+    _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.BossAwardChange)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DecorationBossMainView.Name)
+    if view then
+        view:RefrshDifficulty()
+    end
+    if not self.refreshTimer then
+        self:SetRefreshTimer()
+    end
+    if not self.redPointTimer then
+        self:SetRedPointTimer()
+    end
+    self.super.ParseData(self)
+end
+
+---获取上一次战斗时间
+function DecorationBossModel:GetLastFightTime()
+    return self.lastFightTime
+end
+
+---设置上一次战斗时间
+function DecorationBossModel:SetLastFightTime(time)
+    self.lastFightTime = time
+end
+
+---获取上一次测试战斗时间
+function DecorationBossModel:GetLastTestTime()
+    return self.lastTestTime
+end
+
+---设置上一次测试战斗时间
+function DecorationBossModel:SetLastTestTime(time)
+    self.lastTestTime = time
+end
+
+---获取当前选定的boss
+function DecorationBossModel:GetMonsterSid()
+    return self.monsterSid
+end
+
+---设置当前选定的boss
+function DecorationBossModel:SetMonsterSid(sid)
+    self.monsterSid = sid
+end
+
+---剩余领奖次数
+function DecorationBossModel:GetLeftAwardTimes()
+    return self.awardTimes
+end
+
+---最大领奖次数
+function DecorationBossModel:GetMaxAwardTimes()
+    return _G.ConfigManager.discrete_cfg[115310][1][1]
+end
+
+---获取当日领奖记录
+function DecorationBossModel:GetAwardRecord()
+    return self.awardRecord
+end
+
+---检测是否有可领取的奖励
+function DecorationBossModel:CheckCanGetAward()
+    if self.awardRecord then
+        for _, v in pairs(self.awardRecord) do
+            if self.awardTimes == v.index then
+                return v.is_get == 0
+            end
+        end
+    end
+
+    return false
+end
+
+---获取关注列表
+function DecorationBossModel:GetAttention()
+    return self.attention
+end
+
+---获取boss信息
+function DecorationBossModel:GetBossData(sid)
+    return self.bossInfo[sid]
+end
+
+---是否关注boss
+function DecorationBossModel:CheckAttentionBoss(sid)
+    return _G.table.indexof(self.attention, sid)
+end
+
+---获取当前boss的状态
+function DecorationBossModel:GetBossState(bossId)
+    local time = _G.ConfigManager.discrete_cfg[115301][1]
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local beginTime = _G.TimeUtil.GetDayBegin(serverTime)
+    if serverTime < beginTime + time[1] * 3600 then
+        return self.bossStateEnum.NotArrived, beginTime + time[1] * 3600, true
+    end
+
+    if serverTime >= beginTime + time[2] * 3600 then
+        return self.bossStateEnum.NotArrived, beginTime + 86400 + time[1] * 3600, false
+    end
+
+    ---判断boss是否死亡
+    if self.bossInfo[bossId] and self.bossInfo[bossId].last_end_time > 0 then
+        local deadTime = self.bossInfo[bossId].last_end_time
+        if serverTime < deadTime + self.reviveCd then
+            return self.bossStateEnum.Reviving, deadTime + self.reviveCd
+        end
+    end
+    return self.bossStateEnum.Fighting, 0
+end
+
+---进入boss战斗界面
+function DecorationBossModel:EnterBossBattleView(config)
+    local state, endTime = self:GetBossState(config.id)
+    if state == self.bossStateEnum.Reviving then
+        local serverTime = _G.TimeUtil.GetServerUnixTime()
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            960107,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            _G.TimeUtil.TimeToString(endTime - serverTime, 1)
+        )
+        return
+    end
+
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecorationBossBattleView.Name, config)
+end
+
+--region 通讯消息
+---获取boss信息
+---@param sidList table sid列表
+function DecorationBossModel:GetBossInfo(sidList, callback)
+    DecorationBossNet:GetInstance():GetBossInfo(
+        sidList,
+        function(msg)
+            if msg.ack == 1 then
+                if not _G.table.isEmptyOrNil(msg.boss_info) then
+                    for _, v in pairs(msg.boss_info) do
+                        self.bossInfo[v.monster_sid] = v
+                    end
+                end
+                if callback then
+                    callback(msg.boss_info)
+                end
+                _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.RefreshBossInfo)
+            end
+        end
+    )
+end
+
+function DecorationBossModel:GetBoxList()
+    return self.awardBox
+end
+
+---获取排行榜信息
+---@param sid number boss的sid
+---@param type number 1:练功房 2:正式战斗
+function DecorationBossModel:GetRankInfo(sid, type, page, callback)
+    local pbData = { monster_sid = sid, type = type, page = page }
+    DecorationBossNet:GetInstance():GetRankInfo(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                if callback then
+                    callback(msg.rank_info)
+                end
+            end
+        end
+    )
+end
+
+---放弃boss
+function DecorationBossModel:GiveUpBoss(callback)
+    DecorationBossNet:GetInstance():GiveUpBoss(
+        function(msg)
+            if msg.ack == 1 then
+                local bossInfo = self.bossInfo[self.monsterSid] or {}
+                if bossInfo.num and bossInfo.num > 0 then
+                    bossInfo.num = bossInfo.num - 1
+                end
+                self.monsterSid = nil
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+---领取排行奖励
+---@param list table 奖励列表
+function DecorationBossModel:GetRankAward(callback)
+    DecorationBossNet:GetInstance():GetRankAward(
+        function(msg)
+            if msg.ack == 1 then
+                self.monsterSid = 0
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                ---更新宝箱数据
+                for _, v in pairs(self.awardRecord) do
+                    if self.awardTimes == v.index then
+                        v.is_get = 1
+                        for k2, v2 in pairs(v.box_award) do
+                            if self.awardBox[v2.k] == nil then
+                                self.awardBox[v2.k] = {}
+                                self.awardBox[v2.k].box_sid = v2.k
+                                self.awardBox[v2.k].num = 0
+                                self.awardBox[v2.k].index = 1
+                            end
+                            self.awardBox[v2.k].num = self.awardBox[v2.k].num + v2.v
+                            if msg.award and msg.award.item then
+                                local config = _G.ConfigManager.decoration_box_cfg[v2.k]
+                                if config and config.item then
+                                    _G.table.insert(msg.award.item, { type = { config.item, v2.v } })
+                                end
+                            end
+                        end
+                        self:RefreshAwardRedPoint()
+                        break
+                    end
+                end
+                self:RefreshRedPoint()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg, function()
+                    if callback then
+                        callback()
+                    end
+                end)
+            end
+        end
+    )
+end
+
+---选择宝箱掉落组
+---@param sid number boss的sid
+function DecorationBossModel:ChooseBoxAward(sid, index, callback)
+    DecorationBossNet:GetInstance():ChooseBoxAward(
+        { box_sid = sid, index = index },
+        function(msg)
+            if msg.ack == 1 then
+                if self.awardBox[sid] == nil then
+                    self.awardBox[sid] = {}
+                    self.awardBox[sid].box_sid = sid
+                    self.awardBox[sid].num = 0
+                    self.awardBox[sid].index = 1
+                end
+                self.awardBox[sid].index = index
+                _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.ChooseBoxAward, index)
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+---开启宝箱
+---@param sid number boss的sid
+function DecorationBossModel:GetBoxAward(sid, num, callback)
+    DecorationBossNet:GetInstance():GetBoxAward(
+        { box_sid = sid, draw_times = num },
+        function(msg)
+            if msg.ack == 1 then
+                self.awardBox[sid].num = self.awardBox[sid].num - num
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg, nil, true)
+                _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.OpenBox)
+                self:RefreshAwardRedPoint()
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+---获取战斗回放
+---@param sid number boss_sid
+---@param type number 1:练功房 2:正式战斗
+function DecorationBossModel:GetPlayBack(uid, sid, type, isCommonRank)
+    DecorationBossNet:GetInstance():PlayBack(
+        { role_uid = uid, monster_sid = sid, fight_type = type },
+        function(msg)
+            if msg.ack == 1 then
+                self.fight_arg = msg.data
+                self:UpdateData(_G.BattleManager:GetInstance():GetStatisticsRecord(msg.data), isCommonRank)
+            end
+        end
+    )
+end
+
+function DecorationBossModel:UpdateData(data, isCommonRank)
+    if not data then
+        _G.PopWindowManager:GetInstance():ShowAllTips(540302)
+        return
+    end
+    self.maxCountRank = _G.table.count(data.FighterInfo)
+    self.PveData = {}
+    local damage, win = _G.GameUtil.ShowStatisticsView(data)
+    self.PveData = damage
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name,
+        self.PveData,
+        win,
+        function()
+            if not isCommonRank then
+                local ChangllengeView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ChangllengeView
+                    .Name)
+                if ChangllengeView then
+                    ChangllengeView.View:Show()
+                end
+                local DecorationBossMainView =
+                    _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DecorationBossMainView.Name)
+                if DecorationBossMainView then
+                    DecorationBossMainView.View:Show()
+                end
+                local DecorationBossRankView =
+                    _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DecorationBossRankView.Name)
+                if DecorationBossRankView then
+                    DecorationBossRankView.View:Show()
+                end
+            end
+        end,
+        nil,
+        self.otherPlayer,
+        1,
+        true,
+        self.fight_arg
+    )
+end
+
+---关注/取消关注
+---@param sid number boss的sid
+---@param type number 1:关注 2:取消关注
+function DecorationBossModel:AttentionBoss(sid, type, callback)
+    DecorationBossNet:GetInstance():AttentionBoss(
+        { monster_sid = sid, type = type },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            local index = _G.table.indexof(self.attention, sid)
+            if type == 1 then
+                if index and _G.AppSetting.DEBUG then
+                    _G.LogError("该monster_sid已经在关注列表中,sid: " .. sid)
+                    return
+                end
+                _G.table.insert(self.attention, sid)
+            elseif type == 2 then
+                if not index and _G.AppSetting.DEBUG then
+                    _G.LogError("该monster_sid不在关注列表中,sid: " .. sid)
+                    return
+                end
+                for k, v in ipairs(self.attention) do
+                    if v == sid then
+                        _G.table.remove(self.attention, k)
+                        break
+                    end
+                end
+                -- self.attention[index] = nil
+            end
+            _G.Events:GetInstance():Broadcast(_G.eDecorationBoss.AttentionBoss, sid)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---@param msg p2c_box_award 宝箱奖励推送
+function DecorationBossModel:P2CBoxAward(msg)
+    if msg.ack ~= 1 then
+        return
+    end
+    for k, v in pairs(msg.box_award) do
+        if self.awardBox[v.k] == nil then
+            self.awardBox[v.k] = {}
+            self.awardBox[v.k].box_sid = v.k
+            self.awardBox[v.k].num = 0
+            self.awardBox[v.k].index = 1
+        end
+        self.awardBox[v.k].num = self.awardBox[v.k].num + v.v
+    end
+    self:RefreshAwardRedPoint()
+end
+
+--endregion
+
+--region 红点相关
+function DecorationBossModel:CheckRedPoint()
+    if _G.PlayerPrefsManager.GetInt("decoration_boss_first_open_func", 0) == 0 then
+        return 1
+    end
+
+    if self:CheckCanGetAward() then
+        return 1
+    end
+
+    local lastRefreshTime = _G.PlayerPrefsManager.GetInt("decoration_boss_refresh_time", 0)
+    if lastRefreshTime == 0 then
+        return 1
+    end
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    return serverTime >= lastRefreshTime + 86400 and 1 or 0
+end
+
+---奖励红点
+function DecorationBossModel:CheckAwardRedPoint()
+    if not self.awardBox then
+        return 0
+    end
+    for _, v in pairs(self.awardBox) do
+        if v.num > 0 then
+            return 1
+        end
+    end
+
+    return 0
+end
+
+---刷新红点
+function DecorationBossModel:RefreshRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DecorationBoss.id)
+end
+
+---刷新奖励红点
+function DecorationBossModel:RefreshAwardRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DecorationBossAward.id)
+end
+
+---进入界面后刷新红点
+function DecorationBossModel:EnterRefreshRedPoint()
+    _G.PlayerPrefsManager.SetInt("decoration_boss_first_open_func", 1)
+    local lastRefreshTime = _G.PlayerPrefsManager.GetInt("decoration_boss_refresh_time", 0)
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if lastRefreshTime == 0 or serverTime >= lastRefreshTime + 86400 then
+        local refreshTime = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime()) + 43200
+        _G.PlayerPrefsManager.SetInt("decoration_boss_refresh_time", refreshTime)
+        self:RefreshRedPoint()
+    end
+end
+
+---每天12点刷新红点
+function DecorationBossModel:SetRedPointTimer()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local refreshTime = _G.TimeUtil.GetDayBySix(serverTime) + _G.TimeUtil.GAME_DAY_TIME
+    local delay
+    if refreshTime > serverTime then
+        delay = refreshTime - serverTime
+    else
+        delay = refreshTime + 86400 - serverTime
+    end
+    if self.redPointTimer then
+        self.redPointTimer:Stop()
+        self.redPointTimer = nil
+    end
+    self.redPointTimer = _G.TimerManager:GetInstance():GetTimer(delay + 1, self.RefreshRedPointTime, self, true, false,
+        true)
+    self.redPointTimer:Start()
+end
+
+function DecorationBossModel:RefreshRedPointTime()
+    self:RefreshRedPoint()
+    self:SetRedPointTimer()
+end
+
+--endregion
+
+---销毁对象时,析构函数
+function DecorationBossModel:Dispose()
+    self.bossInfo = nil
+    _G.Events:GetInstance():RemoveListener(
+        _G.ConfigManager.net_map.ultimate_conclusion_boss_state.Cmd,
+        self.UpdateBossState,
+        self
+    )
+    if self.bossReviveTimer then
+        self.bossReviveTimer:Stop()
+        self.bossReviveTimer = nil
+    end
+    if self.refreshTimer then
+        self.refreshTimer:Stop()
+        self.refreshTimer = nil
+    end
+    if self.redPointTimer then
+        self.redPointTimer:Stop()
+        self.redPointTimer = nil
+    end
+end
+
+return DecorationBossModel

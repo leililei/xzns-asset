@@ -1,0 +1,542 @@
+---@class Afk2MainView: UIBaseView	灵域巡查主界面
+---@field go_table Afk2MainView_GoTable
+---@field model Afk2Model
+---@field sectionItems table<any, Afk2MainView._obj_sectionItem_GoTable>    @关卡列表实例节点
+---@field sections afk2_cfg[]                                               @关卡列表数据
+---@field nextSection number                                                @当前挑战中的关卡id
+---@field rewardTimer Timer                                                 @奖励信息刷新定时器
+---@field goldItems UnityEngine.GameObject[]                                @金币动画缓存节点
+local Afk2MainView = _G.BaseClass("Afk2MainView", _G.UIBaseView)
+
+function Afk2MainView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+
+    --添加奖励刷新定时器
+    self.rewardTimer = _G.TimerManager:GetInstance():GetTimer(1, self.RefreshRewardView, self, false, false)
+    self.rewardTimer:Start()
+
+    --监听金币动画创建事件
+    _G.Events:GetInstance():AddListener(_G.AnimationEvents.Afk2AnimationAttack, self.CreateGoldAnimationWithState, self)
+end
+
+function Afk2MainView:OnDestroy()
+    if self.rewardTimer then
+        self.rewardTimer:Stop()
+        self.rewardTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.AnimationEvents.Afk2AnimationAttack, self.CreateGoldAnimationWithState,
+        self)
+end
+
+function Afk2MainView:OnCreate()
+    self.model = require("Afk2Model"):GetInstance()
+
+    self:InitSectionView()
+    self:RefreshView()
+    self.go_table.obj_privilegredpoint:UpdateRedPointItemIDAndParam(
+        _G.ConfigManager.redpoint_cfg.Afk2Privilege.id
+    )
+    self.go_table.obj_buildredpoint:UpdateRedPointItemIDAndParam(
+        _G.ConfigManager.redpoint_cfg.Afk2BuildManage.id
+    )
+    self:OnBuildLevelChange()
+    self:AddListener(_G.eAfk2Events.BuildLevelChange, self.OnBuildLevelChange)
+end
+
+---建筑等级变化监听，有建筑解锁的时候才显示建设按钮
+function Afk2MainView:OnBuildLevelChange()
+    local allData = self.model:GetAllBuildData()
+    self.go_table.aorbtn_building:SetActiveE(_G.table.isEmptyOrNil(allData) and 0 or 1)
+end
+
+---刷新整个页面视图(等级丶奖励丶关卡和按钮状态)
+---@return void
+function Afk2MainView:RefreshView()
+    self:RefreshStates()
+    self:RefreshRewardView()
+    self:RefreshSectionView()
+    self:MoveCurrentSction()
+end
+
+---刷新经验条
+function Afk2MainView:RefreshExpSlider()
+    self.go_table.aortext_exp.text = ""
+
+    local level = self.model:GetAfkLevel()
+    local exp = self.model:GetAfkExp()
+    local cfg = _G.ConfigManager.afk2_level_cfg[level]
+    --本级拥有的经验和升级所需经验
+    local needExp = cfg.afk2_exp[2]
+    if level > 1 then
+        local preCfg = _G.ConfigManager.afk2_level_cfg[level - 1]
+        needExp = cfg.afk2_exp[2] - preCfg.afk2_exp[2]
+        exp = _G.Mathf.Max(exp - preCfg.afk2_exp[2], 0)
+    end
+
+    self.go_table.aortext_exp.text = needExp > 0 and (exp .. "/" .. needExp) or ""
+    self.go_table.slider_exp.value = needExp > 0 and (exp / needExp) or 1
+end
+
+---刷新页面状态(等级丶按钮状态)
+---@return void
+function Afk2MainView:RefreshStates()
+    local level = self.model:GetAfkLevel()
+    local nextId = self.model:GetAfkNextSid()
+    local nextCfg = nextId > 0 and _G.ConfigManager.afk2_cfg[nextId] or nil
+    local sectionLevel = nextCfg and nextCfg.afk2_lv or level + 1
+    self.go_table.aortext_level.text = _G.GetLangPackValue(90000011492, level)
+    self.go_table.obj_challengefont:SetActiveE(level < sectionLevel and 0 or 1)
+    if level < sectionLevel then
+        self.go_table.aortext_challengeTip.text = _G.GetLangPackValue(90000011664, sectionLevel)
+    else
+        self.go_table.aortext_challengeTip.text = ""
+    end
+    self.go_table.aortext_challengeCount.text = ""
+    self.go_table.obj_challengeEffect:SetActiveE(level < sectionLevel and 0 or 1)
+    self:RefreshExpSlider()
+
+    ---向后查找可用奖励信息或解锁建筑
+    local rewardData, rewardIndex = nil, 0
+    local buildId, buildLevel = 0, 0
+    local move = nextCfg
+    for i = 1, 100 do
+        if not move then
+            break
+        end
+        buildId, buildLevel = self.model:GetSectionUnlock(move.id)
+        if buildId > 0 then
+            rewardIndex = i
+            break
+        end
+        if move and move.reward and #move.reward > 0 then
+            rewardData = move.reward
+            rewardIndex = i
+            break
+        end
+        move = _G.ConfigManager.afk2_cfg[move.next_section]
+    end
+    if not rewardData and buildId <= 0 then
+        self.go_table.obj_nextReward:SetActiveE(0)
+        return
+    end
+    if buildId > 0 then
+        --解锁建筑信息
+        local buildCfg = _G.ConfigManager.afk2_building_cfg[buildId]
+        self.go_table.aortext_nextRewardSection.text = _G.GetLangPackValue(
+            buildLevel == 1 and 90000011600 or 90000011601,
+            rewardIndex,
+            _G.GetLangPackValue(buildCfg.name)
+        )
+    else
+        local sid, num = table.unpack(rewardData)
+        self.go_table.aortext_nextRewardSection.text = _G.GetLangPackValue(90000011493, rewardIndex)
+        self.go_table.aorrawimage_nextReward:LoadImage(_G.StorageManager:GetInstance():GetItemIcon(sid))
+        self.go_table.aortext_nextRewardNum.text = num and num > 0 and ("x" .. _G.UIUtils.NumberToUnitStr(num)) or ""
+    end
+    self.go_table.aorrawimage_nextReward:SetActiveE(buildId <= 0 and 1 or 0)
+    self.go_table.aortext_nextRewardNum:SetActiveE(buildId <= 0 and 1 or 0)
+    self.go_table.obj_nextReward:SetActiveE(1)
+end
+
+---刷新奖励信息状态
+---@return void
+function Afk2MainView:RefreshRewardView()
+    --尚未通过任何关卡
+    if self.model:GetAfkSid() <= 0 then
+        self.go_table.slider_mxbox:SetActiveE(0)
+        self.go_table.aortext_mxbox.text = ""
+        self.go_table.obj_box1:SetActiveE(0)
+        self.go_table.obj_box2:SetActiveE(0)
+        self.go_table.obj_box3:SetActiveE(0)
+        return
+    end
+
+    local maxTime = self.model:GetAfkMaxTime()
+    local duration = _G.TimeUtil.GetServerUnixTime() - self.model:GetAfkTime()
+    if duration > maxTime then
+        duration = maxTime
+    elseif duration < 0 then
+        duration = 0
+    end
+
+    --进度条和时间
+    self.go_table.slider_mxbox:SetActiveE(1)
+    self.go_table.slider_mxbox.value = duration / maxTime
+    self.go_table.aortext_mxbox.text =
+        duration < maxTime and _G.TimeUtil.TimeToString(duration, 1) or _G.GetLangPackValue(90000010282)
+    --宝箱状态
+    local state = duration >= maxTime * 0.66 and 3 or duration >= self.model:GetAfkInterval() and 2 or 1
+    self.go_table.obj_box1:SetActiveE(state == 1 and 1 or 0)
+    self.go_table.obj_box2:SetActiveE(state == 2 and 1 or 0)
+    self.go_table.obj_box3:SetActiveE(state == 3 and 1 or 0)
+end
+
+---初始关卡列表
+---@return void
+function Afk2MainView:InitSectionView()
+    self.go_table.obj_sectionItem:SetActiveE(0)
+    self.go_table.scrollloophorizontal_section:InitItemData(0, _G.handler(self, self.RefreshSectionItem))
+    self.go_table.scrollloophorizontal_section:SetContentPosChangeCall(
+        _G.handler(self, self.OnSctionContentPositionChange)
+    )
+end
+
+---刷新关卡列表
+---@return void
+function Afk2MainView:RefreshSectionView()
+    --获取当前进行中的关卡
+    self.nextSection = self.model:GetAfkNextSid()
+
+    --初始化关卡列表
+    local afk2_cfg = _G.ConfigManager.afk2_cfg
+    local oldCount = not self.sections and 0 or #self.sections
+    self.sections = {}
+    --初始化关卡数据(显示之前20关和之后50关预览)
+    local showPrevious, showNext = 10, 50
+    local cfg = afk2_cfg[self.nextSection > 0 and self.nextSection or self.model:GetAfkSid()]
+    local move = cfg
+    for _ = 1, showPrevious do
+        move = afk2_cfg[move.pre_section]
+        if not move then
+            break
+        end
+        table.insert(self.sections, 1, move)
+    end
+    table.insert(self.sections, cfg)
+    move = cfg
+    for _ = 1, showNext do
+        move = afk2_cfg[move.next_section]
+        if not move then
+            break
+        end
+        table.insert(self.sections, move)
+    end
+
+    if oldCount ~= #self.sections then
+        self.go_table.scrollloophorizontal_section:UpdateCount(#self.sections)
+    else
+        self.go_table.scrollloophorizontal_section:UpdateAllItem()
+    end
+end
+
+---移动到当前关卡位置
+---@return void
+function Afk2MainView:MoveCurrentSction()
+    local index = self:GetCurrentSectionIndex() - 3 --C#从0开始并额外显示前两个节点
+    if index < 0 then
+        index = 0
+    end
+    self.go_table.scrollloophorizontal_section:ScrollToIndex(index)
+    self:OnSctionContentPositionChange()
+end
+
+---监听关卡列表滑动事件
+---@return void
+function Afk2MainView:OnSctionContentPositionChange()
+    --获取节点宽度和间隔
+    ---@type number,number
+    local itemWidth, itemSpacing, viewCount = self.sectionItemWidth, self.sectionItemSpacing, self.sectionViewCount
+    if not itemWidth then
+        itemWidth = self.go_table.obj_sectionItem:GetRectTransformSizeDelta()
+        itemSpacing = 0
+        local viewWidth = self.go_table.scrollloophorizontal_section:GetRectTransformSizeDelta()
+        viewCount = math.floor(math.abs(viewWidth / (itemWidth + itemSpacing)))
+        self.sectionItemWidth = itemWidth
+        self.sectionItemSpacing = itemSpacing
+        self.sectionViewCount = viewCount
+    end
+
+    --计算当前显示的节点的序号
+    local x = self.go_table.obj_sectionContent:GetAnchorPosition()
+    local index = math.floor(math.abs(x / (itemWidth + itemSpacing)))
+    local offset = self:GetCurrentSectionIndex() - index
+
+    --向左拖动10关或向右拖动10关, 显示复位按钮
+    self.go_table.aorbtn_sectionReset1:SetActiveE(offset - viewCount <= -10 and 1 or 0)
+    self.go_table.aorbtn_sectionReset2:SetActiveE(offset >= 10 and 1 or 0)
+end
+
+---获取当前关卡在列表中的序号(lua数组序号从1开始)
+---@return number
+function Afk2MainView:GetCurrentSectionIndex()
+    if not self.sections then
+        return 0
+    end
+    if self.nextSection <= 0 then
+        return #self.sections
+    end
+    local index = 1
+    for i, cfg in ipairs(self.sections) do
+        if cfg.id == self.nextSection then
+            index = i
+            break
+        end
+    end
+    return index
+end
+
+---刷新关卡列表
+---@param index number
+---@param obj UnityEngine.GameObject
+---@return void
+function Afk2MainView:RefreshSectionItem(index, obj)
+    if not self.sectionItems then
+        self.sectionItems = {}
+    end
+
+    ---@type Afk2MainView._obj_sectionItem_GoTable|{data:afk2_cfg}
+    local item = self.sectionItems[obj:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(obj)
+        _G.AddViewBtnClick(obj, _G._G.handlerbind(self, self.OnSectionClickBtn, item))
+        self.sectionItems[obj:GetInstanceIDE()] = item
+    end
+
+    index = index + 1 --C#序号从0开始, lua序号从1开始
+
+    local cfg = self.sections[index]
+    local isPass = self.nextSection <= 0 or (cfg.number < _G.ConfigManager.afk2_cfg[self.nextSection].number) --是否通关
+    local hasReward = cfg.reward and #cfg.reward > 0                                                          --是否有奖励
+    local isGetReward = self.model:CheckAfkSectionAward(cfg.id)                                               --是否已领取奖励
+    --是否为当前挑战关卡
+    local isCurSection = cfg.id == self.nextSection
+    --此关卡解锁的建筑(已通关或当前挑战中, 不显示建筑信息)
+    local buildId, buildLevel = 0, 0
+    if not isPass and not isCurSection then
+        buildId, buildLevel = self.model:GetSectionUnlock(cfg.id)
+    end
+    item.data = cfg
+    --显示基础信息
+    item.aortext_index.text = _G.GetLangPackValue(90024300004, cfg.number)
+    item.obj_nextLight:SetActiveE(isPass and 1 or 0)
+    item.obj_previousLight:SetActiveE((index == 1 or isCurSection or isPass) and 1 or 0)
+    item.obj_pass:SetActiveE(buildId <= 0 and isPass and 1 or 0)
+    item.obj_nopass:SetActiveE(buildId <= 0 and isPass and 0 or 1)
+    item.obj_reward:SetActiveE(buildId <= 0 and 1 or 0)
+    item.aorrawimage_build:SetActiveE(buildId > 0 and 1 or 0)
+    if buildId > 0 then
+        --解锁建筑信息
+        local buildCfg = _G.ConfigManager.afk2_building_cfg[buildId]
+        item.aortext_buildLv.text = _G.GetLangPackValue(buildLevel > 1 and 90000011585 or 90000011584) --等级提升或解锁建筑
+        ---@param trans AorRawImage
+        item.aorrawimage_build:LoadImage(buildCfg.icon, function(trans)
+            if _G.IsNil(trans) then
+                return
+            end
+            local _, originalHeight = trans:GetRectTransformWidthHeight()
+            trans:SetNativeSize()
+            local width, height = trans:GetRectTransformWidthHeight()
+            trans:SetRectTransformSize(originalHeight * width / height, originalHeight)
+        end)
+    elseif isPass then
+        item.obj_pass:SetLocalScaleXYZ((isCurSection or hasReward) and 1 or 0.5)
+        item.obj_pass:SetLocalEulerAngles(0, 0, (isCurSection or hasReward) and 45 or 0)
+    else
+        item.obj_nopass:SetLocalScaleXYZ((isCurSection or hasReward) and 1 or 0.5)
+        item.obj_nopass:SetLocalEulerAngles(0, 0, (isCurSection or hasReward) and 45 or 0)
+    end
+
+    --显示奖励及其状态
+    if item.awardItem then
+        _G.DestroyObject(item.awardItem.gameObject)
+    end
+    if hasReward then
+        --加载奖励节点
+        _G.StorageManager:GetInstance():GetItemBaseViewNew(
+            cfg.reward,
+            item.obj_rewardParent,
+            function(awardItem)
+                if not awardItem or not awardItem.gameObject and awardItem.gameObject:IsNull() then
+                    return
+                end
+
+                --检查是否有效的加载回调
+                --如果item.data不一致, 则表示已被之后的加载覆盖
+                --如果parent为空, 则表示界面已被销毁
+                if cfg ~= item.data or item.obj_rewardParent:IsNull() then
+                    _G.DestroyObject(awardItem.gameObject)
+                    return
+                end
+                awardItem.gameObject:SetLocalScale(0.6, 0.6, 0.6)
+                awardItem:ShowNumText(not isCurSection, require("ItemViewBase").NumTextAnchor.RightDown)
+                awardItem:ShowEffect(isPass and not isGetReward)
+                item.awardItem = awardItem
+            end
+        )
+    end
+    item.obj_redpoint:SetActiveE(hasReward and isPass and not isGetReward and 1 or 0)
+    item.obj_rewardCompleted:SetActiveE(hasReward and isPass and isGetReward and 1 or 0)
+    --显示当前挑战信息
+    item.obj_fight:SetActiveE(isCurSection and 1 or 0)
+    item.obj_head:SetActiveE(isCurSection and 1 or 0)
+    if isCurSection then
+        _G.UIUtils.SetPlayerHeadItemNew(
+            item.obj_HeadItemBase,
+            _G.PlayerModel:GetInstance():GetIRroleTable(),
+            1,
+            false,
+            false,
+            false,
+            function()
+            end
+        )
+    end
+end
+
+---创建金币掉落动画(优先检测状态)
+---@return void
+function Afk2MainView:CreateGoldAnimationWithState()
+    if self:IsNil() then
+        return
+    end
+    --未通关任何关卡, 不掉落金币
+    if self.model:GetAfkSid() <= 0 then
+        return
+    end
+    self:CreateGoldAnimation()
+end
+
+---创建金币掉落动画
+---@return void
+function Afk2MainView:CreateGoldAnimation()
+    if not self.goldItems then
+        self.goldItems = {}
+    end
+
+    --创建动画节点
+    local obj = #self.goldItems > 0 and table.remove(self.goldItems, 1) or nil
+    if not obj then
+        obj = _G.InstantiateObject(self.go_table.obj_gold, self.go_table.obj_gold:GetParent())
+        obj:SetLocalPosition(self.go_table.obj_gold:GetLocalPosition())
+        obj:SetActiveE(0)
+    end
+    obj:SetActiveE(1)
+
+    --延时后回收节点
+    _G.DelayDo(3, function()
+        if self:IsNil() or not self.goldItems then
+            return
+        end
+        obj:SetActiveE(0)
+        table.insert(self.goldItems, obj)
+    end)
+end
+
+---领取奖励回调
+---@param msg public.s2c_common_ack
+---@param beforeLevel number
+---@param afterLevel number
+---@return void
+function Afk2MainView:OnRewardCallback(msg, beforeLevel, afterLevel)
+    if msg then
+        _G.UIUtils.ShowCommonAward(msg, function()
+            if self:IsNil() then
+                return
+            end
+            if not beforeLevel or not afterLevel or beforeLevel >= afterLevel then
+                return
+            end
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.Afk2LevelUpView.Name, beforeLevel, afterLevel)
+        end)
+    end
+    self:RefreshStates()
+    self.go_table.scrollloophorizontal_section:UpdateAllItem()
+end
+
+---监听界面UI事件
+---@return void
+function Afk2MainView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_close then
+        self:Close()
+    elseif go == self.go_table.aorbtn_sectionPreview then
+        --关卡预览
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.Afk2SectionPreviewView.Name)
+    elseif go == self.go_table.aorbtn_challenge then
+        local nextSid = self.model:GetAfkNextSid()
+        if nextSid <= 0 then
+            --TODO: 已完成所有关卡
+            return
+        end
+        --检查是否满足等级要求
+        local needLevel = _G.ConfigManager.afk2_cfg[nextSid].afk2_lv
+        if self.model:GetAfkLevel() < needLevel then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.Afk2UpgradeWayView.Name)
+            return
+        end
+        self.model:InitFight()
+        self.model:Fight()
+    elseif go == self.go_table.aorbtn_mxbox then
+        if self.model:GetAfkSid() <= 0 then
+            --TODO: 尚未进行任何挑战
+            return
+        end
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.Afk2RewardView.Name)
+    elseif go == self.go_table.aorbtn_sectionReset1 or go == self.go_table.aorbtn_sectionReset2 then
+        self:MoveCurrentSction()
+    elseif go == self.go_table.aorbtn_building then
+        ---街道管理
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AfkBuildingView.Name)
+    elseif go == self.go_table.aorbtn_privilege then
+        ---巡查特权
+        self.model:RefreshPrivilegeRedPoint()
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LimitedTimePrivilegeView.Name, 405005)
+    elseif go == self.go_table.aorbtn_level then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.Afk2LevelView.Name)
+    elseif go == self.go_table.aorbtn_help then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 142)
+    end
+end
+
+---监听关卡列表UI事件
+---@param go UnityEngine.Component
+---@param item Afk2MainView._obj_sectionItem_GoTable|{data:afk2_cfg}
+---@return void
+function Afk2MainView:OnSectionClickBtn(go, _, item)
+    if not item or not item.data then
+        return
+    end
+
+    local cfg = item.data
+    local isPass = self.nextSection <= 0 or (cfg.number < _G.ConfigManager.afk2_cfg[self.nextSection].number) --是否通关
+    local isCurSection = cfg.id == self.nextSection
+    --未通过关卡显示建筑Tip
+    local buildId, buildLevel = 0, 0
+    if not isPass and not isCurSection then
+        buildId, buildLevel = self.model:GetSectionUnlock(cfg.id)
+    end
+    if buildId > 0 then
+        --显示建筑tip
+        local buildCfg = _G.ConfigManager.afk2_building_cfg[buildId]
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            buildLevel == 1 and 970113 or 970114,
+            nil, nil, nil, nil, nil,
+            cfg.number,
+            _G.GetLangPackValue(buildCfg.name)
+        )
+    elseif cfg.reward and #cfg.reward > 0 and cfg.id ~= self.nextSection then
+        --当前挑战关卡显示头像, 不显示奖励
+        local isGetReward = self.model:CheckAfkSectionAward(cfg.id)
+        if isPass and not isGetReward then
+            ---@type number[]
+            local sids = {}
+            --遍历所有已通关关卡, 领取可领取的奖励
+            local move = _G.ConfigManager.afk2_cfg[self.model:GetAfkSid()]
+            while move do
+                if move and move.reward and #move.reward > 0 and not self.model:CheckAfkSectionAward(move.id) then
+                    table.insert(sids, move.id)
+                end
+                move = _G.ConfigManager.afk2_cfg[move.pre_section]
+            end
+            if #sids <= 0 then
+                return
+            end
+            --获取奖励
+            self.model:GetAfkSectionAward(sids, _G.handler(self, self.OnRewardCallback))
+        else
+            local sid, num = table.unpack(cfg.reward)
+            require("CommonTipManager"):GetInstance():OpenTip(go.gameObject, sid, nil, nil)
+        end
+    end
+end
+
+return Afk2MainView

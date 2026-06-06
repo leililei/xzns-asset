@@ -1,0 +1,542 @@
+-----------------------------------------------------------------------
+-- D:.ProjectHZ.Alpha.Client.Assets.Resources.LuaScripts.Game.Nav.NavManager	(修改路径必须修正此项!)
+-- Created by wyx
+-- DateTime: 2020/04/02
+-- Description 寻路管理器
+-----------------------------------------------------------------------
+
+---@field Object BaseItem 需要寻路的物体
+---@field OriginSceneSid number 起点SceneSid
+---@field TargetSceneSid number 终点SceneSid
+---@field Speed number 寻路时的速度
+---@field Position UnityEngine.Vector3 寻路的终点坐标Position
+---@class NavParam 执行寻路参数
+
+---@field PassPortalWarpCallBack function 通过传送阵的回调
+---@field ResScene number[] 所有可达通过的场景集合
+---@field ResDoor number[] 所有可达通过的传送门集合
+---@field DoorItem WorldDoorItem 将要通过的传送门
+---@field EndSceneSid number 终点场景Sid
+---@field DeadSceneWay number[] 所有不可达通过的场景集合
+---@field AllDoorItemCfg WorldDoorCfg_Item[] 所有传送门配置表
+---@field DoorCfgByScene table<numer,WorldDoorCfg_Item[]> 每个场景的传送门配置表
+---@field NavItemDicByUid table<number,NavItem> 所有寻路NavItem字典 Key:Uid
+---@class NavManager : Singleton    寻路管理器
+local NavManager = _G.BaseClass("NavManager", _G.Singleton)
+_G.NavManager = NavManager
+local NavItem = _G.reimport("Game.Nav.NavItem")
+
+---@return NavManager NavManager
+function NavManager:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---@field Success string 寻路可达
+---@field SameScene string 同一个场景寻路，不需要填写SceneSid
+---@field DontArrive string 寻路不可达
+---@field TooClose string 寻路点和当前点太近
+---@field SceneError string 寻路的初始场景和当前场景不一致
+---@class NavState
+local NavState = {
+    Success = "Success",
+    SameScene = "SameScene",
+    DontArrive = "DontArrive",
+    TooClose = "TooClose",
+    SceneError = "SceneError"
+}
+_G.NavState = NavState
+
+---取得队尾
+---@param queue number[] 队列
+---@return number
+local function GetQueueTailItem(queue)
+    if #queue == 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("the queue is empyt")
+        end
+        return nil
+    end
+    return queue[#queue]
+end
+
+---创建对象时,入口构造函数
+function NavManager:__init()
+    self.NavItemDicByUid = {}
+    self.AllDoorItemCfg = {}
+    for key, value in pairs(_G.ConfigManager.object_world_cfg) do
+        if value.Type1 == _G.WorldItemType.Door then
+            self.AllDoorItemCfg[key] = {
+                Sid = key,
+                ToProtalSid = value.Params[1],
+                SceneSid = value.Params[3],
+                ToSceneSid = value.Params[2]
+            }
+        end
+    end
+    self.DoorCfgByScene = self:InitDoorCfgByScene(self.AllDoorItemCfg)
+    self:AddListener(true)
+end
+
+---销毁对象时,析构函数
+function NavManager:Dispose()
+    self:AddListener(false)
+end
+
+---是否添加事件
+---@param isAdd boolean 是否添加 true添加 false移除
+function NavManager:AddListener(isAdd)
+    if isAdd then
+        _G.Events:GetInstance():AddListener(_G.eNav.NavSceneSwitchContinue, self.OnNavSceneSwitchContinue, self)
+        _G.Events:GetInstance():AddListener(_G.eNav.NavInterruptMove, self.OnNavInterruptMove, self)
+        _G.Events:GetInstance():AddListener(_G.eNav.NavPause, self.OnNavPause, self)
+        _G.Events:GetInstance():AddListener(_G.eScene.ExitWorld, self.OnExitWorld, self)
+    else
+        _G.Events:GetInstance():RemoveListener(_G.eNav.NavSceneSwitchContinue, self.OnNavSceneSwitchContinue, self)
+        _G.Events:GetInstance():RemoveListener(_G.eNav.NavInterruptMove, self.OnNavInterruptMove, self)
+        _G.Events:GetInstance():RemoveListener(_G.eNav.NavPause, self.OnNavPause, self)
+        _G.Events:GetInstance():RemoveListener(_G.eScene.ExitWorld, self.OnExitWorld, self)
+    end
+end
+
+function NavManager:OnExitWorld()
+    local Uid = _G.WorldManager:GetInstance():GetCurWorldPlayer().Uid
+    for key, _ in pairs(self.NavItemDicByUid) do
+        if key ~= Uid then
+            self.NavItemDicByUid[key] = nil
+        end
+    end
+    self:DeleteAllNavItem()
+end
+
+---将同一个场景的配置表归类
+---@param cfg WorldDoorCfg_Item[] 配置表
+---@return table<number,WorldDoorCfg_Item[]> 各个场景的配置表
+function NavManager:InitDoorCfgByScene(cfg)
+    local tbl = {}
+    for _, value in pairs(cfg) do
+        if value.ToSceneSid and value.ToSceneSid ~= 0 then
+            if not tbl[value.SceneSid] then
+                tbl[value.SceneSid] = {}
+            end
+            table.insert(tbl[value.SceneSid], value)
+        end
+    end
+    return tbl
+end
+
+---取得下个场景的传送门配置表
+---@param doorCfg WorldDoorCfg_Item 当前传送门配置
+---@param passedSidScene table<number,number> 已通过的场景字典
+---@return WorldDoorCfg_Item[] 可达的传送门数组
+function NavManager:GetNextSceneCfg(doorCfg, passedSidScene)
+    local nextSceneCfg = self.DoorCfgByScene[doorCfg.ToSceneSid]
+    local res = {}
+    if nextSceneCfg then
+        for _, value in ipairs(nextSceneCfg) do
+            if not passedSidScene[value.ToSceneSid] then
+                table.insert(res, value)
+            end
+        end
+    end
+    return res
+end
+
+---通过Sid取得传送门配置
+---@param sid number Sid
+---@return WorldDoorCfg_Item
+function NavManager:GetDoorCfgBySid(sid)
+    return self.AllDoorItemCfg[sid]
+end
+
+---进入下个场景取得可达路线
+---@param cfg WorldDoorCfg_Item[] 下个场景的符合条件的传送门配置数组
+---@param sceneSidQueue number[] 已通过的场景Sid队列
+---@param doorSidQueue number[] 已通过的传送门Sid队列
+---@param passedSceneDic table<number,number> 已通过的场景KV表  K:SceneSid V:SceneSid
+---@param deadDoorDic table<number,number> 不会通过的传送门KV表 K:Sid V:Sid
+---@return boolean
+function NavManager:EnterNextScene(cfg, sceneSidQueue, doorSidQueue, passedSceneDic, deadDoorDic)
+    for _, value in ipairs(cfg) do
+        if deadDoorDic[value.Sid] == nil then
+            if value.ToSceneSid == self.EndSceneSid then
+                table.insert(sceneSidQueue, value.SceneSid)
+                table.insert(sceneSidQueue, value.ToSceneSid)
+
+                table.insert(doorSidQueue, value.Sid)
+                table.insert(self.ResScene, _G.DeepCopy(sceneSidQueue))
+                table.insert(self.ResDoor, _G.DeepCopy(doorSidQueue))
+
+                table.remove(sceneSidQueue)
+                table.remove(sceneSidQueue)
+                table.remove(doorSidQueue)
+            else
+                --不会再向回走
+                if passedSceneDic[value.SceneSid] == nil and passedSceneDic[value.ToSceneSid] == nil then
+                    passedSceneDic[value.SceneSid] = value.SceneSid
+                    table.insert(sceneSidQueue, value.SceneSid)
+                    table.insert(doorSidQueue, value.Sid)
+                    local nextSceneCfg = self:GetNextSceneCfg(value, passedSceneDic)
+                    if #nextSceneCfg > 0 then
+                        self:EnterNextScene(nextSceneCfg, sceneSidQueue, doorSidQueue, passedSceneDic, deadDoorDic)
+                    else
+                        local theLastDoor = GetQueueTailItem(doorSidQueue)
+                        local doorCfg = self:GetDoorCfgBySid(theLastDoor)
+                        local _nextSceneCfg = self.DoorCfgByScene[doorCfg.ToSceneSid]
+
+                        --只有单向走的路线
+                        local isSingleDir =
+                            not _G.IsNil(_nextSceneCfg) and (#_nextSceneCfg == 1) and
+                            doorCfg.ToSceneSid ~= self.EndSceneSid
+
+                        local exit = GetQueueTailItem(sceneSidQueue)
+                        if isSingleDir then
+                            --
+                            if _G.AppSetting.DEBUG then
+                                _G.LogError("走进了单向死路")
+                            end
+                            local node = _G.DeepCopy(sceneSidQueue)
+                            table.insert(node, doorCfg.ToSceneSid)
+                            table.insert(node, "OneDirDeadWay")
+                            table.insert(self.DeadSceneWay, node)
+
+                            --回退
+                            if passedSceneDic[exit] then
+                                passedSceneDic[exit] = nil
+                            end
+                            table.remove(sceneSidQueue)
+                            table.remove(doorSidQueue)
+                        else
+                            local isNotLoop = false
+                            if not _G.IsNil(_nextSceneCfg) then
+                                for _, v in ipairs(_nextSceneCfg) do
+                                    if not passedSceneDic[v.ToSceneSid] then
+                                        isNotLoop = true
+                                    end
+                                end
+                            end
+
+                            --绕圈走进了死门
+                            if isNotLoop == false then
+                                --
+                                if _G.AppSetting.DEBUG then
+                                    _G.LogError("走进了绕圈死路")
+                                end
+                                local node = _G.DeepCopy(sceneSidQueue)
+                                table.insert(node, doorCfg.ToSceneSid)
+                                table.insert(node, "LoopDeadWay")
+                                table.insert(self.DeadSceneWay, node)
+
+                                --回退
+                                if passedSceneDic[exit] then
+                                    passedSceneDic[exit] = nil
+                                end
+                                table.remove(sceneSidQueue)
+                                table.remove(doorSidQueue)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local exit = GetQueueTailItem(sceneSidQueue)
+    table.remove(sceneSidQueue)
+    table.remove(doorSidQueue)
+    passedSceneDic[exit] = nil
+    return true
+end
+
+---取得只通过传送门所有可行的路线
+---@param fromSceneSid number 起点
+---@param toSceneSid number 终点
+---@param cfg WorldDoorCfg_Item[] 所有传送门配置表
+---@return number[] 可行的传送门Sid集合
+function NavManager:GetNavByDoorWay(fromSceneSid, toSceneSid)
+    if fromSceneSid == toSceneSid then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("处于同一个场景")
+        end
+        return nil
+    end
+
+    self.ResScene = {}
+    self.ResDoor = {}
+    self.DeadSceneWay = {}
+    self.EndSceneSid = toSceneSid
+
+    ---@type WorldDoorCfg_Item[]
+    local startPoint = self.DoorCfgByScene[fromSceneSid]
+    if startPoint == nil then
+        -- _G.PopWindowManager:GetInstance():ShowTips("该目标不可自动寻路前往")
+        return
+    end
+    local index = 1
+    repeat
+        local node = startPoint[index]
+        if node.ToSceneSid == toSceneSid then
+            table.insert(self.ResScene, {node.SceneSid, node.ToSceneSid})
+            table.insert(self.ResDoor, {node.Sid})
+            index = index + 1
+        else
+            local passedScene = {}
+            passedScene[node.SceneSid] = node.SceneSid
+            local nextSceneCfg = self:GetNextSceneCfg(node, passedScene)
+            local SidQueue = {node.Sid}
+            local sceneSidQueue = {node.SceneSid}
+
+            local deadScene = {}
+            if self:EnterNextScene(nextSceneCfg, sceneSidQueue, SidQueue, passedScene, deadScene) then
+                index = index + 1
+            end
+        end
+    until (index > #startPoint)
+
+    table.sort(
+        self.ResDoor,
+        function(a, b)
+            return #a < #b
+        end
+    )
+
+    table.sort(
+        self.ResScene,
+        function(a, b)
+            return #a < #b
+        end
+    )
+
+    if #self.ResDoor < 1 then
+        return nil
+    end
+
+    return _G.DeepCopy(self.ResDoor), self.ResScene
+end
+
+--找到本场景的对应传送门
+---@param sid number sid
+---@return WorldDoorItem
+function NavManager:GetSceneDoorItemBySid(sid)
+    ---@type WorldDoorModel
+    local model = require("WorldItemManager"):GetInstance():GetModelByType(_G.WorldItemType.Door)
+    return model:GetSceneDoorItemBySid(sid)
+end
+
+---寻路打断
+---@param uid number uid
+---@param isDrag boolean 是否通过摇杆移动
+function NavManager:OnNavInterruptMove(uid, isDrag)
+    if isDrag == nil then
+        isDrag = false
+    end
+
+    local item = self.NavItemDicByUid[uid]
+    if item then
+        item:OnNavInterruptMove(isDrag)
+    end
+end
+
+---执行寻路
+---@param param NavParam
+---@return NavItem, NavState
+function NavManager:DoNavMove(param, OverFun)
+    if not param.Object then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("param.Object is nil")
+        end
+        return
+    end
+    local Uid = param.Object.Uid
+
+    --region 只寻路至指定点
+    if param.TargetSceneSid == nil then
+        if param.Position then
+            if self.NavItemDicByUid[Uid] then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("<color=red><size=20>" .. "self.AllNavItemTable 赋予新值    " .. Uid .. "</size></color>")
+                end
+                self:DeleteNavItemByUid(Uid)
+            end
+            ---@type NavItem
+            local navItem = NavItem.New(param)
+            navItem:AddListener(_G.NavItemEvent, _G.NavItemEvent.EnumValue.NavComplete, OverFun, self, true)
+            self.NavItemDicByUid[Uid] = navItem
+            local isArrive, isTooClose = navItem:DoNavByPosition(param.Position, param.Speed)
+            if isTooClose then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("<color=red><size=20>" .. param.Object.Uid .. " 寻路点太近" .. "</size></color>")
+                end
+                return nil, NavState.TooClose
+            end
+            if isArrive == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("<color=red><size=20>" .. param.Object.Uid .. "  无法寻路" .. "</size></color>")
+                end
+                return nil, NavState.DontArrive
+            end
+        end
+
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red><size=20>" .. param.Object.Uid .. "  只寻路至指定点" .. "</size></color>")
+        end
+        return self.NavItemDicByUid[Uid], NavState.Success
+    end
+    --endregion
+
+    local OriginSceneSid = param.OriginSceneSid or param.Object.World.Cfg.Sid
+    if OriginSceneSid == param.TargetSceneSid then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("同一个场景param 只寻路至指定点")
+        end
+        if param.Object and param.Position then
+            local newParam = {
+                Object = param.Object,
+                Position = param.Position
+            }
+            return self:DoNavMove(newParam)
+        end
+    end
+
+    if OriginSceneSid ~= _G.WorldManager:GetInstance():GetCurWorldSid() then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("寻路的初始场景和玩家所在当前场景不一致")
+        end
+        return nil, NavState.SceneError
+    end
+
+    --取得全走传送门路径,暂定为最短
+    local resByDoor = self:GetNavByDoorWay(OriginSceneSid, param.TargetSceneSid, nil)
+    if resByDoor and next(resByDoor) ~= nil then
+        local navItem = NavItem.New(param, resByDoor[1])
+        if self.NavItemDicByUid[Uid] then
+            self:DeleteNavItemByUid(Uid)
+
+            if _G.AppSetting.DEBUG then
+                _G.Log("<color=red><size=20>" .. "self.AllNavItemTable 赋予新值    " .. Uid .. "</size></color>")
+            end
+        end
+        self.NavItemDicByUid[Uid] = navItem
+        navItem:DoNavQueue()
+        return self.NavItemDicByUid[Uid], NavState.Success
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(_G.TipsSystemCfgDic.task.CanNotGo)
+
+        _G.Events:GetInstance():Broadcast(_G.eNav.NavDontArrive)
+        return nil, NavState.DontArrive
+    end
+end
+
+---取得玩家的寻路
+---@return NavItem
+function NavManager:GetPlayerNavItem()
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    if not player then
+        _G.LogFatal("找不到player")
+    end
+    local Uid = player.Uid
+
+    return self.NavItemDicByUid[Uid]
+end
+
+--切换场景的回调,判断是否进行下一步寻路
+function NavManager:OnNavSceneSwitchContinue()
+    local playerNavItem = self:GetPlayerNavItem()
+    if playerNavItem then
+        playerNavItem:OnNavSceneSwitchContinue()
+    end
+end
+
+--切换场景的回调
+function NavManager:OnNavSceneSwitchComplete()
+    --直接传送阵传送
+    if self.PassPortalWarpCallBack then
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red><size=20>" .. "wyx    " .. "PassPortalWarpCallBack" .. "</size></color>")
+        end
+        _G.Events:GetInstance():Broadcast(_G.eNav.NavComplete)
+        local PassPortalWarpCallBack = self.PassPortalWarpCallBack
+        self.PassPortalWarpCallBack = nil
+        PassPortalWarpCallBack()
+        return
+    end
+
+    local playerNavItem = self:GetPlayerNavItem()
+    if playerNavItem then
+        playerNavItem:OnNavSceneSwitchComplete()
+    end
+end
+
+---寻路暂停启动
+---(和跳跃等特殊动作关联)
+---@param isPause boolean 是否暂停 true 暂停 false 继续
+---@param uid number uid
+function NavManager:OnNavPause(isPause, uid)
+    if not uid then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("uid is nil", uid)
+        end
+        return
+    end
+
+    local item = self.NavItemDicByUid[uid]
+    if item then
+        item:OnNavPause(isPause)
+    end
+end
+
+---寻找寻路
+---@param uid number uid
+---@return NavItem 中文描述
+function NavManager:GetNavItemByUid(uid)
+    local item = self.NavItemDicByUid[uid]
+    return item
+end
+
+---销毁此条寻路
+---@param uid number uid
+function NavManager:DeleteNavItemByUid(uid)
+    local item = self.NavItemDicByUid[uid]
+    if item then
+        local worldItem = item:GetDoNavObjByUid(uid)
+        if worldItem then
+            worldItem:StopGoto()
+        end
+        item:Dispose()
+        self.NavItemDicByUid[uid] = nil
+    end
+end
+
+---销毁所有寻路
+function NavManager:DeleteAllNavItem()
+    local playerUid = _G.WorldManager:GetInstance():GetCurWorldPlayer().Uid
+    local playerNavItem = self.NavItemDicByUid[playerUid]
+
+    for uid, _ in pairs(self.NavItemDicByUid) do
+        self:DeleteNavItemByUid(uid, true)
+    end
+
+    --跨场景寻路,要保留玩家寻路信息
+    if playerNavItem and playerNavItem.NavDoorSidQueue and #playerNavItem.NavDoorSidQueue > 0 then
+        self.NavItemDicByUid[playerUid] = playerNavItem
+    end
+end
+
+---注册寻路,通过BaseItem:GotoPoint(to, gotoEnd)触发
+---@param obj WorldBaseItem 寻路物体
+---@param to UnityEngine.Vector3 终点坐标
+function NavManager:RegisterNavItemByUid(obj, to)
+    local item = self.NavItemDicByUid[obj.Uid]
+    if not item then
+        if _G.AppSetting.DEBUG then
+            _G.Log("注册寻路    " .. obj.Uid)
+        end
+        ---@type NavParam
+        local param = {}
+        param.Object = obj
+        param.Position = to
+        item = NavItem.New(param)
+        self.NavItemDicByUid[obj.Uid] = item
+        _G.Events:GetInstance():Broadcast(_G.eNav.Naving, obj.Uid)
+        return item
+    end
+end

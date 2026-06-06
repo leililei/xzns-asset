@@ -1,0 +1,822 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Arena.Model.ArenaSingleClassSenior	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/01/06
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local ArenaManager = require "ArenaManager"
+local ArenaNet = require "ArenaNet"
+local ArenaController = require "ArenaController"
+---宝箱存储竞技比上限离散ID
+local MaxCoinDiscreteID = 104203
+---挑战券价格
+local TicketPriceDiscreteID = 104201
+---单次购买挑战券ID和数量
+local TicketNumDiscreteID = 104202
+
+local base = require "ArenaSingleClass"
+---@field curEmbattleItem EmbattleItemBase
+---@class ArenaSingleClassSenior  :ArenaSingleClass
+local ArenaSingleClassSenior = _G.BaseClass("ArenaSingleClassSenior", base)
+
+---类的构造函数
+function ArenaSingleClassSenior:__init()
+    self.curRank = nil
+    self.ShopRedPoint = false --竞技场商店红点
+    local cfgs = _G.ConfigManager.discrete_cfg
+    self.maxAwardCount = cfgs[MaxCoinDiscreteID][1][1]
+    self.ticketPrice = cfgs[TicketPriceDiscreteID][1]
+    cfgs = cfgs[TicketNumDiscreteID][1]
+    self.ticketID = cfgs[1]
+    self.ticketCountByOne = cfgs[2]
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.stage_changed.Cmd, self.OnRankChangedCall, self)
+end
+---类的析构函数
+function ArenaSingleClassSenior:Dispose()
+    self.curRank = nil
+    self.freshTime = nil
+    self.freeChallengeTimes = nil
+    self.awardTime = nil
+    self.resCount = nil
+    self.curAwardCount = nil
+    if self.awardTimer then
+        self.awardTimer:Stop()
+        self.awardTimer = nil
+    end
+    self.ticketID = nil
+    self.ticketCountByOne = nil
+    self.maxAwardCount = nil
+    self.ticketPrice = nil
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.stage_changed.Cmd, self.OnRankChangedCall, self)
+    if self.sixUpdateTimer then
+        self.sixUpdateTimer:Stop()
+        self.sixUpdateTimer = nil
+    end
+end
+--region 对外接口
+---获取当前排名
+---@return number 排名
+function ArenaSingleClassSenior:GetCurRank()
+    return self.curRank
+end
+---获取最高排名
+---@return number 排名
+function ArenaSingleClassSenior:GetMaxRank()
+    return self.maxRank
+end
+---获取自己的战力
+---@return 变量类型 中文描述
+function ArenaSingleClassSenior:GetPower()
+    return _G.StorageManager:GetInstance():GetPlayerPower()
+end
+---获取奖励数量
+---@param callback function 奖励更新回调
+function ArenaSingleClassSenior:GetAwardCount()
+    return self:CalculateAwardCount()
+end
+---宝箱奖励数量最大值
+---@return number 最大值
+function ArenaSingleClassSenior:GetAwardMax()
+    return self.maxAwardCount
+end
+---获取免费挑战次数
+---@return number 免费挑战次数
+function ArenaSingleClassSenior:GetFreeFightTimes()
+    return self.freeChallengeTimes
+end
+---获取挑战券数量
+---@return number 挑战券数量
+function ArenaSingleClassSenior:GetFightTicketNum()
+    return _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.Prop, self.ticketID)
+end
+---消耗挑战券，本地更新
+function ArenaSingleClassSenior:CastFightTicket()
+    _G.StorageManager:GetInstance():ConsumeItem(self.ticketID, 0, 1)
+end
+---获取所有挑战次数
+---@return number 挑战次数
+function ArenaSingleClassSenior:GetAllChallengeCount()
+    return self.freeChallengeTimes + self:GetFightTicketNum()
+end
+---获取购买挑战券的消耗
+---@return number 消耗
+function ArenaSingleClassSenior:GetBuyTicketPrice()
+    return self.ticketPrice[self.buyTicketTimes]
+end
+---获取购买挑战券的数量
+---@return number 数量
+function ArenaSingleClassSenior:GetBuyTicketCountOnce()
+    return self.ticketCountByOne
+end
+---购买门票
+---@param call function 购买回调
+function ArenaSingleClassSenior:BuyTicket(call)
+    self.onBuyTicketCall = call
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ItemBuyView.Name,
+        self.cfg.ticket,
+        _G.handler(self, self.OnBuyTicketCall)
+    )
+    -- ArenaNet:GetInstance():BuyTicketSenior(
+    --     function(msg)
+    --         if msg.ack == 1 then
+    --             local StorageManagerIns = _G.StorageManager:GetInstance()
+    --             StorageManagerIns:ReceiveAwardData(msg)
+    --             StorageManagerIns:ConsumeItem(12, 0, self.ticketPrice[self.buyTicketTimes])
+    --             self.buyTicketTimes = self.buyTicketTimes + 1
+    --             if self.buyTicketTimes > #self.ticketPrice then
+    --                 self.buyTicketTimes = #self.ticketPrice
+    --             end
+    --             if call then
+    --                 call()
+    --             end
+    --         end
+    --     end
+    -- )
+end
+
+function ArenaSingleClassSenior:OnBuyTicketCall(result)
+    if self.onBuyTicketCall then
+        self.onBuyTicketCall(result)
+    end
+    self.onBuyTicketCall = nil
+end
+
+--领奖
+function ArenaSingleClassSenior:GetAward(callback)
+    if self.curAwardCount <= 0 then
+        callback()
+        return
+    end
+    ArenaNet:GetInstance():GetBoxAwardSenior(
+        function(msg)
+            if msg.ack ~= 1 then
+                callback(self.resCount)
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self.resCount = 0
+            self.curAwardCount = 0
+            self.awardTimeStamp = _G.TimeUtil.GetServerUnixTime()
+            callback(msg)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaSeniorBoxAward.id)
+        end
+    )
+end
+---注册段位变化监听事件
+---@param call function 调用方法
+function ArenaSingleClassSenior:RegistLeagueChangeCall(call, viewname)
+    if not self.onLeagueChangeCall then
+        self.onLeagueChangeCall = {}
+    end
+    self.onLeagueChangeCall[viewname] = call
+end
+---注册战报变化
+---@param call function 调用方法
+function ArenaSingleClassSenior:RegistReportChangeCall(call)
+    self.onReportChangeCall = call
+end
+---获取段位奖励是否已领取
+---@param id number 奖励ID
+---@return boolean 是否领取
+function ArenaSingleClassSenior:GetRankAwardState(id)
+    return false
+end
+---检测段位奖励是否达到
+---@param id number 奖励ID
+---@return boolean 是否达到
+function ArenaSingleClassSenior:CheckRankAwardTo(id)
+    local cfg = ArenaController:GetInstance():CalculateSeniorLeagueByRank(self.maxRank)
+    if nil == cfg then
+        return false
+    end
+    return id >= cfg.level
+end
+---获取段位奖励领取标志
+---@param id number 段位ID
+---@return boolean 是否已领取
+function ArenaSingleClassSenior:GetRankAwardState(id)
+    return self.stageAward and self.stageAward[id] or false
+end
+---段位奖励
+---@param id number 段位ID
+---@param callback function 领取完回调
+function ArenaSingleClassSenior:GetRankAward(id, callback)
+    if self.curChooseRankAwardID and self.curChooseRankAwardID > 0 then
+        return
+    end
+    self.onRankAwardCall = callback
+    self.curChooseRankAwardID = id
+    ArenaNet:GetInstance():GetStageAwardSenior(id, _G.handler(self, self.ParseRankAward))
+end
+function ArenaSingleClassSenior:SetDataUpdateCall(call)
+    self.onDataUpdateCall = call
+end
+--endregion
+
+--region 子类重写
+---初始化数据
+function ArenaSingleClassSenior:OnInitInfo()
+    ArenaNet:GetInstance():GetArenaDataSenior(_G.handler(self, self.ParseData))
+end
+---初始化挑战对手数据
+function ArenaSingleClassSenior:OnInitEnemyData()
+    ArenaNet:GetInstance():GetEnemyInfoSenior(_G.handler(self, self.ParseEnemyData))
+end
+---刷新挑战对手
+function ArenaSingleClassSenior:OnRefreshEnemyData()
+    ArenaNet:GetInstance():RefreshEnemySenior(_G.handler(self, self.ParseEnemyData))
+end
+---初始化挑战对手卡牌数据
+---@param uid number 玩家uid
+function ArenaSingleClassSenior:OnInitEnemyArray(uid)
+    ArenaNet:GetInstance():GetEnemyArraySenior(
+        uid,
+        self.enemyList[self.curGetEnemyCardArrayindex].type,
+        _G.handler(self, self.ParseEnemyArray)
+    )
+end
+function ArenaSingleClassSenior:OnInitReportList()
+    ArenaNet:GetInstance():GetReportSenior(_G.handler(self, self.ParseBattleReport))
+end
+---刷新战报红点
+function ArenaSingleClassSenior:OnRefreshReportRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaReportSenior.id)
+end
+---初始化排行榜数据
+function ArenaSingleClassSenior:OnInitRankList()
+    ArenaNet:GetInstance():GetRankListSenior(_G.handler(self, self.ParseRankList))
+end
+---打开防守布阵
+function ArenaSingleClassSenior:OpenEmbattleDefence()
+    local embattleType = _G.EmbattleType
+    local call = _G.handler(self, self.OnDefenceEmbattleClosed)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnDefenceEmbattleOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ArenaEmbattleSeniorView.Name,
+        {
+            embattleType.arenaSeniorDefence1,
+            embattleType.arenaSeniorDefence2,
+            embattleType.arenaSeniorDefence3
+        },
+        _G.EmbattleControllerItemType.arenaSeniorDefence,
+        call,
+        call,
+        nil,
+        _G.ConfigManager.ui_cfg.ArenaChallengeTeamDefenceView.Name,
+        true
+    )
+end
+---打开挑战布阵
+---@param index number 挑战敌人编号
+function ArenaSingleClassSenior:OpenEmbattleAttack(index, call)
+    self.curGetEnemyCardArrayindex = index
+    local embattleType = _G.EmbattleType
+    self:GetEnemyEmbattleArray(
+        self.enemyList[index].uid,
+        function(data)
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.ArenaEmbattleSeniorView.Name,
+                {
+                    embattleType.arenaSeniorAttack1,
+                    embattleType.arenaSeniorAttack2,
+                    embattleType.arenaSeniorAttack3
+                },
+                _G.EmbattleControllerItemType.arenaSeniorAttack,
+                call,
+                function()
+                    local skip =
+                        _G.PlayerPrefsManager.GetInt(
+                        tostring(_G.PlayerModel:GetInstance().role_uid) .. "SkipBattle" .. 3
+                    ) or 0
+                    if self:CheckEnemyEmpty() then
+                        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+                        skip = 1
+                    end
+                    if skip == 1 then
+                        if call then
+                            call()
+                        end
+                    end
+                    local port =
+                        ArenaNet:GetInstance():FightSenior(
+                        self.enemyList[index].uid,
+                        _G.handlerbind(self, self.OnFightCall, skip)
+                    )
+                    _G.BattleManager:GetInstance():AddLuaNetEvent(port)
+                end,
+                self.enemyList[index],
+                _G.ConfigManager.ui_cfg.ArenaChallengeTeamAttackView.Name
+            )
+        end,
+        true
+    )
+end
+---检测是否可以挑战
+---@param index number 挑战敌人编号
+---@param call function 检测回调
+function ArenaSingleClassSenior:CheckFight(index, call)
+    ArenaNet:GetInstance():CheckSeniorFight(
+        self.enemyList[index].uid,
+        function(msg)
+            if msg.ack == 1 then
+                call(true)
+            elseif msg.ack == 540301 then
+                --对手段位变化
+                call(false)
+                local view =
+                    _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ArenaChallengeSeniorView.Name)
+                self:GetEnemyInfo(_G.handler(view, view.OnEnemyArrayCall), true)
+            end
+        end
+    )
+end
+--region 数据解析
+--[[
+  required uint32 ack = 1;
+  required uint32 fight_times = 2;//剩余免费战斗次数
+  required uint32 rank = 3;//高阶竞技场排名
+  optional uint32 refresh_time = 4;//上次刷新对手时间
+  required bool attacked = 5;//离线期间是否被攻击
+  required uint32 time=6;//挂机开始时间戳
+  required uint32 reward = 7;//截至该时间戳已积攒奖励数量
+  required uint32 ticket=8;//挑战券已经购买的次数（每日刷新置0）
+  required uint32 refresh_times =9;//今日已刷新对手次数
+  required uint32 max_rank = 10;//历史最高排名
+  repeated uint32 stage_award = 11;//段位奖励领取情况  整数列表，存段位sid[stageSid...]
+]]
+---@param data arena_senior.s2c_arena_senior_info
+function ArenaSingleClassSenior:OnParseData(data)
+    self.curArenaState = data.status
+    self.curSeason = data.current_season
+    self.nextOpenTime = data.next_open_time
+    self.closeCountdown = data.season_closing_countdown
+    if self.nextTimer then
+        self.nextTimer:Stop()
+        self.nextTimer = nil
+    end
+    if self.curArenaState == ArenaManager.State.open then
+        self.curRank = data.rank --20
+        self.freshTime = data.refresh_time and data.refresh_time - _G.TimeUtil.GetServerUnixTime() or 0 --1642487874
+        if self.freshTime < 0 then
+            self.freshTime = 0
+        end
+        self.freeChallengeTimes = data.fight_times --10
+        self.isNewReport = self.isNewReport or (data.attacked or false)
+        self.awardTime = _G.TimeUtil.GetServerUnixTime() - data.time --1642487874
+        self.awardTimeStamp = data.time
+        self.resCount = data.reward
+        self.buyTicketTimes = data.ticket + 1
+        if self.buyTicketTimes > #self.ticketPrice then
+            self.buyTicketTimes = #self.ticketPrice
+        end
+        self.maxRank = data.max_rank or self.curRank
+        self.refreshEnemyTimes = data.refresh_times or 0
+        self.stageAward = {}
+        if data.stage_award then
+            for i = 1, #data.stage_award do
+                self.stageAward[data.stage_award[i]] = true
+            end
+        end
+        self:CalculateAwardCount()
+        self.nextTimer = _G.TimerManager:GetInstance():GetTimer(
+            self.closeCountdown - _G.TimeUtil.GetServerUnixTime(),
+            self.OnSettlementStart,
+            self,
+            true)
+        self.nextTimer:Start()
+    else
+        self.nextTimer = _G.TimerManager:GetInstance():GetTimer(
+            self.nextOpenTime - _G.TimeUtil.GetServerUnixTime(),
+            self.OnSettlementEnd,
+            self,
+            true)
+        self.nextTimer:Start()
+    end
+    if self.sixUpdateTimer then
+        self.sixUpdateTimer:Stop()
+        self.sixUpdateTimer = nil
+    end
+    self.sixUpdateTimer =
+        _G.TimerManager:GetInstance():GetTimer(_G.TimeUtil.GetSixClockTimer(), self.OnInitInfo, self, true)
+    self.sixUpdateTimer:Start()
+    if self.settleEnd then
+        self.settleEnd = false
+        _G.Events:GetInstance():Broadcast(_G.eArena.SeniorSettlement, 2)
+        self:RefreshAllRedPoint()
+    end
+    if self.onDataUpdateCall then
+        self.onDataUpdateCall()
+    end
+end
+---解析挑战玩家数据
+--[[
+  required uint32 type = 1;// 1 npc，2为玩家
+  required uint64 uid = 2;//
+  required uint32 league = 3;// 段位sid
+  required string name = 4;// 名字
+  required uint32 style = 5;//头像
+  required uint32 frame = 6;//头像框
+  required uint32 lv = 7;//等级
+  required uint32 power = 8;// 战斗力
+  ]]
+function ArenaSingleClassSenior:OnParseEnemyData(data)
+    if data.ack ~= 1 then
+        return
+    end
+    self.enemyList = {{}, {}, {}, {}}
+    local enemy
+    for i = 1, #data.enemy do
+        enemy = data.enemy[i]
+        self.enemyList[i].uid = enemy.uid
+        self.enemyList[i].type = enemy.type
+        self.enemyList[i].rank = enemy.rank
+        if enemy.type == 1 then
+            self.enemyList[i].name = _G.GetLangPackValue(enemy.name)
+        else
+            self.enemyList[i].name = enemy.name
+        end
+        self.enemyList[i].style = enemy.style
+        self.enemyList[i].frame = enemy.frame
+        self.enemyList[i].level = enemy.lv
+        self.enemyList[i].power = enemy.power
+    end
+end
+---解析玩家卡牌数据
+---@param index number 序列号
+---@param data table 数据
+--[[
+  optional uint32 sid = 1;//卡牌sid
+  optional uint32 level = 2;//等级
+  optional uint32 star = 3;//星级
+  optional uint32 soul_index = 4;//魂链等级
+  ]]
+function ArenaSingleClassSenior:OnParseEnemyCard(index, data)
+    self.enemyList[index].garray = {false, false, false}
+    self.enemyList[index].combSkill = {false, false, false}
+    local card
+    for i = 1, #data.team do
+        local items = {
+            {sid = 0, level = 0, star = 0, soulLV = 0, power = 0},
+            {sid = 0, level = 0, star = 0, soulLV = 0, power = 0},
+            {sid = 0, level = 0, star = 0, soulLV = 0, power = 0},
+            {sid = 0, level = 0, star = 0, soulLV = 0, power = 0},
+            {sid = 0, level = 0, star = 0, soulLV = 0, power = 0}
+        }
+        for j = 1, #items do
+            card = data.team[i].cards[j]
+            items[j].sid = card.sid
+            items[j].level = card.level
+            items[j].star = card.star
+            items[j].soulLV = card.soul_lv
+            items[j].power = card.power
+            items[j].soulState = card.soul_state
+            items[j].talents = card.born_skill_num
+        end
+        self.enemyList[index].garray[data.team[i].index] = items
+        local skills = data.team[i].combine or {0, 0, 0}
+        self.enemyList[index].combSkill[data.team[i].index] = skills
+    end
+end
+---解析排行榜数据
+---@param data table 数据
+--[[
+   required uint64 uid=1;
+   required string name = 2;//名字
+   required uint32 portrait = 3;//头像
+   required uint32 frame = 4;//头像框
+   required uint32 lv = 5;//等级
+   required uint32 power = 6;//战力
+   required uint32 type = 7;//1， 机器人，2，玩家
+   require  string union = 8;//公会
+]]
+function ArenaSingleClassSenior:OnParseRankList(data)
+    self.rankList = {}
+    local player
+    for i = 1, #data.arenas do
+        local item = {}
+        player = data.arenas[i]
+        item.uid = player.uid
+        item.type = player.type
+        item.style = player.portrait
+        item.name = player.type == 1 and _G.GetLangPackValue(player.name) or player.name
+        item.frame = player.frame
+        item.level = player.lv
+        item.power = player.power
+        item.union = player.union or ""
+        item.rank = i
+        self.rankList[i] = item
+    end
+end
+---解析战报数据
+---@param data table 数据
+--[[
+  required uint64 uid = 1;//战报uid
+  required uint64 target_uid = 2;//对手uid
+  required string target_role_name = 3;//对手角色名
+  required uint32 target_style = 4;//对手头像
+  required uint32 frame = 5;//对手头像框
+  required uint32 target_power = 6;//对手战斗力
+  required uint32 target_level =7;//对手等级
+  required uint32 winner = 8;//胜负，0 胜利 | 1 失败
+  required uint32 time = 9;//时间
+  required uint32 report_type = 10;//战报类型 0 攻击， 1 防御
+]]
+function ArenaSingleClassSenior:OnParseReport(data)
+    if not data.reports then
+        self.reportList = {}
+        return
+    end
+    local GetLangPackValue = _G.LangUtil.GetLangPackValue
+    local reports = data.reports or {}
+    for i = 1, #reports do
+        reports[i].target_role_name =
+            reports[i].target_type == 2 and reports[i].target_role_name or GetLangPackValue(reports[i].target_role_name)
+    end
+    self.reportList = data.reports
+end
+---回放战斗
+---@param uid number 战报uid
+---@param callback function 是否可以回放的回调(boolean true 则成功 false 则失败 并返回错误代码)
+function ArenaSingleClassSenior:ReplayReport(uid, callback)
+    ArenaNet:GetInstance():GetReportPlayBackSenior(
+        uid,
+        function(data)
+            if data.ack == 1 then
+                callback(data)
+            end
+        end
+    )
+end
+---领取段位奖励
+---@param data table 领取数据
+function ArenaSingleClassSenior:ParseRankAward(data)
+    local state = false
+    if data.ack == 1 then
+        state = true
+        self.stageAward[self.curChooseRankAwardID] = true
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        require("RedPointManager"):GetInstance():RefreshNode(
+            _G.ConfigManager.redpoint_cfg.ArenaAwardSenior.id,
+            self.curChooseRankAwardID
+        )
+    end
+    if self.onRankAwardCall then
+        self.onRankAwardCall(state, data)
+    end
+    self.curChooseRankAwardID = 0
+    self.onRankAwardCall = nil
+end
+
+--endregion
+--endregion
+
+--region 内部方法
+local awardAddCount = 0
+---计算奖励数量
+function ArenaSingleClassSenior:CalculateAwardCount()
+    if nil == self.resCount or nil == self.maxAwardCount then
+        return 0
+    end
+    if self.resCount >= self.maxAwardCount then
+        self.resCount = self.maxAwardCount
+        self.curAwardCount = self.resCount
+        return self.resCount
+    end
+    self.awardTime = _G.TimeUtil.GetServerUnixTime() - self.awardTimeStamp
+    local cfg = ArenaController:GetInstance():CalculateSeniorLeagueByRank(self.curRank)
+    self.curAwardCount = _G.Mathf.RoundToInt(cfg.efficiency * self.awardTime / 3600) + self.resCount
+    if self.curAwardCount > self.maxAwardCount then
+        return self.maxAwardCount
+    end
+    return self.curAwardCount
+end
+---请求战斗返回
+function ArenaSingleClassSenior:OnFightCall(msg, skip)
+    if msg.ack ~= 1 then
+        local openviewcall
+        openviewcall = function(self, name)
+            if name == _G.ConfigManager.ui_cfg.ArenaMainPanelSeniorView.Name then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArenaChallengeSeniorView.Name)
+            elseif name == _G.ConfigManager.ui_cfg.ArenaChallengeSeniorView.Name then
+                _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, openviewcall, self)
+                if msg.ack == 540101 then
+                    --对手段位变化
+                    _G.PopWindowManager:GetInstance():ShowAllTips(540301)
+                end
+            end
+        end
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, openviewcall, self)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArenaMainPanelSeniorView.Name)
+        return
+    end
+    if self.freeChallengeTimes <= 0 then
+        self:CastFightTicket()
+    else
+        --TODO:刷新挑战次数红点
+        self.freeChallengeTimes = self.freeChallengeTimes - 1
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaSeniorChallenge.id)
+    end
+    local win = 0
+    for i = 1, #msg.winner do
+        if msg.winner[i] then
+            win = win + 1
+        end
+    end
+    -- local skip = _G.PlayerPrefsManager.GetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "SkipBattle" .. 3) or 0
+    -- if self:CheckEnemyEmpty() then
+    --     skip = 1
+    -- end
+    if skip == 1 then
+        local view = _G.ConfigManager.ui_cfg.ArenaBattleFailSeniorPanelView.Name
+        if win >= 2 then
+            view = _G.ConfigManager.ui_cfg.ArenaBattleVictorySeniorPanelView.Name
+        end
+        local enemy = self.enemyList[self.curGetEnemyCardArrayindex]
+        local info = {}
+        info.rank = self.curRank
+        local PlayerModel = _G.PlayerModel:GetInstance()
+        info.frame = PlayerModel:GetCurFrame()
+        info.name = PlayerModel:GetName()
+        info.style = PlayerModel:GetRoleStyle()
+        info.level = PlayerModel:GetLevel()
+        info.re_uid = msg.re_uid
+        if win >= 2 and info.rank > enemy.rank then
+            local rank = info.rank
+            info.rank = enemy.rank
+            enemy.rank = rank
+        end
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+        _G.UIManager:GetInstance():OpenWindow(
+            view,
+            function()
+                -- body
+            end,
+            info,
+            enemy,
+            msg.winner,
+            _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg),
+            true,
+            msg.fight_arg
+        )
+        if self:GetCurArenaState() == 1 then
+            self:ClearReport()
+            self:InitInfo(
+                function()
+                    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                        _G.ConfigManager.redpoint_cfg.ArenaAwardSenior.id
+                    )
+                    _G.Events:GetInstance():Broadcast(_G.eArena.RefreshSeniorView)
+                end,
+                true
+            )
+        end
+        self:RefreshEnemy()
+    else
+        _G.BattleManager:GetInstance():EnterFight(
+            _G.BattleControllerType.arenaSenior,
+            msg.winner,
+            self.enemyList[self.curGetEnemyCardArrayindex],
+            self.curRank,
+            msg.re_uid
+        )
+    end
+
+    if win > 1 then
+        --胜利才刷新
+        self:RefreshEnemy()
+    end
+end
+---排名变化推送
+---@param sid number 新段位
+function ArenaSingleClassSenior:OnRankChangedCall(sid)
+    self:InitInfo(
+        function()
+            self.enemyListTemp = self.enemyList
+            self.enemyList = nil
+            if self.onLeagueChangeCall and _G.table.count(self.onLeagueChangeCall) > 0 then
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                    540301,
+                    nil,
+                    function()
+                        for _, call in pairs(self.onLeagueChangeCall) do
+                            call()
+                        end
+                    end
+                )
+            end
+        end,
+        true
+    )
+end
+---当防守布阵界面打开
+function ArenaSingleClassSenior:OnDefenceEmbattleOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnDefenceEmbattleOpened, self)
+        --_G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArenaMainPanelSeniorView.Name)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ArenaMainPanelSeniorView.Name)
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(false, true)
+    end
+end
+function ArenaSingleClassSenior:OnDefenceEmbattleClosed()
+    local RedPointManager = require("RedPointManager"):GetInstance()
+    local embattleType = _G.EmbattleType
+    local id = _G.ConfigManager.redpoint_cfg.ArenaEmbattleSenior.id
+    --获取奖励默认刷新青铜段位奖励
+    RedPointManager:RefreshNode(id, embattleType.arenaSeniorDefence1)
+    RedPointManager:RefreshNode(id, embattleType.arenaSeniorDefence2)
+    RedPointManager:RefreshNode(id, embattleType.arenaSeniorDefence3)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ArenaMainPanelSeniorView.Name)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+end
+--endregion
+
+---赛季是否开启（未在结算中）
+function ArenaSingleClassSenior:CheckSeasonIsOpen()
+    return self.curArenaState == ArenaManager.State.open
+end
+
+function ArenaSingleClassSenior:OnSettlementStart()
+    self.curRank = nil
+    self.freeChallengeTimes = nil
+    self.isNewReport = nil
+    self.awardTime = nil
+    self.awardTimeStamp = nil
+    self.resCount = nil
+    self.buyTicketTimes = nil
+    self.maxRank = nil
+    self.refreshEnemyTimes = nil
+    self.stageAward = nil
+    self.curArenaState = ArenaManager.State.close
+    _G.Events:GetInstance():Broadcast(_G.eArena.SeniorSettlement, 1)
+    self:RefreshAllRedPoint()
+end
+
+function ArenaSingleClassSenior:OnSettlementEnd()
+    self:OnInitInfo()
+    self.settleEnd = true
+end
+
+---获取赛季
+---@return number 当前赛季
+function ArenaSingleClassSenior:GetSeason()
+    return self.curSeason or 1
+end
+
+---获取赛季剩余时间
+---@return number 剩余时间
+function ArenaSingleClassSenior:GetSeasonCountDown()
+    local time = self.closeCountdown - _G.TimeUtil.GetServerUnixTime()
+    if time < 0 then
+        time = 0
+    end
+    return time
+end
+
+---获取赛季结算剩余时间
+---@return number 剩余时间
+function ArenaSingleClassSenior:GetSeasonSettlementCountDown()
+    local time = self.nextOpenTime - _G.TimeUtil.GetServerUnixTime()
+    if time < 0 then
+        time = 0
+    end
+    return time
+end
+
+function ArenaSingleClassSenior:RefreshAllRedPoint()
+    local RedPointManager = require("RedPointManager"):GetInstance()
+    RedPointManager:RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaSeniorShop.id)
+    RedPointManager:RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaSeniorChallenge.id)
+    RedPointManager:RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaSeniorBoxAward.id)
+    RedPointManager:RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaEmbattleSenior.id)
+    RedPointManager:RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaReportSenior.id)
+    RedPointManager:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.ArenaAwardSenior.id)
+    RedPointManager:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SeniorArena.id)
+end
+
+---检测对手是否存在空阵容
+function ArenaSingleClassSenior:CheckEnemyEmpty()
+    local count = #self.enemyList[self.curGetEnemyCardArrayindex].garray
+    for _, v in pairs(self.enemyList[self.curGetEnemyCardArrayindex].garray) do
+        for _, card in pairs(v) do
+            if card.sid ~= 0 then
+                count = count - 1
+                break
+            end
+        end
+    end
+    return count > 0
+end
+
+function ArenaSingleClassSenior:Dispose()
+    if self.nextTimer then
+        self.nextTimer:Stop()
+        self.nextTimer = nil
+    end
+    if self.sixUpdateTimer then
+        self.sixUpdateTimer:Stop()
+        self.sixUpdateTimer = nil
+    end
+end
+
+return ArenaSingleClassSenior

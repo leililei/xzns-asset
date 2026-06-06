@@ -1,0 +1,2477 @@
+-----------------------------------------------------------------------
+-- Created by szs on 12. 三月 2021
+--
+-- @Description 新手引导管理
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+local GuideModel = require("GuideModel")
+local GuideNet = require("GuideNet")
+
+---@class GuideManager : Singleton
+---@field GetInstance fun():GuideManager
+---@field CurGuideId number 当前引导id
+---@field CurGuideModelCfg teach_model_cfg 当前引导组信息
+---@field CurGuideCfg teach_info_cfg 当前引导配置
+---@field IsGuideing boolean 是否引导中
+---@field Guide GuideView 引导界面
+---@field AllGuideCfgList teach_info_cfg[] 强制引导配置
+---@field GuideBlackList string[] 引导黑名单（排除一些非常规窗体的UI以及自身）
+---@field GuideModelCfgList teach_model_cfg[] 排序后的组表
+---@field GuideMTModelCfgList teach_model_cfg[] 触发式引导排序保存
+---@field IsSpOpening boolean[] index1 剧情，index2 对话界面，index3 其他界面
+local GuideManager = _G.BaseClass("GuideManager", _G.Singleton)
+_G.GuideManager = GuideManager
+
+---引导条件判断(因解析方式和条件复用性不高，暂时不放通用条件判断中去)
+-- 0：无；1：进入房间(填id)；2：等级；3：副本已通关（填id）；4：已获得装备（填装备id）；5：已获得道具（填道具id）；6：已开启未通关（填id）；7：未穿戴；8：放置已通关（放置id）;9:已开启未通关（填放置id）
+local CheckCondition = {
+    [1] = function(params)
+        local isPass = _G.ChapterRoomManager:GetInstance():CheckRoomPass(params[1])
+        -- (isPass, "进入房间" .. params[1] .. ">>>>>>>>>>")
+        return isPass
+    end,
+    [2] = function(params)
+        -- 角色等级
+        local lv = params and params[1] or 0
+        -- (_G.PlayerModel:GetInstance():GetLevel() .. ">=" .. lv, "角色等级条件")
+        return _G.PlayerModel:GetInstance():GetLevel() >= lv
+    end,
+    [3] = function(params)
+        -- 关卡是否完成
+        local id = params and params[1] or 0
+        return require("ChapterModel"):GetInstance():CheckSectionPass(id)
+    end,
+    [4] = function(params)
+        -- 已获得装备（填装备id）
+        for i = 1, #params do
+            if not _G.StorageManager:GetInstance():CheckItem(params[i], 1) then
+                return false
+            end
+        end
+        return true
+    end,
+    [5] = function(params)
+        -- 持有道具
+        for i = 1, #params do
+            if not _G.StorageManager:GetInstance():CheckItem(params[i], 1) then
+                return false
+            end
+        end
+        return true
+    end,
+    [6] = function(params)
+        -- 已开启未通关
+        -- (require("ChapterModel"):GetInstance():GetCurSectionSID(), "已开启未通关条件" .. params[1] .. ">>>>>>>>>>获得SectionSID是")
+        return require("ChapterModel"):GetInstance():GetCurSectionSID() == params[1]
+    end,
+    [7] = function(params)
+        -- 此装备未穿戴
+        ---@type EquipmentItem
+        local item = _G.StorageManager:GetInstance():GetDatasBySidGuide(_G.StorageID.Equipment, params[1])
+        if #item <= 0 then
+            return false
+        end
+        for i = 1, #item do
+            if item[i].cardUid <= 0 then
+                return true
+            end
+        end
+        return false
+    end,
+    [8] = function(params)
+        -- 放置已通关（放置id）
+        return require("AfkModel"):GetInstance():CheckSectionIsPass(params[1])
+    end,
+    [9] = function(params)
+        -- 已开启未通关（放置id）
+        return require("AfkModel"):GetInstance():IsCurSection(params[1])
+    end,
+    [10] = function(params)
+        -- 指定ID角色未穿戴装备
+        ---@type CardData[]
+        local item = _G.StorageManager:GetInstance():GetDatasBySidGuide(_G.StorageID.Card, params[1])
+        if #item <= 0 then
+            return false
+        end
+        for i = 1, #item do
+            if item[i]:GetEquipBarNumber() <= 0 then
+                return true
+            end
+        end
+        -- end
+        return false
+    end,
+    [11] = function(params)
+        -- 指定任务未完成
+        if not _G.TaskModule:GetInstance():IsCompletedTask(params[1]) then
+            return true
+        end
+        return false
+    end,
+    [12] = function(params)
+        -- 是否有可升星的卡片
+        local CardList = require("CardInfoManager"):GetInstance():GetSortUpStarAll(nil, true)
+        if #CardList > 0 then
+            return true
+        end
+        return false
+    end,
+    [13] = function(params)
+        -- 布阵中是否是对应的战斗怪物组id
+        local base = require("EmbattleController"):GetInstance():GetCurEmbattleItem()
+        if base and base:GetMonsterGroupID() == params[1] then
+            return true
+        end
+        return false
+    end,
+    [14] = function(params)
+        -- 是否创建角色
+        local ccr = _G.PlayerModel:GetInstance():CheckCreateRole()
+        local ccrParams = ccr and 1 or 0
+        return ccrParams == params[1]
+    end,
+    [15] = function(params)
+        -- 玩家创号天数
+        local ct = _G.PlayerModel:GetInstance():GetCreateRoleTime()
+
+        local createToEndTime = _G.TimeUtil.GetInterValDayByGame(ct, _G.TimeUtil.GetServerUnixTime()) + 1
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(ct, "创建时间戳")
+            _G.Log(_G.TimeUtil.GetServerUnixTime(), "创建时间戳")
+            _G.Log(createToEndTime, "玩家建号总天数>>>>>")
+        end
+
+        if createToEndTime < params[1] then
+            return false
+        end
+        return true
+    end,
+    [16] = function(params)
+        -- 是否满足招募次数要求
+        local curDrawNum = require("DrawModel"):GetInstance().XinYuanDanDrawNum
+        if curDrawNum >= params[1] then
+            return true
+        end
+        return false
+    end,
+    [17] = function(params)
+        -- 是否满足VIP等级要求
+        local vipLevel = require("VIPPrivilegeModel"):GetInstance().currentVipLevel
+        if vipLevel >= params[1] then
+            return true
+        end
+        return false
+    end,
+    [18] = function(params)
+        -- 匹配序章进度
+        local key = _G.LoginManager:GetInstance():GetCreatePlayerKey()
+        local data = _G.PlayerPrefsManager.GetTable(key, true)
+        if nil ~= data then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(data.last_room, "本地记录房间号")
+                _G.Log(params[1], "要求房间号")
+            end
+            if data.last_room == params[1] then
+                return true
+            end
+        end
+        return false
+    end,
+    [19] = function(params)
+        -- 当前招募类型是否匹配
+        local win = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DrawView.Name)
+        if win and win.View then
+            if win.View.CurView == params[1] then
+                return true
+            end
+        end
+        return false
+    end,
+    [20] = function(params)
+        --镇魂街ZHJ-31230 【主任务】beta_0.2.0_jttw贪玩三测ZHJ-33073
+        --【客户端】助战引导优化
+        local embattleType = require("EmbattleController"):GetInstance():GetAssistID()
+        if embattleType == _G.EmbattleType.AFKOnly then
+            -- NPC助战可开启引导
+            -- local showGuide = require("EmbattleController"):GetInstance():CheckCardAssist()
+            -- local FriendHelpModel = require "FriendHelpModel":GetInstance()
+            -- local isCountTrue =
+            --     FriendHelpModel:GetUseCount(embattleType, false) > 0 or
+            --     FriendHelpModel:GetUseCount(embattleType, true) > 0
+            -- return showGuide or isCountTrue
+
+            local FriendHelpModel = require "FriendHelpModel":GetInstance()
+            local datas, npcDatas = FriendHelpModel:GetBorrowCardDatas(true, 1)
+            return #datas > 0 or #npcDatas > 0
+        else
+            return false
+        end
+    end,
+    [50] = function(params)
+        -- 未通关放置关卡
+        local isPass = require("AfkModel"):GetInstance():CheckSectionIsPass(params[1])
+        return not isPass
+    end,
+    [51] = function(params)
+        ---判断是否满足开服天数
+        if not _G.PlayerModel:GetInstance().open_time then
+            return false
+        end
+        local result =
+            _G.TimeUtil.GetServerUnixTime() - _G.PlayerModel:GetInstance().open_time >= (params[1] - 1) * 86400
+        return result
+    end,
+    [52] = function(params)
+        ---千机黑刹阵亡≥1时
+        local ishpz = require "DungonesModel":GetInstance():CheckHpZero()
+        return ishpz
+    end,
+    [53] = function(params)
+        ---竞技场未结算
+        local ArenaManager = require "ArenaManager"
+        local arenaClass = ArenaManager:GetInstance():GetArenaClass(ArenaManager.arenaType.normal)
+        if nil == arenaClass then
+            return false
+        end
+        return arenaClass:GetCurArenaState() == 1
+    end,
+    [54] = function(params)
+        ---千机黑刹未结算
+        local DungonesModel = require "DungonesModel":GetInstance()
+        return not DungonesModel:IsSettle()
+    end,
+    [55] = function(params)
+        ---Vip等级
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("当前vip等级是" .. require("VIPPrivilegeModel"):GetInstance().realVipLevel)
+            _G.LogWarning("要求vip等级是" .. params[1])
+        end
+        return require("VIPPrivilegeModel"):GetInstance().realVipLevel >= params[1]
+    end,
+    [56] = function(params)
+        ---判断招募资源打到N次
+        local dmIns = require "DrawModel":GetInstance()
+        local num = dmIns.Pools[101].total_count
+        --普通招募+五行招募次数
+        --_G.Log(num, "普通招募次数")
+        for i = 301, 305 do
+            num = num + dmIns.Pools[i].total_count
+        end
+        --_G.Log(num, "总招募次数")
+        return num >= params[1]
+    end,
+    [57] = function(params)
+        ---判断背包中是否有满足星级条件卡
+        local storageCard = _G.StorageManager:GetInstance():GetCardDataSortList(false)
+        for _, value in pairs(storageCard) do
+            if value:GetStar() >= params[1] then
+                return true
+            end
+        end
+        return false
+    end,
+    [58] = function(params)
+        ---判断当前是否开启对应副玩法
+        local model = require("MiniGameJumpManager"):GetInstance()
+        return model:GetGameType() == params[1]
+    end
+}
+
+function GuideManager:__init()
+    if _G.AppSetting.IsShowTeach then
+        self.CurGuideId = 0
+        self.IsGuideing = false
+        self.GuideBlackList = {
+            _G.ConfigManager.ui_cfg.HUDView.Name,
+            _G.ConfigManager.ui_cfg.ShadowView.Name,
+            _G.ConfigManager.ui_cfg.LoadingView.Name,
+            _G.ConfigManager.ui_cfg.BattleView.Name,
+            _G.ConfigManager.ui_cfg.GameNetTipsView.Name,
+            _G.ConfigManager.ui_cfg.View_PropUp.Name,
+            _G.ConfigManager.ui_cfg.PowerUpView.Name,
+            _G.ConfigManager.ui_cfg.EmbattleView.Name,
+            _G.ConfigManager.ui_cfg.BlackCurtainView.Name,
+            _G.ConfigManager.ui_cfg.MainSceneView.Name,
+            _G.ConfigManager.ui_cfg.LoginView.Name,
+            _G.ConfigManager.ui_cfg.QuickUseTipView.Name,
+            _G.ConfigManager.ui_cfg.FloatMessagesView.Name
+        }
+        self.AllGuideCfgList = {}
+        self.GuideModelCfgList = {}
+        self.GuideMTModelCfgList = {}
+        if _G.AppSetting.IsEditor then
+            for gid, v in pairs(_G.ConfigManager.teach_model_cfg) do
+                if v.discard == false then --and v.id ~= 5000 then
+                    local cfg
+                    for i = 1, #v.start_node do
+                        local id = v.start_node[i]
+                        cfg = _G.ConfigManager.teach_info_cfg[id]
+                        if cfg then
+                            if cfg.group_id ~= gid then
+                                if _G.AppSetting.IsDebugTeach then
+                                    _G.LogError(gid, "引导组中的开始节点对应的组id不匹配，请修复当前组>>>>>>>>>>")
+                                end
+                            end
+                            if cfg.node ~= _G.GuideNodeType.Start then
+                                if _G.AppSetting.IsDebugTeach then
+                                    _G.LogError(gid, "引导组中的结束节点对应的引导类型不匹配，它不是一个开始节点，请修复当前组>>>>>>>>>>")
+                                end
+                            end
+                        else
+                            if _G.AppSetting.IsDebugTeach then
+                                _G.LogError(gid, "引导组中的开始节点找不到引导节点，请修复当前组>>>>>>>>>>")
+                            end
+                        end
+                    end
+                    cfg = _G.ConfigManager.teach_info_cfg[v.end_node]
+                    if cfg then
+                        if cfg.group_id ~= gid then
+                            if _G.AppSetting.IsDebugTeach then
+                                _G.LogError(gid, "引导组中的结束节点对应的组id不匹配，请修复当前组>>>>>>>>>>")
+                            end
+                        end
+                        if cfg.node ~= _G.GuideNodeType.End then
+                            if _G.AppSetting.IsDebugTeach then
+                                _G.LogError(gid, "引导组中的结束节点对应的引导类型不匹配，它不是一个结束点，请修复当前组>>>>>>>>>>")
+                            end
+                        end
+                    else
+                        if _G.AppSetting.IsDebugTeach then
+                            _G.LogError(gid, "引导组中的结束节点找不到引导节点，请修复当前组>>>>>>>>>>")
+                        end
+                    end
+                end
+            end
+        end
+
+        ---筛选强制和非强制
+        for _, v in pairs(_G.ConfigManager.teach_info_cfg) do
+            local group = _G.ConfigManager.teach_model_cfg[v.group_id]
+            if group then
+                ---组未废弃，(单个引导废弃在引导中处理)
+                if group.discard == false and group.id ~= 5000 and group.make_type == false then
+                    table.insert(self.AllGuideCfgList, v)
+                end
+            end
+        end
+
+        ---@param info teach_info_cfg
+        _G.SortList(
+            self.AllGuideCfgList,
+            function(info)
+                local cfg = _G.ConfigManager.teach_model_cfg[info.group_id]
+                return -cfg.order, -info.id
+            end
+        )
+
+        ---分别保存主线引导model和触发式model
+        for _, v in pairs(_G.ConfigManager.teach_model_cfg) do
+            if v.id ~= 5000 then
+                if v.make_type == false then
+                    table.insert(self.GuideModelCfgList, v)
+                else
+                    table.insert(self.GuideMTModelCfgList, v)
+                end
+            end
+        end
+        _G.SortList(
+            self.GuideModelCfgList,
+            function(item)
+                return -item.order
+            end
+        )
+
+        _G.SortList(
+            self.GuideMTModelCfgList,
+            function(item)
+                return -item.order
+            end
+        )
+
+        self.FirstTeachType = 2
+        self.FirstFunctionId = _G.ConfigManager.ui_cfg.ChapterEmbattleView.Name
+
+        self.IsGuideLoading = false
+        self.GotoBattleIng = false
+        self.LoseGuideId = 0
+        self.NotForceGroupId = 0
+        self.RuningStorys = {}
+        self.RuningStorysDebug = {}
+
+        self.IsSpOpening = { false, false, false }
+
+        _G.Events:GetInstance():AddListener(_G.MianViewState.MainViewEnable, self.MainViewEnable, self)
+        _G.Events:GetInstance():AddListener(_G.MianViewState.MainViewChangeTab, self.MainViewEnable, self)
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnUIOpened, self)
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIShow, self.OnUIShow, self)
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed, self)
+        _G.Events:GetInstance():AddListener(_G.eScene.EnterWorldOver, self.OnSceneChangeOver, self)
+        _G.Events:GetInstance():AddListener(_G.eDialogueEvent.ShowTaskinfo, self.OnActionEvent, self)
+        _G.Events:GetInstance():AddListener(_G.eNav.NavInterruptMove, self.OnNavInterruptMove, self)
+        _G.Events:GetInstance():AddListener(_G.GuideStoryStart.StoryStart, self.OnStoryStart, self)
+        _G.Events:GetInstance():AddListener(_G.GuideStoryStart.StoryEnd, self.OnStoryEnd, self)
+        _G.Events:GetInstance():AddListener(_G.VideoPlayState.PlayStart, self.OnVideoPlayStart, self)
+        _G.Events:GetInstance():AddListener(_G.VideoPlayState.PlayEnd, self.OnVideoPlayEnd, self)
+        _G.Events:GetInstance():AddListener(_G.eGuideEvent.WaitFo, self.OnWaitFo, self)
+        _G.Events:GetInstance():AddListener(_G.eGuideEvent.WorldObjRespond, self.OnWorldObjRespond, self)
+        _G.TaskModule:GetInstance():AddListener(
+            _G.TaskModuleEvent,
+            _G.TaskModuleEvent.EnumValueTable.NavComplete,
+            self.OnTaskInfoUpdate,
+            self
+        )
+        _G.Events:GetInstance():AddListener(_G.eGuideEvent.TreasureMap, self.DoTreasureMap, self)
+        _G.Events:GetInstance():AddListener(_G.eGuideEvent.SpecialTrigger, self.SpecialTrigger, self)
+
+        self.CurAudio = nil
+    end
+end
+
+---@param type GuideSpecialTrigger
+function GuideManager:SpecialTrigger(type)
+    if type == _G.GuideSpecialTrigger.DrawTypeChange then
+        ---招募
+        self:CheckFunctionGuide(_G.ConfigManager.ui_cfg.DrawView.Name)
+    end
+end
+
+function GuideManager:DoTreasureMap(isStart)
+    if isStart then
+        if self.IsGuideing then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log("引导监听寻宝触发")
+            end
+            if self.CurGuideModelCfg.not_force then
+                if self.CurGuideCfg.click_tag == "" and self.CurGuideCfg.text_type == 0 then
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log("非强制引导非操作的节点不能打断>>>>>>>>")
+                    end
+                else
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log("非强制引导打断操作节点>>>>>>>>>>")
+                    end
+                    self:DoBreak()
+                    self.LoseGuideId = 0
+                end
+            end
+        end
+    end
+end
+
+---等待外部触发，不确定的逻辑，（如消息等）
+function GuideManager:OnWaitFo(pbCmd)
+    if self.IsGuideing then
+        if self.CurGuideCfg.node == _G.GuideNodeType.WaitForDo then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(self.CurGuideCfg.cmd, "引导cmd字段>>>>>>>>>>>")
+            end
+            if self.CurGuideCfg.cmd then
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log(pbCmd, "当前接收到的消息CMD>>>>>>>>>>>")
+                end
+
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log(self.CurGuideCfg.cmd.PBCmd, "配置表对应消息CMD>>>>>>>>>>>")
+                end
+                if self.CurGuideCfg.cmd.PBCmd == pbCmd then
+                    self:ShowMask(false)
+
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log(self.CurGuideCfg.id, "引导cmd字段外部触发逻辑>>>>>>>>>>>")
+                    end
+                    self:DoNext()
+                    return
+                end
+            end
+        end
+    end
+end
+
+---剧情开始
+function GuideManager:OnStoryStart(key)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(tostring(key) .. ">>>>>>" .. os.clock(), "新手引导中剧情<<<<<<< 开始 <<<<<<<<<<")
+    end
+    local tb = _G.debug.traceback()
+    _G.table.insert(self.RuningStorys, key)
+    _G.table.insert(self.RuningStorysDebug, tb)
+
+    if not self.IsSpOpening[1] then
+        self.IsSpOpening[1] = true
+        self:HideGuide()
+    end
+end
+
+---剧情结束
+function GuideManager:OnStoryEnd(key)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(tostring(key) .. ">>>>>>" .. os.clock(), "新手引导中剧情<<<<<<< 结束 <<<<<<<<<<")
+    end
+    local index = _G.table.indexof(self.RuningStorys, key)
+    if _G.table.ContainsValue(self.RuningStorys, key) then
+        _G.table.removebyvalue(self.RuningStorys, key)
+    end
+    if index ~= false then
+        _G.table.remove(self.RuningStorysDebug, index)
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(self.RuningStorys, "执行中的剧情>>>>>>>>>>>")
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(self.RuningStorysDebug, "执行中的剧情堆栈>>>>>>>>>>>")
+    end
+    if self.IsSpOpening[1] and #self.RuningStorys <= 0 then
+        self.IsSpOpening[1] = false
+        self:DisPlayGuide(true)
+    end
+end
+
+---视频播放开始
+function GuideManager:OnVideoPlayStart()
+    if self.IsGuideing then
+        --镇魂街ZHJ-30707 Beta_0.1.9_jttw BUG合集ZHJ-30998
+        --【新手引导】特殊操作下导致功能与新手引导不一致
+        --多开几个界面的情况下，可能触发了上个界面的引导导致出现异常
+        if self.CurGuideCfg.teach_type == _G.GuideTeachType.Function then
+            if self.CurGuideCfg.node == 1 then
+                if self.CurGuideModelCfg.make_type then
+                    --local GuideModel = require("GuideModel")
+                    self:DelDot(self.CurGuideModelCfg.id)
+                end
+                self:DoBreak()
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log("", "打开视频时，可能触发了上个界面的引导导致出现异常,>>>>>>")
+                end
+            end
+        end
+        return
+    end
+end
+
+---视频播放结束
+function GuideManager:OnVideoPlayEnd()
+    if self.IsGuideing then
+        if self.CurGuideCfg.node == _G.GuideNodeType.WaitVideoEnd then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(self.CurGuideCfg.id, "引导视频播放结束>>>>>>>>>>>")
+            end
+            self:DoNext()
+            return
+        end
+    end
+end
+
+---寻路中断
+function GuideManager:OnNavInterruptMove()
+    if self.IsGuideing then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("<color=red><size=20>寻路中断事件>>>>>>></size></color>", "")
+        end
+        if self.CurGuideCfg.node == _G.GuideNodeType.WaitNav then
+            self.Guide:StopView()
+        end
+    end
+end
+
+---任务接领事件
+function GuideManager:OnActionEvent()
+    if self.IsGuideing then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("<color=red><size=20>任务接领事件>>>>>>></size></color>", "")
+        end
+        if self.CurGuideCfg.node == _G.GuideNodeType.WaitForDo then
+            self:DoNext()
+        end
+    end
+end
+
+---寻路结束事件
+function GuideManager:OnTaskInfoUpdate()
+    if self.IsGuideing then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("<color=red><size=20>寻路结束事件>>>>>>></size></color>", "")
+        end
+        if self.CurGuideCfg.node == _G.GuideNodeType.WaitNav then
+            self:DoNext()
+        end
+    end
+end
+
+---场景切换完成
+function GuideManager:OnSceneChangeOver()
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log("引导切换场景完成场景类型>>>")
+    end
+    if self.IsGuideing then
+        if self:CheckMainViewTab(self.CurGuideCfg) then
+            if self.CurGuideCfg.teach_type == _G.GuideTeachType.Fight then
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log(self.CurGuideCfg.id, "<color=red><size=10>引导异常，当前引导和主城场景不匹配，非正常流程请忽略</size></color>")
+                end
+
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log(_G.WorldManager:GetInstance().CurrentWorld.Cfg.WorldType, "引导切换场景完成世界类型>>>")
+                end
+                self:DoBreak()
+                if self:CheckMainViewTab(self.CurGuideCfg) then
+                    ---主界面检测
+                    self:CheckFunctionGuide(_G.ConfigManager.ui_cfg.MainView.Name)
+                else
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log("<color=red>非主世界不刷新引导</color>")
+                    end
+                end
+            end
+        end
+    else
+        if self:CheckMainViewTab(self.CurGuideCfg) then
+            ---主界面检测
+            self:CheckFunctionGuide(_G.ConfigManager.ui_cfg.MainView.Name)
+        end
+    end
+end
+
+---刷新引导信息
+---@param teachType GuideTeachType 是否是战斗功能
+---@param name string 功能对应名称
+function GuideManager:UpdateGuide(teachType, name)
+    ---如果没有开始引导就找出引导
+    if not self.IsGuideing then
+        --local GuideModel = require("GuideModel")
+
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(GuideModel:GetInstance().GuideDot, "刷新引导时记录打点数据")
+        end
+
+        ---没有打点就视为新手引导起点(强制引导)
+        if GuideModel:GetInstance().GuideDot == 0 then
+            if teachType == _G.GuideTeachType.Function then --and name == self.FirstFunctionId then
+                for i = 1, #self.AllGuideCfgList do
+                    ---@type teach_info_cfg
+                    local guideCfg = self.AllGuideCfgList[i]
+                    if
+                        guideCfg.teach_type == teachType and guideCfg.node == _G.GuideNodeType.Start and
+                        --guideCfg.function_id == name and
+                        0 == self:DoCheckFunConditon(guideCfg)
+                    then
+                        self.CurGuideId = self.AllGuideCfgList[i].id
+                        break
+                    end
+                end
+            else
+                self.CurGuideId = 0
+            end
+        else
+            ---如果打点不在配置范围内视为结束
+            local item = _G.ConfigManager.teach_info_cfg[GuideModel:GetInstance().GuideDot]
+            if item then
+                ---如果不是结束点，就直接从这个组开始
+                if item.node ~= _G.GuideNodeType.End then
+                    local cfg = _G.ConfigManager.teach_model_cfg[item.group_id]
+                    local itemTemp = _G.ConfigManager.teach_info_cfg[cfg.start_node[1]]
+                    local conditionType = self:DoCheckFunConditon(itemTemp)
+                    if conditionType == 1 then
+                        if _G.AppSetting.IsDebugTeach then
+                            _G.LogError(
+                                item.open_condition,
+                                "新手引导  关键点打点异常并且>>[" .. item.id .. "]条件不满足，检测后续引导，要求条件>>>>>>>>>>>"
+                            )
+                        end
+                        self:GetNextGroupCondition(item.group_id, teachType, name)
+                    else
+                        for _, v in ipairs(cfg.start_node) do
+                            local cfginfo = _G.ConfigManager.teach_info_cfg[v]
+                            if teachType == 1 then
+                                if cfginfo.teach_type == teachType and cfginfo.function_id == name then
+                                    if cfginfo.function_id == _G.ConfigManager.ui_cfg.MainView.Name then
+                                        if self:CheckMainViewTab(cfginfo) then
+                                            if v > GuideModel:GetInstance().GuideDot then
+                                                self.CurGuideId = v
+                                                break
+                                            end
+                                        end
+                                    else
+                                        if v > GuideModel:GetInstance().GuideDot then
+                                            self.CurGuideId = v
+                                            break
+                                        end
+                                    end
+                                end
+                            else
+                                if cfginfo.teach_type == teachType then
+                                    if v > GuideModel:GetInstance().GuideDot then
+                                        self.CurGuideId = v
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        if (not self.CurGuideId or self.CurGuideId == 0) and item.node == _G.GuideNodeType.Irreversible then
+                            self:GetNextGroupCondition(item.group_id, teachType, name)
+                        end
+                    end
+                else
+                    self:GetNextGroupCondition(item.group_id, teachType, name)
+                end
+            else
+                self.CurGuideId = 0
+            end
+        end
+
+        if self.CurGuideId == 0 then
+            self.CurGuideCfg = nil
+            self.CurGuideModelCfg = nil
+        else
+            self.CurGuideCfg = _G.ConfigManager.teach_info_cfg[self.CurGuideId]
+            self.CurGuideModelCfg = _G.ConfigManager.teach_model_cfg[self.CurGuideCfg.group_id]
+        end
+    end
+end
+
+---目标界面是否在最上层
+function GuideManager:CheckTargetViewIsTop(name)
+    ---@type UIWindow
+    local topui = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.TopLayer.Name)
+    if topui then
+        return false
+    end
+    topui = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.NormalLayer.Name)
+    if topui then
+        return false
+    end
+    topui = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.SceneLayer.Name)
+    return topui and topui.Name == name
+end
+
+---检查主界面页签
+function GuideManager:CheckMainViewTab(guideCfg)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if view and (not view.gameObject or view.gameObject:GetActiveSelf() == 0) then
+        return false
+    end
+
+    if not self:CheckTargetViewIsTop(_G.ConfigManager.ui_cfg.MainView.Name) then
+        return false
+    end
+
+    if guideCfg then
+        if view and not _G.table.indexof(guideCfg.function_type, view:GetTogKey()) then
+            return false
+        end
+    end
+
+    return true
+end
+
+---是否已经过了验证关卡
+function GuideManager:IsPassSection(cfg)
+    local isPass = false
+    local sectionId = 0
+    for i = 1, #cfg.open_condition do
+        if cfg.open_condition[i][1] == 9 then
+            sectionId = cfg.open_condition[i][2]
+            break
+        end
+    end
+
+    if sectionId > 0 then
+        isPass = require("AfkModel"):GetInstance():CheckSectionIsPass(sectionId)
+    end
+
+    return isPass
+end
+
+---条件检测
+---@param group_id number 组id
+function GuideManager:GetNextGroupCondition(group_id, teachType, name)
+    ---@type teach_info_cfg_Item
+    local cfg = self:GetNextGroup(group_id, teachType, name)
+    if cfg then
+        local conditionType = self:DoCheckFunConditon(cfg)
+        if conditionType == 1 then
+            self.CurGuideId = 0
+            if self:IsPassSection(cfg) then
+                ---@type teach_model_cfg
+                --local cfgModel = _G.ConfigManager.teach_model_cfg[cfg.group_id]
+                --self:DotTheEndNode(cfgModel.end_node)
+                --local GuideModel = require("GuideModel")
+                --local itemTemp = _G.ConfigManager.teach_info_cfg[GuideModel:GetInstance().GuideDot]
+                self:GetNextGroupCondition(cfg.group_id, teachType, name)
+            end
+            return
+        end
+        self.CurGuideId = cfg.id
+    else
+        self.CurGuideId = 0
+    end
+end
+
+---获取对应完成组的下一组
+---@param groupId number 组id
+---@param teachType number 引导类型（1=功能引导；2=战斗引导；）
+function GuideManager:GetNextGroup(groupId, teachType, name)
+    local index = 0
+    for i = 1, #self.GuideModelCfgList do
+        if self.GuideModelCfgList[i].id == groupId then
+            index = i
+            break
+        end
+    end
+    ---没找到组
+    if index <= 0 then
+        if _G.AppSetting.IsDebugTeach then
+            _G.LogError(groupId, "<color=red><size=20>当前打点的组不存在，请检查配置是否正常</size></color>")
+        end
+        return nil
+    end
+    ---最后一组
+    if index >= #self.GuideModelCfgList then
+        return nil
+    end
+    for j = index + 1, #self.GuideModelCfgList do
+        if self.GuideModelCfgList[j].discard == false then
+            for k = 1, #self.GuideModelCfgList[j].start_node do
+                local cfginfo = _G.ConfigManager.teach_info_cfg[self.GuideModelCfgList[j].start_node[k]]
+                if teachType == 1 then
+                    if cfginfo.teach_type == teachType and cfginfo.function_id == name then
+                        return cfginfo
+                    end
+                else
+                    if cfginfo.teach_type == teachType then
+                        return cfginfo
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+---非强制引导保存记录
+---@param groupId number 组id
+function GuideManager:SaveDot(groupId)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(groupId, "触发式引导保存")
+    end
+    --_G.PlayerPrefsManager.SetInt("Guide" .. groupId, 1)
+    --local GuideNet = require("GuideNet")
+    ---@type guide.c2s_guide_other
+    local msg = {}
+    msg.guide_id = groupId
+    GuideNet:GetInstance():OtherDot(msg, _G.handlerbind(self, self.BackOtherDot, groupId))
+end
+
+function GuideManager:BackOtherDot(msg, groupId)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(groupId, "触发式引导保存完成>>>>>>>>>>>")
+    end
+    --local GuideModel = require("GuideModel")
+    GuideModel:GetInstance():AddOtherDot(groupId)
+end
+
+---非强制引导删除记录
+---@param groupId number 组id
+function GuideManager:DelDot(groupId)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(groupId, "触发式引导删除")
+    end
+    --_G.PlayerPrefsManager.SetInt("Guide" .. groupId, 1)
+    --local GuideNet = require("GuideNet")
+    ---@type guide.c2s_guide_other_del
+    local msg = {}
+    msg.guide_id = groupId
+    GuideNet:GetInstance():OtherDotDel(msg, _G.handlerbind(self, self.BackOtherDotDel, groupId))
+end
+
+function GuideManager:BackOtherDotDel(msg, groupId)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(groupId, "触发式引导删除完成>>>>>>>>>>>")
+    end
+    --local GuideModel = require("GuideModel")
+    GuideModel:GetInstance():RemoveOtherDot(groupId)
+end
+
+---获取触发式引导组是否完成
+---@param groupId number 组id
+function GuideManager:GetDot(groupId)
+    --return _G.PlayerPrefsManager.GetInt("Guide" .. groupId) == 1
+    --local GuideModel = require("GuideModel")
+    local isDoOther = GuideModel:GetInstance():CheckOtherDot(groupId)
+    if isDoOther then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(groupId, "获取触发式引导是已完成状态")
+        end
+    end
+    return isDoOther
+end
+
+---开启功能引导检测（非战斗的）
+function GuideManager:CheckFunctionGuide(name)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(name, "检测功能面板引导")
+    end
+    --local GuideModel = require("GuideModel")
+    if not GuideModel:GetInstance().GetDataFinish then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("数据还没有准备好")
+        end
+        return
+    end
+
+    if _G.JumpManager:GetInstance().IsJumping then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("如果是跳转中，就不做检测>>>>")
+        end
+        return
+    end
+
+    if self.GotoBattleIng then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("正在进入战斗，不做引导检测")
+        end
+        return
+    end
+
+    if not self.IsGuideing then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(self.LoseGuideId, "失败引导id")
+        end
+        ---失败了需要引导的
+        if self.LoseGuideId > 0 then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log("执行失败引导组")
+            end
+            self.CurGuideId = self.LoseGuideId
+            self.CurGuideCfg = _G.ConfigManager.teach_info_cfg[self.CurGuideId]
+            self.CurGuideModelCfg = _G.ConfigManager.teach_model_cfg[self.CurGuideCfg.group_id]
+        else
+            self:UpdateGuide(_G.GuideTeachType.Function, name)
+            if self.CurGuideId <= 0 then
+                self.CurGuideId = self:GetNFGuide(_G.GuideTeachType.Function, name)
+                if self.CurGuideId > 0 then
+                    self.CurGuideCfg = _G.ConfigManager.teach_info_cfg[self.CurGuideId]
+                    self.CurGuideModelCfg = _G.ConfigManager.teach_model_cfg[self.CurGuideCfg.group_id]
+                end
+            end
+        end
+
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(self.CurGuideId, "功能刷新出id")
+        end
+        if self.CurGuideId > 0 and self.CurGuideCfg then
+            if name == _G.ConfigManager.ui_cfg.MainView.Name and not self:CheckMainViewTab(self.CurGuideCfg) then
+                return
+            end
+            self:DoPlay(self.CurGuideId)
+        else
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log("未查询到" .. name .. "对应的引导组开始节点，确实没配请忽略！")
+            end
+        end
+    end
+end
+
+---获取符合条件的触发式引导
+---@param teachType number 引导类型（1=功能引导；2=战斗引导；）
+function GuideManager:GetNFGuide(teachType, name)
+    local guideId = 0
+    for i = 1, #self.GuideMTModelCfgList do
+        local item = self.GuideMTModelCfgList[i]
+        if item.discard == false then
+            if not self:GetDot(item.id) then
+                local cfginfo = _G.ConfigManager.teach_info_cfg[item.start_node[1]]
+                local conditionType = self:DoCheckFunConditon(cfginfo)
+                if conditionType ~= 1 then
+                    if cfginfo.teach_type == teachType then
+                        if teachType == 1 and cfginfo.function_id == name then
+                            guideId = cfginfo.id
+                        else
+                            if require("ChapterModel"):GetInstance():GetCurSectionSID() == cfginfo.function_id then
+                                guideId = cfginfo.id
+                            end
+                        end
+                        if guideId > 0 then
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return guideId
+end
+
+---主界面激活引导检测
+function GuideManager:MainViewEnable()
+    local name = _G.ConfigManager.ui_cfg.MainView.Name
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(name .. os.clock(), "引导主界面激活>>>>>>")
+    end
+
+    if self.IsGuideing then
+        return
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(name, "引导主界面激活引导检测>>>>>>")
+    end
+
+    if not _G.MainManager:GetInstance():ExistMainView() or not self:CheckMainViewTab() then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("不在主界面")
+        end
+        return
+    end
+
+    ---主界面激活引导检测
+    self:CheckFunctionGuide(name)
+end
+
+---UI打开
+---@param name string UI名称
+function GuideManager:OnUIOpened(name)
+    if false ~= _G.table.indexof(self.GuideBlackList, name) then
+        -- 黑名单界面，不会检测引导
+        return
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(name, "引导监听打开界面>>>>>>")
+    end
+
+    if self.IsGuideing then
+        if self.CurGuideCfg.function_id == name and self.CurGuideCfg.node == _G.GuideNodeType.WaitUIOpen then
+            self:ShowMask(false)
+            self:DoNext()
+            return
+        end
+        if self.CurGuideCfg.function_id == name and self.CurGuideCfg.node == _G.GuideNodeType.WaitUIClose then
+            if self.WaitNodeTimer then
+                self.WaitNodeTimer:Stop()
+                self.WaitNodeTimer = nil
+            end
+            self:ShowMask(false)
+            return
+        end
+
+        if self.Guide and self.Guide.gameObject and self.Guide.gameObject:GetActiveSelf() == 1 then
+            ---特殊界面隐藏引导
+            if
+                name == _G.ConfigManager.ui_cfg.DialogueView.Name and self.CurGuideCfg.node ~= _G.GuideNodeType.Dialogue and
+                self.CurGuideCfg.function_id ~= _G.ConfigManager.ui_cfg.DialogueView.Name
+            then
+                if not self.IsSpOpening[2] then
+                    self.IsSpOpening[2] = true
+                    self:HideGuide()
+                end
+                return
+            end
+            if
+                name == _G.ConfigManager.ui_cfg.RoleLevelUpView.Name or
+                name == _G.ConfigManager.ui_cfg.MapIllustrationView.Name or
+                name == _G.ConfigManager.ui_cfg.OpenFunctionsView.Name or
+                (name == _G.ConfigManager.ui_cfg.CommonAwardView.Name and
+                    self.CurGuideCfg.function_id ~= _G.ConfigManager.ui_cfg.CommonAwardView.Name)
+            then
+                if not self.IsSpOpening[3] then
+                    self.IsSpOpening[3] = true
+                    self:HideGuide()
+                end
+                return
+            end
+        end
+        --镇魂街ZHJ-30707 Beta_0.1.9_jttw BUG合集ZHJ-30998
+        --【新手引导】特殊操作下导致功能与新手引导不一致
+        --多开几个界面的情况下，可能触发了上个界面的引导导致出现异常
+        if self.CurGuideCfg.teach_type == _G.GuideTeachType.Function then
+            if self.CurGuideCfg.node == 1 then
+                local curView = _G.UIManager:GetInstance():GetWindowCtrl(self.CurGuideCfg.function_id)
+                if curView then
+                    ---@type UIWindow
+                    local topui = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.TopLayer.Name)
+                    if nil == topui then
+                        topui = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.NormalLayer.Name)
+                    end
+                    if topui and topui.Name == name then
+                        if self.CurGuideCfg.function_id ~= name then
+                            if self.CurGuideModelCfg.make_type then
+                                --local GuideModel = require("GuideModel")
+                                self:DelDot(self.CurGuideModelCfg.id)
+                            end
+                            self:DoBreak()
+                            if _G.AppSetting.IsDebugTeach then
+                                _G.Log(name, "多开几个界面的情况下，可能触发了上个界面的引导导致出现异常,当前多层界面是>>>>>>")
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(name, "UI对应名称的界面引导检测>>>>>>")
+    end
+
+    ---UI对应名称的界面引导检测
+    if name ~= _G.ConfigManager.ui_cfg.DialogueView.Name then
+        self:CheckFunctionGuide(name)
+    end
+end
+
+---激活一个界面
+function GuideManager:OnUIShow(name)
+    if name == _G.ConfigManager.ui_cfg.DungonesRuningView.Name then
+        self:CheckFunctionGuide(name)
+    end
+end
+
+---ui关闭
+---@param name string UI名称
+function GuideManager:OnUIClosed(name)
+    ---如果是当前界面，并且是等待的
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(name, "引导监听关闭界面>>>>>>")
+    end
+
+    if self.IsGuideing then
+        if self.CurGuideCfg.function_id == name and self.CurGuideCfg.node == _G.GuideNodeType.WaitUIClose then
+            self:DoNext()
+            return
+        end
+    end
+
+    if self.IsSpOpening[2] then
+        if name == _G.ConfigManager.ui_cfg.DialogueView.Name then
+            self.IsSpOpening[2] = false
+            self:DisPlayGuide()
+        end
+    end
+
+    if self.IsSpOpening[3] then
+        if
+            name == _G.ConfigManager.ui_cfg.RoleLevelUpView.Name or
+            name == _G.ConfigManager.ui_cfg.MapIllustrationView.Name or
+            name == _G.ConfigManager.ui_cfg.OpenFunctionsView.Name or
+            name == _G.ConfigManager.ui_cfg.CommonAwardView.Name
+        then
+            self.IsSpOpening[3] = false
+            self:DisPlayGuide()
+        end
+    end
+
+    ---主界面只隐藏不关，所以在关闭时检测是否退到了主界面
+    if self:CheckMainViewTab(self.CurGuideCfg) then
+        self:CheckFunctionGuide(_G.ConfigManager.ui_cfg.MainView.Name)
+    else
+        --特殊处理一些返回触发式引导
+        if name == _G.ConfigManager.ui_cfg.DrawResultView.Name then
+            self:CheckFunctionGuide(_G.ConfigManager.ui_cfg.DrawView.Name)
+            return
+        end
+
+        ---@type UIWindow
+        local topui = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.TopLayer.Name)
+        if nil == topui then
+            topui = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.NormalLayer.Name)
+        end
+        if topui then
+            self:CheckFunctionGuide(topui.Name)
+        end
+    end
+end
+
+---重新跑一次这个引导
+function GuideManager:DoRePlay(guideId)
+    self:DoBreak()
+    self:DoPlay(guideId)
+end
+
+--- 打断新手引导
+function GuideManager:DoBreak()
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(self.CurGuideId, "跳出引导")
+    end
+    if self.IsGuideing then
+        self:ShowMask(false)
+        if self.Guide then
+            self.Guide:StopView()
+        end
+        self.CurGuideId = 0
+        self.CurGuideCfg = nil
+        self.CurGuideModelCfg = nil
+        if self.CheckFunConditonTimer ~= nil then
+            self.CheckFunConditonTimer:Stop()
+            self.CheckFunConditonTimer = nil
+        end
+        self.IsGuideing = false
+        if self.CurAudio then
+            _G.AudioManager.StopSound(self.CurAudio)
+        end
+    end
+end
+
+---外部执行某一个id的引导
+-- function GuideManager:DoExternalPlay(guideId)
+--     if self.IsGuideing then
+--         if _G.AppSetting.IsDebugTeach then
+--             _G.LogError(self.CurGuideId, "外部执行引导失败，引导执行中")
+--         end
+--         return
+--     end
+--     self:DoPlay(guideId)
+-- end
+
+--- 开始引导
+---@param guideId number 新手引导id
+function GuideManager:DoPlay(guideId)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(guideId, "启动引导===id>>>>>>")
+    end
+    if _G.AppSetting.IsShowTeach == false then
+        if _G.AppSetting.IsDebugTeach then
+            _G.LogError("新手引导IsShowTeach已关，不开始引导")
+        end
+        return
+    end
+
+    if guideId <= 0 then
+        if _G.AppSetting.IsDebugTeach then
+            _G.LogError(guideId, "引导id不存在，不开始引导")
+        end
+        return
+    end
+
+    --local GuideModel = require("GuideModel")
+    if GuideModel:GetInstance().GuideSkipId == GuideModel:GetInstance().GuideDot then
+        if _G.AppSetting.IsDebugTeach then
+            _G.LogError(GuideModel:GetInstance().GuideDot, "新手引导GM跳过，不开始引导")
+        end
+        return
+    end
+
+    self.CurGuideId = guideId
+    self.CurGuideCfg = _G.ConfigManager.teach_info_cfg[guideId]
+
+    if nil == self.CurGuideCfg then
+        if _G.AppSetting.IsDebugTeach then
+            _G.LogError(guideId, "错误的新手引导id>>>>>>>>>>")
+        end
+        self:DoBreak()
+        return
+    end
+
+    ---引导记录bi
+    if
+        self.CurGuideCfg.node ~= _G.GuideNodeType.Nomal and self.CurGuideCfg.node ~= _G.GuideNodeType.End and
+        self.CurGuideCfg.node ~= _G.GuideNodeType.Irreversible
+    then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(guideId, "<color=yellow><size=20>引导点发送BI信息id>>>></size></color>")
+        end
+        --local GuideNet = require("GuideNet")
+        --@type guide.c2s_guide_bi
+        local msg = {}
+        msg.guide_id = self.CurGuideCfg.id
+        GuideNet:GetInstance():DoBI(msg, nil)
+    end
+
+    self.CurGuideModelCfg = _G.ConfigManager.teach_model_cfg[self.CurGuideCfg.group_id]
+
+    if self.CurGuideModelCfg.not_force then
+        self.NotForceGroupId = self.CurGuideModelCfg.id
+    else
+        self.NotForceGroupId = 0
+    end
+
+    self:CallCSDoCustomGuide()
+
+    ---如果这一步废弃，就去下一步
+    if self.CurGuideCfg.discard then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(guideId, "废弃引导id>>>>>>>>>>>>>>>>>")
+        end
+        self:DoNext()
+        return
+    end
+
+    _G.Log("设置IsGuideing引导为开启状态")
+
+    self.IsGuideing = true
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(guideId, "开始引导===id>>>>>>")
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(self.CurGuideCfg.group_id, "开始引导组===id>>>>>>")
+    end
+    if self.CurGuideCfg.teach_type == _G.GuideTeachType.Fight then
+        _G.SDKManager:GetInstance():GameStepInfo(-70003)
+        _G.SDKManager:GetInstance():MiniGameTrack(require("SDKDef").DotMsg.ShuShu.guide_battle)
+    end
+
+    local globalInfo = function()
+        ---辅助打开界面
+        if self.CurGuideCfg.open_oneview ~= "" then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(guideId, "辅助打开界面>>>>>>" .. self.CurGuideCfg.open_oneview .. ">>>>>>>>>")
+            end
+            local param
+            if #self.CurGuideCfg.oneview_param > 0 then
+                param = self.CurGuideCfg.oneview_param
+            end
+            if param then
+                _G.UIManager:GetInstance():OpenWindow(self.CurGuideCfg.open_oneview, _G.SafeUnpack(param))
+            end
+        end
+
+        ---调用全局接口
+        if self.CurGuideCfg.global_function ~= "" then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(guideId, "调用全局接口>>>>>>" .. self.CurGuideCfg.global_function .. ">>>>>>>")
+            end
+            local gfs = _G.string.split(self.CurGuideCfg.global_function, ".")
+            local model = _G.table.remove(gfs, 1)
+            local fun = _G.table.remove(gfs, 1)
+
+            if _G[model] and _G[model][fun] then
+                _G[model][fun](_G.table.unpack(gfs))
+            end
+        end
+    end
+
+    ---不是等待暂停节点
+    if
+        self.CurGuideCfg.node ~= _G.GuideNodeType.Pause and self.CurGuideCfg.node ~= _G.GuideNodeType.WaitFightEnd and
+        self.CurGuideCfg.node ~= _G.GuideNodeType.WaitUIClose and
+        self.CurGuideCfg.node ~= _G.GuideNodeType.WaitForDo and
+        self.CurGuideCfg.node ~= _G.GuideNodeType.WaitUIOpen and
+        self.CurGuideCfg.node ~= _G.GuideNodeType.WaitVideoEnd
+    then
+        ---判断条件
+        local conditionType = self:DoCheckFunConditon(self.CurGuideCfg)
+        if conditionType == 1 then
+            if _G.AppSetting.IsDebugTeach then
+                _G.LogError(
+                    self.CurGuideCfg.open_condition,
+                    "新手引导[" .. self.CurGuideCfg.id .. "]条件不满足，不开始引导，要求条件>>>>>>>>>>>"
+                )
+            end
+            self:DoBreak()
+            return
+        end
+    elseif self.CurGuideCfg.node == _G.GuideNodeType.Pause then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(guideId, "暂停节点挂起>>>>>>>>")
+        end
+        if self.CurGuideCfg.teach_type == _G.GuideTeachType.Function then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(guideId, "功能暂停节点挂起>>>>>>>>")
+            end
+            local conditionType = self:UpdateCheckFunConditon()
+            ---条件不成立就挂起来等否则就不用挂起了
+            if conditionType == 1 then
+                if _G.AppSetting.IsDebugTeach then
+                    _G.LogError("功能条件不成立不开始引导，条件判断已挂起，请检查以下条件是否有异常")
+                    _G.LogError(self.CurGuideCfg.open_condition)
+                end
+                ---条件判断挂起
+                if self.CheckFunConditonTimer == nil then
+                    self.CheckFunConditonTimer =
+                        _G.TimerManager:GetInstance():GetTimer(1, self.UpdateCheckFunConditon, self, false)
+                    self.CheckFunConditonTimer:Start()
+                end
+            end
+        else
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(guideId, "战斗暂停节点挂起>>>>>>>>")
+            end
+        end
+        return
+    elseif self.CurGuideCfg.node == _G.GuideNodeType.WaitVideoEnd then
+        if self.CurGuideCfg.video == "sihundao" then
+            local firstOpen = _G.PlayerPrefsManager.GetTable("sihunta", false)
+            if firstOpen then
+                self:DoNext()
+                return
+            end
+        elseif self.CurGuideCfg.video == "zhaomu" then
+            local kaihuan
+            if self.CurGuideCfg.function_id == "DrawView" then
+                kaihuan = _G.PlayerPrefsManager.GetInt("kaiguan")
+            elseif self.CurGuideCfg.function_id == "DrawUpMainView" then
+                kaihuan = _G.PlayerPrefsManager.GetInt("DrawUpMainViewkaiguan")
+            elseif self.CurGuideCfg.function_id == "ArtifactDrawUpMainView" then
+                kaihuan = _G.PlayerPrefsManager.GetInt("DrawUpMainViewkaiguan")
+            end
+            if kaihuan == 1 then
+                self:DoNext()
+                return
+            end
+        end
+    else
+        ---等待或者暂停节点挂起无操作
+
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(guideId, "等待节点挂起>>>>>>>")
+        end
+        if self.CurGuideCfg.node == _G.GuideNodeType.WaitUIOpen and self.CurGuideCfg.set_obstacle == false then
+            self:ShowMask(true)
+        elseif self.CurGuideCfg.node == _G.GuideNodeType.WaitForDo and self.CurGuideCfg.set_obstacle == false then
+            self:ShowMask(true)
+        elseif self.CurGuideCfg.node == _G.GuideNodeType.WaitUIClose and self.CurGuideCfg.set_obstacle == false then
+            local win = _G.UIManager:GetInstance():GetWindowCtrl(self.CurGuideCfg.function_id)
+            if nil == win or nil == win.gameObject then
+                self:ShowMask(true)
+            end
+        end
+        globalInfo()
+
+        ---如果不是等待战斗结束，设定超时机制
+        if self.CurGuideCfg.node ~= _G.GuideNodeType.WaitFightEnd then
+            if self.CurGuideCfg.wait_timeout and self.CurGuideCfg.wait_timeout > 0 then
+                if self.WaitNodeTimer then
+                    self.WaitNodeTimer:Stop()
+                    self.WaitNodeTimer = nil
+                end
+
+                self.WaitNodeTimer =
+                    _G.TimerManager:GetInstance():GetTimer(
+                        self.CurGuideCfg.wait_timeout,
+                        self.DoWaitOutTimer,
+                        self,
+                        true,
+                        false,
+                        true
+                    )
+                self.WaitNodeTimer:Start()
+            end
+        end
+        return
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(guideId, "引导条件通过===id>>>>>>")
+    end
+
+    globalInfo()
+
+    -- 触发式引导保存到本地
+    if self.CurGuideModelCfg.make_type and self.CurGuideCfg.node == _G.GuideNodeType.Start then
+        self:SaveDot(self.CurGuideModelCfg.id)
+    end
+
+    ---如果配了暂停游戏就暂停
+    if self.CurGuideCfg.rec_pause == 2 then
+        _G.CS.BattleManager.Inst:PauseBattle(false)
+    end
+
+    ---链接外部剧情对话内容
+    if self.CurGuideCfg.node == _G.GuideNodeType.Dialogue then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(guideId, "外接对话框>>>>>>>")
+        end
+        if self.CurGuideCfg.open_oneview ~= "" then
+            if self.GuideWiatCoroutine == nil then
+                self.GuideWiatCoroutine = _G.coroutine.start(_G.handler(self, self.CoOnProgress))
+            end
+        else
+            if _G.WorldManager:GetInstance().CurrentWorld.Cfg.Scene_Type == _G.SceneType.Section then
+                _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+            elseif _G.MainManager:GetInstance():ExistMainView() then
+                _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+            end
+            _G.StoryManager:GetInstance():PlayDialogueView(
+                self.CurGuideCfg.text_type,
+                _G.handler(self, self.OnClaimPreDialogueCompleted)
+            )
+        end
+        return
+    end
+
+    if self.CurGuideCfg.node == _G.GuideNodeType.HUD then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(guideId, "外接人物HUD>>>>>>>")
+        end
+
+        if self.CurGuideCfg.teach_type == 1 then
+            _G.HUDUtilities.ShowHudID(
+                self.CurGuideCfg.text_type,
+                function()
+                    self:DoNext()
+                end,
+                self.CurGuideCfg.text
+            )
+        elseif self.CurGuideCfg.teach_type == 2 then
+            _G.HUDUtilities.ShowHudIDFight(
+                self.CurGuideCfg.text_type,
+                function()
+                    self:DoNext()
+                end,
+                self.CurGuideCfg.text
+            )
+            if self.CurGuideCfg.rec_pause == 1 then
+                _G.CS.BattleManager.Inst:ResumeBattle()
+            end
+        end
+
+        return
+    end
+
+    ---一个没有操作的开始节点或者普通节点条件成立去下一步
+    if
+        (self.CurGuideCfg.node == _G.GuideNodeType.Start or self.CurGuideCfg.node == _G.GuideNodeType.Nomal) and
+        self.CurGuideCfg.click_tag == "" and
+        self.CurGuideCfg.text_type == 0
+    then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(guideId, "空节点跳转到下一步>>>>>")
+        end
+        self:DoNext()
+        return
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(guideId, "引导条件通过===id>>>>>>")
+    end
+
+    self:ShowGuide()
+end
+
+---等待判断是否超时
+function GuideManager:DoWaitOutTimer()
+    self:DotCurrentAndOver()
+    if self.WaitNodeTimer then
+        self.WaitNodeTimer:Stop()
+        self.WaitNodeTimer = nil
+    end
+end
+
+function GuideManager:CallCSDoCustomGuide()
+    if
+        self.CurGuideCfg and self.CurGuideCfg.teach_type == _G.GuideTeachType.Fight and
+        _G.CS.BattleManager.Inst.battleGuideManager ~= nil
+    then
+        _G.CS.BattleManager.Inst.battleGuideManager:DoCustomGuide(self.CurGuideCfg.id)
+    end
+end
+
+function GuideManager:CallCSSetRoomId()
+    if
+        self.CurGuideCfg and self.CurGuideCfg.teach_type == _G.GuideTeachType.Fight and
+        _G.CS.BattleManager.Inst.battleGuideManager ~= nil
+    then
+        _G.CS.BattleManager.Inst.battleGuideManager:SetRoomId(self.CurGuideCfg.function_id)
+    end
+end
+
+---检测界面进度
+function GuideManager:CoOnProgress()
+    _G.coroutine.waitforendofframe()
+    local uimgr = _G.UIManager:GetInstance()
+    local name = self.CurGuideCfg.open_oneview
+    local nowWindow = uimgr:GetWindow(name)
+    while _G.IsNil(nowWindow) do
+        nowWindow = uimgr:GetWindow(name)
+        _G.coroutine.waitforendofframe()
+    end
+    if self.GuideWiatCoroutine ~= nil then
+        _G.coroutine.stopwaiting(self.GuideWiatCoroutine)
+        self.GuideWiatCoroutine = nil
+    end
+
+    if _G.WorldManager:GetInstance().CurrentWorld.Cfg.Scene_Type == _G.SceneType.Section then
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    end
+    _G.StoryManager:GetInstance():PlayDialogueView(
+        self.CurGuideCfg.text_type,
+        _G.handler(self, self.OnClaimPreDialogueCompleted)
+    )
+end
+
+---计时检测功能条件是否成立
+function GuideManager:UpdateCheckFunConditon()
+    local conditionType = 1
+    if self.CurGuideCfg.node == _G.GuideNodeType.Pause then
+        conditionType = self:DoCheckFunConditon(self.CurGuideCfg)
+        if conditionType == 0 then
+            self:DoNext()
+        end
+    end
+    return conditionType
+end
+
+---功能条件检测
+---@param guideCfg teach_info_cfg
+function GuideManager:DoCheckFunConditon(guideCfg)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(guideCfg.id, "条件检测id>>>>>")
+    end
+    if guideCfg.function_id == _G.ConfigManager.ui_cfg.MainView.Name and not self:CheckMainViewTab(guideCfg) then
+        return -1
+    end
+    ---条件类型 0 条件成立 1 条件不成立
+    local conditionType = 0
+    if #guideCfg.open_condition > 0 then
+        for k = 1, #guideCfg.open_condition do
+            local param = {}
+            for i = 2, #guideCfg.open_condition[k] do
+                table.insert(param, guideCfg.open_condition[k][i])
+            end
+            if CheckCondition[guideCfg.open_condition[k][1]] then
+                local istrue = CheckCondition[guideCfg.open_condition[k][1]](param)
+                if not istrue then
+                    conditionType = 1
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.LogError(
+                            guideCfg.id .. ">>>>" .. guideCfg.open_condition[k][1],
+                            "<color=red><size=20>引导匹配条件不成立>>>>>>>>></size></color>"
+                        )
+                    end
+                    break
+                end
+            else
+                if _G.AppSetting.IsDebugTeach then
+                    _G.LogError(
+                        guideCfg.id .. ">>>>" .. guideCfg.open_condition[k][1],
+                        "<color=red><size=20>功能引导未找到匹配条件的类型>>>>>>>>></size></color>"
+                    )
+                end
+                conditionType = 1
+            end
+        end
+    end
+
+    ---条件类型 0 条件成立 1 条件不成立
+    local conditionType1 = 0
+    if #guideCfg.open_condition1 > 0 then
+        for k = 1, #guideCfg.open_condition1 do
+            local param = {}
+            for i = 2, #guideCfg.open_condition1[k] do
+                table.insert(param, guideCfg.open_condition1[k][i])
+            end
+            if CheckCondition[guideCfg.open_condition1[k][1]] then
+                local istrue = CheckCondition[guideCfg.open_condition1[k][1]](param)
+                if not istrue then
+                    conditionType1 = 1
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.LogError(
+                            guideCfg.id .. ">>>>" .. guideCfg.open_condition1[k][1],
+                            "<color=red><size=20>引导匹配条件不成立>>>>>>>>></size></color>"
+                        )
+                    end
+                    break
+                end
+            else
+                if _G.AppSetting.IsDebugTeach then
+                    _G.LogError(
+                        guideCfg.id .. ">>>>" .. guideCfg.open_condition1[k][1],
+                        "<color=red><size=20>功能引导未找到匹配条件的类型>>>>>>>>></size></color>"
+                    )
+                end
+                conditionType1 = 1
+            end
+        end
+    else
+        return conditionType
+    end
+
+    if conditionType == 1 and conditionType1 == 1 then
+        return 1
+    else
+        return 0
+    end
+end
+
+---主动链接外部对话内容回调
+function GuideManager:OnClaimPreDialogueCompleted()
+    if self.CurGuideCfg.node == _G.GuideNodeType.Dialogue then
+        if _G.WorldManager:GetInstance().CurrentWorld.Cfg.Scene_Type == _G.SceneType.Section then
+            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+            _G.CS.BattleManager.Inst:ResumeBattle()
+        elseif _G.MainManager:GetInstance():ExistMainView() then
+            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        end
+        self:DoNext()
+    end
+end
+
+---打一个结束点
+function GuideManager:DotTheEndNode(guideId)
+    --local GuideModel = require("GuideModel")
+    --local GuideNet = require("GuideNet")
+    ---@type guide.c2s_guide_dot
+    local msg = {}
+    msg.guide_id = guideId
+    local info = {}
+    info.guideId = guideId
+    info.guideDot = GuideModel:GetInstance().GuideDot
+    GuideNet:GetInstance():InstanceDot(msg, _G.handlerbind(self, self.BackInstanceDot, info))
+    GuideModel:GetInstance().GuideDot = guideId
+end
+
+---打点当前引导组并且结束引导组逻辑
+function GuideManager:DotCurrentAndOver()
+    self:DotTheEndNode(self.CurGuideModelCfg.end_node)
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.LogError(self.CurGuideCfg.id, "引导等待节点超时异常>>>>>>>>>>>>>>>")
+    end
+
+    _G.GuideManager:GetInstance():DoBreak()
+end
+
+--- 完成执行下一步
+function GuideManager:DoNext()
+    if not self.CurGuideCfg then
+        if _G.AppSetting.IsDebugTeach then
+            _G.LogWarning("引导提示：GuideManager.DoNext：CurGuideCfg是nil")
+        end
+        return
+    end
+    local guideId = self.CurGuideCfg.next_id
+    ---检测下一部引导，如果没有，就退出引导组
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(guideId, "下一步引导")
+    end
+
+    if self.CheckFunConditonTimer ~= nil then
+        self.CheckFunConditonTimer:Stop()
+        self.CheckFunConditonTimer = nil
+    end
+
+    if self.WaitNodeTimer then
+        self.WaitNodeTimer:Stop()
+        self.WaitNodeTimer = nil
+    end
+
+    local curFunctionId = self.CurGuideCfg.function_id
+
+    -- 移除战斗引导特效
+    if self.handEffect then
+        _G.UIUtils.RemoveEffect(self.handEffect, 0)
+        self.handEffect = nil
+    end
+
+    if guideId == 0 then
+        self.LoseGuideId = 0
+
+        ---清理掉界面，打开主界面
+        local special = self.CurGuideCfg.special
+        local combatType = self.CurGuideCfg.combat_type
+
+        self:DoBreak()
+
+        _G.Events:GetInstance():Broadcast(_G.eGuideEvent.GuideEnd)
+
+        ---自动返回（0=无处理；1=直接返回主场景）
+        if special then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log("自动返回主场景")
+            end
+            _G.UIManager:GetInstance():CloseWindowsByLayer(_G.UILayers.NormalLayer, _G.UILayers.InfoLayer)
+            _G.WorldManager:GetInstance():SetCurrentWorldVisible(true)
+        end
+
+        ---是否进入副本（0=否；1=是；）
+
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(combatType, "是否进入副本")
+        end
+        self.GotoBattleIng = combatType
+        ---如果是进副本了或者本来就是从主界面操作的，就不再刷新主界面的
+        if combatType == false and curFunctionId ~= _G.ConfigManager.ui_cfg.MainView.Name then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(_G.WorldManager:GetInstance().CurrentWorld.Cfg.Scene_Type, "当前场景类型")
+            end
+
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(_G.MainManager:GetInstance().isInMainView, "是否在主界面")
+            end
+            if _G.MainManager:GetInstance().ExistMainView() then
+                self:CheckFunctionGuide(_G.ConfigManager.ui_cfg.MainView.Name)
+            end
+        end
+    else
+        self:DoPlay(guideId)
+    end
+end
+
+---显示引导界面
+function GuideManager:ShowGuide()
+    if self.Guide then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("启动更新引导")
+        end
+        self.Guide:UpdateView(self.CurGuideCfg, self.CurGuideModelCfg)
+    else
+        if _G.AppSetting.IsDebugTeach then
+            _G.LogError("引导未启动")
+        end
+        self.NeedUpdateGuide = true
+        self:InitGuideView()
+    end
+end
+
+---刷新当前引导页面
+---@return void
+function GuideManager:RefreshGuideView()
+    if not self.Guide then
+        return
+    end
+    self:ShowGuide()
+end
+
+---添加引导界面
+function GuideManager:InitGuideView()
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log("创建引导")
+    end
+    if self.IsGuideLoading == false then
+        local parent = _G.UIManager:GetInstance():GetUILayerTrans(_G.UILayers.TopLayer.Name)
+        self:AddInitMask(parent)
+        self:CreateGuide(parent)
+        self.IsGuideLoading = true
+    end
+end
+
+---添加一个初始化的蒙版
+---@param parent UnityEngine.GameObject 父节点
+function GuideManager:AddInitMask(parent)
+    self.GuideMask = _G.GameObject("guidemask")
+    self.GuideMask.layer = _G.LayerMask.NameToLayer("UI")
+    self.GuideMask:SetParentE(parent)
+
+    local rt = self.GuideMask:AddComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform))
+    rt:SetRectTransformAnchor(0, 0, 1, 1)
+    rt:SetRectTransformOffset(0, 0, 0, 0)
+    self.GuideMask:AddComponentE(_G.typeof(_G.CS.UnityEngine.CanvasRenderer))
+    local canvas = self.GuideMask:AddComponentE(_G.typeof(_G.CS.UnityEngine.Canvas))
+    canvas.overrideSorting = true
+    canvas.sortingOrder = 4500
+    self.GuideMask:AddComponentE(_G.typeof(_G.CS.AorEmptyGraphic))
+    self.GuideMask:AddComponentE(_G.typeof(_G.CS.AorGraphicRaycaster))
+end
+
+---添加遮挡
+function GuideManager:ShowMask(show)
+    if not _G.IsNil(self.GuideMask) then
+        _G.GameUtil.SetActiveByCondition(self.GuideMask, show)
+    end
+end
+
+---创建引导
+---@param parent UnityEngine.GameObject 父节点
+function GuideManager:CreateGuide(parent)
+    _G.PoolsManager:GetInstance():Spawn(
+        "UIH5/Guide/GuideView",
+        _G.ePoolType.Static,
+        parent,
+        function(go)
+            go:SetLocalPositionToZero()
+            go:SetLocalScaleToOne()
+            go:SetRectOffSetToZero()
+
+            local guideSort = 4000
+
+            local canvas = go:GetComponentE(_G.typeof(_G.Canvas))
+            canvas.overrideSorting = true
+            canvas.sortingOrder = guideSort
+
+            go:SetName("guide")
+            self.Guide = require("GuideView").New()
+            self.Guide:SetBind(go)
+
+            local allComponents = go:GetComponentsInChildren(_G.typeof(_G.Canvas), true)
+            local len1 = allComponents.Length - 1
+            for i = 1, len1 do
+                local child = allComponents[i]
+                local oneSort = child.sortingOrder
+                child.sortingOrder = guideSort + oneSort
+            end
+
+            self:ShowMask(false)
+
+            if self.NeedUpdateGuide and self.CurGuideCfg then
+                self.Guide:UpdateView(self.CurGuideCfg, self.CurGuideModelCfg)
+            end
+        end
+    )
+end
+
+---不显示引导
+function GuideManager:HideGuide()
+    if self.Guide then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("隐藏引导")
+        end
+        _G.GameUtil.SetActiveByCondition(self.Guide.gameObject, false)
+    end
+end
+
+---显示引导
+function GuideManager:DisPlayGuide(isStory)
+    if nil == isStory then
+        isStory = false
+    end
+
+    if self.Guide then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("显示引导")
+        end
+        if self.IsGuideing and self.CurGuideCfg then
+            if
+                self.CurGuideCfg.global_function ~= "" and
+                _G.string.contains(self.CurGuideCfg.global_function, "GlobalInterface.PlayStory")
+            then
+                isStory = false
+            end
+            if
+                self.CurGuideCfg.node ~= _G.GuideNodeType.WaitFightEnd and
+                self.CurGuideCfg.node ~= _G.GuideNodeType.WaitUIClose and
+                self.CurGuideCfg.node ~= _G.GuideNodeType.WaitForDo and
+                self.CurGuideCfg.node ~= _G.GuideNodeType.WaitUIOpen
+            then
+                if self.CurGuideCfg.click_tag == "" and self.CurGuideCfg.text_type == 0 then
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log("空节点不处理显示引导处理逻辑")
+                    end
+                else
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log("显示引导并处理引导遮挡更新操作>>>>>>>>>>>>>")
+                    end
+                    self.Guide:UpdateShowAorBtnFull(isStory)
+                end
+            end
+        end
+        _G.GameUtil.SetActiveByCondition(self.Guide.gameObject, true)
+    end
+end
+
+---引用数据清理掉
+function GuideManager:ClearGuide()
+    self.Guide = nil
+end
+
+---获取引导id是否执行过
+function GuideManager:IsDoed(guideId)
+    if not _G.AppSetting.IsShowTeach then
+        return false
+    end
+    --local GuideModel = require("GuideModel")
+    local dot = GuideModel:GetInstance().GuideDot
+    if dot > 0 and dot ~= GuideModel:GetInstance().GuideSkipId then
+        local gid = _G.ConfigManager.teach_info_cfg[dot].group_id
+        local order = _G.ConfigManager.teach_model_cfg[gid].order
+
+        for i = 1, #self.AllGuideCfgList do
+            local cfg = self.AllGuideCfgList[i]
+            local ordertemp = _G.ConfigManager.teach_model_cfg[cfg.group_id].order
+            if ordertemp <= order and guideId == cfg.id then
+                return true
+            end
+        end
+
+        return false
+    else
+        return false
+    end
+end
+
+---非强制引导其它区域响应
+function GuideManager:UpdateSystemCurrentName(systemCurrentName)
+    ---如果是非强制引导，如果不操作出牌，就打断
+    if self.IsGuideing then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(systemCurrentName, "引导监听事件响应对象")
+        end
+        if
+            self.CurGuideModelCfg.not_force and systemCurrentName ~= "" and
+            systemCurrentName ~= "@_aorbtn_szsGuideClick" and
+            systemCurrentName ~= "@_aorimage_szsGuideDrag" and
+            systemCurrentName ~= "@_obj_szsGuideDoubleClick"
+        then
+            if self.CurGuideCfg.click_tag == "" and self.CurGuideCfg.text_type == 0 then
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log("非强制引导非操作的节点不能打断>>>>>>>>")
+                end
+            else
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log("非强制引导打断操作节点>>>>>>>>>>")
+                end
+                self:DoBreak()
+                self.LoseGuideId = 0
+            end
+        end
+    end
+end
+
+---世界物体包括玩家等被点击执行
+function GuideManager:OnWorldObjRespond()
+    if self.IsGuideing then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("引导接收场景对象点击")
+        end
+        if self.CurGuideModelCfg.not_force then
+            if self.CurGuideCfg.click_tag == "" and self.CurGuideCfg.text_type == 0 then
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log("非强制引导非操作的节点不能打断>>>>>>>>")
+                end
+            else
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log("非强制引导打断操作节点>>>>>>>>>>")
+                end
+                self:DoBreak()
+                self.LoseGuideId = 0
+            end
+        end
+    end
+end
+
+---通过配置表播放视频资源
+---@param cfg video_cfg_Item 配置表
+---@param callback function 播放完回调
+---@param startPlaycallback function 开始播放 回调
+function GuideManager:PlayGuideVideo(cfg, callback, startPlaycallback)
+    _G.CS.BattleManager.Inst:PauseBattle(false)
+    _G.UIUtils.PlayVideo(cfg, callback, startPlaycallback)
+end
+
+---战斗开始
+function GuideManager:FightStart()
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log("引导调用战斗开始")
+    end
+    self.GotoBattleIng = false
+
+    if _G.BattleManager:GetInstance().IsRecordFight then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("战斗回放中，不参与引导>>>>>>>>>>>")
+        end
+        return
+    end
+
+    if not self.IsGuideing then
+        self:UpdateGuide(_G.GuideTeachType.Fight)
+        if self.CurGuideId <= 0 then
+            ---强制引导如果没了就考虑非强制
+            self.CurGuideId = self:GetNFGuide(_G.GuideTeachType.Fight)
+        end
+
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(self.CurGuideId, "战斗刷新出id")
+        end
+        self:DoPlay(self.CurGuideId)
+    else
+        if self.CurGuideCfg.teach_type == 1 then
+            self:DoBreak()
+        end
+        self:UpdateGuide(_G.GuideTeachType.Fight)
+        if self.CurGuideId <= 0 then
+            ---强制引导如果没了就考虑非强制
+            self.CurGuideId = self:GetNFGuide(_G.GuideTeachType.Fight)
+        end
+
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(self.CurGuideId, "继续战斗已刷新出id")
+        end
+        self:DoPlay(self.CurGuideId)
+    end
+end
+
+---战斗结束
+---@param win boolean 是否胜利
+function GuideManager:FightEnd(win)
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log("引导调用战斗结束>>>>>>>>>>")
+    end
+    local monsterGroupId = _G.BattleManager:GetInstance():GetMonsterGroupId()
+    local chapter = require "AfkModel":GetInstance():GetCurAfkChapter()
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(chapter, "获取到的当前是那一个章节>>>>>")
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(monsterGroupId, "获取到的当前GroupId>>>>>")
+    end
+
+    if win then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(win, "战斗胜利>>>>>")
+        end
+        if self.IsGuideing then
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log(tostring(_G.table.keyof(_G.GuideNodeType, self.CurGuideCfg.node)), "引导中>>>当前引导节点类型")
+            end
+            self.LoseGuideId = 0
+            if self.CurGuideCfg.node == _G.GuideNodeType.WaitFightEnd then
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log(self.CurGuideCfg.function_id, "引导要求房间id>>>>>")
+                end
+                if monsterGroupId == tonumber(self.CurGuideCfg.function_id) then
+                    self:DoNext()
+                else
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log("等待战斗结束，房间号不匹配")
+                    end
+                end
+            else
+                if _G.PlayerModel:GetInstance():CheckCreateRole() then
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.LogError(self.CurGuideCfg.id, "战斗内引导执行异常，请检查战斗节奏或者配置步骤是否有异常")
+                    end
+                    self:DoBreak()
+                end
+            end
+        else
+            ---循环非强制引导
+            if self.NotForceGroupId > 0 then
+                local model = _G.ConfigManager.teach_model_cfg[self.NotForceGroupId]
+
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log(self.NotForceGroupId, "非强制引导记录id>>>>>")
+                end
+                self.LoseGuideId = 0
+                if monsterGroupId == model.relation_group then
+                    --local GuideNet = require("GuideNet")
+                    --local GuideModel = require("GuideModel")
+                    ---@type guide.c2s_guide_dot
+                    local msg = {}
+                    msg.guide_id = model.end_node
+                    local info = {}
+                    info.guideId = model.end_node
+                    info.guideDot = GuideModel:GetInstance().GuideDot
+                    GuideNet:GetInstance():InstanceDot(msg, _G.handlerbind(self, self.BackInstanceDot, info))
+                    GuideModel:GetInstance().GuideDot = model.end_node
+                end
+            end
+        end
+        local times = _G.ConfigManager.discrete_cfg[102102][1][2]
+        local curTimes = _G.PlayerPrefsManager.GetInt("LoseGuideTimes", times)
+        curTimes = curTimes + 1
+        _G.PlayerPrefsManager.SetInt("LoseGuideTimes", curTimes)
+    else
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log("战斗失败>>>>>>")
+        end
+        self.LoseGuideId = 0
+        local controller = _G.BattleManager:GetInstance().curBattleController
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(nil ~= controller, "当前战斗控制器是否存在")
+            if nil ~= controller then
+                _G.Log(controller._class_type.__cname, "当前战斗控制器是名称是")
+            end
+        end
+        if nil ~= controller and controller._class_type.__cname == _G.BattleControllerType.afkChallenge then
+            local id = _G.ConfigManager.discrete_cfg[102102][1][1]
+            local times = _G.ConfigManager.discrete_cfg[102102][1][2]
+            local curTimes = _G.PlayerPrefsManager.GetInt("LoseGuideTimes", times)
+
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log("配置章节id>>>>>" .. id)
+            end
+
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log("配置失败次数>>>>>" .. times)
+            end
+
+            if _G.AppSetting.IsDebugTeach then
+                _G.Log("当前失败次数>>>>>" .. curTimes)
+            end
+            if curTimes >= times then
+                if chapter <= id then
+                    self.LoseGuideId =
+                        _G.ConfigManager.teach_model_cfg[_G.ConfigManager.discrete_cfg[102103][1][1]].start_node[1]
+
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log(self.LoseGuideId, "失败引导id")
+                    end
+                end
+                curTimes = 0
+                _G.PlayerPrefsManager.SetInt("LoseGuideTimes", curTimes)
+            end
+
+            local sid = require("AfkModel"):GetInstance():GetLastSection()
+            if sid and sid <= 101006 then
+                --战斗失败后防止出现死循环直接中止当前的整个引导组
+                self:DotBreakGuide()
+            end
+            -- self:DoBreak()
+        end
+    end
+end
+
+---异常兼容，中断引导
+function GuideManager:DotBreakGuide()
+    if _G.Application.DEBUG then
+       _G.LogError("引导异常，中止引导") 
+    end
+    local cfg = _G.ConfigManager.discrete_cfg[120014][1]
+    self:DotTheEndNode(cfg[2])
+end
+
+---打点数据回来
+---@param msg public.s2c_common_ack
+---@param info table 打点引导记录信息
+function GuideManager:BackInstanceDot(msg, info)
+    --local GuideModel = require("GuideModel")
+    if msg.ack == 1 then
+        GuideModel:GetInstance().GuideDot = info.guideId
+    else
+        GuideModel:GetInstance().GuideDot = info.guideDot
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(GuideModel:GetInstance().GuideDot, "打点结果")
+    end
+
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log(GuideModel, "打点结果")
+    end
+end
+
+function GuideManager:StopNextTimer()
+    if self.Guide then
+        self.Guide:StopForceTimer()
+    end
+end
+
+function GuideManager:Dispose()
+    if _G.AppSetting.IsDebugTeach then
+        _G.Log("GuideManager:Dispose")
+    end
+    if self.Guide then
+        self.Guide:Close()
+        self.Guide = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.MianViewState.MainViewChangeTab, self.MainViewEnable, self)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnUIOpened, self)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIShow, self.OnUIShow, self)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eScene.EnterWorldOver, self.OnSceneChangeOver, self)
+    _G.Events:GetInstance():RemoveListener(_G.eDialogueEvent.ShowTaskinfo, self.OnActionEvent, self)
+    _G.Events:GetInstance():RemoveListener(_G.eNav.NavInterruptMove, self.OnNavInterruptMove, self)
+    _G.Events:GetInstance():RemoveListener(_G.GuideStoryStart.StoryStart, self.OnStoryStart, self)
+    _G.Events:GetInstance():RemoveListener(_G.GuideStoryStart.StoryEnd, self.OnStoryEnd, self)
+    _G.Events:GetInstance():RemoveListener(_G.VideoPlayState.PlayStart, self.OnVideoPlayStart, self)
+    _G.Events:GetInstance():RemoveListener(_G.VideoPlayState.PlayEnd, self.OnVideoPlayEnd, self)
+    _G.Events:GetInstance():RemoveListener(_G.eGuideEvent.WaitFo, self.OnWaitFo, self)
+    _G.Events:GetInstance():RemoveListener(_G.eGuideEvent.WorldObjRespond, self.OnWorldObjRespond, self)
+    _G.TaskModule:GetInstance():RemoveListener(
+        _G.TaskModuleEvent,
+        _G.TaskModuleEvent.EnumValueTable.NavComplete,
+        self.OnTaskInfoUpdate,
+        self
+    )
+    _G.Events:GetInstance():RemoveListener(_G.eGuideEvent.TreasureMap, self.DoTreasureMap, self)
+    _G.Events:GetInstance():RemoveListener(_G.eGuideEvent.SpecialTrigger, self.SpecialTrigger, self)
+end
+
+---获得当前引导id
+function GuideManager.GetCurGuideId()
+    return GuideManager:GetInstance().CurGuideId
+end
+
+---是否有战斗引导
+function GuideManager.CSGetGuide()
+    if _G.AppSetting.IsShowTeach then
+        GuideManager:GetInstance():UpdateGuide(_G.GuideTeachType.Fight)
+        if GuideManager:GetInstance().CurGuideId > 0 then
+            return true
+        end
+    end
+    return false
+end
+
+---战斗条件检测接口
+function GuideManager.CSTryDoGuide(tab)
+    local battleGuideType = tab.battleGuideType
+    if battleGuideType == _G.BattleGuideType.OnStartFight then
+        GuideManager:GetInstance():CallCSSetRoomId()
+        GuideManager:GetInstance():FightStart()
+    elseif battleGuideType == _G.BattleGuideType.OnEndFight then
+        if _G.AppSetting.IsDebugTeach then
+            _G.Log(tab.arg1, "胜利失败标记")
+        end
+        local win = tonumber(tab.arg1) == 1 and true or false
+        GuideManager:GetInstance():FightEnd(win)
+        return
+    end
+
+    local curGuideCfg = GuideManager:GetInstance().CurGuideCfg
+    local monsterGroupId = _G.BattleManager:GetInstance():GetMonsterGroupId()
+
+    if
+        curGuideCfg ~= nil and curGuideCfg.teach_type == _G.GuideTeachType.Fight and
+        curGuideCfg.function_id == tostring(monsterGroupId)
+    then
+        local OpenCondition
+        local OpenConditionType = -1
+        if #curGuideCfg.open_condition > 0 then
+            OpenCondition = curGuideCfg.open_condition[1]
+            OpenConditionType = curGuideCfg.open_condition[1][1]
+        end
+
+        -- _G.CS.BattleManager.Inst:PauseBattle(true) -- 暂停战斗（参数为是否隐藏战斗UI）
+        -- _G.CS.BattleManager.Inst:ResumeBattle()   -- 恢复战斗
+
+        if battleGuideType == OpenConditionType then
+            local function RealDoGuide()
+                if curGuideCfg.node == _G.GuideNodeType.Pause then
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log("curGuideCfg.node == _G.GuideNodeType.Pause")
+                    end
+
+                    if _G.AppSetting.IsDebugTeach then
+                        _G.Log(battleGuideType, "条件触发一个节点")
+                    end
+                    _G.CS.BattleManager.Inst:PauseBattle(false)
+                end
+
+                if _G.AppSetting.IsDebugTeach then
+                    _G.Log(curGuideCfg.id, "条件触发去下一个节点")
+                end
+                GuideManager:GetInstance():DoNext()
+            end
+
+            local function DoGuide()
+                local OpenConditionFrame = curGuideCfg.open_condition[2]
+                if OpenConditionFrame then
+                    local OpenConditionFrameStart = OpenConditionFrame[2]
+                    local OpenConditionFrameEnd = OpenConditionFrame[3]
+                    local frame = tab.frame
+                    if OpenConditionFrameStart <= frame and frame < OpenConditionFrameEnd then
+                        RealDoGuide()
+                    end
+                else
+                    RealDoGuide()
+                end
+            end
+
+            if battleGuideType == _G.BattleGuideType.OnStartFight then
+                local delayTime = OpenCondition[2]
+                _G.DelayDo(
+                    delayTime,
+                    function()
+                        DoGuide()
+                    end
+                )
+            elseif battleGuideType == _G.BattleGuideType.OnMpChange then
+                local monsterId = tab.arg1
+                local cardId = tab.arg2
+                local ratio = tab.arg3
+                local conditionMonsterId = OpenCondition[2]
+                local conditionRatio = OpenCondition[3]
+                if (monsterId == conditionMonsterId or cardId == conditionMonsterId) and ratio >= conditionRatio then
+                    DoGuide()
+                end
+            elseif battleGuideType == _G.BattleGuideType.OnHPChange then
+                local monsterId = tab.arg1
+                local cardId = tab.arg2
+                local ratio = tab.arg3
+                local conditionMonsterId = OpenCondition[2]
+                local conditionRatio = OpenCondition[3]
+                if (monsterId == conditionMonsterId or cardId == conditionMonsterId) and ratio <= conditionRatio then
+                    DoGuide()
+                end
+            elseif battleGuideType == _G.BattleGuideType.OnSkillStart then
+                local monsterId = tab.arg1
+                local cardId = tab.arg2
+                local skillId = tab.arg3
+                local conditionMonsterId = OpenCondition[2]
+                local conditionSkillId = OpenCondition[3]
+                local delayTime = OpenCondition[4]
+                if (monsterId == conditionMonsterId or cardId == conditionMonsterId) and skillId == conditionSkillId then
+                    _G.DelayDo(
+                        delayTime,
+                        function()
+                            DoGuide()
+                        end
+                    )
+                end
+            elseif battleGuideType == _G.BattleGuideType.OnAttackerSpChange then
+                local jointSkillId = tab.arg1
+                local conditionSkillId = OpenCondition[2]
+                if jointSkillId == conditionSkillId then
+                    DoGuide()
+                end
+            elseif battleGuideType == _G.BattleGuideType.OnDefenderSpChange then
+                local jointSkillId = tab.arg1
+                local conditionSkillId = OpenCondition[2]
+                if jointSkillId == conditionSkillId then
+                    DoGuide()
+                end
+            elseif battleGuideType == _G.BattleGuideType.OnGhostSkillEnd then
+                local monsterId = tab.arg1
+                local cardId = tab.arg2
+                local skillId = tab.arg3
+                local conditionMonsterId = OpenCondition[2]
+                local conditionSkillId = OpenCondition[3]
+                local delayTime = OpenCondition[4] + 1
+                if (monsterId == conditionMonsterId or cardId == conditionMonsterId) and skillId == conditionSkillId then
+                    _G.DelayDo(
+                        delayTime,
+                        function()
+                            DoGuide()
+                        end
+                    )
+                end
+            end
+        end
+    end
+end
+
+_G.CS.BattleGuideManager.CallLuaCSTryDoGuide = GuideManager.CSTryDoGuide
+
+---战斗合击技拖拽屏幕坐标接口
+function GuideManager.CSJointScreenPos(tab)
+    local view = GuideManager:GetInstance().Guide
+    if view then
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.Ef_yindaoshoushipingyi,
+            view.transform,
+            function(trans)
+                GuideManager:GetInstance().handEffect = trans
+                _G.GameUtil.SetActiveByCondition(trans, true)
+                local GuideHandMove = view:GetComponent(trans, require "GuideHandMove")
+                if not GuideHandMove then
+                    GuideHandMove = view:AddComponent(trans, require "GuideHandMove".New(trans))
+                end
+                GuideHandMove:Show(tab)
+            end
+        )
+    end
+end
+
+_G.CS.BattleGuideManager.CallLuaCSJointScreenPos = GuideManager.CSJointScreenPos
+
+---监听分辨率变化
+if _G.AppSetting.IsShowTeach then
+    local ok, err = pcall(function()
+        if not _G.CS.Launcher.Inst.RegisterScreenResolutionChange then
+            return
+        end
+        local callback = _G.__guide__onScreenResolutionChange
+        if callback then
+            return --GameMain:ResetGame()将重新require("GuideManager"), 此处只需要注册一次
+        end
+
+        callback = function()
+            _G.GuideManager:GetInstance():RefreshGuideView()
+        end
+        _G.__guide__onScreenResolutionChange = callback
+        _G.CS.Launcher.Inst:RegisterScreenResolutionChange(callback)
+    end)
+    if not ok then
+        error(err)
+    end
+end

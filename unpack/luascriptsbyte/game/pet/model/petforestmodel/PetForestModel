@@ -1,0 +1,408 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Pet.Model.PetForestModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/07/03
+-- Description: 灵兽之森数据类
+-----------------------------------------------------------------------
+local PetNet = require("PetNet")
+
+local base = _G.GameDataModelBase
+---@class PetForestModel : GameDataModelBase
+local PetForestModel = _G.BaseClass("PetForestModel", base)
+
+---数值大小比较
+---@param x number
+---@param y number
+---@return number   -1: x小于y, 0: x等于y, 1:x大于y
+local function compareNumber(x, y)
+    return x == y and 0 or x < y and -1 or 1
+end
+
+---@return PetForestModel PetForestModel
+function PetForestModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function PetForestModel:__init()
+    -- self.curFunctionOpenID = _G.FunctionID.Pet
+    self.maxStage = 1
+    for _, v in pairs(_G.ConfigManager.pet_phase_cfg) do
+        if v.phase > self.maxStage then
+            self.maxStage = v.phase
+        end
+    end
+    _G.Events:GetInstance():AddListener(_G.ePetUpStar.PetUpStarRefresh, self.OnPetStarChange, self)
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+---从服务器拉取数据
+function PetForestModel:GetDataFormServer()
+    PetNet:GetInstance():GetPetForestInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg pet.s2c_pet_forest_info
+function PetForestModel:ParseData(msg)
+    self.level = msg.level
+    self.stage = msg.class
+    self.position = {}
+    local positionLis = msg.position_list or {}
+    for _, v in pairs(positionLis) do
+        self.position[v.index] = v.pet_sid
+    end
+    self.super.ParseData(self)
+end
+
+---升级
+---@param newLevel number 目标等级
+function PetForestModel:UpLevel(newLevel, call)
+    local materials = self:CalMaterialCost(newLevel)
+    for k, v in pairs(materials) do
+        if not _G.StorageManager:GetInstance():CheckItem(k, v) then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, k)
+            if call then
+                call()
+            end
+            return
+        end
+    end
+    local pbData = {new_level = newLevel}
+    PetNet:GetInstance():PetForestUpLevel(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.level = newLevel
+            for k, v in pairs(materials) do
+                _G.StorageManager:GetInstance():ConsumeItem(k, nil, v)
+            end
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.PetForest)
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {_G.ActiveTaskEnum.ConditionEnum.Pet.PetForestLevel},
+                newLevel,
+                false,
+                true
+            )
+            -- require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PetForestUp.id)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---升阶
+function PetForestModel:UpStage(call)
+    local materials = self:CalMaterialCost(self.stage + 1, self.stage, true)
+    for k, v in pairs(materials) do
+        if not _G.StorageManager:GetInstance():CheckItem(k, v) then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, k)
+            return
+        end
+    end
+    PetNet:GetInstance():PetForestUpClass(
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.stage = self.stage + 1
+            for k, v in pairs(materials) do
+                _G.StorageManager:GetInstance():ConsumeItem(k, nil, v)
+            end
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.PetForest)
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {_G.ActiveTaskEnum.ConditionEnum.Pet.PetForestLevel},
+                self.stage,
+                false,
+                true
+            )
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PetForestPosition.id)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PetForestPositionBetter.id)
+            -- require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PetForestUp.id)
+            self:RefreshForestView()
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---上/下槽灵兽
+---@param index number 槽位
+---@param sid number 灵兽sid
+function PetForestModel:PutOnPet(index, sid, call)
+    local pbData = {index = index, pet_sid = sid}
+    PetNet:GetInstance():PetForestPutPet(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if sid == 0 then
+                self.position[index] = 0
+            else
+                self.position[index] = sid
+            end
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.PetForest)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PetForestPosition.id)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PetForestPositionBetter.id)
+            self:RefreshForestView()
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---获取等级
+function PetForestModel:GetLevel()
+    return self.level
+end
+
+---获取阶段
+function PetForestModel:GetStage()
+    return self.stage
+end
+
+---获取配置最大阶段
+function PetForestModel:GetMaxStage()
+    return self.maxStage
+end
+
+---获取槽位灵兽
+function PetForestModel:GetPositionPet(index)
+    return self.position[index] or 0
+end
+
+---获取槽位开启总数
+function PetForestModel:GetPosUnlockNum()
+    return _G.ConfigManager.pet_phase_cfg[self.stage].pet_num
+end
+
+---获取所有已激活但未上槽的灵兽
+function PetForestModel:GetAllActiveAndIdlePets()
+    local allPets = require("PetModel"):GetInstance():GetAllActivePets()
+    local pets = {}
+    for _, v in pairs(allPets) do
+        if not self:CheckPetIsInForest(v.sid) then
+            _G.table.insert(pets, v)
+        end
+    end
+    return pets
+end
+
+---获取所有固定值加成
+---@param level number 等级 默认为当前等级
+function PetForestModel:GetAllOtherProp(level)
+    level = level or self.level
+    local allProp = {atk = 0, bre = 0, def = 0, max_hp = 0}
+    local PetModelIns = require("PetModel"):GetInstance()
+    local petData, prop
+    for _, sid in pairs(self.position) do
+        if sid > 0 then
+            petData = PetModelIns:GetPet(sid)
+            prop = petData:GetAttributeDict()
+            for k, v in pairs(allProp) do
+                allProp[k] = allProp[k] + prop[k]
+            end
+        end
+    end
+    local stageCfg = _G.ConfigManager.pet_phase_cfg[self.stage]
+    local lvCfg = _G.ConfigManager.pet_level_cfg[level]
+    local rate = stageCfg.pet_trans / 10000
+    for k, v in pairs(allProp) do
+        allProp[k] = _G.Mathf.RoundToInt(allProp[k] * rate) + lvCfg[k]
+    end
+    return allProp
+end
+
+function PetForestModel:GetAllAttribute()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Pet) or self.stage == nil then
+        local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute)
+        return attribute, changeAttrTypes
+    end
+    local cfg = _G.ConfigManager.pet_phase_cfg[self.stage]
+    local prop = self:GetAllOtherProp()
+    for k, v in pairs(prop) do
+        attribute:AddValueByName(k, v, false, _G.AttCountType.other)
+    end
+    local aType
+    for _, v in pairs(cfg.att) do
+        aType = v[2] == "2" and _G.AttCountType.basePercent or _G.AttCountType.other
+        attribute:AddValueByName(v[1], AttributeClassManager:GetValueWithName(v[1], v[3], aType), false, aType)
+    end
+    local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute)
+    return attribute, changeAttrTypes
+end
+
+function PetForestModel:CheckPetIsInForest(sid)
+    for _, v in pairs(self.position) do
+        if v == sid then
+            return true
+        end
+    end
+    return false
+end
+
+---计算升级/升阶材料消耗
+function PetForestModel:CalMaterialCost(new, old, isStage)
+    local oldCfg, newCfg
+    if isStage then
+        old = old or self.stage
+        oldCfg = _G.ConfigManager.pet_phase_cfg[old]
+        newCfg = _G.ConfigManager.pet_phase_cfg[new]
+    else
+        old = old or self.level
+        oldCfg = _G.ConfigManager.pet_level_cfg[old]
+        newCfg = _G.ConfigManager.pet_level_cfg[new]
+    end
+    local materials = {}
+    for _, v in pairs(newCfg.material) do
+        materials[v[1]] = v[2]
+    end
+    for _, v in pairs(oldCfg.material) do
+        if materials[v[1]] then
+            materials[v[1]] = materials[v[1]] - v[2]
+        end
+    end
+    return materials, oldCfg, newCfg
+end
+
+function PetForestModel:OnPetStarChange(sid)
+    if self:CheckPetIsInForest(sid) then
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.PetForest)
+    end
+end
+
+function PetForestModel:OnUpData(data)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PetForestUp.id)
+end
+
+---槽位红点(检查空位置, 非空时检测是否有更高品质和星级)
+---@return boolean
+function PetForestModel:CheckRedPointPos(pos)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Pet) then
+        return false
+    end
+    local petId = self:GetPositionPet(pos)
+    if petId > 0 then
+        ---@type PetData
+        local curPet = require("PetModel"):GetInstance():GetPet(petId)
+        curPet:CalculatePower()
+        ---@type PetData[]
+        local pets = self:GetAllActiveAndIdlePets()
+        for _, v in pairs(pets) do
+            v:CalculatePower()
+            local flag = compareNumber(v.power, curPet.power)
+            if flag == 0 then
+                flag = compareNumber(v:GetOrder(), curPet:GetOrder())
+            end
+            if flag == 0 then
+                flag = compareNumber(v.star, curPet.star)
+            end
+            if flag > 0 then
+                return true
+            end
+        end
+        return false
+    end
+    if pos > self:GetPosUnlockNum() then
+        return false
+    end
+    local pets = self:GetAllActiveAndIdlePets()
+    if #pets > 0 then
+        return true
+    end
+    return false
+end
+
+---检查是否可一键上阵(检查空位置, 且检查每个位置是否可替换更高战力)
+---@return boolean
+function PetForestModel:CheckRedPointPosBetter()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Pet) then
+        return false
+    end
+
+    local petNum = #self:GetAllActiveAndIdlePets()
+    local posNum = self:GetPosUnlockNum()
+    for pos = 1, posNum do
+        if self:GetPositionPet(pos) <= 0 and petNum > 0 or
+            self:GetPositionPet(pos) > 0 and self:CheckPowerByPos(pos) then
+            return true
+        end
+    end
+    return false
+end
+
+---刷新灵兽之森视图
+---@return void
+function PetForestModel:RefreshForestView()
+    ---@type PetMainView
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.PetMainView.Name)
+    if view then
+        view:RefreshBetterButton()
+    end
+end
+
+---比较灵兽战力
+---@param pos number 槽位
+---@return boolean 是否有战力更高的灵兽
+function PetForestModel:CheckPowerByPos(pos)
+    local curPower = require("PetModel"):GetInstance():GetPet(self:GetPositionPet(pos)).power
+    local pets = self:GetAllActiveAndIdlePets()
+    for _, v in ipairs(pets) do
+        if v.power > curPower then
+            return true
+        end
+    end
+    return false
+end
+
+---升级红点
+function PetForestModel:CheckRedPointLvUp()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Pet) then
+        return false
+    end
+    if self.stage == nil then
+        return false
+    end
+    local stageCfg = _G.ConfigManager.pet_phase_cfg[self.stage]
+    if stageCfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到配置：pet_phase_cfg, id=" .. self.stage)
+        end
+        return false
+    end
+    if self.stage == self.maxStage and self.level == stageCfg.max_level then
+        return false
+    end
+    local materials
+    if self.level < stageCfg.max_level then
+        materials = self:CalMaterialCost(self.level + 1)
+    else
+        materials = self:CalMaterialCost(self.stage + 1, self.stage, true)
+    end
+    for k, v in pairs(materials) do
+        if not _G.StorageManager:GetInstance():CheckItem(k, v) then
+            return false
+        end
+    end
+    return true
+end
+
+---销毁对象时,析构函数
+function PetForestModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ePetUpStar.PetUpStarRefresh, self.OnPetStarChange, self)
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+return PetForestModel

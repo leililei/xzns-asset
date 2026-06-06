@@ -1,0 +1,1153 @@
+-- F:.H5.Client.Assets.Resources.LuaScripts.Game.RechargeDraw.Net.MaidAcademyModel	(修改路径必须修正此项!)
+-- Created by
+-- DateTime:
+-- Description
+-----------------------------------------------------------------------
+local MaidUtil = require("MaidUtil")
+local MaidAcademyNet = require("MaidAcademyNet")
+local MaidData = require("MaidData")
+
+local decMainAttribute = {
+    "atk",
+    "bre",
+    "def",
+    "max_hp"
+}
+
+local quelityTxt = {
+    [1] = "f1f1f1",
+    [2] = "83e496",
+    [3] = "7caaff",
+    [4] = "bf9af7",
+    [5] = "ff9b5e",
+    [6] = "ff655b"
+}
+
+
+local base = _G.GameDataModelBase
+
+---@class MaidAcademyModel : GameDataModelBase
+local MaidAcademyModel = _G.BaseClass("MaidAcademyModel", base)
+
+function MaidAcademyModel:__init()
+    self.curFunctionOpenID = 305
+    local startup = MaidUtil.startup
+    self.MaxNum = 4
+    self.HasRequest = 0
+    self.level = 1
+    self.exp = 0
+    self.pos = {}
+    self.finish = {}
+    self.appoint =  {}
+    self.attr = { 0, 0, 0, 0 }
+    self.record = {}
+    self.study_info = { 0, 0, 0 }
+    self.posingmaids = {}
+
+    _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenFunctionNewEvent, self.FunOpen, self)
+end
+
+function MaidAcademyModel:FunOpen()
+    if _G.AppSetting.DEBUG then
+        _G.Log("刷新女仆功能红点")
+    end
+    self:GetDataFormServer()
+end
+
+---从服务器拉取数据
+function MaidAcademyModel:GetDataFormServer()
+    MaidAcademyNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg any
+function MaidAcademyModel:ParseData(msg)
+    self:SetSelfData(msg)
+    base.ParseData(self)
+end
+
+---初始化数据
+function MaidAcademyModel:SetSelfData(msg)
+    self.level = msg.level or 1
+    self.exp = msg.exp or 0
+    self.pos = msg.pos or {}
+    self.finish = msg.finish or {}
+    self.appoint = msg.appoint or {}
+    self.attr = msg.attr or { 0, 0, 0, 0 }
+    self.record = msg.record or {}
+    self.study_info = msg.study_info or { 0, 0, 0 }
+
+    self:UpDateData()
+
+    self.posingmaids = {}
+    for i = 1, #self.pos do
+        if self.pos[i].s_role then
+            local maiddata = MaidData.New()
+            maiddata:Parse(self.pos[i].s_role)
+            self.posingmaids[self.pos[i].index] = maiddata
+        end
+    end
+
+    self:NewStrength()
+
+    if self.ThisTimer then
+        self.ThisTimer:Stop()
+        self.ThisTimer = nil
+    end
+    ---测试一秒刷
+    self.ThisTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnThisTimer, self)
+    --self.ThisTimer = _G.TimerManager:GetInstance():GetTimer(self.restStrengthBl / 5, self.OnThisTimer, self)
+    self.ThisTimer:Start()
+
+    MaidAcademyModel:GetInstance():GetApply(function(data)
+        self.cList = data.apply or {}
+        if #self.cList > 0 then
+            self.HasRequest = 1
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PointMaidHasRequest.id)
+        end
+    end)
+    _G.Events:GetInstance():Broadcast(_G.eMaidUpdate.MaidInit)
+
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PointMaidCanDraw.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PointMaidCanCultivate
+        .id)
+end
+
+function MaidAcademyModel:UpDateData()
+    self.cfg = _G.ConfigManager.study_cfg[self.level]
+    self.maxStreng = self.cfg.physical[1]      --体力上限
+    self.restStrengthBl = self.cfg.physical[2] --x秒回复1点体力
+end
+
+---恢复体力倒计时
+function MaidAcademyModel:OnThisTimer(elapsed)
+    self:ResetStrength()
+
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PointMaidCanCultivate
+        .id)
+end
+
+---恢复体力
+function MaidAcademyModel:ResetStrength()
+    for k = 1, #self.pos do
+        ---体力未满做一下算法
+        if self.pos[k].physical < self.maxStreng then
+            local addstreng = math.floor((_G.TimeUtil.GetServerUnixTime() - self.pos[k].l_time) / self.restStrengthBl)
+            local old = self.pos[k].oldphysical or 0
+            local curstreng = old + addstreng
+            if curstreng >= self.maxStreng then
+                curstreng = self.maxStreng
+            end
+            if curstreng < 0 then
+                curstreng = 0
+            end
+            self.pos[k].physical = curstreng
+        end
+    end
+end
+
+---新加的体力(前端按时间自行换算)
+function MaidAcademyModel:NewStrength()
+    for k = 1, #self.pos do
+        self.pos[k].oldphysical = self.pos[k].physical
+        ---体力未满做一下算法
+        if self.pos[k].physical < self.maxStreng then
+            local addstreng = math.floor((_G.TimeUtil.GetServerUnixTime() - self.pos[k].l_time) / self.restStrengthBl)
+            local curstreng = self.pos[k].physical + addstreng
+            if curstreng >= self.maxStreng then
+                curstreng = self.maxStreng
+            end
+            if curstreng < 0 then
+                curstreng = 0
+            end
+            self.pos[k].physical = curstreng
+        end
+    end
+end
+
+---女仆毕业一个加一点经验
+function MaidAcademyModel:AddExp()
+    if not self:IsMax() then
+        self.exp = self.exp + 1
+        local cfg = _G.ConfigManager.study_cfg[self.level]
+        local nextcfg = _G.ConfigManager.study_cfg[self.level + 1]
+        if self.exp >= nextcfg.exp - cfg.exp then
+            self.level = self.level + 1
+            self.exp = 0
+
+            self:UpDateData()
+
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PointMaidCanAppoint.id)
+
+            _G.Events:GetInstance():Broadcast(_G.eMaidAcademyEvent.UpLevel)
+        end
+    end
+end
+
+---是否为满级
+function MaidAcademyModel:IsMax()
+    if self.level >= #_G.ConfigManager.study_cfg then
+        return true
+    end
+    return false
+end
+
+---基础属性加成倍率
+function MaidAcademyModel:GetPropRate(grow, level)
+    local percent = 1
+    local studycfg = _G.ConfigManager.study_role_level_cfg[level]
+
+    percent = (studycfg.role_level + math.floor(grow / studycfg.role_grow[1]) * studycfg.role_grow[2]) * 0.0001
+
+    return percent
+end
+
+---获取成长
+function MaidAcademyModel:GetAllOtherProp()
+    local allProp = { atk = 0, bre = 0, def = 0, max_hp = 0 }
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Maid) then
+        return allProp
+    end
+    local attribute = self:GetCultivateBasePropAttr()
+    if not _G.table.isEmptyOrNil(attribute.attriOther) then
+        allProp = attribute.attriOther
+    end
+    return allProp
+end
+
+---功能全属性
+function MaidAcademyModel:GetAllAttribute()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Maid) then
+        local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute)
+        return attribute, changeAttrTypes
+    end
+    ---基础加成
+    local base = self:GetBasePropAttr()
+    _G.AttributeClassManager:GetInstance():AddAttribute(attribute, base)
+
+    ---上阵加成
+    local appoint = self:GetAllAppiotAttr()
+    _G.AttributeClassManager:GetInstance():AddAttribute(attribute, appoint)
+
+    local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrList(attribute)
+    return attribute, changeAttrTypes
+end
+
+---获取基础属性
+---@return AttributeClass
+function MaidAcademyModel:GetBasePropAttr()
+    local attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    for i = 1, #decMainAttribute do
+        local tempValue = self.attr[i]
+        if tempValue and tempValue > 0 then
+            attribute:SetValueByName(decMainAttribute[i], tempValue, false, _G.AttCountType.other)
+        end
+    end
+    for j = 1, 4 do
+        local maiddata = self.posingmaids[j]
+        if nil ~= maiddata and not maiddata.idle then
+            local posbase = maiddata:GetProp()
+            _G.AttributeClassManager:GetInstance():AddAttribute(attribute, posbase)
+        end
+    end
+    return attribute
+end
+
+--获取培养中女仆属性
+---@return AttributeClass
+function MaidAcademyModel:GetCultivateBasePropAttr()
+    local attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    for j = 1, 4 do
+        local maiddata = self.posingmaids[j]
+        if nil ~= maiddata and not maiddata.idle then
+            local posbase = maiddata:GetProp()
+            _G.AttributeClassManager:GetInstance():AddAttribute(attribute, posbase)
+        end
+    end
+    return attribute
+end
+
+---招募女仆
+function MaidAcademyModel:Execute(msg, call)
+    MaidAcademyNet:GetInstance():Execute(msg, function(data)
+        if data.ack == 1 then
+            local index = 0
+            for k = 1, #self.pos do
+                if self.pos[k].index == msg.index then
+                    index = k
+                    break
+                end
+            end
+            data.pos.oldphysical = data.pos.physical
+            if index > 0 then
+                self.pos[index] = data.pos
+            else
+                table.insert(self.pos, data.pos)
+            end
+
+            local maiddata = self.posingmaids[data.pos.index]
+            if nil == maiddata then
+                maiddata = MaidData.New()
+                maiddata:Parse(data.pos.s_role)
+                self.posingmaids[data.pos.index] = maiddata
+            else
+                maiddata:Parse(data.pos.s_role)
+            end
+
+            if call then
+                call(data)
+            end
+
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PointMaidCanDraw.id)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PointMaidCanCultivate.id)
+        end
+    end)
+end
+
+---培养女仆
+function MaidAcademyModel:Cultivate(msg, call)
+    MaidAcademyNet:GetInstance():Cultivate(msg, function(data)
+        if data.ack == 1 then
+            for i = 1, #data.pos do
+                local times = 0
+                for j = 1, #msg.c_info do
+                    if data.pos[i].index == msg.c_info[j].key then
+                        times = msg.c_info[j].value
+                    end
+                end
+                local tpos
+                for k = 1, #self.pos do
+                    if self.pos[k].index == data.pos[i].index then
+                        tpos = self.pos[k]
+                        break
+                    end
+                end
+                tpos.l_time = data.pos[i].l_time
+                tpos.physical = data.pos[i].physical
+                tpos.oldphysical = data.pos[i].physical
+                if tpos.s_role then
+                    tpos.s_role.grow = tpos.s_role.grow + times
+                    local maiddata = self.posingmaids[tpos.index]
+                    if maiddata then
+                        maiddata.grow = tpos.s_role.grow
+                    end
+                end
+            end
+            if call then
+                call(data)
+            end
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PointMaidCanCultivate.id)
+        end
+    end)
+end
+
+---完成培养女仆
+function MaidAcademyModel:FinishRole(msg, call)
+    MaidAcademyNet:GetInstance():FinishRole(msg, function(data)
+        if data.ack == 1 then
+            local role
+            for k = 1, #self.pos do
+                if self.pos[k].index == msg.index then
+                    role = _G.DeepCopy(self.pos[k].s_role)
+                    self.pos[k].s_role = nil
+                    local maiddata = self.posingmaids[msg.index]
+                    local attr = maiddata:GetProp()
+                    local attrs = { "atk", "bre", "def", "max_hp" }
+                    for o = 1, #attrs do
+                        self.attr[o] = self.attr[o] + attr.attriOther[attrs[o]]
+                    end
+                    maiddata.idle = true
+                    break
+                end
+            end
+            if role then
+                table.insert(self.finish, role)
+            end
+            self:AddExp()
+            self.study_info[1] = self.study_info[1] + 1
+            if call then
+                call(data)
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PointMaidCanDraw.id)
+
+            _G.Events:GetInstance():Broadcast(_G.eMaidUpdate.MaidUpdate)
+        end
+    end)
+end
+
+---发布
+function MaidAcademyModel:Release(msg, call)
+    MaidAcademyNet:GetInstance():Release(msg, function(data)
+        if data.ack == 1 then
+            local time = _G.ConfigManager.discrete_cfg[202005][1][1]
+            for k = 1, #self.finish do
+                if self.finish[k].uid == msg.uid then
+                    self.finish[k].state = _G.TimeUtil.GetServerUnixTime() + time
+                    self.finish[k].state_type = msg.type
+                    break
+                end
+            end
+            if call then
+                call(data)
+            end
+        end
+    end)
+end
+
+---取消发布
+function MaidAcademyModel:ReleaseCancel(msg, call)
+    MaidAcademyNet:GetInstance():ReleaseCancel(msg, function(data)
+        if data.ack == 1 then
+            for k = 1, #self.finish do
+                if self.finish[k].uid == msg.uid then
+                    self.finish[k].state = 0
+                    self.finish[k].state_type = 0
+                    break
+                end
+            end
+            if call then
+                call(data)
+            end
+        end
+    end)
+end
+
+---获取随机推荐
+function MaidAcademyModel:Select(msg, call)
+    MaidAcademyNet:GetInstance():Select(msg, function(data)
+        if data.ack == 1 then
+            if call then
+                call(data)
+            end
+        end
+    end)
+end
+
+---合作
+function MaidAcademyModel:Cooperation(msg, call)
+    MaidAcademyNet:GetInstance():Cooperation(msg, function(data)
+        if data.ack == 1 then
+            if data.del_uid then
+                for i = 1, #data.del_uid do
+                    for k = 1, #self.record do
+                        if self.record[k].uid == data.del_uid[i] then
+                            table.remove(self.record, k)
+                            break
+                        end
+                    end
+                end
+            end
+            if data.attr then
+                self.attr = data.attr
+            end
+            if data.n_sr then
+                table.insert(self.record, data.n_sr)
+                for k = 1, #self.finish do
+                    if self.finish[k].uid == data.n_sr.uid then
+                        table.remove(self.finish, k)
+                        break
+                    end
+                end
+                self.study_info[2] = self.study_info[2] + 1
+                ---模拟推送
+                _G.Events:GetInstance():Broadcast(_G.eMaidAcademyEvent.P2CCooperation)
+            end
+
+            if call then
+                call(data)
+            end
+        end
+    end)
+end
+
+---获取收到的申请信息
+function MaidAcademyModel:GetApply(call)
+    MaidAcademyNet:GetInstance():GetApply(function(data)
+        if call then
+            call(data)
+        end
+    end)
+end
+
+---发起申请
+function MaidAcademyModel:Apply(msg, call)
+    MaidAcademyNet:GetInstance():Apply(msg, function(data)
+        if data.ack == 1 then
+            local time = _G.ConfigManager.discrete_cfg[202005][1][1]
+            for k = 1, #self.finish do
+                if self.finish[k].uid == msg.s_uid then
+                    self.finish[k].state = _G.TimeUtil.GetServerUnixTime() + time
+                    self.finish[k].state_type = 3
+                    break
+                end
+            end
+            if call then
+                call(data)
+            end
+        end
+    end)
+end
+
+---处理申请
+function MaidAcademyModel:CheckApply(msg, call)
+    MaidAcademyNet:GetInstance():CheckApply(msg, function(data)
+        if data.ack == 1 then
+            if data.del_uid then
+                for i = 1, #data.del_uid do
+                    for k = 1, #self.record do
+                        if self.record[k].uid == data.del_uid[i] then
+                            table.remove(self.record, k)
+                            break
+                        end
+                    end
+                end
+            end
+            if data.attr then
+                self.attr = data.attr
+            end
+            if data.s_role then
+                for i = 1, #data.s_role do
+                    table.insert(self.record, data.s_role[i])
+
+                    for k = 1, #self.finish do
+                        if self.finish[k].uid == data.s_role[i].uid then
+                            table.remove(self.finish, k)
+                            break
+                        end
+                    end
+                    self.study_info[2] = self.study_info[2] + 1
+                end
+                ---模拟推送
+                _G.Events:GetInstance():Broadcast(_G.eMaidAcademyEvent.P2CCooperation)
+            end
+
+            if call then
+                call(data)
+            end
+        end
+    end)
+end
+
+---任命
+function MaidAcademyModel:Appoint(msg, call, info)
+    MaidAcademyNet:GetInstance():Appoint(msg, function(data)
+        if data.ack == 1 then
+            if msg.uid == 0 then
+                ---下
+                local role
+                for k = 1, #self.appoint do
+                    if self.appoint[k].index == msg.index then
+                        role = _G.DeepCopy(self.appoint[k].s_role)
+                        table.remove(self.appoint, k)
+                        break
+                    end
+                end
+                if role then
+                    table.insert(self.record, 1, role)
+                end
+            else
+                ---上
+                local role
+                for k = 1, #self.appoint do
+                    if self.appoint[k].index == msg.index then
+                        role = _G.DeepCopy(self.appoint[k].s_role)
+                        table.remove(self.appoint, k)
+                        break
+                    end
+                end
+                if role then
+                    table.insert(self.record, 1, role)
+                end
+                if info then
+                    local infonew = {}
+                    infonew.index = msg.index
+                    infonew.s_role = info
+                    table.insert(self.appoint, infonew)
+
+                    for k = 1, #self.record do
+                        if self.record[k].uid == info.uid then
+                            table.remove(self.record, k)
+                            break
+                        end
+                    end
+                end
+            end
+            if call then
+                call(data)
+            end
+
+            _G.Events:GetInstance():Broadcast(_G.eMaidAcademyEvent.AppointFinish)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PointMaidCanAppoint.id)
+        end
+    end)
+end
+
+---补充体力
+function MaidAcademyModel:AddStrength(msg, call)
+    MaidAcademyNet:GetInstance():AddStrength(msg, function(data)
+        if data.ack == 1 then
+            if data.pos then
+                for i = 1, #data.pos do
+                    local index = 0
+                    for k = 1, #self.pos do
+                        if self.pos[k].index == data.pos[i].index then
+                            index = k
+                            break
+                        end
+                    end
+                    if index > 0 then
+                        self.pos[index].index = data.pos[i].index
+                        self.pos[index].physical = data.pos[i].physical
+                        self.pos[index].oldphysical = data.pos[i].physical
+                        self.pos[index].l_time = data.pos[i].l_time
+                    end
+                end
+            end
+            if call then
+                call(data)
+            end
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .PointMaidCanCultivate.id)
+        end
+    end)
+end
+
+---合作达成推送
+function MaidAcademyModel:P2CStudyCooperation(data)
+    if data.del_uid then
+        for i = 1, #data.del_uid do
+            for k = 1, #self.record do
+                if self.record[k].uid == data.del_uid[i] then
+                    table.remove(self.record, k)
+                    break
+                end
+            end
+        end
+    end
+    if data.s_role then
+        table.insert(self.record, data.s_role)
+
+        for k = 1, #self.finish do
+            if self.finish[k].uid == data.s_role.uid then
+                table.remove(self.finish, k)
+                break
+            end
+        end
+        self.study_info[2] = self.study_info[2] + 1
+    end
+
+    if data.attr then
+        self.attr = data.attr
+    end
+
+    _G.Events:GetInstance():Broadcast(_G.eMaidAcademyEvent.P2CCooperation)
+end
+
+---收到新的申请的推送
+function MaidAcademyModel:P2CStudyCheckApply(data)
+    _G.Events:GetInstance():Broadcast(_G.eMaidAcademyEvent.P2CApply, data)
+
+    self.HasRequest = 1
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PointMaidHasRequest.id)
+end
+
+---被拒绝推送
+function MaidAcademyModel:P2CStudySendApply(data)
+    if data.type == 1 then
+        ---拒绝
+        for k = 1, #self.finish do
+            if self.finish[k].uid == data.s_uid then
+                self.finish[k].state = 0
+                self.finish[k].state_type = 0
+                break
+            end
+        end
+        _G.Events:GetInstance():Broadcast(_G.eMaidAcademyEvent.P2CSendApply)
+    end
+end
+
+---获取女仆
+function MaidAcademyModel:GetMiadByUid(uid)
+    for k = 1, #self.finish do
+        if self.finish[k].uid == uid then
+            return self.finish[k]
+        end
+    end
+    return nil
+end
+
+---获取女仆等级变化
+function MaidAcademyModel:GetLevelChange()
+    if self:IsMax() then
+        return self.level, self.level
+    else
+        return self.level, self.level + 1
+    end
+end
+
+---获取女仆培养上限
+function MaidAcademyModel:GetCultivateMaxChange()
+    local cfg = _G.ConfigManager.study_role_level_cfg[self.level]
+    if self:IsMax() then
+        return cfg.position_pay, cfg.position_pay
+    else
+        local nextcfg = _G.ConfigManager.study_role_level_cfg[self.level + 1]
+        return cfg.position_pay, nextcfg.position_pay
+    end
+end
+
+---获取女仆任命上限
+function MaidAcademyModel:GetAppointMaxChange()
+    self.ids = { 101, 201, 202, 301, 302 }
+    if self:IsMax() then
+        return #self.ids, #self.ids
+    else
+        local curo = 0
+        local nexto = 0
+        for i = 1, #self.ids do
+            local cfg = _G.ConfigManager.study_cooperation_cfg[self.ids[i]]
+            if cfg.condition_type <= self.level then
+                curo = curo + 1
+            end
+        end
+        nexto = curo + 1
+        return curo, nexto
+    end
+end
+
+---获取体力上限
+function MaidAcademyModel:GetStregthMaxChange()
+    local cfg = _G.ConfigManager.study_cfg[self.level]
+    if self:IsMax() then
+        return cfg.physical[1], cfg.physical[1]
+    else
+        local nextcfg = _G.ConfigManager.study_cfg[self.level + 1]
+        return cfg.physical[1], nextcfg.physical[1]
+    end
+end
+
+---词条特质
+function MaidAcademyModel:GetEntryInfo()
+    local preList = {}
+    local cfg = _G.ConfigManager.study_role_level_cfg
+    for i = 1, #cfg do
+        local add = cfg[i].study_entry_add
+        if self.level >= i and #add > 0 then
+            table.insert(preList, add)
+        end
+    end
+    return preList[#preList]
+end
+
+---获取品质抽取概率
+
+function MaidAcademyModel:GetDrawPro(herolevel)
+    local proList = {}
+    local cfg = _G.ConfigManager.study_role_cfg
+    for key, value in pairs(cfg) do
+        if nil == proList[value.order] then
+            proList[value.order] = {}
+        end
+        table.insert(proList[value.order], key)
+    end
+
+    local model = require("HeroicIconModel"):GetInstance()
+    local curLevel = model:GetIconTotalLevel()
+    ---测试用
+    --local curLevel = herolevel
+
+    local index = 0
+    local dcfg = _G.ConfigManager.discrete_cfg[202009]
+    for i = 1, #dcfg do
+        if curLevel >= dcfg[i][1] then
+            index = i
+        end
+    end
+    local quepro = { 0, 0, 0, 0, 0, 0 }
+    local result = {}
+
+    local ocfg = _G.ConfigManager.discrete_cfg[202009][index]
+    local id = ocfg[2]
+    local rcfg = _G.ConfigManager.study_role_roller_cfg[id]
+    for k = 1, #rcfg.study_role do
+        for j = 1, 6 do
+            if false ~= table.indexof(proList[j], rcfg.study_role[k][1]) then
+                quepro[j] = quepro[j] + rcfg.study_role[k][2]
+            end
+        end
+    end
+
+    local total = 0
+    local bwIndex = 0
+    for k = 1, #quepro do
+        if quepro[k] > 0 then
+            bwIndex = k
+        end
+        total = total + quepro[k]
+    end
+    local temptotal = 100
+    for k = 1, #quepro do
+        local qp = self:TruncateDecimal(quepro[k] / total, 2)
+        result[k] = qp
+        if temptotal > qp then
+            temptotal = temptotal - qp
+        else
+            temptotal = 0
+        end
+    end
+
+    result[bwIndex] = result[bwIndex] + temptotal
+
+    if index >= #dcfg then
+        ---满了
+        return result, result
+    else
+        local quepro1 = { 0, 0, 0, 0, 0, 0 }
+        local result1 = {}
+
+        local ocfg1 = _G.ConfigManager.discrete_cfg[202009][index + 1]
+        local id1 = ocfg1[2]
+        local rcfg1 = _G.ConfigManager.study_role_roller_cfg[id1]
+        for k = 1, #rcfg1.study_role do
+            for j = 1, 6 do
+                if false ~= table.indexof(proList[j], rcfg1.study_role[k][1]) then
+                    quepro1[j] = quepro1[j] + rcfg1.study_role[k][2]
+                end
+            end
+        end
+
+        local total1 = 0
+        local bwIndex1 = 0
+        for k = 1, #quepro1 do
+            if quepro1[k] > 0 then
+                bwIndex1 = k
+            end
+            total1 = total1 + quepro1[k]
+        end
+        local temptotal1 = 100
+        for k = 1, #quepro1 do
+            local qp = self:TruncateDecimal(quepro1[k] / total1, 2)
+            result1[k] = qp
+            if temptotal1 > qp then
+                temptotal1 = temptotal1 - qp
+            else
+                temptotal1 = 0
+            end
+        end
+        result1[bwIndex1] = result1[bwIndex1] + temptotal1
+        return result, result1
+    end
+end
+
+---获取品质抽取概率
+
+function MaidAcademyModel:GetDrawNextLevel(herolevel)
+    local model = require("HeroicIconModel"):GetInstance()
+    local curLevel = model:GetIconTotalLevel()
+    ---测试用
+    --local curLevel = herolevel
+
+    local index = 0
+    local dcfg = _G.ConfigManager.discrete_cfg[202009]
+    for i = 1, #dcfg do
+        if curLevel >= dcfg[i][1] then
+            index = i
+        end
+    end
+
+    if index >= #dcfg then
+        ---满了
+        return dcfg[index][1]
+    else
+        return dcfg[index + 1][1]
+    end
+end
+
+---保留两位换算百分比值
+function MaidAcademyModel:TruncateDecimal(number, places)
+    local multiplier = 10 ^ places
+    return math.floor(number * multiplier)
+end
+
+--可招募红点
+function MaidAcademyModel:CanDraw()
+    local posList = self.pos
+    if posList then
+        _G.SortList(posList, function(a)
+            return -a.index
+        end)
+        if self.cfg then
+            for i = 1, self.MaxNum do
+                if self.cfg.position >= i then
+                    ---解锁了
+                    local posdata = posList[i]
+                    if not posdata or not posdata.s_role then
+                        return 1
+                    end
+                end
+            end
+        end
+    end
+    return 0
+end
+
+--可培养红点
+function MaidAcademyModel:CanCultivate(index)
+    local posList = self.pos
+    if posList then
+        _G.SortList(posList, function(a)
+            return -a.index
+        end)
+        for i = 1, self.MaxNum do
+            if self.cfg then
+                if self.cfg.position >= i then
+                    ---解锁了
+                    local posdata = posList[i]
+                    if posdata and posdata.s_role and posdata.index == index then
+                        local rcfg = _G.ConfigManager.study_role_level_cfg[posdata.s_role.level]
+                        ---人没满并且有体力
+                        if posdata.s_role.grow < rcfg.position_pay and posdata.physical > 0 then
+                            return 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return 0
+end
+
+--有请求红点
+function MaidAcademyModel:CheckHasRequest()
+    return self.HasRequest
+end
+
+--可上阵红点
+function MaidAcademyModel:CanAppoint(id)
+    local ids = { 101, 201, 202, 301, 302 }
+    local appointList = self.appoint
+
+    for i = 1, #ids do
+        local cfg = _G.ConfigManager.study_cooperation_cfg[ids[i]]
+        if cfg.condition_type <= self.level and id == ids[i] then
+            ---开了
+            local data
+            for k = 1, #appointList do
+                if appointList[k].index == ids[i] then
+                    data = appointList[k]
+                end
+            end
+            if not data and #self.record > 0 then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---设置聊天数据
+function MaidAcademyModel:SetChatStr(data)
+    self.ChatTable = {
+        cdata = data,
+        roleuid = _G.PlayerModel:GetInstance().role_uid,
+        rolename = _G.PlayerModel:GetInstance().role_name
+    }
+end
+
+---获得聊天json
+
+function MaidAcademyModel:GetChatStr()
+    local table = self.ChatTable
+
+    return _G.Table2Json(table)
+end
+
+---最大属性加成
+function MaidAcademyModel:GetMaxAttrAdd()
+    local cfg = _G.ConfigManager.study_role_level_cfg[self.level]
+    return math.floor((cfg.attribute_max - 10000) / 100)
+end
+
+---最大属性加成不超过自身
+function MaidAcademyModel:GetMaxAttrAddBySelf()
+    local cfg = _G.ConfigManager.study_role_level_cfg[self.level]
+    return cfg.attribute_max / 100
+end
+
+---拿所有上阵属性
+function MaidAcademyModel:GetAllAppiotAttr()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    ---上阵加成
+    for i = 1, #self.appoint do
+        local maid = self.appoint[i].s_role
+        if maid then
+            local acfg = _G.ConfigManager.study_cooperation_cfg[self.appoint[i].index]
+            ---上阵属性
+            for j = 1, #maid.r_add do
+                local ecfg = _G.ConfigManager.study_entry_cfg[maid.r_add[j]]
+
+                for _, v in pairs(ecfg.attribute) do
+                    attribute:AddValueByName(
+                        v[1],
+                        _G.AttributeClassManager:GetInstance():GetValueWithName(v[1],
+                            v[3], _G.tonumber(v[2])),
+                        false,
+                        _G.tonumber(v[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+                    )
+                end
+            end
+
+            for k = 1, #maid.entry_add do
+                local ecfg = _G.ConfigManager.study_entry_cfg[maid.entry_add[k]]
+                local levelcfg = _G.ConfigManager.study_role_level_cfg[maid.level]
+                local levelgrow = levelcfg.role_cooperate_grow or 10000
+
+                for _, v in pairs(ecfg.attribute) do
+                    attribute:AddValueByName(
+                        v[1],
+                        _G.AttributeClassManager:GetInstance():GetValueWithName(v[1], v[3] * (10000 + acfg.cooperation_level)/10000 * levelgrow /
+                            10000, _G.tonumber(v[2])),
+                        false,
+                        _G.tonumber(v[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+                    )
+                end
+            end
+
+            local otheradd = maid.p_info.partner
+            for j = 1, #otheradd.r_add do
+                local ecfg = _G.ConfigManager.study_entry_cfg[otheradd.r_add[j]]
+
+                for _, v in pairs(ecfg.attribute) do
+                    attribute:AddValueByName(
+                        v[1],
+                        _G.AttributeClassManager:GetInstance():GetValueWithName(v[1],
+                            v[3], _G.tonumber(v[2])),
+                        false,
+                        _G.tonumber(v[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+                    )
+                end
+            end
+
+            for k = 1, #otheradd.entry_add do
+                local ecfg = _G.ConfigManager.study_entry_cfg[otheradd.entry_add[k]]
+                local levelcfg = _G.ConfigManager.study_role_level_cfg[otheradd.level]
+                local levelgrow = levelcfg.role_cooperate_grow or 10000
+
+                for _, v in pairs(ecfg.attribute) do
+                    attribute:AddValueByName(
+                        v[1],
+                        _G.AttributeClassManager:GetInstance():GetValueWithName(v[1], v[3] *(10000 + acfg.cooperation_level)/10000 * levelgrow /
+                            10000, _G.tonumber(v[2])),
+                        false,
+                        _G.tonumber(v[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+                    )
+                end
+            end
+        end
+    end
+    if attribute.attriOther then
+        for k, v in pairs(attribute.attriOther) do
+            if v ~= 0 then
+                local ev = self:CheckAttrRate(k, v)
+                attribute.attriOther[k] = ev
+            end
+        end
+    end
+
+    if attribute.attributePercent then
+        for k, v in pairs(attribute.attributePercent) do
+            if v ~= 0 then
+                local ev = self:CheckAttrRate(k, v)
+                attribute.attributePercent[k] = ev
+            end
+        end
+    end
+    return attribute
+end
+
+---判断属性加成上限
+function MaidAcademyModel:CheckAttrRate(k, v)
+    if nil == self.cfg then
+        return 0
+    end
+    local attribute = self.cfg.attribute_rate
+    local rvalue = 0
+    for i = 1, #attribute do
+        local key = attribute[i][1]
+        if key == k then
+            local type = tonumber(attribute[i][2])
+            local value = tonumber(attribute[i][3])
+            local evalue = 0
+            if type == 1 then
+                if _G.AttrType[key].percentage == 1 then
+                    evalue = value / 10000
+                else
+                    evalue = value
+                end
+            else
+                evalue = value / 10000
+            end
+            if v > evalue then
+                rvalue = evalue
+            else
+                rvalue = v
+            end
+            break
+        end
+    end
+    return rvalue
+end
+
+---判断是不是满了
+function MaidAcademyModel:CheckFinishMax()
+    local finishmax = _G.ConfigManager.discrete_cfg[202003][1][1]
+    if #self.finish >= finishmax then
+        return true
+    end
+    return false
+end
+
+function MaidAcademyModel:GetFinishNum()
+    return self.study_info[1]
+end
+
+---获取圣像关联等级描述
+function MaidAcademyModel:GetHeroicLevelDesc()
+    local model = require("HeroicIconModel"):GetInstance()
+    local curLevel = model:GetIconTotalLevel()
+    local curque = ""
+
+    local cfg = _G.ConfigManager.discrete_cfg[202009]
+    for i = 1, #cfg do
+        local fav = cfg[i][1]
+        local id = cfg[i][2]
+        local rollercfg = _G.ConfigManager.study_role_roller_cfg[id]
+
+        if curLevel >= fav then
+            curque = rollercfg.describe
+        end
+    end
+
+    if curque == "" then
+        local id = cfg[#cfg][2]
+        local rollercfg = _G.ConfigManager.study_role_roller_cfg[id]
+        curque = rollercfg.describe
+    end
+    return curque
+end
+
+function MaidAcademyModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenFunctionNewEvent, self.FunOpen, self)
+    if self.ThisTimer then
+        self.ThisTimer:Stop()
+        self.ThisTimer = nil
+    end
+end
+
+return MaidAcademyModel

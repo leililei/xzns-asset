@@ -1,0 +1,169 @@
+---@class SociatyMazeGiftView: UIBaseView	公会-暗影迷宫-藏宝库
+---@field go_table SociatyMazeGiftView_GoTable
+---@field listItems table<number,SociatyMazeGiftView._obj_listItem_GoTable>
+---@field cell guild_maze.s2c_maze_cell     @地图格子数据
+---@field data SociatyMazeGiftData[]        @商品列表
+local SociatyMazeGiftView = _G.BaseClass("SociatyMazeGiftView", _G.UIBaseView)
+
+function SociatyMazeGiftView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self:AddListener(_G.eSociatyEvent.BeKicked, self.OnBeKicked)
+
+    --初始化节点状态
+    self.go_table.obj_listItem:SetActiveE(0)
+end
+
+function SociatyMazeGiftView:OnDestroy()
+    self:RemoveAllListener()
+end
+
+---@param msg guild_maze.s2c_get_treasure_info
+function SociatyMazeGiftView:OnCreate(data, msg)
+    self.cell = data
+    self.data = {}
+    --解析商品信息
+    --根据策划要求这样做, store_exchange_cfg表中每条数据都有自己的价格丶货币和折扣, 综合显示...
+    if msg and msg.shop_list then
+        for i, id in ipairs(msg.shop_list) do
+            ---@type SociatyMazeGiftData
+            local v = {
+                index = i,
+                isBuy = not not (msg.index_list and _G.table.indexof(msg.index_list, i)),
+                items = {},
+                currency = 0,
+                price = 0,
+                discount = 0
+            }
+            local cfg = _G.ConfigManager.store_exchange_cfg[id]
+            if cfg then
+                v.price = v.price + cfg.price
+                v.items = cfg.goods or {}
+                if v.currency == 0 then
+                    v.currency = cfg.type_price
+                elseif v.currency ~= cfg.type_price and _G.AppSetting.DEBUG then
+                    _G.LogError("商品货币ID不一致:" .. _G.Table2Json(msg))
+                end
+                if cfg.discount > v.discount then
+                    v.discount = cfg.discount
+                end
+            end
+            table.insert(self.data, v)
+        end
+    end
+
+    --初始化商品列表
+    self.go_table.scrollloophorizontal_list:InitItemData(# self.data, _G.handler(self, self.OnRefreshItem))
+end
+
+---监听被踢出公会
+---@return void
+function SociatyMazeGiftView:OnBeKicked()
+    self:Close()
+end
+
+---刷新商品列表
+---@param obj UnityEngine.GameObject
+function SociatyMazeGiftView:OnRefreshItem(index, obj)
+    if not self.listItems then
+        self.listItems = {}
+    end
+    ---@type SociatyMazeGiftView._obj_listItem_GoTable|{data:SociatyMazeGiftData}
+    local item = self.listItems[obj:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(obj)
+        item.obj_awardItem:SetActiveE(0)
+        _G.AddViewBtnClick(obj, _G.handlerbind(self, self.OnClickItemBtn, item))
+        self.listItems[obj:GetInstanceIDE()] = item
+        --显示商品列表
+        local rewardItems = {}
+        item.scrollloopvectical_reward:InitItemData(0, function(subIndex, subObj)
+            ---@type _obj_listItem._obj_awardItem_GoTable|{sid:number,_awardItem:itemViewNewWithCount}
+            local subItem = rewardItems[subObj:GetInstanceIDE()]
+            if not subItem then
+                subItem = _G.GetAutoGoTable(subObj)
+                subItem._awardItem = require("itemViewNewWithCount").New(subObj:GetChildE(0))
+                --添加点击事件
+                _G.AddViewBtnClick(subObj, function()
+                    local type = _G.StorageManager:GetInstance():CheckSidType(subItem.sid)
+                    if type == _G.StorageType.Card then
+                        ---@type DynamicCfg
+                        local dc = {}
+                        dc.HideWorld = false
+                        require("CommonTipManager"):GetInstance():OpenTip(subItem.gameObject, subItem.sid, nil, dc)
+                    else
+                        require("CommonTipManager"):GetInstance():OpenTip(subItem.gameObject, subItem.sid)
+                    end
+                end)
+                rewardItems[obj:GetInstanceIDE()] = item
+            end
+            --物品信息
+            local _item = item.data.items[subIndex + 1] --C#数组下标从0开始, lua从1开始
+            subItem._awardItem:Show(_item[1], nil, _item[2])
+            subItem.sid = _item[1]
+            subItem.obj_alreadyGet:SetActiveE(item.data.isBuy and 1 or 0)
+        end)
+    end
+    local data = self.data[index + 1]
+    item.data = data
+
+    --显示商品信息
+    item.scrollloopvectical_reward:UpdateCount(#data.items)
+    item.obj_sellout:SetActiveE(data.isBuy and 1 or 0)
+    item.aorrawimage_price:LoadImage(_G.StorageManager:GetInstance():GetItemIcon(data.currency))
+    item.aortext_price.text = tostring(data.price)
+    item.aortext_limit.text = data.isBuy and "" or _G.GetLangPackValue(90021600042, 1)
+    item.obj_discount:SetActiveE(data.discount > 0 and 1 or 0)
+    item.obj_discountMask:SetActiveE((data.discount > 0 and data.isBuy) and 1 or 0)
+    if data.discount > 0 then
+        local v = data.discount / 1000
+        local vi = math.floor(v)
+        item.aortext_discount.text = (v - vi) > 0.09 and string.format("%.1f", v) or tostring(v)
+    end
+end
+
+---商品点击事件
+---@param item SociatyMazeGiftView._obj_listItem_GoTable|{data:SociatyMazeGiftData}
+function SociatyMazeGiftView:OnClickItemBtn(go, isOn, item)
+    local data = item.data
+    if not data then
+        return
+    end
+    --检查消耗状态
+    if not _G.StorageManager:GetInstance():CheckItem(data.currency, data.price) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(230303)
+        return
+    end
+    --购买商品
+    require("SociatyMazeBattleModel"):GetInstance():BuyGift(self.cell.uid, data.index, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        --消耗货币获取奖励
+        _G.StorageManager:GetInstance():ConsumeItem(data.currency, 0, data.price)
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+        --显示奖励
+        _G.UIUtils.ShowCommonAward(msg)
+        --更新缓存并更新视图
+        data.isBuy = true
+        self.go_table.scrollloophorizontal_list:UpdateAllItem()
+    end)
+end
+
+---监听界面UI事件
+---@return void
+function SociatyMazeGiftView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_close or go == self.go_table.aorbtn_close1 then
+        self:Close()
+    end
+end
+
+---@class SociatyMazeGiftData
+---@field items number[][]      @物品数据
+---@field index number          @商品序号
+---@field isBuy boolean         @是否已购买
+---@field currency number       @代币id
+---@field price number          @价格
+---@field discount number       @折扣
+
+return SociatyMazeGiftView

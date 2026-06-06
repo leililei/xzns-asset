@@ -1,0 +1,704 @@
+-----------------------------------------------------------------------
+-- D:\zhenhunjie-s\client\trunk\alpha\Client\Assets\Resources\LuaScripts\Game\Nitpick\View
+--	(修改路径必须修正此项!)
+-- Created by zhaoshubo
+-- DateTime: 2026/03/03
+-- Description 诡夜魅影
+-----------------------------------------------------------------------
+---@class NitpickView : UIBaseView    诡夜魅影
+---@field go_table NitpickView_GoTable
+local NitpickView = _G.BaseClass("NitpickView", _G.UIBaseView)
+
+local showClueNum = 3
+
+function NitpickView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self:AddListener(_G.eUIManagerStatus.OnUIClosed, _G.handler(self, self.OnUIClosed))
+end
+
+---界面入口
+function NitpickView:OnCreate(index)
+    self:InitData(index)
+    self:InitView()
+    _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, self.cfg.audio_id)
+    self:DoShuShuTrack()
+    self:InitAnimator()
+    if self.model:CheckIsShowEnter() or index ~= 1 then
+        self:InitTimer()
+    end
+end
+
+---初始化数据
+function NitpickView:InitData(index)
+    self.model = require("NitpickModel"):GetInstance()
+    self.cfg = _G.ConfigManager.nitpick_cfg[index] or {}
+    self.itemData = self.cfg.interaction or {}
+    self.clickEff, self.clickRect = self.model:GetClickEff()
+    self.clueData = {}
+    self.clueFind = {}
+    self.clueItem = {}
+    self.clueDic = {}
+    self.clueList = {}
+    self.guideDic = {}
+    self.finishGuide = {}
+    self.autoGuide = {}
+    self.freeGuideNum = _G.ConfigManager.discrete_cfg[201613] and _G.ConfigManager.discrete_cfg[201613][1][1] or 3
+    self.freeGuideCount = 0
+    self.allNum = 0
+    self.showNum = 0
+    self.textTime = self.model:GetTextDelayCfg()
+    self.wrongTime = self.model:GetWrongDelayCfg()
+    self.correctTime = self.model:GetCorrectDelayCfg()
+    self.hasFreeGuide, self.freeGuideTime = self.model:CheckHasFreeGuide()
+    for _, v in ipairs(self.itemData) do
+        local data = _G.ConfigManager.nitpick_Interaction_cfg[v]
+        self.clueData[data.id] = data
+        if data.type_section ~= 7 then--不交互类型不参与逻辑处理，只做显示
+            local hasNext = data.is_spine and data.is_spine ~= 0
+            if hasNext then--有下一条交互则不是最终交互
+                local clueList = self.model:GetFinalClue(data.id)--一条交互可能出现多个新的交互，全都获取一遍
+                if not _G.table.isEmptyOrNil(clueList) then
+                    for _, id in pairs(clueList) do
+                        self.clueDic[id] = true
+                        self.clueData[id] = _G.ConfigManager.nitpick_Interaction_cfg[id]
+                        self.clueList[#self.clueList + 1] = id
+                        self.allNum = self.allNum + 1
+                    end
+                end
+            else
+                self.clueDic[data.id] = true
+                self.clueList[#self.clueList + 1] = v
+                self.allNum = self.allNum + 1
+            end
+        end
+        
+    end
+    self.addTime = self.model:GetAddTime()
+    self.guideTime = self.model:GetGuideTime()
+    ---埋点数据
+    self.showGuideDic = {}
+    self.recordTime = 0
+    self.solutionDic = {
+        [1] = { 0, 0 },--最终交互
+        [2] = { 1, 0 },--过渡交互
+    }
+    self.adDic = {
+        [1] = { 0, 0 },--谜底提示
+        [2] = { 1, 0 },--延长时间
+        [3] = { 2, 0 },--复活
+    }
+end
+
+---初始化界面
+function NitpickView:InitView()
+    self:InitInteraction()
+    self.go_table.aortext_Name.text = _G.GetLangPackValue(self.cfg.name)
+    self.clueText = _G.GetAutoGoTable(self.go_table.obj_ClueText)
+    self.go_table.scrollloophorizontal_Clue:InitItemData(#self.clueDic, _G.handler(self, self.RefreshList))
+    self.go_table.aorrawimage_Bg:LoadImage(
+        self.cfg.level_bg[1],
+        function(image)
+            image:SetNativeSize()
+        end
+    )
+    self:UpdateClue()
+    self.go_table.aortext_AddTime.text = "+" .. _G.GetLangPackValue(90000011450, self.addTime)
+    self.go_table.obj_Mask:SetActiveE(0)
+end
+
+---初始化交互点
+function NitpickView:InitInteraction()
+    self.ItemList = {}
+    for _, id in ipairs(self.itemData) do
+        self:InitSingleInteraction(id)
+    end
+end
+
+function NitpickView:InitSingleInteraction(id)
+    ---@type nitpick_Interaction_cfg
+    local cfg = self.clueData[id]
+    local obj = _G.InstantiateObject(self.go_table.obj_InteractionItem, self.go_table.obj_InteractionContent)
+    obj:SetName(cfg.id)
+    self.showNum = self.showNum + 1
+    local tb = _G.GetAutoGoTable(obj)
+    self.ItemList[cfg.id] = tb
+    if cfg.scale and cfg.scale[1] > 0 and cfg.scale[2] > 0 then
+        obj:SetRectTransformSize(cfg.scale[1], cfg.scale[2])
+    end
+    if cfg.param and #cfg.param > 0 then
+        obj:SetLocalPosition(cfg.param[1], cfg.param[2])
+    end
+    if cfg.icon_scale and cfg.icon_scale > 0 then
+        tb.obj_Correct:SetLocalScaleXYZ(cfg.icon_scale)
+        tb.obj_Help:SetLocalScaleXYZ(cfg.icon_scale)
+    end
+    if cfg.icon_param and #cfg.icon_param > 0 then
+        tb.obj_Correct:SetLocalPosition(cfg.icon_param[1], cfg.icon_param[2], cfg.icon_param[3])
+        tb.obj_Help:SetLocalPosition(cfg.icon_param[1], cfg.icon_param[2], cfg.icon_param[3])
+    end
+    if cfg.type_spine and #cfg.type_spine > 0 then
+        _G.PoolsManager:GetInstance():Spawn(
+            cfg.type_spine,
+            _G.ePoolType.Temporary,
+            tb.obj_SpineRoot,
+            function(trans)
+                if not self.go_table then
+                    _G.DestroyImmediate(trans)
+                    return
+                end
+                if cfg.spine_scale and #cfg.spine_scale > 0 then
+                    trans:SetLocalScale(
+                        (cfg.spine_scale[1] and cfg.spine_scale[1] > 0) and cfg.spine_scale[1] or 1,
+                        (cfg.spine_scale[2] and cfg.spine_scale[2] > 0) and cfg.spine_scale[2] or 1,
+                        (cfg.spine_scale[3] and cfg.spine_scale[3] > 0) and cfg.spine_scale[3] or 1
+                    )
+                end
+                trans:SetLocalPosition(cfg.spine_param[1], cfg.spine_param[2], cfg.spine_param[3])
+                tb.sg = trans:GetChildE(0):GetComponentE(_G.typeof(_G.CS.Spine.Unity.SkeletonGraphic))
+                local showAnimation = cfg.action_gd
+                local normalAnimation = cfg.action_init
+                if showAnimation and #showAnimation > 0 then
+                    tb.sg.AnimationState:SetAnimation(0, showAnimation, false)
+                    tb.sg.AnimationState:Complete(
+                        "+",
+                        function()
+                            if normalAnimation and #normalAnimation > 0 then
+                                tb.sg.AnimationState:SetAnimation(0, normalAnimation, true)
+                            end
+                        end
+                    )
+                else
+                    if normalAnimation and #normalAnimation > 0 then
+                        tb.sg.AnimationState:SetAnimation(0, normalAnimation, true)
+                    end
+                end
+            end
+        )
+    end
+    if cfg.type_section == 1 then--点击
+        _G.AddViewBtnClick(obj, _G.handlerbind(self, self.OnClickItem, cfg))
+    elseif cfg.type_section == 2 or cfg.type_section == 3 or cfg.type_section == 4 or cfg.type_section == 5 then--拖动
+        _G.AddViewBtnClick(obj, _G.handlerbind(self, self.Wrong, {}, cfg))--如果不是滑动是单点视为错误
+        _G.SetEventTrigger(obj, "onDragBegin", _G.handlerbind(self, self.OnDragBegin, cfg))
+        _G.SetEventTrigger(obj, "onDragEnd", _G.handlerbind(self, self.OnDragEnd, cfg))
+    elseif cfg.type_section == 7 then--不可交互，只显示
+        tb.aorbtn_Click:SetActiveE(0)
+    end
+end
+
+---初始化计时器
+function NitpickView:InitTimer(time)
+    self.remainTime = time or self.model:GetGameTime()
+    self.gameTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTimer, self, false, false, true)
+    self.gameTimer:Start()
+    self:UpdateTimeText()
+    if self.hasFreeGuide then
+        self.freeGuideTimer = _G.TimerManager:GetInstance():GetTimer(self.freeGuideTime, 
+        function()
+            self:UpdateFreeGuide()
+        end, self, false, false, true)
+        self.freeGuideTimer:Start()
+    end
+end
+
+function NitpickView:InitAnimator()
+    self.animator = self.go_table.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+end
+
+function NitpickView:ShowAnimation()
+    self.animator.enabled = true
+    local delayTime = _G.ConfigManager.ui_effect_cfg.ef_ruchangtexiao.LifeTime + _G.ConfigManager.discrete_cfg[201617][1][1]
+    _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.Nitpick .. "ShowEnter", 1)
+    _G.DelayDo(
+        delayTime, 
+        function()
+            self:InitTimer()
+        end
+    )
+end
+
+---更新时间
+function NitpickView:UpdateTimer()
+    if not self.go_table then
+        self:StopTimer(true)
+        return
+    end
+    if self.remainTime <= 1 then
+        self:StopTimer(true)
+        if not self.isPopping and self:CheckIsFindAll() then
+            self:Complete()
+            return
+        end
+        self:Fail()
+    end
+    self.remainTime = self.remainTime - 1
+    self.recordTime = self.recordTime + 1
+    self:UpdateTimeText()
+end
+
+---更新时间文本
+function NitpickView:UpdateTimeText()
+    local minute = self.remainTime // 60
+    minute = _G.math.max(0, minute)
+    local second = self.remainTime - (minute * 60)
+    local time = minute == 0 and string.format("%02d", second) or
+            string.format("%02d:%02d", minute, second)
+    self.go_table.aortext_Time.text = _G.GetLangPackValue(90050300023, time)
+end
+
+---更新线索栏
+function NitpickView:UpdateClue()
+    _G.SortList(
+        self.clueData,
+        function(data)
+            return self.clueFind[data.id] and -self.clueFind[data.id] or -99999 + data.id
+        end
+    )
+    _G.SortList(
+        self.clueList,
+        function(data)
+            return self.clueFind[data] and -self.clueFind[data] or -99999 + data
+        end
+    )
+    local findNum = _G.table.count(self.clueFind)
+    local allNum = _G.table.count(self.clueDic)
+    local progress = string.format("%s/%s", findNum, allNum)
+    self.go_table.aortext_Task.text = _G.GetLangPackValue(90050300024, progress)
+    self.go_table.scrollloophorizontal_Clue:UpdateCount(allNum)
+    self.go_table.scrollloophorizontal_Clue:ScrollToIndex(findNum - showClueNum)
+end
+
+function NitpickView:UpdateDes(cfg)
+    self:PlayFadeAni(self.clueText,true, self.textTime[1])
+    self.clueText.aortext_ClueText.text = cfg.describe ~= 0 and _G.GetLangPackValue(cfg.describe) or cfg.id
+    if self.hideDesTimer then
+        self.hideDesTimer:Reset()
+    else
+        self.hideDesTimer = _G.TimerManager:GetInstance():GetTimer(
+            self.textTime[2],
+            function()
+                if self.go_table then
+                    self:StopTimer()
+                    self:PlayFadeAni(self.clueText,false, self.textTime[3])
+                end
+            end,
+            self,
+            false,
+            false,
+            true
+        )
+        self.hideDesTimer:Start()
+    end
+end
+
+function NitpickView:UpdateGuide(sid)
+    if not self.go_table then
+        return
+    end
+    if sid then--持续时间结束，隐藏引导框
+        self.ItemList[sid].obj_Help:SetActiveE(0)
+        self.ItemList[sid].obj_Help:RemoveAllChildren()
+        self.finishGuide[sid] = true
+        if self.lastFreeGuide and sid == self.lastFreeGuide and self.freeGuideTimer then
+            if self.autoGuide[sid] then
+                local addTime = _G.ConfigManager.discrete_cfg[201614] and _G.ConfigManager.discrete_cfg[201614][1][1] or 5
+                self.freeGuideTimer.delay = self.freeGuideTimer.delay + addTime
+                self.freeGuideTimer:Reset()
+            end
+        end
+    else
+        --if self.guideId then
+        --    self:UpdateGuide(true)
+        --end
+        if self.lastGuide then--全部显示过，不显示引导
+            if self.freeGuideTimer then
+                self.freeGuideTimer:Stop()
+                self.freeGuideTimer = nil
+            end
+            return
+        end
+        local guideId
+        _G.AudioManager.PlayAudio(_G.AudioType.PlaySound, 16056)
+        for id, v in pairs(self.clueData) do
+            if not guideId and not self.guideDic[id] and self.ItemList[id] and v.type_section ~= 7 then
+                self.guideDic[id] = true
+                if _G.table.count(self.guideDic) == self.showNum then--只剩最后一个交互
+                    self.lastGuide = true
+                end
+                guideId = id
+            end
+        end
+        if not guideId then
+            return
+        end
+        self.lastFreeGuide = self.isAutoGuide and guideId or self.lastFreeGuide
+        self.autoGuide[guideId] = self.isAutoGuide
+        self.isAutoGuide = false
+        local tb = self.ItemList[guideId]
+        self.showGuideDic[guideId] = true
+        tb.obj_Help:SetActiveE(1)
+        --策划需求改成不交互不消失，不需要引导持续时间了
+        --if self.guideTimer then
+        --    self.guideTimer:Reset()
+        --else
+        --    self.guideTimer = _G.TimerManager:GetInstance():GetTimer(self.guideTime, self.UpdateGuideTimer, self, false, false, true)
+        --    self.guideTimer:Start()
+        --end
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg["ef_shouzhitishi_" .. self.clueData[guideId].type_section],
+            tb.obj_Help,
+            function(trans)
+                if not self.go_table then
+                    _G.DestroyImmediate(trans)
+                    return
+                end 
+            end
+        )
+    end
+end
+
+---刷新免费引导
+function NitpickView:UpdateFreeGuide()
+    if self.lastFreeGuide and not self.finishGuide[self.lastFreeGuide] then
+        return
+    end
+    self.isAutoGuide = true
+    self:UpdateGuide()
+end
+
+function NitpickView:UpdateGuideTimer()
+    self:StopTimer(false, true)
+    self:UpdateGuide(true)
+end
+
+---刷新线索
+function NitpickView:RefreshList(index, obj)
+    index = index + 1
+    local tb = self.clueItem[index]
+    if not tb then
+        tb = _G.GetAutoGoTable(obj)
+    end
+    local data = self.clueData[self.clueList[index]]
+    tb.aorrawimage_Icon:LoadImage(
+        data.icon
+    )
+    tb.aorrawimage_Icon:SetActiveE(self.clueFind[data.id] and 1 or 0)
+    tb.aorimage_Unknow:SetActiveE(self.clueFind[data.id] and 0 or 1)
+    tb.aortext_Name:SetActiveE(self.clueFind[data.id] and 1 or 0)
+    tb.aortext_Name.text = data.name ~= 0 and _G.GetLangPackValue(data.name) or data.id
+end
+
+function NitpickView:PlayFadeAni(tb, isOn, speed, callback)
+    if not self.go_table then
+        return
+    end
+    if not tb.canvasGroup then
+        tb.canvasGroup = tb.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.CanvasGroup))
+    end
+    tb.canvasGroup.alpha = isOn and 0 or 1
+    local time = speed and speed or FadeTime
+    tb.canvasGroup:DOFade(isOn and 1 or 0, time):SetEase(
+        _G.CS.DG.Tweening.Ease.Linear):OnComplete(
+            function()
+                if callback then
+                    callback()
+                end
+            end
+    )
+end
+
+function NitpickView:CheckIsFindAll()
+    return _G.table.count(self.clueFind) == self.allNum
+end
+
+function NitpickView:StopTimer(isGameTimer, isGuideTimer)
+    if isGameTimer then
+        if self.gameTimer then
+            self.gameTimer:Stop()
+            self.gameTimer = nil
+        end
+        if self.freeGuideTimer then
+            self.freeGuideTimer:Stop()
+            self.freeGuideTimer = nil
+        end
+    end
+    if isGameTimer or isGuideTimer then
+        if self.guideTimer then
+            self.guideTimer:Stop()
+            self.guideTimer = nil
+        end
+    end
+    if isGameTimer or not isGuideTimer then
+        if self.hideDesTimer then
+            self.hideDesTimer:Stop()
+            self.hideDesTimer = nil
+        end
+    end
+end
+
+---显示错误标记
+function NitpickView:Wrong(go, isOn, pos, cfg)
+    if cfg and self.clueFind[cfg.id] then
+        return
+    end
+    if self.freeGuideTimer then
+        self.freeGuideTimer:Reset()
+    end
+    _G.AudioManager.PlayAudio(_G.AudioType.PlaySound, 16055)
+    if self.clickRect then
+        local x, y = self.clickRect:GetLocalPosition()
+        if pos and pos.x then
+            x = pos.x
+            y = pos.y
+        end
+        local wrong = _G.InstantiateObject(self.go_table.obj_Wrong, self.go_table.obj_InteractionContent)
+        local tb = _G.GetAutoGoTable(wrong)
+        wrong:SetLocalPosition(x, y)
+        _G.DelayDo(self.wrongTime[1], function()
+            if self.go_table then
+                self:PlayFadeAni(
+                    tb,
+                    false,
+                        self.wrongTime[2],
+                        function()
+                        if self.go_table then
+                            _G.DestroyImmediate(wrong)
+                        end
+                    end
+                )
+            end
+        end)
+    end
+end
+
+---找到线索
+function NitpickView:Correct(cfg)
+    if self.freeGuideTimer then
+        self.freeGuideTimer:Reset()
+    end
+    local isPop = cfg.window_is ~= 0
+    if isPop then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.NitpickPopView.Name, cfg.window)
+        self.isPopping = true
+        if self.freeGuideTimer then
+            self.freeGuideTimer:Pause()
+        end
+    end
+    --if self.guideId == cfg.id then
+    --    self:UpdateGuide(true)
+    --end
+    _G.AudioManager.PlayAudio(_G.AudioType.PlaySound, 16054)
+    self.guideDic[cfg.id] = true
+    self:UpdateGuide(cfg.id)
+    if self.clueDic[cfg.id] then--最终互动
+        if not self.clueFind[cfg.id] then
+            if not self.showGuideDic[cfg.id] then--没有提示的前提下交互成功
+                self.solutionDic[1][2] = self.solutionDic[1][2] + 1
+            end
+            self.clueFind[cfg.id] = _G.table.count(self.clueFind) + 1
+            self.ItemList[cfg.id].obj_Correct:SetActiveE(1)
+            self:PlayFadeAni(_G.GetAutoGoTable(self.ItemList[cfg.id].obj_Correct), true, self.correctTime)
+            --self.ItemList[cfg.id].aorbtn_Click:SetActiveE(0)
+            self:UpdateClue()
+            self:UpdateDes(cfg)
+            if self:CheckIsFindAll() and not self.isPopping then
+                self:Complete()
+            end
+        end
+    else--过渡互动，不视为找到线索
+        if self.lastGuide then
+            self.lastGuide = nil
+        end
+        if not self.showGuideDic[cfg.id] then--没有提示的前提下交互成功
+            self.solutionDic[2][2] = self.solutionDic[2][2] + 1
+        end
+        self.ItemList[cfg.id].aorbtn_Click:SetActiveE(0)
+        local interactAnimation = cfg.action_end
+        local showNext = function()
+            local nextList = cfg.again_id
+            for _, v in pairs(nextList) do
+                local nextCfg = _G.ConfigManager.nitpick_Interaction_cfg[v]
+                if not self.ItemList[nextCfg.id] then
+                    self:InitSingleInteraction(nextCfg.id)
+                end
+            end
+        end
+        if interactAnimation and #interactAnimation > 0 then
+            local sg = self.ItemList[cfg.id].sg
+            sg.AnimationState:SetAnimation(0, interactAnimation, false)
+            sg.AnimationState:Complete(
+                "+",
+                function()
+                    showNext()
+                end
+            )
+        else
+            showNext()
+        end
+    end
+end
+
+---完成关卡
+function NitpickView:Complete()
+    self.go_table.obj_Mask:SetActiveE(1)--通关后不能点
+    self:StopTimer(true)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.NitpickPopView.Name)
+    if view then--未关闭弹窗时不弹结算
+        return
+    end
+    self:DoShuShuTrack()
+    self.model:LevelFinish(true)
+    self.model:ClearLevel(self.cfg.id)
+end
+
+---通关失败
+function NitpickView:Fail()
+    self:StopTimer(true)
+    self:DoShuShuTrack( true)
+    self.model:LevelFinish(
+        false, 
+        nil, 
+        function()
+            self:InitTimer(self.addTime)
+            self.adDic[3][2] = self.adDic[3][2] + 1
+        end
+    )
+end
+
+function NitpickView:DoShuShuTrack(isLose)
+    if _G.CS.Launcher.Inst.IsSDK then
+        local winType = self.model.clearDic[self.cfg.id] and 2 or 1
+        local json = _G.Table2Json(
+            {
+                nitpick_sid = self.cfg.id,
+                role_uid = _G.tostring(_G.PlayerModel:GetInstance().role_uid),
+                server_id = tostring(_G.ServerManager:GetInstance().CurServer.ServerID),
+                record_time = self.recordTime * 1000,
+                battle_result = tonumber(isLose and 0 or winType),
+                solution_count = self.solutionDic,
+                ad_type = self.adDic,
+            }
+        )
+        if _G.AppSetting.DEBUG then
+            _G.Log(json, "找茬结算打点")
+        end
+        _G.SDKManager:GetInstance():DoShushuData_track("nitpick_list", json)
+    end
+end
+
+function NitpickView:OnUIClosed(_, name)
+    if name == _G.ConfigManager.ui_cfg.NitpickPopView.Name then
+        if self.freeGuideTimer then
+            self.freeGuideTimer:Resume()
+            self.freeGuideTimer:Reset()
+        end
+        self.isPopping = nil
+        if self:CheckIsFindAll() then
+            self:Complete()
+            self:RemoveListener(_G.eUIManagerStatus.OnUIClosed, _G.handler(self, self.OnUIClosed))
+        end
+    end
+end
+
+---点击交互点
+function NitpickView:OnClickItem(go, isOn, cfg)
+    self:Correct(cfg)
+end
+
+---开始滑动
+function NitpickView:OnDragBegin(go, data, cfg)
+    if self.clueFind[cfg.id] then
+        return
+    end
+    self.DragData = data.position
+end
+
+---结束滑动
+function NitpickView:OnDragEnd(go, data, cfg)
+    if self.clueFind[cfg.id] then
+        return
+    end
+    local x = data.position.x - self.DragData.x
+    local y = data.position.y - self.DragData.y
+    local result = 0
+    if _G.math.abs(x) > _G.math.abs(y) then--水平位移较大
+        result = x < 0 and 2 or 5--x<0是左滑，x>0是右滑
+    else--水平垂直位移相同或垂直位移较大
+        result = y < 0 and 3 or 4
+    end
+    if result == cfg.type_section then
+        self:Correct(cfg)
+    else
+        self:Wrong(self.DragData)
+    end
+    self.DragData = nil
+end
+
+---点击按钮
+function NitpickView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_Close then
+        _G.PopWindowManager:GetInstance():ShowAllTipsExtend(
+            1080502,
+            nil,
+            nil,
+            function()
+                self:DoShuShuTrack(true)
+                self.model:CloseLevel(self.cfg.id)
+            end,
+            nil,
+            nil,
+            { notCall = true }
+        )
+    elseif go == self.go_table.aorbtn_Wrong then
+        self:Wrong()
+    elseif go == self.go_table.aorbtn_AddTime then
+        self.model:VideoAD(
+            5001,
+            function(isSuccess)
+                if isSuccess then
+                    self.remainTime = self.remainTime + self.addTime
+                    self.remainTime = _G.math.min(self.model:GetGameMaxTime(), self.remainTime)
+                    self.gameTimer:Reset()
+                    self:UpdateTimeText()
+                    self.adDic[2][2] = self.adDic[2][2] + 1
+                end
+                if self.freeGuideTimer then
+                    self.freeGuideTimer:Reset()
+                end
+            end
+        )
+    elseif go == self.go_table.aorbtn_Help then
+        if self.lastGuide then--全部显示以后点提示不继续播广告
+            return
+        end
+        if self.hasFreeGuide then
+            if self.freeGuideCount < self.freeGuideNum then
+                self:UpdateGuide()
+                self.freeGuideCount = self.freeGuideCount + 1
+                self.adDic[1][2] = self.adDic[1][2] + 1
+                return
+            end
+        end
+        self.model:VideoAD(
+            5002,
+            function(isSuccess)
+                if isSuccess then
+                    self:UpdateGuide()
+                    self.adDic[1][2] = self.adDic[1][2] + 1
+                end
+                if self.freeGuideTimer then
+                    self.freeGuideTimer:Reset()
+                end
+            end
+        )
+    end
+end
+
+---类的析构函数
+function NitpickView:OnDestroy()
+    self.go_table = nil
+    self:RemoveListener(_G.eUIManagerStatus.OnUIClosed, _G.handler(self, self.OnUIClosed))
+    self:StopTimer()
+end
+
+return NitpickView

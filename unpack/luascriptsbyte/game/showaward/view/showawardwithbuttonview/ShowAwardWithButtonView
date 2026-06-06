@@ -1,0 +1,1505 @@
+-----------------------------------------------------------------------
+-- Created by lsy 03.03
+--
+-- @Description 获得奖励物品展示界面
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local TrackingPointModel = require("TrackingPointModel")
+local SettlementModel = require "SettlementModel"
+local SettlementBaseView = require "SettlementBaseView"
+---@class ShowAwardWithButtonView : SettlementBaseView
+---@field go_table ShowAwardWithButtonView_GoTable
+---@field super SettlementBaseView
+local ShowAwardWithButtonView = _G.BaseClass("ShowAwardWithButtonView", SettlementBaseView)
+local monster_cfg = _G.ConfigManager.monster_cfg
+local card_cfg = _G.ConfigManager.card_cfg
+local LoadEffectByCfg = _G.UIUtils.LoadEffectByCfg
+local ui_effect_cfg = _G.ConfigManager.ui_effect_cfg
+local AutoNextTimeID = 100216           --自动推图时间
+local TapAutoNextText = 90000010030     --点击开启自动挑战
+local AutoNextText = 90000010031        -- %d秒后自动下一关
+local TapScreenToContinue = 90000000919 --点击屏幕继续
+--local ContinueFight = 90000010033 --下一关
+local back = 90000010034                --返回
+local nextChapter = 90000010035         --下一章
+
+---是否为圣兽
+---@param sid number id
+---@return boolean 是否为圣兽
+local function isBeastCard(sid)
+    local cfg = card_cfg[sid]
+    if not cfg then
+        local monsterCfg = monster_cfg[sid]
+        if monsterCfg then
+            cfg = card_cfg[monsterCfg.CardID]
+        end
+    end
+    if cfg and cfg.UnitType == _G.HeroType.Beast then
+        return true
+    end
+    return false
+end
+
+--- 启动
+---@param iSWin boolean 是否胜利
+---@param AwardData ShowAwardData[] 奖励显示数据
+---@param btnDisplay boolean 显示功能按钮
+---@param funcForecast boolean 显示功能预告
+---@param statistics boolean 显示统计按钮
+---@param islv boolean  是否显示等级
+---@param autonextDisplay boolean  是否推图
+---@param NextChapter boolean  是否为章末
+---@param back boolean  是否显示返回按钮
+---@param afktips afk_stage_cfg  推图目标
+---@param extraAward public.i_award  额外奖励
+---@param mvpData table 部分跳过战斗没有战斗数据，故由上层指定mvp角色传入{sid=x,uid=x}
+---@param privilegeData ShowAwardData[] 特权奖励
+---@param showTwoBtn boolean  是否显示“确定”按钮
+function ShowAwardWithButtonView:OnCreateChild(
+        result,
+        extraAward,
+        statisticsData,
+        statisticsIndex,
+        curFightArgTable,
+        mvpData,
+        defender)
+    if nil == result or type(result) ~= "table" then
+        result = {}
+    end
+    self.awardCount = 0
+    self.funcForecast = result.funcForecast or false
+    self.autonextDisplay = result.autonextDisplay or false
+    self.showTwoBtn = result.showTwoBtn or false
+    self.bottomTip = result.bottomTip
+    self.NextChapter = result.NextChapter or false
+    self.showStatisticsBtn = result.statistics or false
+    self.back = result.back or false
+    self.emptyNotBack = result.emptyNotBack or false
+    self.myWin = result.iSWin or false
+    self.winTable = result.winTable
+    self.showBtn = result.btnDisplay or false
+    self.AwardData = result.AwardData or nil
+    ---奖励结果排序: 0.不排序(默认值), 1.排序
+    ---@type number
+    self.AwardDataSort = result.AwardDataSort or 0
+    self.ExtraAward = extraAward or nil
+    self.re_uid = result.re_uid or {}
+    self.reportType = result.reportType or 0
+    self.isReport = result.isReport
+    self.afkPage = result.page or 1
+    self.privilegeData = result.privilegeData or nil
+    ---当前战斗是否为防守方
+    self.defender = defender or 1
+    self.statisticsData = not _G.table.isEmptyOrNil(statisticsData) and statisticsData or nil
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(result.AwardData, "result.AwardDataresult.AwardDataresult.AwardData")
+    end
+    self.otherInfo = result.otherInfo or nil
+    self.itemTable = {}
+    self.AllItemGoTable = {}
+    self.waitTime = nil --自动推图等待时间
+    self.addExp = 0
+    self.nowExp = 0
+    self.isUp = nil
+    self.CardData = nil
+    self.afktips = result.afktips or nil
+    self.task = result.task or nil
+    self.hideCombBtn = result.hideCombBtn
+    self.hidePetBtn = result.hidePetBtn
+    self.mvpCardSid = result.MvpCardSid
+    self.hidePlayerInfo = result.hidePlayerInfo
+    self.fightArgTable = curFightArgTable
+    if AppSetting.IsXzns then
+        if not self.myWin then
+            self.showBtn = true
+        end
+        if result.forceHideBtn then
+            self.forceHideBtn = result.forceHideBtn
+        end
+        self.hidePlayerInfo = true
+    end
+    self:SetAwardCount()
+    self:GetMvp(statisticsData, statisticsIndex, mvpData)
+    self:Init()
+    self.go_table.obj_tips:SetActiveE(not self.emptyNotBack and 1 or 0)
+    if self.emptyNotBack then
+        self:SetCloseTimer()
+    end
+    -- if _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name) then
+    --     _G.GameUtil.ChangeDefulfRootSize(true)
+    --     _G.GameUtil.ChangeChatDefultLayer()
+    -- else
+    --     self.isOpenChat = true
+    --     _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name, { x = 45, y = 65 })
+    -- end
+    --关闭Mask屏蔽遮罩
+    self.go_table.obj_Mask:SetActiveE(0)
+end
+
+---注册特效界面打开和关闭监听
+---@param call function 回调方法
+function ShowAwardWithButtonView:RegiestEffectViewOpen(call)
+    self.onEffectViewOpenCall = call
+end
+
+---注册奖励加载完监听
+---@param call function 回调方法
+function ShowAwardWithButtonView:RegiestAwardOpen(call)
+    self.onAwardOpenCall = call
+end
+
+function ShowAwardWithButtonView:SetCloseTimer()
+    local time = _G.ConfigManager.discrete_cfg[120010][1][1]
+    self.closeTimer = _G.TimerManager:GetInstance():GetTimer(time, function()
+        --如果此面板已被销毁或被隐藏, 不用继续执行
+        if self:IsNil() or self.go_table.gameObject:GetctiveInHierarchy() ~= 1 then
+            return
+        end
+        self:CloseCall(SettlementModel.FunctionEnum.Back)
+    end, self, true, false)
+    self.closeTimer:Start()
+end
+
+function ShowAwardWithButtonView:CloseCall(Back)
+    ShowAwardWithButtonView.super.CloseCall(self, Back)
+    self.isCloseCall = true
+end
+
+function ShowAwardWithButtonView:GetMvp(statisticsData, statisticsIndex, mvpData)
+    ---@type Card CardData
+    local Card = _G.CardData.New()
+    if mvpData then
+        Card:Parse(mvpData)
+        self.CardData = Card
+        self.showStatisticsBtn = false
+        return
+    end
+    --默认一个sid保证一定会有模型生成
+    --ZHJH-6671【战斗】战斗完后结算界面卡死且报错: 原本默认的card_cfg配置已被删除
+    Card:Parse({ sid = 111070000, uid = 111070000 })
+    self.CardData = Card
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return
+    end
+
+    --没传战报数据
+    local hasFightArgs = self.fightArgTable and #self.fightArgTable > 0
+    if not self.statisticsData then
+        if _G.BattleManager:GetInstance():HasStatisticsCached() then
+            self.statisticsData = _G.BattleManager:GetInstance():GetStatistics() --直接返回缓存数据
+        elseif not hasFightArgs then
+            self.statisticsData = _G.BattleManager:GetInstance():GetStatistics() --走C#打一遍纯逻辑战斗
+            if _G.AppSetting.DEBUG then
+                _G.LogError("没有战报数据和统计数据, 默认执行C#战斗统计")
+            end
+        end
+    end
+
+    if self.mvpCardSid then
+        Card:Parse({ sid = self.mvpCardSid, uid = self.mvpCardSid })
+        self.CardData = Card
+    elseif self.statisticsData then
+        --通过统计数据获取mvp
+        local lastTeamIndex = #self.statisticsData.FighterInfo
+        if self.statisticsData.FighterInfo[lastTeamIndex].Attacker ~= nil then
+            self.Attacker = self.statisticsData.FighterInfo[lastTeamIndex].Attacker
+        end
+        if self.statisticsData.FighterInfo[lastTeamIndex].Defender ~= nil then
+            self.Defender = self.statisticsData.FighterInfo[lastTeamIndex].Defender
+        end
+        local cardData
+        if self.defender == 1 then
+            cardData = self:SortAttacker()
+        else
+            cardData = self:SortDefender()
+        end
+        if cardData then
+            if string.len(tostring(cardData.Uid)) < 12 then
+                if card_cfg[cardData.Sid] then
+                    Card:Parse({ sid = cardData.Sid, uid = cardData.Uid })
+                elseif monster_cfg[cardData.Sid] then
+                    Card:Parse({ sid = monster_cfg[cardData.Sid].CardID, uid = cardData.Uid })
+                end
+                self.CardData = Card
+            else
+                self.CardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, cardData.Uid)
+                --判断是不是空，如果是空 （去千机黑煞 卡牌库，拿数据）
+                if self.CardData == nil then
+                    Card:Parse({ sid = cardData.Sid, uid = cardData.Uid })
+                    self.CardData = Card
+                end
+            end
+        else
+            self.showStatisticsBtn = false
+            if _G.AppSetting.DEBUG then
+                _G.LogError("没有进攻方数据")
+            end
+        end
+    elseif hasFightArgs then
+        --通过战报数据获取mvp
+        ---@type fight.i_fight_arg
+        local fightArg = self.fightArgTable[#self.fightArgTable]
+        ---@type fight.i_fight_team[]
+        local teamData = self.defender == 1 and fightArg.attacker_team or fightArg.defender_team
+        if teamData and #teamData > 0 then
+            ---@type fight.i_fight_fighter,number
+            local cardArg, cardPower = nil, 0
+            --计算卡牌属性战力
+            ---@type AttributeClass
+            local pc = _G.AttributeClass.New()
+            pc:OnInit(nil, nil)
+            for _, fight in pairs(teamData[1].fights) do
+                if not isBeastCard(fight.sid) then
+                    pc.attribute = fight.attrs
+                    local power = pc:CalculatePower()
+                    if not cardArg or power > cardPower or power == cardPower and fight.lv > cardArg.lv then
+                        cardArg = fight
+                        cardPower = power
+                    end
+                end
+            end
+            if cardArg then
+                if string.len(tostring(cardArg.uid)) < 12 then
+                    if card_cfg[cardArg.sid] then
+                        Card:Parse({ sid = cardArg.sid, uid = cardArg.uid })
+                    elseif monster_cfg[cardArg.sid] then
+                        Card:Parse({ sid = monster_cfg[cardArg.sid].CardID, uid = cardArg.uid })
+                    end
+                    self.CardData = Card
+                else
+                    self.CardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, cardArg.uid)
+                    --判断是不是空，如果是空 （去千机黑煞 卡牌库，拿数据）
+                    if self.CardData == nil then
+                        Card:Parse({ sid = cardArg.sid, uid = cardArg.uid })
+                        self.CardData = Card
+                    end
+                end
+            end
+        else
+            self.showStatisticsBtn = false
+            if _G.AppSetting.DEBUG then
+                _G.LogError("战报数据无团队信息, 无法获取mvp信息")
+            end
+        end
+    else
+        --是否展示统计数据按钮
+        self.showStatisticsBtn = false
+        if _G.AppSetting.DEBUG then
+            _G.LogError("没有战报数据和统计数据, 无法获取mvp信息")
+        end
+    end
+
+    -- if _G.PlayerModel:GetInstance():CheckCreateRole() then
+    --     if self.statisticsData == nil then
+    --         self.statisticsData = statisticsData or _G.BattleManager:GetInstance():GetStatistics()
+    --     end
+    --     ---放置改为多队 mvp规则变为多队中随机取一队的mvp展示（弃）statisticsIndex or 1
+    --     ---如果有其他功能也需要多队 找策划确认mvp显示规则（弃）
+    --     ---ZHJ-24471 多队布阵显示最后一队的mvp
+    --     if self.statisticsData ~= nil then
+    --         local lastNum = #self.statisticsData.FighterInfo
+    --         if self.statisticsData.FighterInfo[lastNum].Attacker ~= nil then
+    --             self.Attacker = self.statisticsData.FighterInfo[lastNum].Attacker
+    --         end
+    --         if self.statisticsData.FighterInfo[lastNum].Defender ~= nil then
+    --             self.Defender = self.statisticsData.FighterInfo[lastNum].Defender
+    --         end
+    --     else
+    --         self.showStatisticsBtn = false
+    --     end
+    --     if self.mvpCardSid then
+    --         Card:Parse({ sid = self.mvpCardSid, uid = self.mvpCardSid })
+    --         self.CardData = Card
+    --     else
+    --         local cardData
+    --         if self.defender == 1 then
+    --             cardData = self:SortAttacker()
+    --         else
+    --             cardData = self:SortDefender()
+    --         end
+    --         if cardData then
+    --             if string.len(tostring(cardData.Uid)) < 12 then
+    --                 if card_cfg[cardData.Sid] then
+    --                     Card:Parse({ sid = cardData.Sid, uid = cardData.Uid })
+    --                 elseif monster_cfg[cardData.Sid] then
+    --                     Card:Parse({ sid = monster_cfg[cardData.Sid].CardID, uid = cardData.Uid })
+    --                 end
+    --                 self.CardData = Card
+    --             else
+    --                 self.CardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, cardData.Uid)
+    --                 --判断是不是空，如果是空 （去千机黑煞 卡牌库，拿数据）
+    --                 if self.CardData == nil then
+    --                     Card:Parse({ sid = cardData.Sid, uid = cardData.Uid })
+    --                     self.CardData = Card
+    --                 end
+    --             end
+    --         else
+    --             if _G.AppSetting.DEBUG then
+    --                 _G.Log("没有进攻方数据")
+    --             end
+    --         end
+    --     end
+    -- end
+end
+
+--region ----------------------------------------------------结算场景相关
+function ShowAwardWithButtonView:Init()
+    --战斗结束, 销毁RoleParent缓存(缓存布阵丶战斗相关节点)
+    --_G.WorldManager:GetInstance():DespawnRoleParent()
+    --战斗逻辑处理
+    --_G.BattleManager:GetInstance():SetCineAndVisualCam(false)
+    --_G.BattleManager:GetInstance():SetSceneObjActive(false)
+    --self:StartLoadRoleScene(self.CardData)
+    self:InitView(self.myWin)
+end
+
+---@param tCardData CardData
+function ShowAwardWithButtonView:StartLoadRoleScene(tCardData)
+    if tCardData == nil then
+        return
+    end
+    local skin = nil
+    if skin == nil then
+        skin = tCardData.skin
+    end
+    self.tempSkin = skin
+
+    self.ShowCfg = require("CardInfoManager").GetCardSkin_ShowCfg(tCardData.skin, tCardData.sid)
+    self:LoadRoleScene(
+            self.ShowCfg.ModelPathHi,
+            function()
+                self:SetScene(false)
+                local uiModel = _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.ui_model_1)
+                self.go_table.obj_mvpTitle:SetActiveE(uiModel and 0 or 1)
+                self.go_table.obj_mvpTitle1:SetActiveE(uiModel and 1 or 0)
+            end
+    )
+end
+
+function ShowAwardWithButtonView:LoadRoleScene(rolepath, callback)
+    self:RoleRecycle()
+    ---@type ui_params_cfg
+    _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.ShowAwardWithButtonView, self.go_table)
+    self.spawn = require("CardInfoManager").GetRole(
+            rolepath,
+            _G.ePoolType.UIItem,
+            self.go_table.obj_mvpRoot,
+            _G.RoleEffTypeEnum.RoleShow,
+            function(trans)
+                if trans == nil then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("角色无法加载 path:" .. rolepath .. "    CardInfoself LoadRoleScene")
+                    end
+                    return
+                end
+                if _G.IsNil(self.go_table) or self.CardData == nil or rolepath ~= self.ShowCfg.ModelPathHi then
+                    self.spawn:DisposeItem()
+                    return
+                end
+                if _G.AppSetting.IsXzns then
+                    local spineCfg = _G.ConfigManager.card_show_cfg[self.CardData.sid] or _G.ConfigManager.skin_cfg[self.CardData.sid]
+                    local idle = spineCfg.display_idle[1]
+                    _G.GameUtil.SetCardUiSpineAnimation(trans, idle, true)
+                    _G.GameUtil.SetUiHeXieMask(self.go_table, 3)
+                end
+                self.spawn = nil
+                _G.GameUtil.SetActiveByCondition(trans, false)
+                self.RoleTrans = trans
+                local myCard_show_cfg = _G.ConfigManager.card_show_cfg[self.CardData.skin] or
+                        _G.ConfigManager.card_show_cfg[self.CardData.sid]
+                if myCard_show_cfg == nil then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("card_show_cfg 未找到配置 sid:" .. self.CardData.sid)
+                    end
+                end
+                self.myCard_show_cfg = myCard_show_cfg
+
+                local cardCfg = _G.ConfigManager.card_cfg[self.CardData.skin] or
+                        _G.ConfigManager.card_cfg[self.CardData.sid]
+                -- --设置  缩放
+                local scale = cardCfg and cardCfg.size4 or 1
+                trans:SetLocalScale(scale, scale, scale)
+                self:InitRotPos()
+                if callback then
+                    callback(trans)
+                end
+            end
+    )
+end
+
+function ShowAwardWithButtonView:InitRotPos(isDel)
+    if _G.IsNil(self.RoleTrans) then
+        return
+    end
+
+    self.EfDic = {}
+    self.IsAniPlaying = false
+    self.RoleTrans:SetLocalEulerAngles(0, 0, 0)
+    --播放一次 初始化 RoleAnimatorController.cs--> animationTime
+    if _G.AppSetting.IsXzns then
+        self.RoleTrans:SetActiveE(not _G.GameUtil.IsHeXieHide() and 1 or 0)
+    else
+        _G.GameUtil.SetActiveByCondition(self.RoleTrans, true)
+    end
+
+    self.Timer_InitCard = _G.TimerManager:GetInstance():GetTimer(1, self.GetTimerCallBackRotPos, self, true, true)
+    self.Timer_InitCard:Start()
+end
+
+function ShowAwardWithButtonView:GetTimerCallBackRotPos()
+    local pos = {}
+    if self.myCard_show_cfg ~= nil then
+        pos = self.myCard_show_cfg.pos
+    end
+
+    local x, y, z = pos[1] or 0, pos[2] or 0, pos[3] or 0
+    if self.RoleTrans ~= nil then
+        self.RoleTrans:SetLocalPosition(x, y, z)
+    end
+    self:PlaySound(self.myCard_show_cfg.audio_enter, self.myCard_show_cfg.sound_enter)
+end
+
+function ShowAwardWithButtonView:PlaySound(audioCfg, soundPath)
+    self:ClearAudio()
+    self.ActionAudioArr = {}
+    if self.IsAniPlaying then
+        if _G.string.IsNullOrEmpty(audioCfg) == false then
+            local path = audioCfg
+            if path ~= nil then
+                self.ActionAudioArr[path] = true
+                _G.AudioManager.Dialogue_PlayPath(path)
+            end
+        end
+        if _G.string.IsNullOrEmpty(soundPath) == false then
+            local path = soundPath
+            if path ~= nil then
+                self.LinesPath = path
+                _G.AudioManager.PlayPathBackFun(path)
+            end
+        end
+    end
+end
+
+function ShowAwardWithButtonView:ClearAudio()
+    if self.ActionAudioArr ~= nil then
+        for path, value in pairs(self.ActionAudioArr) do
+            _G.AudioManager.StopSoundByPath(path)
+            self.ActionAudioArr[path] = nil
+        end
+    end
+    if self.LinesPath ~= nil then
+        _G.AudioManager.Dialogue_StopPath(self.LinesPath)
+    end
+end
+
+function ShowAwardWithButtonView:LoadActionEff(idArr)
+    if idArr == nil or #idArr == 0 then
+        return
+    end
+
+    local effcfg = _G.ConfigManager.card_effect_cfg
+
+    for i = 1, #idArr do
+        local id = idArr[i]
+        local myEff = effcfg[id]
+        if myEff == nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" card_effect_cfg 未找到id: " .. tostring(id))
+            end
+        else
+            self:LoadFunc(myEff, self.sceneTrans)
+        end
+    end
+end
+
+---@param cfg card_effect_cfg
+function ShowAwardWithButtonView:LoadFunc(cfg, parent)
+    if self.RoleTrans == nil then
+        return
+    end
+
+    local pos = cfg.pos or { 0, 0, 0 }
+    local scale = cfg.scale > 0 and cfg.scale or 1
+    --region --------------------------------------当前特效 要隐藏的其他特效--------
+    if #cfg.ef_false > 0 then
+        for i = #cfg.ef_false, 1, -1 do
+            local tranPath = cfg.ef_false[i]
+            local efobj = self.RoleTrans:FindE(tranPath)
+            if efobj ~= nil then
+                _G.GameUtil.SetActiveByCondition(efobj, false)
+            end
+        end
+    end
+    --endregion
+
+    --region --------------------------------------如果加载过 或者本身有这特效--------
+    -- _G.UIUtils.LoadEffectByPath(
+    --     cfg.Ef_Path,
+    --     parent,
+    --     function(tran)
+    --         _G.table.insert(self.ActionEffTempArr, tran)
+    --     end,
+    --     nil,
+    --     0,
+    --     pos,
+    --     scale,
+    --     0,
+    --     true
+    -- )
+    local efTran = self.EfDic[cfg.id]
+    if efTran ~= nil then
+        ---  特效要隐藏在显示  确保动画重播
+        _G.GameUtil.SetActiveByCondition(efTran, false)
+        _G.GameUtil.SetActiveByCondition(efTran, true)
+    else
+        if string.IsNullOrEmpty(cfg.ef_point) == false then
+            if cfg.ef_point == "1" then
+                parent = self.RoleTrans
+            else
+                parent = self.RoleTrans:FindE(cfg.ef_point)
+                if parent == nil then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError(cfg.id .. " 挂点路径未找到: " .. cfg.ef_point)
+                    end
+                    return
+                end
+            end
+        end
+        --- 否则 加载
+        _G.UIUtils.LoadEffectByPath(
+                cfg.Ef_Path,
+                parent,
+                function(tran)
+                    table.insert(self.ActionEffTempArr, tran)
+                    self.EfDic[cfg.id] = tran
+                end,
+                nil,
+                0,
+                pos,
+                scale,
+                1,
+                true
+        )
+    end
+end
+
+function ShowAwardWithButtonView:RoleRecycle()
+    if self.spawn then
+        self.spawn:DisposeItem()
+        self.spawn = nil
+    end
+    if not _G.IsNil(self.RoleTrans) then
+        self:InitRotPos(true)
+        if self.Timer_InitCard ~= nil then
+            self.Timer_InitCard:Stop()
+            self.Timer_InitCard = nil
+        end
+
+        if self.RoleTrans ~= nil then
+            _G.PoolsManager:GetInstance():Despawn(self.RoleTrans, _G.ePoolType.UIItem)
+        end
+        self.EfCardSid = 0
+        self.EfDic = {}
+        self.RoleTrans = nil
+        self.myCard_show_cfg = nil
+    end
+end
+
+--endregion ----------------------------------------------------结算场景相关
+
+---解析结算奖励
+function ShowAwardWithButtonView:SetAwardCount()
+    local count = 0
+    local count1 = 0
+    if self.AwardData and not _G.table.isEmptyOrNil(self.AwardData) then
+        count = _G.table.count(self.AwardData)
+    end
+    if self.ExtraAward and not _G.table.isEmptyOrNil(self.ExtraAward) then
+        count1 = _G.table.count(self.ExtraAward)
+    end
+    self.awardCount = count + count1
+end
+
+function ShowAwardWithButtonView:SortAttacker()
+    if self.myWin then
+        if self.Attacker ~= nil then
+            _G.SortList(
+                    self.Attacker,
+                    function(a)
+                        return a.DmgOut
+                    end
+            )
+        end
+    else
+        if self.Attacker ~= nil then
+            _G.SortList(
+                    self.Attacker,
+                    function(a)
+                        return a.HpRecover, a.DmgIn
+                    end
+            )
+        end
+    end
+    if self.Attacker then
+        for _, cardData in ipairs(self.Attacker) do
+            if not isBeastCard(cardData.Sid) then
+                return cardData
+            end
+        end
+        --return self.Attacker[1]
+    end
+    return nil
+end
+
+function ShowAwardWithButtonView:SortDefender()
+    if self.myWin then
+        if self.Defender ~= nil then
+            _G.SortList(
+                    self.Defender,
+                    function(a)
+                        return a.DmgOut
+                    end
+            )
+        end
+    else
+        if self.Defender ~= nil then
+            _G.SortList(
+                    self.Defender,
+                    function(a)
+                        return a.HpRecover, a.DmgIn
+                    end
+            )
+        end
+    end
+    if self.Defender then
+        for _, cardData in ipairs(self.Defender) do
+            if not isBeastCard(cardData.Sid) then
+                return cardData
+            end
+        end
+        --return self.Defender[1]
+    end
+    return nil
+end
+
+function ShowAwardWithButtonView:InitView(iSWin)
+    -- if _G.table.isEmptyOrNil(self.funcForecast) and _G.table.isEmptyOrNil(self.task) and not self.afktips then
+    --     self.go_table.obj_ScrollView:SetRectTransformOffset(0, 0, 0, 0)
+    -- end
+    if iSWin then
+        self.go_table.obj_V:SetActiveE(1)
+        self.go_table.obj_L:SetActiveE(0)
+        self.Scroll = self.go_table.obj_ScrollView:GetComponentE(_G.typeof(_G.CS.UnityEngine.UI.ScrollRect))
+        self:CreateVEff()
+        --_G.AudioManager.PlayAudioByAudioCfgID(2053)
+    else
+        self.go_table.obj_V:SetActiveE(0)
+        self.go_table.obj_L:SetActiveE(1)
+        self:CreateLEff()
+        _G.AudioManager.PlayAudioByAudioCfgID(2052)
+    end
+    --通知c#战斗内清除特效表现层(要求在结算界面出来的时候清理特效)
+    _G.CS.BattleManager.ShowFightPoseEnd()
+
+    --角色信息
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() or self.hidePlayerInfo then
+        self.go_table.obj_info:SetActiveE(0)
+        return
+    end
+
+    local playerModel = _G.PlayerModel:GetInstance()
+    local lvCfg = _G.ConfigManager.player_level_cfg[playerModel:GetLevel()]
+    local exp = playerModel.exp or 0
+    local upExp = lvCfg and lvCfg.exp or exp
+    self.go_table.aorimage_exp:SetLocalScale((upExp <= 0 or exp > upExp) and 1 or exp / upExp, 1, 1)
+    if AppSetting.IsXzns then
+        self.go_table.aortext_level.text = _G.GetLangPackValue(9201005001, playerModel:GetLevel())
+        exp = string.AddColor(exp, "ffb93f")
+    else
+        self.go_table.aortext_level.text = _G.GetLangPackValue(90000011081, playerModel:GetLevel())
+    end
+    self.go_table.aortext_exp.text = string.format("%s/%s", exp, upExp)
+    --角色头像/头像框
+    local headStyle = playerModel:GetRoleStyle()
+    local headCfg = headStyle and _G.ConfigManager.player_portrait_cfg[headStyle]
+    if headCfg then
+        self.go_table.aorimage_head.SpriteName = headCfg.portrait1
+    end
+    local frame = playerModel:GetCurFrame()
+    local frameCfg = frame and _G.ConfigManager.player_frame_cfg[frame]
+    if frameCfg then
+        _G.UIUtils.RemoveChildren(self.go_table.aorrawimage_frame)
+        if frameCfg.type_title ~= 2 then
+            self.go_table.aorrawimage_frame:LoadImage(frameCfg.frame)
+        else
+            self.go_table.aorrawimage_frame.color = _G.Color.New(1, 1, 1, 0)
+            _G.DelayFrameDo(function()
+                _G.UIUtils.LoadEffectTitleOrFrame(
+                        frameCfg.frame,
+                        self.go_table.aorrawimage_frame,
+                        function(item)
+                            item:SetLocalScale(0.85, 0.85, 1)
+                        end
+                )
+            end)
+        end
+    end
+end
+
+function ShowAwardWithButtonView:OnEnable()
+end
+
+----关闭的时候物体进池
+function ShowAwardWithButtonView:OnDisable()
+    if self.itemTable then
+        for i = 1, #self.itemTable do
+            require("ItemViewBase").Dispose(self.itemTable[i])
+        end
+        self.itemTable = {}
+    end
+    if self.closeTimer then
+        self.closeTimer:Stop()
+        self.closeTimer = nil
+    end
+end
+
+function ShowAwardWithButtonView:DisposeReource()
+    _G.BattleManager:GetInstance():SetCineAndVisualCam(true)
+    self:SetScene(true)
+    --_G.BattleManager:GetInstance():HideFighterRootItem(true)
+    if self.RoleTrans then
+        _G.PoolsManager:GetInstance():Despawn(self.RoleTrans, _G.ePoolType.UIItem)
+    end
+    if self.spawn then
+        self.spawn:DisposeItem()
+    end
+    if self.sceneTrans then
+        _G.PoolsManager:GetInstance():Despawn(self.sceneTrans, _G.ePoolType.Static)
+    end
+end
+
+function ShowAwardWithButtonView:OnDestroy()
+    if self.isCloseCall == nil then
+        self:CloseCall(SettlementModel.FunctionEnum.Back)
+    end
+    self.isClose = nil
+    self.isCloseCall = nil
+    if self.timer ~= nil then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.waitTimer ~= nil then
+        self.waitTimer:Stop()
+        self.waitTimer = nil
+    end
+    if self.maskTimer ~= nil then
+        self.maskTimer:Stop()
+        self.maskTimer = nil
+    end
+    if self.closeTimer ~= nil then
+        self.closeTimer:Stop()
+        self.closeTimer = nil
+    end
+    self.waitTime = nil
+    self.gameObject = nil
+    self.transform = nil
+    self.go_table = nil
+    self.showBtn = nil
+    self.showStatisticsBtn = nil
+    self.Scroll = nil
+    self.afktips = nil
+    self.funcForecast = nil
+    if self.Toggle then
+        self.Toggle = nil
+    end
+end
+
+function ShowAwardWithButtonView:NextChapterClose()
+    if self.NextChapter then
+        self:ClickNextChapter()
+    else
+        self:CloseCall(SettlementModel.FunctionEnum.None)
+    end
+end
+
+-- 按钮单击事件
+function ShowAwardWithButtonView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_BG then
+        if self.emptyNotBack then
+            return
+        end
+        if self.NextChapter then
+            self:ClickNextChapter()
+        else
+            if self.myWin and self.back == false and self.autonextDisplay and self.showTwoBtn and self.Toggle.isOn == true then
+                self:CloseCall(SettlementModel.FunctionEnum.Next)
+                return
+            end
+            self:CloseCall(SettlementModel.FunctionEnum.None)
+        end
+    end
+end
+
+function ShowAwardWithButtonView:OnHellGuardAuotNext()
+    self:CloseCall(SettlementModel.FunctionEnum.Next)
+end
+
+function ShowAwardWithButtonView:GetTimerCallBackA()
+    self.go_table.obj_Mask:SetActiveE(0)
+end
+
+function ShowAwardWithButtonView:GetTimerCallBackB()
+    self.go_table.obj_Mask:SetActiveE(0)
+    ---非新手关显示
+    _G.GameUtil.SetActiveByCondition(
+            self.VEff.aorbtn_shibaitotal,
+            self.showStatisticsBtn and _G.PlayerModel:GetInstance():CheckCreateRole()
+    )
+    self.go_table.aortext_tip:SetParentE(self.go_table.obj_tips1)
+    self.go_table.aortext_tip:SetActiveE(1)
+end
+
+local ProgressCompletedRGB = _G.Color.New(55 / 255, 197 / 255, 90 / 255, 1)
+
+function ShowAwardWithButtonView:GetTimerCallBackC()
+    local sid = require "AfkModel":GetInstance():GetLastSection()
+    local cfg
+    if not _G.table.isEmptyOrNil(self.funcForecast) then
+        _G.GameUtil.SetActiveByCondition(self.VEff.aorimage_forecast, true)
+        self.VEff.aortext_forecastProgress.text = self.funcForecast.progress
+        self.VEff.aortext_forecast.text = self.funcForecast.desc
+        if self.funcForecast.finish then
+            self.VEff.aortext_forecastProgress.color = ProgressCompletedRGB
+            self.VEff.aortext_forecast.color = ProgressCompletedRGB
+            self.VEff.aorimage_foreDone:SetActiveE(1)
+        end
+        _G.GameUtil.SetActiveByCondition(self.VEff.obj_forecastItem, self.funcForecast.item)
+        _G.GameUtil.SetActiveByCondition(self.VEff.obj_forecastItemEff, self.funcForecast.item)
+        if self.funcForecast.item then
+            _G.StorageManager:GetInstance():GetItemBaseView(
+                    self.funcForecast.item,
+                    1,
+                    self.VEff.obj_forecastItem,
+                    function(tran)
+                        tran:ShowNumText(false)
+                    end
+            )
+            LoadEffectByCfg(
+                    ui_effect_cfg.ef_jiesuanjiangli,
+                    self.VEff.obj_forecastItemEff,
+                    function(trans)
+                    end
+            )
+        end
+    end
+    if self.afktips then
+        cfg = _G.ConfigManager.afk_cfg[self.afktips[2]]
+        _G.GameUtil.SetActiveByCondition(self.VEff.aorimage_afktips, true)
+        self.VEff.aortext_afkProgress.text = "(" ..
+                _G.ConfigManager.afk_cfg[sid].number .. "/" .. _G.ConfigManager.afk_cfg[self.afktips[2]].number .. ")"
+        self.VEff.aortext_afktips.text = _G.LangUtil.GetLangPackValue(10100003579, cfg.chapter, cfg.section)
+        if sid == self.afktips[2] then
+            self.VEff.aortext_afkProgress.color = ProgressCompletedRGB
+            self.VEff.aortext_afktips.color = ProgressCompletedRGB
+            self.VEff.aorimage_afkDone:SetActiveE(1)
+        end
+    end
+    if not _G.table.isEmptyOrNil(self.task) then
+        _G.GameUtil.SetActiveByCondition(self.VEff.aorimage_task, self.task.finish)
+        self.VEff.aortext_task.text = self.task.desc
+        self.VEff.aortext_taskProgress.text = self.task.progress
+        if self.task.finish then
+            self.VEff.aortext_taskProgress.color = ProgressCompletedRGB
+            self.VEff.aortext_task.color = ProgressCompletedRGB
+            self.VEff.aorimage_taskDone:SetActiveE(1)
+        end
+    end
+    -- if self.AllItem and #self.AllItem > 0 then
+    --     for _, v in pairs(self.AllItem) do
+    --         v:SetActiveE(1)
+    --     end
+    -- end
+    ---非新手关显示
+    _G.GameUtil.SetActiveByCondition(
+            self.VEff.aorbtn_shenglitotal,
+            self.showStatisticsBtn and _G.PlayerModel:GetInstance():CheckCreateRole()
+    )
+    self.VEff.toggle_autoNext:SetActiveE(self.autonextDisplay and 1 or 0)
+    self.go_table.aortext_tip:SetActiveE(1)
+    self.VEff.aortext_bottomTip:SetActiveE(self.bottomTip and 1 or 0)
+    self.VEff.aortext_bottomTip.text = self.bottomTip and self.bottomTip or ""
+end
+
+---打开和点击按钮
+function ShowAwardWithButtonView:OpenBtn()
+    -- local delay = _G.ConfigManager.discrete_cfg[_G.DiscreteCfg_Enum.viewCloseDelay][1][1]
+    local delay = 0.8
+    local maskDelay = 1.5
+    self.maskTimer = _G.TimerManager:GetInstance():GetTimer(maskDelay, self.GetTimerCallBackA, self, true, false)
+    if self.myWin == false then
+        self.timer = _G.TimerManager:GetInstance():GetTimer(delay, self.GetTimerCallBackB, self, true, false)
+    else
+        self.timer = _G.TimerManager:GetInstance():GetTimer(delay, self.GetTimerCallBackC, self, true, false)
+    end
+    self.go_table.aortext_tip.text = _G.GetLangPackValue(TapScreenToContinue)
+    self.go_table.aortext_tip:DOFade(0.2, 1):SetLoops(-1, _G.CS.DG.Tweening.LoopType.Yoyo)
+    self.maskTimer:Start()
+    self.timer:Start()
+end
+
+---初始化胜利界面加载特效
+function ShowAwardWithButtonView:InitV()
+    local LoadEnd = true
+    if self.awardCount > 0 then
+        LoadEnd = false
+        if self.AllItem == nil then
+            self.AllItem = {}
+        end
+        self.CreateCount = 0
+        self:ParseAward(self.AwardData, self.ExtraAward, self.privilegeData)
+        self:CreateItem(self.Award)
+    end
+    if LoadEnd then
+        self:CreateVEff()
+    end
+end
+
+function ShowAwardWithButtonView:LoadAwardView()
+    if self.awardCount > 0 then
+        if self.AllItem == nil then
+            self.AllItem = {}
+        end
+        self.CreateCount = 0
+        self:ParseAward(self.AwardData, self.ExtraAward, self.privilegeData)
+        self:CreateItem(self.Award)
+    end
+end
+
+function ShowAwardWithButtonView:ParseAward(award, extraAward, privilegeData)
+    self.Award = {}
+    local Award = {}
+    if award and not _G.table.isEmptyOrNil(award) then
+        for k, v in pairs(award) do
+            _G.table.insert(Award, { _award = v, _extra = false })
+        end
+    end
+    if extraAward and not _G.table.isEmptyOrNil(extraAward) then
+        for k, v in pairs(extraAward) do
+            _G.table.insert(Award, { _award = v, _extra = true })
+        end
+    end
+    if privilegeData and not _G.table.isEmptyOrNil(privilegeData) then
+        for k, v in pairs(privilegeData) do
+            _G.table.insert(Award, { _award = v, _privilege = true })
+        end
+    end
+    if not _G.table.isEmptyOrNil(Award) and self.AwardDataSort ~= 0 then
+        _G.SortList(
+                Award,
+                function(a)
+                    local storageID = _G.StorageManager:GetInstance():CheckSidType(a._award[1])
+                    local extra = a._extra and 0 or 1
+                    return storageID, a._award[1], extra
+                end
+        )
+    end
+    self.Award = Award
+end
+
+function ShowAwardWithButtonView:CreateItem(award)
+    local awardItem
+    -- local sid
+    -- local count
+    if award and not _G.table.isEmptyOrNil(award) then
+        --按照货币，道具，装备，id的顺序排序
+        if self.AwardDataSort ~= 0 then
+            for i = 1, #award do
+                local type = _G.StorageManager:GetInstance():CheckSidType(award[i]._award[1])
+                type = tonumber(type)
+                if type == 4 then
+                    award[i].Order = 1
+                elseif type == 1 then
+                    award[i].Order = 2
+                elseif type == 5 then
+                    award[i].Order = 3
+                else
+                    award[i].Order = 4
+                end
+            end
+            _G.SortList(
+                    award,
+                    function(a)
+                        if not _G.table.isEmptyOrNil(self.privilegeData) then
+                            local privilege = a._privilege and 0 or 1
+                            return privilege, -a.Order, -a._award[1]
+                        end
+                        return -a.Order, -a._award[1]
+                    end
+            )
+        end
+        for _, v in ipairs(award) do
+            local goTable
+            awardItem = _G.InstantiateObject(self.go_table.obj_item, self.go_table.obj_AwardContent)
+            awardItem:SetActiveE(1)
+            _G.table.insert(self.AllItem, awardItem:GetComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform)))
+            goTable = _G.GetAutoGoTable(awardItem)
+            goTable.sid = v._award[1]
+            goTable.data = v._award
+            _G.StorageManager:GetInstance():GetItemBaseViewNew(
+                    v._award,
+                    goTable.obj_root,
+                    function(tran)
+                        if self:IsNil() then
+                            _G.DestroyObject(tran)
+                            return
+                        end
+                        tran.gameObject:SetLocalPosition(0, 0, 0)
+                        tran:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+                        self.CreateCount = self.CreateCount + 1
+                    end,
+                    function()
+                        self:ClickAward(goTable)
+                    end
+            )
+            _G.GameUtil.SetActiveByCondition(goTable.aorimage_extra, v._extra)
+            _G.GameUtil.SetActiveByCondition(goTable.aorimage_zengyi, v._privilege)
+            _G.table.insert(self.AllItemGoTable, goTable)
+            if _G.table.count(award) == _G.table.count(self.AllItemGoTable) then
+                if self.onAwardOpenCall then
+                    self:onAwardOpenCall()
+                end
+            end
+        end
+    end
+end
+
+function ShowAwardWithButtonView:ClickAward(goTable)
+    local type = _G.StorageManager:GetInstance():CheckSidType(goTable.sid)
+    if type == _G.StorageType.Card then
+        ---@type DynamicCfg
+        local dc = {}
+        dc.HideWorld = false
+        require("CommonTipManager"):GetInstance():OpenTip(goTable.gameObject, goTable.sid, nil, dc)
+    elseif type == _G.StorageType.Decoration then
+        local uid = goTable.data and goTable.data[2] or 0
+        local cfg = _G.ConfigManager.decoration_cfg[goTable.sid]
+        local data = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Decoration, uid)
+        if _G.table.isEmptyOrNil(data) then
+            data = nil
+        end
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RuneTipView.Name, data, cfg, false, nil, nil, false, true)
+    elseif type == _G.StorageType.Carving then
+        local uid = goTable.data and goTable.data[2] or 0
+        local cfg = _G.ConfigManager.carving_cfg[goTable.sid]
+        local data = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Carving, uid)
+        if _G.table.isEmptyOrNil(data) then
+            data = nil
+        end
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CarvingTipView.Name, data, cfg, false, nil, nil, false, true)
+    else
+        require("CommonTipManager"):GetInstance():OpenTip(goTable.gameObject, goTable.sid)
+    end
+end
+
+---创建胜利界面特效
+function ShowAwardWithButtonView:CreateVEff()
+    if AppSetting.IsXzns then
+        self.go_table.obj_shengli_bg:SetActiveE(1)
+        self.go_table.obj_shibai_bg:SetActiveE(0)
+    end
+    _G.DelayFrameDo(function()
+        LoadEffectByCfg(
+                ui_effect_cfg.ShowAwardVBG1,
+                self.go_table.obj_Eff,
+                function(tran)
+                    if _G.AppSetting.DEBUG then
+                        _G.Log("生成结算胜利特效成功")
+                    end
+                    if self:IsNil() then
+                        _G.DestroyObject(tran)
+                        return
+                    end
+                    self.VEff = _G.GetAutoGoTable(tran)
+                    -- if self.isLv then
+                    --     self.VEff.aortext_LV.text = ""
+                    -- else
+                    --     self.VEff.aortext_LV.text = string.format("Lv.%d", self.PlayerLv)
+                    -- end
+                    -- self.VEff.slider_PlayerExp.value = self:CulrExpProgress(self.PlayerLv, self.nowExp)
+                    -- self.VEff.slider_PlayerExp.interactable = false
+                    _G.GameUtil.SetActiveByCondition(self.VEff.obj_shenglibutton, self.showBtn)
+                    --新手关特殊打开返回按钮
+                    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+                        _G.GameUtil.SetActiveByCondition(self.VEff.obj_shenglibutton, true)
+                        self.VEff.aortext_ContinueFight.text = _G.LangUtil.GetLangPackValue(back)
+                        self.VEff = _G.GetAutoGoTable(tran, _G.handlerbind(self, self.OnWinClickBtn, 1))
+                    end
+                    if self.autonextDisplay then
+                        self.Toggle = self.VEff.toggle_autoNext:GetComponentE(_G.typeof(_G.CS.UnityEngine.UI.Toggle))
+                        self.isOn = _G.PlayerPrefsManager.GetInt("AutoNextToggleData")
+                        self.Toggle.isOn = self.isOn == 1 and true or false
+                        self.Toggle.onValueChanged:AddListener(_G.handler(self, self.OnToggleChanged))
+                    end
+                    if self.back then
+                        self.VEff.aortext_ContinueFight.text = _G.LangUtil.GetLangPackValue(back)
+                        self.VEff = _G.GetAutoGoTable(tran, _G.handlerbind(self, self.OnWinClickBtn, 1))
+                    elseif self.NextChapter then
+                        self.VEff.aortext_ContinueFight.text = _G.LangUtil.GetLangPackValue(nextChapter)
+                        self.VEff = _G.GetAutoGoTable(tran, _G.handlerbind(self, self.OnWinClickBtn, 2))
+                    else
+                        self.VEff = _G.GetAutoGoTable(tran, _G.handlerbind(self, self.OnWinClickBtn, 3))
+                        if self.autonextDisplay and self.showTwoBtn then
+                            self.VEff.aorbtn_sure:SetActiveE(1)
+                        end
+                    end
+                    --加载role模型
+                    self:StartLoadRoleScene(self.CardData)
+                    --加载奖励信息
+                    self:LoadAwardView()
+                    self:ShowAward()
+                    if self.onEffectViewOpenCall then
+                        self.onEffectViewOpenCall(true)
+                    end
+                end)
+    end
+    )
+    if AppSetting.IsXzns == false then
+        LoadEffectByCfg(
+                ui_effect_cfg.ShowAwardVBGShengLI,
+                self.go_table.obj_Eff
+        )
+        LoadEffectByCfg(
+                ui_effect_cfg.ShowAwardVBGLight,
+                self.go_table.obj_Eff
+        )
+    end
+end
+
+function ShowAwardWithButtonView:ShowAward()
+    self.VEff.aortext_awardTxt:SetActiveE(self.awardCount > 0 and 1 or 0)
+    if not self.AllItem then
+        self:ShowAwardOverCheckOther(0)
+        return
+    end
+    if #self.AllItem > 4 then
+        self.Scroll.vertical = true
+    end
+    -- for _, v in pairs(self.AllItem) do
+    --     v:SetActiveE(1)
+    -- end
+    self:ShowAwardOverCheckOther()
+end
+
+--自动推图倒计时
+function ShowAwardWithButtonView:ShowWaitTime(elapsed)
+    if _G.AppSetting.DEBUG then
+        _G.Log(self.waitTime, "<color=red>" .. "开始推图倒计时" .. "</color>")
+    end
+    self.VEff.aortext_autoNext.text = string.format(_G.GetLangPackValue(AutoNextText), _G.Mathf.RoundToInt(self.waitTime))
+    self.waitTime = self.waitTime - elapsed
+    if self.waitTime < 0 then
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red>" .. "开始推图" .. "</color>")
+        end
+        self:CloseCall(SettlementModel.FunctionEnum.Next)
+
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red>" .. "推图成功" .. "</color>")
+        end
+    end
+end
+
+--自动推图toggle监听
+function ShowAwardWithButtonView:OnToggleChanged(isOn)
+    local time = _G.ConfigManager.discrete_cfg[AutoNextTimeID][1][1]
+    if self.Toggle.isOn then
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red>" .. "自动推图开" .. "</color>")
+        end
+        self.waitTime = time
+        self.waitTimer = _G.TimerManager:GetInstance():GetTimer(1, self.ShowWaitTime, self)
+        self.waitTimer:Start()
+        _G.PlayerPrefsManager.SetInt("AutoNextToggleData", 1)
+    else
+        if self.waitTimer ~= nil then
+            self.waitTimer:Stop()
+            self.waitTimer = nil
+
+            if _G.AppSetting.DEBUG then
+                _G.Log("<color=red>" .. "自动推图关" .. "</color>")
+            end
+        end
+        self.waitTime = time
+        self.VEff.aortext_autoNext.text = _G.GetLangPackValue(TapAutoNextText)
+        _G.PlayerPrefsManager.SetInt("AutoNextToggleData", 0)
+    end
+end
+
+---初始化失败界面加载特效
+function ShowAwardWithButtonView:CreateLEff()
+    if _G.AppSetting.DEBUG then
+        _G.Log("生成结算失败特效")
+    end
+    if AppSetting.IsXzns then
+        self.go_table.obj_shengli_bg:SetActiveE(0)
+        self.go_table.obj_shibai_bg:SetActiveE(1)
+    end
+    LoadEffectByCfg(
+            ui_effect_cfg.ShowAwardVBG2,
+            self.go_table.obj_FailEff,
+            function(tran)
+                if self:IsNil() then
+                    _G.DestroyObject(tran)
+                    return
+                end
+                if tran then
+                    --_G.AudioManager.PlayAudioByAudioCfgID(2029)
+                    self.VEff = _G.GetAutoGoTable(tran, _G.handler(self, self.OnFailClickBtn))
+                    self.VEff.obj_shibaibutton:SetActiveE((self.showBtn or self.back) and 1 or 0)
+                    if self.back then
+                        self.VEff.aortext_return.text = _G.LangUtil.GetLangPackValue(back)
+                        self.VEff.aorbtn_return:SetActiveE(1)
+                    end
+                    _G.GameUtil.SetActiveByCondition(self.VEff.obj_tips, not self.hideFailTips)
+                    if self.fightBtnStr then
+                        self.VEff.aortext_fight.text = self.fightBtnStr
+                        self.fightBtnStr = nil
+                    end
+                    if self.obj_shibaibutton then
+                        self.VEff.obj_shibaibutton:SetActiveE(self.obj_shibaibutton)
+                        self.fightBtnStr = nil
+                    end
+                    if _G.AppSetting.IsXzns then
+                        if self.forceHideBtn then
+                            self.VEff.obj_shibaibutton:SetActiveE(self.forceHideBtn and 0 or 1)
+                        end
+                    end
+                end
+                self:OpenBtn()
+                --加载role模型
+                self:StartLoadRoleScene(self.CardData)
+                if self.onEffectViewOpenCall then
+                    self.onEffectViewOpenCall(false)
+                end
+            end
+    )
+end
+
+function ShowAwardWithButtonView:ShowStatisticsView()
+    if self.waitTimer ~= nil then
+        self.waitTimer:Stop()
+        self.waitTimer = nil
+    end
+
+    if not self.statisticsData or self.fightArgTable and #self.fightArgTable ~= #self.statisticsData then
+        if not self.fightArgTable then
+            self.statisticsData = _G.BattleManager:GetInstance():GetStatistics()
+        else
+            --从fightArgTable中拉取战报
+            self.statisticsData = self.statisticsData or { FighterInfo = {} }
+            self.winTable = self.winTable or {}
+            for i = 1, #self.fightArgTable do
+                if not self.statisticsData.FighterInfo[i] then
+                    local record = _G.BattleManager:GetInstance():GetStatisticsRecord(self.fightArgTable[i])
+                    if record and record.FighterInfo and record.FighterInfo[1] then
+                        record.FighterInfo[1].TeamIndex = i
+                        self.statisticsData.FighterInfo[i] = record.FighterInfo[1]
+                    end
+                    if record and record.result then
+                        self.winTable[i] = record.result.winner and record.result.winner[1]
+                    end
+                end
+            end
+        end
+    end
+
+    local damage = _G.BattleManager:GetInstance():ParseStatistics(self.statisticsData)
+    local result = {}
+    if _G.table.isEmptyOrNil(self.winTable) then
+        result = self.myWin and { 0 } or { 1 }
+    else
+        for i = 1, #self.winTable do
+            _G.table.insert(result, self.winTable[i] and 0 or 1)
+        end
+    end
+    if damage == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("战斗统计参数为空")
+        end
+        return
+    end
+    _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name,
+            damage,
+            result,
+            function()
+                if self.Toggle and self.Toggle.isOn then
+                    self.waitTimer = _G.TimerManager:GetInstance():GetTimer(1, self.ShowWaitTime, self)
+                    self.waitTimer:Start()
+
+                    if _G.AppSetting.DEBUG then
+                        _G.Log("<color=red>" .. "自动推图倒计时继续" .. "</color>")
+                    end
+                end
+            end,
+            nil,
+            self.otherInfo,
+            nil,
+            self.isReport,
+            self.fightArgTable,
+            nil,
+            self.re_uid,
+            self.reportType,
+            nil,
+            nil,
+            self.afkPage,
+            nil,
+            nil,
+            nil,
+            self.hideCombBtn,
+            self.hidePetBtn
+    )
+end
+
+---关卡结算完  检测升级 检测任务完成
+function ShowAwardWithButtonView:ShowAwardOverCheckOther(exp)
+    self:OpenBtn()
+    if self.showBtn then
+        if self.Toggle then
+            if self.Toggle.isOn then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("<color=red>" .. "结算完成检测自动推图开" .. "</color>")
+                end
+                self.waitTime = _G.ConfigManager.discrete_cfg[AutoNextTimeID][1][1]
+                self.waitTimer = _G.TimerManager:GetInstance():GetTimer(1, self.ShowWaitTime, self)
+                self.waitTimer:Start()
+
+                if _G.AppSetting.DEBUG then
+                    _G.Log("<color=red>" .. "结算完成自动推图倒计时开始" .. "</color>")
+                end
+            end
+        end
+    end
+end
+
+---胜利界面按钮点击
+---@param index 3为下一关 1为返回 2 为下一章
+function ShowAwardWithButtonView:OnWinClickBtn(go, ison, index)
+    if go == self.VEff.aorbtn_ContinueFight then
+        if index == 3 then
+            self:CloseCall(SettlementModel.FunctionEnum.Next)
+        elseif index == 1 then
+            self:CloseCall(SettlementModel.FunctionEnum.Back)
+        elseif index == 2 then
+            self:ClickNextChapter()
+        end
+    elseif go == self.VEff.aorbtn_shenglitotal then
+        self:ShowStatisticsView()
+        _G.Events:GetInstance():Broadcast(_G.eHellGuardShowAwardEvents.ShowTotalView)
+    elseif go == self.VEff.aorbtn_sure then
+        self:CloseCall(SettlementModel.FunctionEnum.None)
+    end
+end
+
+function ShowAwardWithButtonView:ClickNextChapter()
+    -- if self.NextChapter then
+    --     local data = require "AfkModel":GetInstance().CurChapterEndAward
+    --     if data ~= nil then
+    --         local func
+    --         func = function(_, _name)
+    --             if _name == _G.ConfigManager.ui_cfg.CommonAwardView.Name then
+    --                 _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, func, self)
+    --                 local view = _G.UIManager:GetInstance():GetWindowCtrl(_name)
+    --                 view.go_table.aortext_Desc:SetActiveE(1)
+    --                 view.go_table.aortext_Desc.text =
+    --                     _G.LangUtil.GetLangPackValue(_G.ConfigManager.mission_cfg[data[2]].desc)
+    --             end
+    --         end
+    --         _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, func, self)
+    --         _G.UIManager:GetInstance():OpenWindow(
+    --             _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+    --             data[1],
+    --             function()
+    --                 self:CloseCall(SettlementModel.FunctionEnum.None)
+    --             end
+    --         )
+    --     end
+    -- end
+    self:CloseCall(SettlementModel.FunctionEnum.None)
+end
+
+---失败界面按钮点击
+function ShowAwardWithButtonView:OnFailClickBtn(go)
+    if go == self.VEff.aorbtn_yangchengicon then
+        --角色养成
+        self:CloseCall(SettlementModel.FunctionEnum.DevelopRole)
+        TrackingPointModel:GetInstance():CloseActTrackingByLast()
+        _G.Events:GetInstance():Broadcast(_G.eSettlementFail.DevelopRole)
+    elseif go == self.VEff.aorbtn_Equipicon then
+        --装备强化
+        self:CloseCall(SettlementModel.FunctionEnum.DevelopEquip)
+        TrackingPointModel:GetInstance():CloseActTrackingByLast()
+        _G.Events:GetInstance():Broadcast(_G.eSettlementFail.DevelopEquip)
+    elseif go == self.VEff.aorbtn_genghuanicon or go == self.VEff.aorbtn_FightAgain then
+        --更换阵容
+        self:CloseCall(SettlementModel.FunctionEnum.ReEmbattle)
+        _G.Events:GetInstance():Broadcast(_G.eSettlementFail.ReEmbattle)
+    elseif go == self.VEff.aorbtn_shibaitotal then
+        self:ShowStatisticsView()
+    elseif go == self.VEff.aorbtn_return then
+        self:CloseCall(SettlementModel.FunctionEnum.Back)
+    end
+end
+
+--region 新增对外接口
+---设置失败界面tips文字的隐藏
+---@param 变量名 变量类型 中文描述
+function ShowAwardWithButtonView:SetTipsHide(hide)
+    if self.VEff then
+        self.VEff.obj_tips:SetActiveE(hide and 0 or 1)
+    else
+        self.hideFailTips = hide
+    end
+end
+
+---设置再次挑战按钮是否点击
+---@param str string 按钮文字
+function ShowAwardWithButtonView:SetFightBtnBool(str)
+    if self.VEff then
+        self.VEff.obj_shibaibutton:SetActiveE(str)
+    else
+        self.obj_shibaibutton = str
+    end
+end
+
+---设置再次挑战按钮文字
+---@param str string 按钮文字
+function ShowAwardWithButtonView:SetFightBtnLabel(str)
+    if self.VEff then
+        self.VEff.aortext_fight.text = str
+    else
+        self.fightBtnStr = str
+    end
+end
+
+--endregion
+function ShowAwardWithButtonView:OnDisable()
+    if not _G.table.isEmptyOrNil(self.ActionEffTempArr) then
+        for _, v in pairs(self.ActionEffTempArr) do
+            _G.PoolsManager:GetInstance():Despawn(v, _G.ePoolType.UIEffect)
+        end
+        self.ActionEffTempArr = {}
+    end
+    self.onEffectViewOpenCall = nil
+    self.onAwardOpenCall = nil
+end
+
+function ShowAwardWithButtonView:OnStartClose()
+    if self.isOpenChat then
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+    end
+    self:ClearAudio()
+end
+
+return ShowAwardWithButtonView

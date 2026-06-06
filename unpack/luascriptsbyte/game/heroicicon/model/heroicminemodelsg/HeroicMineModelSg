@@ -1,0 +1,271 @@
+-----------------------------------------------------------------------
+-- F:.SG.alpha.Client.Assets.Resources.LuaScripts.Game.HeroicIcon.Model.HeroicMineModelSg	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2026/02/02
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+local base = _G.GameDataModelBase
+---@class HeroicMineModelSg : GameDataModelBase	中文描述
+---@field restore number 小队精力
+---@field level number 小队等级
+---@field lv_time number 小队等级升级时间
+---@field refresh_time number 免费刷新时间
+---@field teamNum number 小队数量
+---@field maxAwardRefreshNum number 最高等级奖励出现次数
+local HeroicMineModelSg = _G.BaseClass("HeroicMineModelSg", base)
+
+local RuinData = require("RuinData")
+function HeroicMineModelSg:__init()
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdate, self)
+end
+
+function HeroicMineModelSg:ParseData(data)
+    self.restore = data.restore
+    self.level = data.level
+    self.lv_time = data.lv_time
+    self.refresh_time = data.refresh_times
+    self.teamNum = data.queue_num
+    self.maxAwardRefreshNum = data.legend_times or 0
+    self:SetRuinData(data.ruins)
+    base.ParseData(self)
+end
+
+---倒计时 跨天刷新
+function HeroicMineModelSg:OnSixClockUpdate()
+    _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.HeroicIconMineLogin, 0)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.HeroicIconMineLogin.id)
+end
+
+function HeroicMineModelSg:PrivilegeUpdate(isInit)
+    if require("PrivilegeManager"):GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.Heroic.teamNum) then
+        self.teamNum = self.teamNum +
+            require("PrivilegeManager"):GetInstance():GetPrivilegeDataNew({ _G.PrivilegeType.Heroic.teamNum })[1][2]
+    end
+    if require("PrivilegeManager"):GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.Heroic.restoreMax) then
+        self.restore = self.restore +
+            require("PrivilegeManager"):GetInstance():GetPrivilegeDataNew({ _G.PrivilegeType.Heroic.restoreMax })[1][2]
+    end
+end
+
+---类的析构函数
+function HeroicMineModelSg:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdate, self)
+    for k, v in pairs(self.ruinDataList) do
+        v:Dispose()
+    end
+    self.ruinDataList = nil
+    if self.upLevelTimer then
+        self.upLevelTimer:Stop()
+        self.upLevelTimer = nil
+    end
+end
+
+function HeroicMineModelSg:SetRuinData(data)
+    self.ruinDataList = {}
+    for _, v in pairs(data) do
+        local Ruin = RuinData.New(v)
+        self.ruinDataList[v.sid] = Ruin
+    end
+end
+
+function HeroicMineModelSg:UpLevelEnd()
+    self.level = self.level + 1
+    local ctrl = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.HeroicMineViewSG.Name).View
+    if ctrl then
+        ctrl:UpdateView()
+    end
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+    .HeroicIconMineTeamLevelSG.id)
+end
+
+---刷新遗迹回调
+function HeroicMineModelSg:RerfeashRuinEnd(msg, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    for _, v in pairs(msg.ruins) do
+        self.ruinDataList[v.sid]:ResetData(v)
+    end
+    self.maxAwardRefreshNum = msg.legend_times
+    if call then
+        call()
+    end
+end
+
+--region 对外接口
+
+---获取精力
+function HeroicMineModelSg:GetRestore()
+    return self.restore
+end
+
+--- 获取遗迹数据
+function HeroicMineModelSg:GetRuinDataList()
+    return self.ruinDataList
+end
+
+function HeroicMineModelSg:GetMaxLevel()
+    return _G.table.count(_G.ConfigManager.heroic_icons_team_cfg)
+end
+
+function HeroicMineModelSg:GetLevel()
+    return self.level
+end
+
+---获取等级升级结束时间，为0表示不在升级时间
+function HeroicMineModelSg:GetUpLevelEndTime()
+    return self.lv_time
+end
+
+---获取小队数量
+function HeroicMineModelSg:GetTeamNum()
+    return self.teamNum
+end
+
+---获取免费刷新数量
+function HeroicMineModelSg:GetFreeRefeashNum()
+    return _G.math.max(0, _G.ConfigManager.discrete_cfg[304007][1][1] - self.refresh_time)
+end
+
+---获取正在派遣的遗迹列表
+function HeroicMineModelSg:GetStartRuinList()
+    local list = {}
+    for k, v in pairs(self.ruinDataList) do
+        if v.ruinState == RuinData.RuinState.Start or v.ruinState == RuinData.RuinState.Get then
+            _G.table.insert(list, v)
+        end
+    end
+    return list
+end
+
+---刷新最高奖励次数
+function HeroicMineModelSg:GetMaxAwardRefreshNum()
+    return self.maxAwardRefreshNum
+end
+
+---开启派遣
+function HeroicMineModelSg:RuinStart(sid, call)
+    local data = self.ruinDataList[sid]
+    if data:CheckOver() then
+        require("HeroicIconNet"):GetInstance():RuinExplore(
+            { sid = { sid } },
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                self.restore = self.restore - _G.ConfigManager.discrete_cfg[304003][1][1]
+                data:Start(msg.ruins[1])
+                if call then
+                    call()
+                end
+            end
+        )
+    elseif _G.AppSetting.DEBUG then
+        _G.LogError("重复向已经派遣的遗迹，多次派遣")
+    end
+end
+
+---获取遗迹奖励
+---@param sidList table<number> 遗迹sid列表
+function HeroicMineModelSg:GetRuinsAward(sidList, call)
+    local checkList = {}
+    for k, v in pairs(sidList) do
+        local ruin = self.ruinDataList[v]
+        if ruin.ruinState == RuinData.RuinState.Get then
+            _G.table.insert(checkList, v)
+        end
+    end
+    require("HeroicIconNet"):GetInstance():GetRuinAward(
+        { sid = checkList },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            for _, v in pairs(msg.ruins) do
+                self.ruinDataList[v.sid]:ResetData(v)
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+            .HeroicIconMineSG.id)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+            .HeroicIconMineTeamLevelSG.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---刷新遗迹
+function HeroicMineModelSg:RefreashRuin(call)
+    if self:GetFreeRefeashNum() > 0 then
+        self.refresh_time = self.refresh_time + 1
+        require("HeroicIconNet"):GetInstance():RuinRerfeash(_G.handlerbind(self, self.RerfeashRuinEnd, call))
+    else
+        local items = _G.ConfigManager.discrete_cfg[304008][1]
+
+        _G.StorageManager:GetInstance():ConsumeItem(items[1], 0, items[2])
+        require("HeroicIconNet"):GetInstance():RuinRerfeash(_G.handlerbind(self, self.RerfeashRuinEnd, call))
+    end
+end
+
+--- 升级小队等级
+function HeroicMineModelSg:UpLevel(call)
+    local cfg = _G.ConfigManager.heroic_icons_team_cfg[self.level + 1]
+    if _G.StorageManager:GetInstance():CheckItem(_G.table.unpack(cfg.exp)) then
+        require("HeroicIconNet"):GetInstance():TeamLevelUp(function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ConsumeItem(cfg.exp[1], 0, cfg.exp[2])
+            self:UpLevelEnd()
+
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .HeroicIconMineTeamLevelSG.id)
+            if call then
+                call(msg)
+            end
+        end)
+    end
+end
+
+--- 升级小队等级  （星座）
+function HeroicMineModelSg:UpLevel_xz(call)
+    local cfg = _G.ConfigManager.heroic_icons_team_cfg[self.level + 1]
+    local iconLevel = require("HeroicIconModel"):GetInstance():GetIconTotalLevel()
+    if cfg and iconLevel >= cfg.exp then
+        require("HeroicIconNet"):GetInstance():TeamLevelUp(function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:UpLevelEnd()
+
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                .HeroicIconMineTeamLevelSG.id)
+            if call then
+                call(msg)
+            end
+        end)
+    end
+end
+
+--- 钻石购买小队
+---@param index number 第几个用钻石购买的小队
+function HeroicMineModelSg:UnlockTeam(index, call)
+    local item = _G.ConfigManager.discrete_cfg[304001][index]
+    require("HeroicIconNet"):GetInstance():UnlockTeam(function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        _G.StorageManager:GetInstance():ConsumeItem(item[1], 0, item[2])
+        self.teamNum = self.teamNum + 1
+        if call then
+            call(msg)
+        end
+    end)
+end
+
+--endregion
+
+return HeroicMineModelSg

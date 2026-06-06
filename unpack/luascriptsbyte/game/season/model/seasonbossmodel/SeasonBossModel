@@ -1,0 +1,227 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Season.Model.SeasonBossModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/05/18
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+---@class SeasonBossModel :	GameDataModelBase 中文描述
+---@field cfg season_boss_cfg
+---@field playerRank rank.s2c_get_rank_num
+---@field infoData season_boss.s2c_season_boss_info
+---@field taskList SeasonBossTaskData[]
+---@field finishTaskList table<number,boolean> 任务sid
+---@field rankList rank.c2s_rank_public[]
+local SeasonBaseModel = require "SeasonBaseModel"
+local SeasonBossModel = _G.BaseClass("SeasonBossModel", SeasonBaseModel)
+---@return SeasonBossModel SeasonBossModel
+function SeasonBossModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SeasonBossModel:__init()
+    self.taskList = {}
+    self.curFunctionOpenID = 60
+    self.finishTaskList = {}
+    _G.Events:GetInstance():AddListener(_G.eSeason.SeasonOver, self.SeasonOver, self)
+end
+
+--region 子类重写
+---从服务器拉取数据
+function SeasonBossModel:GetDataFormServer()
+    self:GetInfo()
+end
+---获取赛季Boss信息
+function SeasonBossModel:GetInfo()
+    require "SeasonNet":GetInstance():GetBossInfo(_G.handler(self, self.GetInfoCall))
+end
+---获取赛季Boss信息回调
+---@param msg season_boss.s2c_season_boss_info
+function SeasonBossModel:GetInfoCall(msg)
+    self.infoData = msg
+    self.cfg = require "SeasonModel":GetInstance():GetBossCfg()
+    self:InitTaskList()
+    self:ParseData()
+    self.isOpen = true
+    _G.Events:GetInstance():Broadcast(_G.eSeason.SeasonRefreshModel, self.curFunctionOpenID)
+end
+
+---获取排行榜
+function SeasonBossModel:GetRank(callback)
+    require "SeasonNet":GetInstance():GetBossRank(_G.handlerbind(self, self.GetRankCall, callback))
+end
+---获取排行榜回调
+---@param msg rank.s2c_rank_record_rank
+function SeasonBossModel:GetRankCall(msg, callback)
+    self.rankList = msg.rankers or {}
+    if callback then
+        callback()
+    end
+end
+
+---获取玩家排行
+function SeasonBossModel:GetPlayerRank(callback)
+    require "SeasonNet":GetInstance():GetBossPlayerRank(_G.handlerbind(self, self.GetPlayerRankCall, callback))
+end
+---@param msg rank.s2c_get_rank_num
+function SeasonBossModel:GetPlayerRankCall(msg, callback)
+    self.playerRank = msg
+    if self.playerRank.value < self.infoData.all_dps / 10000 then
+        self.playerRank.value = _G.math.floor(self.infoData.all_dps / 10000)
+    end
+
+    if callback then
+        callback()
+    end
+end
+
+function SeasonBossModel:InitTaskList()
+    self.taskList = {}
+    self.taskList2 = {}
+    if self.infoData.task then
+        for i, v in ipairs(self.infoData.task) do
+            self.taskList[i] = require "SeasonBossTaskData".New(v, nil, _G.MarkTaskType.SeasonBoss)
+            self.taskList2[v.sid] = self.taskList[i]
+        end
+    end
+    if self.infoData.finish then
+        for _, v in pairs(self.infoData.finish) do
+            local task = {sid = v, state = _G.TaskEnum.ETaskState.Completed, target = {[1] = 999}}
+            local data = require "SeasonBossTaskData".New(task, nil, _G.MarkTaskType.SeasonBoss)
+            _G.table.insert(self.taskList, data)
+            self.taskList2[v] = data
+        end
+    end
+end
+
+--region  挑战
+function SeasonBossModel:OnChallenge()
+    if not require "SeasonModel":GetInstance():CheckSeasonIsOpen() then
+        return
+    end
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require "EmbattleController":GetInstance():OpenEmbattle(
+        _G.EmbattleType.SeasonBoss,
+        _G.EmbattleSaveType.server,
+        true,
+        _G.EmbattleControllerItemType.pve,
+        _G.handler(self, self.OnExit),
+        _G.handler(self, self.OnFight),
+        self.cfg.monster_group
+    )
+end
+---退出布阵
+function SeasonBossModel:OnExit()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SeasonView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SeasonBossView.Name)
+end
+---进入战斗
+function SeasonBossModel:OnFight()
+    if not require "SeasonModel":GetInstance():CheckSeasonIsOpen() then
+        self:OnExit()
+        return
+    end
+    local cfg = _G.DeepCopy(_G.ConfigManager.video_cfg[self.cfg.video])
+    cfg.isShowSkipBtn = self.cfg.id <= _G.PlayerPrefsManager.GetInt("SeasonBossVideo", 0)
+
+    _G.UIUtils.PlayVideo(
+        cfg,
+        function()
+            _G.PlayerPrefsManager.SetInt("SeasonBossVideo", self.cfg.id)
+            _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.SeasonBoss)
+        end
+    )
+end
+
+---监听界面打开
+---@param name string 界面名称
+function SeasonBossModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SeasonView.Name)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SeasonBossView.Name)
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    end
+end
+---完成任务
+function SeasonBossModel:FinishTask(id, callback)
+    require "SeasonNet":GetInstance():FinishBossTask(
+        {sid = id, finish_type = 2},
+        _G.handlerbind(self, self.FinishTaskCall, callback)
+    )
+end
+---完成任务回调
+function SeasonBossModel:FinishTaskCall(msg, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    if callback then
+        callback(msg)
+    end
+end
+
+function SeasonBossModel:ReEnterFight()
+    require "EmbattleController":GetInstance():OpenEmbattle(
+        _G.EmbattleType.SeasonBoss,
+        _G.EmbattleSaveType.server,
+        true,
+        _G.EmbattleControllerItemType.pve,
+        _G.handler(self, self.OnExit),
+        _G.handler(self, self.OnFight),
+        self.cfg.monster_group
+    )
+    -- self:ReturnPanel()
+end
+---更换界面
+function SeasonBossModel:ReturnPanel()
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SeasonView.Name)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SeasonBossView.Name)
+end
+
+function SeasonBossModel:FightEnd()
+end
+---更新伤害
+function SeasonBossModel:UpdateDamages(damage)
+    if not damage then
+        return
+    end
+    if damage > self.infoData.day_dps then
+        self.infoData.day_dps = damage
+    end
+end
+---更新任务
+function SeasonBossModel:UpdataTask(task)
+    if not self.isOpen then
+        return
+    end
+    local isUpdata = false
+
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTask(task.sid)
+    if mTask == nil or not mTask.i_task then
+        return isUpdata
+    end
+    mTask:UpdataData(task)
+    return true
+end
+---获取任务
+function SeasonBossModel:GetTask(id)
+    return self.taskList2[id]
+end
+--endregion
+
+---销毁对象时,析构函数
+function SeasonBossModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eSeason.SeasonOver, self.SeasonOver, self)
+end
+
+function SeasonBossModel:SeasonOver()
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonBossView.Name)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonBossRankView.Name)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonBossTaskView.Name)
+end
+
+return SeasonBossModel

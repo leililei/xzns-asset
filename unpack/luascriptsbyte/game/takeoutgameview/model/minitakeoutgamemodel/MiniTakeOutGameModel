@@ -1,0 +1,399 @@
+---@class MiniTakeOutGameModel  GM小游戏_赛车
+---@field curActivityClass ActivitySynGMActivity
+---@field stages activity_mini_game.activity_mini_game_fb_cfg[] @关卡配置列表
+---@field curStageIndex number                  @当前进行中的关卡sid
+---@field open number                           @当前活动开放时间(天数)
+---@field historyScore table<number,number>     @历史最高分
+---@field coinSid number                        @当前代币id
+---@field coinNum number                        @当前代币数量
+---@field battlePassExp number                  @战令经验(每张门票)
+---@field isGaming boolean                      @是否正在游玩中
+---@field lastStageIndex number                 @正在游玩中的关卡索引
+---@field extraAward award.i_award_item[]       @额外奖励
+local MiniTakeOutGameModel = _G.BaseClass("MiniTakeOutGameModel")
+
+---@param activity ActivitySynGMActivity
+function MiniTakeOutGameModel:__init(activity)
+    local gameCfgs = activity.cfg.self_info.mini_game
+
+    self.curActivityClass = activity
+    self.coinNum = gameCfgs.coin or 0
+    self.coinSid = gameCfgs.base_cfg.ticket.sid
+    self.battlePassExp = gameCfgs.base_cfg.exp
+    self.isGaming = gameCfgs.state ~= 0
+    --初始化关卡配置
+    self.stages = gameCfgs.fb_cfg or {}
+    self.curStageIndex = 1
+    self.lastStageIndex = 1
+    for index, stage in ipairs(self.stages) do
+        if stage.sid == gameCfgs.curr_sid then
+            self.lastStageIndex = index
+        end
+        if stage.sid == gameCfgs.max_sid then
+            self.curStageIndex = index
+        end
+    end
+    --初始化历史最高分
+    self.historyScore = {}
+    if gameCfgs.history_score then
+        for _, v in pairs(gameCfgs.history_score) do
+            self.historyScore[v.k] = v.v
+        end
+    end
+    if gameCfgs.curr_sid > 0 and gameCfgs.curr_score > 0 then
+        local existScore = self.historyScore[gameCfgs.curr_sid] or 0
+        self.historyScore[gameCfgs.curr_sid] = math.max(existScore, gameCfgs.curr_score)
+    end
+    --额外奖励信息
+    self.extraAward = gameCfgs.extra_award_state
+
+    --关卡开放时间
+    local openDuration = _G.TimeUtil.GetServerUnixTime() - self.curActivityClass.cfg.time.start_time
+    self.open = math.max(1, math.ceil(openDuration / 86400))
+
+    --添加事件监听
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdate, self)
+end
+
+---销毁对象时,析构函数
+function MiniTakeOutGameModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdate, self)
+end
+
+function MiniTakeOutGameModel:OnSixClockUpdate()
+    self.open = self.open + 1
+end
+---避免跨天事件被中断导致的跨天刷新问题--主动调用
+function MiniTakeOutGameModel:UpdateOpenTime()
+    local openDuration = _G.TimeUtil.GetServerUnixTime() - self.curActivityClass.cfg.time.start_time
+    self.open = math.max(1, math.ceil(openDuration / 86400))
+end
+
+--region ===========================数据接口===========================
+
+---获取历史最高分
+---@param sid number 关卡id
+---@return number
+function MiniTakeOutGameModel:GetHistoryScore(sid)
+    if not self.historyScore then
+        return 0
+    end
+    return self.historyScore[sid] or 0
+end
+
+---更新历史最高分
+---@param sid number 关卡id
+---@param score number 分数
+function MiniTakeOutGameModel:UpdateHistoryScore(sid, score)
+    if not self.historyScore then
+        self.historyScore = {}
+    end
+    local oldScore = self.historyScore[sid] or 0
+    if score > oldScore then
+        self.historyScore[sid] = score
+    end
+end
+
+---添加当前代币数量
+---@param num number
+function MiniTakeOutGameModel:AddCoinNumber(num)
+    self.coinNum = self.coinNum + num
+
+    --刷新红点
+    self.curActivityClass:GetActivityTypeCls():RefreshRedPoint()
+
+    --通知更新货币信息
+    local tmp = {}
+    _G.table.insert(tmp, self.coinSid)
+    _G.table.insert(tmp, num)
+    _G.table.insert(tmp, self.coinNum)
+    _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, { { type = tmp } })
+end
+
+---获取当前代币数量
+---@return number
+function MiniTakeOutGameModel:GetCoinNumber()
+    return self.coinNum
+end
+
+---获取当前代币id
+---@return number
+function MiniTakeOutGameModel:GetCoinSid()
+    return self.coinSid
+end
+
+---获取所有关卡配置
+---@return activity_mini_game.activity_mini_game_fb_cfg[]
+function MiniTakeOutGameModel:GetStages()
+    return self.stages
+end
+
+---获取当前进行中关卡序号
+---@return number
+function MiniTakeOutGameModel:GetStageIndex()
+    return self.curStageIndex
+end
+
+---获取当前进行中关卡sid
+---@return number
+function MiniTakeOutGameModel:GetStageSid()
+    local stage = self.stages[self.curStageIndex]
+    if not stage then
+        return 0
+    end
+    return stage.sid
+end
+
+---更新当前进行中关卡序号
+function MiniTakeOutGameModel:UpdateStageIndex()
+    if self.curStageIndex >= #self.stages or not self:IsPass(self.curStageIndex) then
+        return
+    end
+    self.curStageIndex = self.curStageIndex + 1
+end
+
+---关卡是否已通关
+---@param index number 关卡序号
+---@return boolean
+function MiniTakeOutGameModel:IsPass(index)
+    local stage = self.stages[index]
+    if not stage then
+        return false
+    end
+    return self:GetHistoryScore(stage.sid) >= stage.pass
+end
+
+---关卡是否已解锁(按天数)
+---@param index number 关卡序号
+---@return boolean
+function MiniTakeOutGameModel:IsLock(index)
+    local stage = self.stages[index]
+    if not stage then
+        return false
+    end
+    return stage.lock_day > self.open
+end
+
+---是否正在游玩中
+---@return boolean
+function MiniTakeOutGameModel:IsGaming()
+    return self.isGaming
+end
+
+---获取最后一次挑战的关卡序号
+---@return number
+function MiniTakeOutGameModel:GetLastStageIndex()
+    return self.lastStageIndex
+end
+
+---获取关卡解锁剩余时长(秒)
+---@param index number 关卡序号
+---@return number
+function MiniTakeOutGameModel:GetUnlockTime(index)
+    local stage = self.stages[index]
+    if not stage or stage.lock_day <= self.open then
+        return 0
+    end
+    --关卡开放时间
+    local openDuration = _G.TimeUtil.GetServerUnixTime() - self.curActivityClass.cfg.time.start_time
+    local time = (stage.lock_day - 1) * 86400 - openDuration
+    return math.max(0, time)
+end
+
+---获取额外奖励
+---@return award.i_award_item[]
+function MiniTakeOutGameModel:GetExtraAwardData()
+    return self.extraAward
+end
+
+---添加额外奖励
+---@param stageSid number   关卡id
+---@param count number 额外奖励次数
+function MiniTakeOutGameModel:AddExtraAwardData(stageSid, count)
+    ---@type award.i_award_item[]
+    local extraAward
+    for _, v in ipairs(self.stages) do
+        if v.sid == stageSid then
+            extraAward = v.extra_award
+            break
+        end
+    end
+    if not extraAward then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format(
+                "找不到关卡%s的额外奖励配置: ",
+                tostring(stageSid)
+            ))
+        end
+        return
+    end
+
+    if not self.extraAward then
+        self.extraAward = {}
+    end
+
+    for _, v in ipairs(extraAward) do
+        if v.type[1] == 0 and #v.type >= 5 then
+            --奖励为活动id
+            v = {
+                type = {
+                    v.type[4],
+                    v.type[5],
+                    v.type[1],
+                    v.type[2],
+                    v.type[3],
+                }
+            }
+        end
+        local isAdd = false
+        local sid = v.type[1]
+
+        for _, exist in ipairs(self.extraAward) do
+            if sid == exist.type[1] then
+                exist.type[2] = exist.type[2] + v.type[2] * count
+                isAdd = true
+                break
+            end
+        end
+        if not isAdd then
+            local copy = { type = { table.unpack(v.type) } }
+            copy.type[2] = copy.type[2] * count
+            _G.table.insert(self.extraAward, copy)
+            isAdd = true
+        end
+    end
+end
+
+--endregion
+
+--region ===========================网络接口===========================
+
+---提交分数状态
+---@param index number 关卡序号
+---@param callback function 回调函数
+function MiniTakeOutGameModel:StartGame(index, callback)
+    local stageSid = self.stages[index].sid
+
+    local pbData = {}
+    pbData.sid = stageSid
+    pbData.id = self.curActivityClass.activityID
+    require("FestivalRedBoundNet"):GetInstance():StartGame(pbData, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        self.lastStageIndex = index
+        self.isGaming = true
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---提交分数状态
+---@param index number 关卡序号
+---@param score number 分数
+---@param callback function 回调函数
+function MiniTakeOutGameModel:FinishGame(index, score, callback)
+    local stageSid = self.stages[index].sid
+
+    local pbData = {}
+    pbData.score = score
+    pbData.id = self.curActivityClass.activityID
+    require("FestivalRedBoundNet"):GetInstance():FinishGame(pbData, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        self.isGaming = false
+        --扣除货币
+        if self:GetHistoryScore(stageSid) > 0 and self:IsPass(index) then
+            --战令经验
+            self:AddBattlePassExp(1)
+            --额外奖励
+            self:AddExtraAwardData(stageSid, 1)
+            self:AddCoinNumber(-1) --(刷新红点)
+        else
+            --刷新红点
+            self.curActivityClass:GetActivityTypeCls():RefreshRedPoint()
+        end
+        self:UpdateHistoryScore(stageSid, score)
+        self:UpdateStageIndex()
+        --获取奖励
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---游戏扫荡
+---@param count number 扫荡次数
+---@param callback function 回调函数
+function MiniTakeOutGameModel:Sweep(index, count, callback)
+    local stageSid = self.stages[index].sid
+
+    local pbData = {}
+    pbData.count = count
+    pbData.id = self.curActivityClass.activityID
+    pbData.sid = stageSid
+    require("FestivalRedBoundNet"):GetInstance():Sweep(pbData, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        self:AddExtraAwardData(stageSid, count)
+        -- 扣除货币(刷新红点)
+        self:AddCoinNumber(-count)
+        --战令经验
+        self:AddBattlePassExp(count)
+
+        --获取奖励
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---领取额外奖励
+---@param callback function 回调函数
+function MiniTakeOutGameModel:GetExtraAward(callback)
+    local pbData = {}
+    pbData.id = self.curActivityClass.activityID
+
+    require("FestivalRedBoundNet"):GetInstance():GetExtraAward(pbData, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        self.extraAward = nil
+        --获取奖励
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        --刷新红点
+        self.curActivityClass:GetActivityTypeCls():RefreshRedPoint()
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+--endregion
+
+---增加战令经验值
+---@param ticket number 消耗的门票
+function MiniTakeOutGameModel:AddBattlePassExp(ticket)
+    if ticket <= 0 or not self.battlePassExp or self.battlePassExp <= 0 then
+        return
+    end
+    local exp = self.battlePassExp * ticket
+    local battleActivity = require("ActivitySynManager"):GetInstance():GetChildAcitivity(
+        10027,
+        self.curActivityClass:GetJumpType(),
+        self.curActivityClass:GetMainType()
+    )
+    if battleActivity then
+        battleActivity:GetActivityTypeCls():AddExp(battleActivity:GetActivityID(), exp)
+    end
+end
+
+return MiniTakeOutGameModel

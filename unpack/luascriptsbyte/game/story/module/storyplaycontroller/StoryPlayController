@@ -1,0 +1,140 @@
+-- 包路径:        Game.Story.Module.StoryPlayController
+-- File Name:    StoryPlayController.lua
+-- Description:    剧情播放控制器
+-- Author:       TangHuan
+-- Create Date:    2020/02/26
+
+require "IStoryPlay"
+
+--- Note:
+--- 此类用于单独的剧情表现播放，如果只是单纯的自动化表现请使用AutomaticPlayStory
+--- 此类的播放所有的对象都会单独挂载到独立的节点上，播放完成后会统一清理所有的对象
+--- 所有的创建使用接口在父类定义
+
+---@class StoryPlayController : IStoryPlay @剧情播放控制器
+---@field StoryRoot UnityEngine.GameObject @剧情根节点(常驻不会被删除)
+---@field MainCamera UnityEngine.Camera @游戏主摄像机
+---@field StoryCamera UnityEngine.Camera @剧情摄像机
+---@field LastBGID number @剧情之前的背景音乐ID
+local StoryPlayController = _G.BaseClass("StoryPlayController", _G.IStoryPlay)
+StoryPlayController.DefaultPoolType = _G.ePoolType.Temporary
+StoryPlayController.StoryRoot = nil
+StoryPlayController.MainCamera = nil
+StoryPlayController.StoryCamera = nil
+
+---测试用接口
+---测试播放指定Story ID的剧情
+function StoryPlayController:TestPlayStoryByID(storyid)
+    self:Play(storyid, _G.handlerbind(self, self.OnStoryPlayComplted))
+end
+
+---剧情播放完成
+---@param storyid number @剧情ID
+---@param result boolean @播放剧情结果
+function StoryPlayController:OnStoryPlayComplted(storyid, result)
+end
+---
+
+---@return StoryPlayController @获取剧情播放控制器单例对象
+function StoryPlayController:GetInstance()
+    if self.Singleton == nil then
+        self.Singleton = _G.New(StoryPlayController)
+    end
+    return self.Singleton
+end
+
+---StoryPlayController构造函数
+function StoryPlayController:__init()
+    self.StoryRoot = _G.GameObject("StoryRoot")
+    _G.CS.UnityEngine.Object.DontDestroyOnLoad(self.StoryRoot)
+    self.MainCamera = nil
+    local storycamerago = _G.GameObject("StoryCamera")
+    storycamerago:AddComponentE(_G.typeof(_G.CS.WorldCamera))
+    self.StoryCamera = storycamerago:AddComponent(_G.typeof(_G.CS.UnityEngine.Camera))
+    self.StoryCamera:SetParentE(self.StoryRoot)
+    self.StoryCamera:SetActiveE(0)
+    self.LastBGID = nil
+end
+
+---剧情播放准备
+function StoryPlayController:PlayStoryPreparation()
+    ---@type StoryView
+    local storyview = _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.StoryView.Name)
+    storyview.View.IsCanSkip = self.CurrentAutoStory:IsStoryCanSkip()
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnStoryViewOpened, self)
+
+    local world = _G.WorldManager:GetInstance():GetCurWorld()
+    --摄像机准备
+    self.MainCamera = world.WorldSetting.SceneCamera.UniCam
+    self.StoryCamera.clearFlags = self.MainCamera.clearFlags
+    self.StoryCamera.backgroundColor = self.MainCamera.backgroundColor
+    self.StoryCamera.farClipPlane = self.MainCamera.farClipPlane
+    local x, y, z = self.MainCamera:GetPosition()
+    self.StoryCamera:SetPosition(x, y, z)
+    local x, y, z, w = self.MainCamera:GetRotation()
+    self.StoryCamera:SetRotation(x, y, z, w)
+    self.StoryCamera.fieldOfView = self.MainCamera.fieldOfView * _G.CS.Launcher.Inst.FovScale
+    self.MainCamera:SetActiveE(0)
+    self.StoryCamera:SetActiveE(1)
+
+    --剧情挂载节点准备
+    self.StoryParentNode = _G.GameObject("StoryParentNode")
+    self.StoryParentNode:SetParentE(self.StoryRoot)
+
+    --记录播放剧情前的一部分数据
+
+    --剧情资源准备
+    --创建剧情缓存池节点，方便资源缓存和释放
+    _G.PoolsManager:GetInstance():CreatePool(_G.ePoolType.Temporary)
+end
+
+---@field viewname string @窗口名
+function StoryPlayController:OnStoryViewOpened(viewname)
+    if viewname == _G.ConfigManager.ui_cfg.StoryView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnStoryViewOpened, self)
+        --窗口打开后再开始预加载资源，避免流程跑的过快，窗口还没打开就结束了
+        self.CurrentAutoStory:PreloadStoryResources(_G.handlerbind(self, self.OnPlayStoryPreparationCompleted))
+    end
+end
+
+---剧情播放完成
+function StoryPlayController:PlayOver()
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("剧情Story ID:%d播放完成", self.CurrentAutoStory.CurrentStory.StoryID)
+    )
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnStoryViewOpened, self)
+    _G.IStoryPlay.PlayOver(self)
+end
+
+---恢复游戏状态
+function StoryPlayController:RestoreGame()
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("剧情Story ID:%d的播放结束，恢复游戏状态", self.CurrentAutoStory.CurrentStory.StoryID)
+    )
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.StoryView.Name)
+    _G.Destroy(self.StoryParentNode)
+    self.MainCamera:SetActiveE(1)
+    self.StoryCamera:SetActiveE(0)
+end
+
+---数据清空
+function StoryPlayController:Clear()
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("清除剧情Story ID:%d播放相关数据", self.CurrentAutoStory.CurrentStory.StoryID)
+    )
+    _G.IStoryPlay.Clear(self)
+    self:DestroyAllStoryItem()
+    self.MainCamera = nil
+    self.LastBGID = nil
+    --清除剧情资源缓存的对象池，方便资源释放
+    _G.PoolsManager:GetInstance():DestoryPool(_G.ePoolType.Temporary)
+end
+---数据接口结束
+
+---@type StoryPlayController @剧情播放控制器
+_G.StoryPlayController = StoryPlayController
+---@type StoryPlayController @剧情播放控制器
+return StoryPlayController

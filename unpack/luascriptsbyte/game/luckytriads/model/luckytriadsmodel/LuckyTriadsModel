@@ -1,0 +1,192 @@
+local LuckyTriadsNet = require("LuckyTriadsNet")
+
+---@class LuckyTriadsModel : GameDataModelBase
+---@field round number      当前抽卡轮次
+---@field drawInfos table<number,lucky_triads.i_lucky_triads_item> 当前抽卡信息
+local LuckyTriadsModel = _G.BaseClass("LuckyTriadsModel", _G.GameDataModelBase)
+
+function LuckyTriadsModel:__init()
+    --目前就配置了两个领取条件(放置关卡丶创号时间)
+    _G.Events:GetInstance():AddListener(_G.eAfkEvents.Pass, self.RefreshRedPoint, self)
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.RefreshRedPoint, self)
+end
+function LuckyTriadsModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eAfkEvents.Pass, self.RefreshRedPoint, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.RefreshRedPoint, self)
+end
+
+---获取当前轮次
+---@return number
+function LuckyTriadsModel:GetRound()
+    return self.round or 1
+end
+---获取当前获得的卡牌数据
+---@param index number    下标
+---@return lucky_triads.i_single_card
+function LuckyTriadsModel:GetCard(index)
+    if not self.drawInfos then
+        return nil
+    end
+    local data = self.drawInfos[index]
+    if not data then
+        return nil
+    end
+    return data.cards[data.special_index]
+end
+---获取抽卡详情数据
+---@param index number    下标
+---@return lucky_triads.i_single_card[]
+function LuckyTriadsModel:GetDrawDetails(index)
+    if not self.drawInfos then
+        return nil
+    end
+    local d = self.drawInfos[index]
+    return d and d.cards or nil
+end
+
+---条件改变时, 刷新红点信息
+function LuckyTriadsModel:RefreshRedPoint()
+    local round = self:GetRound()
+    if not _G.ConfigManager.lucky_triads_cfg[round] then
+        --轮次已结束
+        return
+    end
+
+    --刷新红点
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.LuckyTriads.id)
+end
+
+--region ---------------------网络接口---------------------
+
+---从服务器拉取数据
+function LuckyTriadsModel:GetDataFormServer()
+    LuckyTriadsNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+---获取服务器数据
+---@param msg lucky_triads.s2c_lucky_triads_info
+---@return void
+function LuckyTriadsModel:ParseData(msg)
+    if not msg then
+        self.super.ParseData(self)
+        return
+    end
+    self.round = msg.round or 1
+    if msg.items then
+        self.drawInfos = {}
+        for _, item in pairs(msg.items) do
+            self.drawInfos[item.index] = item
+        end
+    else
+        self.drawInfos = nil
+    end
+    --table.count(_G.ConfigManager.lucky_triads_cfg)
+    self.MaxRound = #_G.ConfigManager.lucky_triads_cfg
+    local curSectionId = require("AfkModel"):GetInstance():GetCurSection()
+    _G.PlayerPrefsManager.SetInt("LuckyTriadsPop", curSectionId)
+    self.super.ParseData(self)
+end
+
+---进行抽卡
+---@param index number    下标
+---@param callback fun():void    回调函数
+---@return void
+function LuckyTriadsModel:Draw(index, callback)
+    LuckyTriadsNet:GetInstance():Draw(index, _G.handlerbind(self, self.OnDrawCallback, index, callback))
+end
+---监听抽卡回调
+---@param msg lucky_triads.s2c_lucky_triads_lottery
+---@param index number    下标
+---@param callback fun():void    回调函数
+---@return void
+function LuckyTriadsModel:OnDrawCallback(msg, index, callback)
+    if msg.ack == 1 then
+        if not self.drawInfos then
+            self.drawInfos = {}
+        end
+        self.drawInfos[index] = msg.item
+    end
+    if callback then
+        callback()
+    end
+end
+
+---领取抽卡奖励
+---@param index number    下标
+---@param callback fun():void    回调函数
+---@return void
+function LuckyTriadsModel:GetReward(index, callback)
+    LuckyTriadsNet:GetInstance():GetReward(index, _G.handlerbind(self, self.OnRewardCallback, callback))
+end
+---监听领奖抽卡回调
+---@param msg any
+---@param callback fun():void    回调函数
+---@return void
+function LuckyTriadsModel:OnRewardCallback(msg, callback)
+    if msg.ack == 1 then
+        self.round = self.round + 1
+        self.drawInfos = nil
+
+        if LuckyTriadsModel.ShowTheBtn() == false then
+            _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.LuckyTriads)
+        end
+
+        if msg.award and msg.award.item then
+            local reward = {award = msg.award}
+            _G.StorageManager:GetInstance():ReceiveAwardData(reward)
+            _G.UIUtils.ShowCommonAward(reward)
+        end
+    end
+
+    if callback then
+        callback()
+    end
+end
+
+---是否显示千抽按钮，如果抽完就不再显示了
+function LuckyTriadsModel.ShowTheBtn()
+    local model = require("LuckyTriadsModel"):GetInstance()
+    if model.round >= model.MaxRound then
+        if not _G.ConfigManager.lucky_triads_cfg[model.round] then
+            return false
+        end
+    end
+    return true
+end
+
+---达到条件后副本结算返回,主动弹出千抽界面
+function LuckyTriadsModel:CheckLuckyTriadsViewPop()
+    local round = self:GetRound()
+    local cfg = _G.ConfigManager.lucky_triads_cfg[round]
+    if not cfg then
+        return false
+    end
+    local checkPop = true
+    for _, condition in ipairs(cfg.conditions) do
+        if condition[1] == _G.GlobalConditionManager.ConditionType.afk then
+            ---通关放置关卡
+            local curSectionId = require("AfkModel"):GetInstance():GetCurSection()
+            if
+                _G.GlobalConditionManager.CheckCondition(condition[1], condition[2]) and
+                    _G.PlayerPrefsManager.GetInt("LuckyTriadsPop", 0) < (condition[2] + 1)
+             then
+                _G.PlayerPrefsManager.SetInt("LuckyTriadsPop", curSectionId)
+            else
+                checkPop = false
+            end
+        elseif condition[1] == _G.GlobalConditionManager.ConditionType.createRoleDay then
+            ---创号达到n天
+            local createDays =
+                _G.TimeUtil.GetInterValDayByGame(
+                _G.PlayerModel:GetInstance():GetCreateRoleTime(),
+                _G.TimeUtil.GetServerUnixTime()
+            ) + 1
+            if createDays < condition[2] then
+                checkPop = false
+            end
+        end
+    end
+    return checkPop
+end
+--endregion
+
+return LuckyTriadsModel

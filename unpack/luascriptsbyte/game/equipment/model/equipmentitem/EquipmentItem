@@ -1,0 +1,728 @@
+-------------------------------------------------------------------------
+-- D:.ClientTrunk.Assets.Resources.LuaScripts.Game.Equipment.Model.EquipmentItem	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/08/12
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+local base = require "BaseItemData"
+
+local eleGrowth = _G.ConfigManager.discrete_cfg[104903][1][1]
+eleGrowth = eleGrowth * 0.0001
+
+---@class EquipmentItem	中文描述
+local EquipmentItem = _G.BaseClass("EquipmentItem", base)
+_G.EquipmentItem = EquipmentItem
+---类的构造函数
+function EquipmentItem:__init()
+    ---true初始化完成 可以检测修改 刷新红点
+    self.Init = false
+    ---要显示的属性
+    self.showAttrType = {
+        _G.AttrType.atk,
+        _G.AttrType.bre,
+        _G.AttrType.def,
+        _G.AttrType.max_hp,
+        _G.AttrType.hit_rate,
+        _G.AttrType.avd_rate,
+        _G.AttrType.cri_rate,
+        _G.AttrType.cri_r_rate
+    }
+    ---临时战力
+    ---@field element number 同五行战力
+    --@class ElementTempPower
+    self.tempPowers = {}
+end
+
+-----计算战力
+---@param ac AttributeClass 装备item
+---@return number 战力
+function EquipmentItem:CalculateEquipmentPower()
+    local ac = self:GetAllAttr(true)
+
+    local scoreArr = self:GetAdditionScore()
+
+    return ac:CalculateEquipmentPower(scoreArr)
+end
+
+---类的析构函数
+function EquipmentItem:Dispose()
+end
+
+function EquipmentItem:GetName()
+    return _G.LangUtil.GetLangPackValue(self.cfg.name)
+end
+
+---@field addition table
+---@field element number
+---@field exp number
+---@field num number
+---@field reset number
+---@field streng number
+---@field uid number
+---@field sid number
+---@class EquipmentItem_ServerMsg  服务器仓库的装备数据
+
+-----初始化装备数据
+---@param data EquipmentItem_ServerMsg
+function EquipmentItem:ParseInitMsg(data)
+    self.sid = data.sid
+    self.uid = data.uid
+    self.streng = data.streng and data.streng or 0
+    ---待替换洗练属性
+    self.reset = data.reset or nil
+    ---堆叠数量
+    self.count = (data.num or data.count) or 0
+    ---强化经验 不累计
+    self.strengExp = data.exp or 0
+    self.element = data.element or 0
+    if _G.AppSetting.IsXzns then --星座没有种族加成，策划要求防止配置出错强制显示没有种族
+        self.element = 0
+    end
+    --随机属性  [{k=id,v=num}]
+    self.addition = {}
+    ---设定随机属性
+    self:SetAddition(data.addition)
+    self.cardUid = 0
+    ---true同五行
+    self.IscardElement = false
+    ---根据sid 设定cfg及相关数据
+    self:UpGradeSid(self.sid)
+    ---突破四阶后绑定的卡牌sid
+    self.bound = data.bound or 0
+    self.Init = true
+end
+
+function EquipmentItem:ParseExtend(extend)
+    self.element = extend[1] or self.element
+    if _G.AppSetting.IsXzns then --星座没有种族加成，策划要求防止配置出错强制显示没有种族
+        self.element = 0
+    end
+end
+
+---重连自动选择 分数最高的随机属性
+---@param data EquipmentItem_ServerMsg
+function EquipmentItem:SelectReset(data)
+    if data.reset == nil then
+        return
+    end
+    local EquipmentModel = require("EquipmentModel"):GetInstance()
+
+    ---属性拼接 锁的+本次随的
+    local additionArr = {}
+    for i, value in pairs(self.addition) do
+        table.insert(additionArr, value)
+    end
+
+    local NewAdditionArr = {}
+    for i = 1, #data.reset do
+        local attArr = {}
+        table.insertto(attArr, additionArr)
+        for _, value in pairs(data.reset[i].addition) do
+            local att = {}
+            local index = value.index
+            att.k = value.sid
+            att.v = value.value
+            if attArr[index] ~= nil then
+                attArr[index] = att
+            else
+                table.insert(attArr, att)
+            end
+        end
+        table.insert(NewAdditionArr, attArr)
+    end
+
+    local nowScore = EquipmentModel:GetAdditionsScore(self.addition)
+    local index = 0
+    local NewAddition, score
+    for tIndex, addition in pairs(NewAdditionArr) do
+        score = EquipmentModel:GetAdditionsScore(addition)
+        if nowScore < score then
+            nowScore = score
+            index = tIndex
+            NewAddition = addition
+        end
+    end
+    require("EquipmentModel"):GetInstance():EquipmentChoose(self, index, NewAddition)
+end
+
+---获取装备卡牌sid
+function EquipmentItem:GetCardSid()
+    if self.cardUid ~= 0 then
+        local cd = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, self.cardUid)
+        if cd then
+            return cd.sid
+        else
+            return 0
+        end
+    else
+        return 0
+    end
+end
+
+---重连自动替换五行
+---@param data EquipmentItem_ServerMsg
+function EquipmentItem:SelectResetElement(data)
+    if data.reset_element == nil or data.reset_element == 0 then
+        return
+    end
+    require("EquipmentModel"):GetInstance():EquipmentSelectRecast(self, 1, data.reset_element)
+end
+
+---获取随机属性评分 装备计算战斗力 用
+---@return number[]
+function EquipmentItem:GetAdditionScore()
+    local scoreArr = {}
+
+    local equipment_add_att_cfg = _G.ConfigManager.equipment_add_att_cfg
+    ---@type equipment_add_att_cfg
+    local equipment_add_att_cfgItem
+
+    local num, sid, score
+    for _, value in pairs(self.addition) do
+        sid = value.k
+        equipment_add_att_cfgItem = equipment_add_att_cfg[sid]
+        num = value.v
+        score = num * equipment_add_att_cfgItem.score_base
+        table.insert(scoreArr, score)
+    end
+    return scoreArr
+end
+
+function EquipmentItem:SetAddition(addition)
+    self.addition = addition or {}
+
+    if self.addition[1] then
+        if self.addition[1].index == nil then
+            for i = 1, #self.addition do
+                self.addition[i].index = i
+            end
+        end
+
+        ----与服务器 index相同 方便锁定判定
+        _G.SortList(
+            self.addition,
+            function(a)
+                return -a.index
+            end
+        )
+    end
+
+    ---随机属性值 {{sid,num},,,}   不用sid=num防止同sid属性
+    self.additionValue = {}
+    self.addition_fixed = {}
+    if addition ~= nil then
+        local sid, num
+        for index, value in pairs(self.addition) do
+            sid = value.k
+            num = value.v
+
+            table.insert(self.additionValue, { sid, num * 0.0001 })
+        end
+    end
+
+    --- 随机属性 加成到卡牌上
+    if self.addProp == nil then
+        self.addProp = _G.AttributeClassManager:GetInstance():GetAttribtueClass(0, _G.PowerType.equipment)
+    else
+        self.addProp:OnInit(0, _G.PowerType.equipment)
+    end
+    if #self.additionValue > 0 then
+        local equipment_add_att_cfg = _G.ConfigManager.equipment_add_att_cfg
+        local equipment_add_att_cfgItem, tAttCountType
+        for _, info in pairs(self.additionValue) do
+            local sid = info[1]
+            local num = info[2]
+            equipment_add_att_cfgItem = equipment_add_att_cfg[sid]
+            if equipment_add_att_cfgItem ~= nil then
+                if equipment_add_att_cfgItem.value_type == 2 then
+                    tAttCountType = _G.AttCountType.basePercent
+                elseif equipment_add_att_cfgItem.value_type == 1 then
+                    tAttCountType = _G.AttCountType.other
+                end
+                self.addProp:SetValueByName(equipment_add_att_cfgItem.type_attribute, num, false, tAttCountType)
+            end
+        end
+    end
+    self:ChangeRedPoint()
+end
+
+--- 复刻装备数据
+------@param equip EquipmentItem
+function EquipmentItem.GetMsg(equip)
+    --- 有培养属性的不会可堆叠 不用Copy
+    ---@type EquipmentItem_ServerMsg
+    local data = {}
+    data.element = equip.element
+    data.exp = equip.strengExp
+    data.num = 1
+    data.sid = equip.sid
+    data.uid = equip.uid
+    data.streng = equip.streng
+    data.addition = equip.addition
+    data.bound = equip.bound
+    return data
+end
+
+---根据装备数据 复刻装备 堆叠装备穿戴脱下
+------@param equip EquipmentItem
+function EquipmentItem.Copy(equip)
+    --- 有培养属性的不会可堆叠 不用Copy
+    local data = EquipmentItem.GetMsg(equip)
+    local equ = require("EquipmentItem").New()
+    equ:Parse(data)
+    return equ
+end
+
+function EquipmentItem:GetCurAttributeBind()
+    if self.cfg == nil then
+        return
+    end
+    return self.cfg.attribute_bind
+end
+
+function EquipmentItem:SetBoundId(sid)
+    if self.bound == 0 and sid ~= nil and sid > 0 then
+        self.bound = sid
+    end
+end
+
+---检测当前装备角色是否和绑定卡牌同sid false则不提供专属加成
+function EquipmentItem:CheckEquipmentBoundSidIsCurCardSid()
+    local sid = self:GetCardSid()
+    if sid == 0 then
+        return false
+    end
+    if self.bound == 0 then
+        return false
+    end
+    return sid == self.bound
+end
+
+---设置专属角色的属性加成
+function EquipmentItem:SetBoundProp()
+    if self.cfg == nil then
+        return
+    end
+    if self:CheckEquipmentBoundSidIsCurCardSid() then
+        --("神阶专属加成")
+        local attributeBind = self:GetCurAttributeBind()
+        if not _G.table.isEmptyOrNil(attributeBind) then
+            for i = 1, #attributeBind do
+                self.BoundProp:AddValueByName(
+                    attributeBind[i][1],
+                    _G.AttributeClassManager:GetInstance():GetValueWithName(
+                        attributeBind[i][1],
+                        attributeBind[i][3],
+                        _G.tonumber(attributeBind[i][2])
+                    ),
+                    nil,
+                    _G.tonumber(attributeBind[i][2])
+                )
+            end
+        end
+    end
+end
+
+function EquipmentItem:SetProp()
+    if self.cfg == nil then
+        return
+    end
+    local num
+    for i, v in pairs(self.showAttrType) do
+        num = self.cfg[v.key]
+        if num ~= nil and num > 0 then
+            if v.proptype == 1 then
+                self.prop:SetValueByName(v.key, num)
+            else
+                self.prop:SetValueByName(v.key, num * 0.0001)
+            end
+        end
+    end
+end
+
+function EquipmentItem:SetUPProp()
+    local att_growth = 0
+    local cfg = self:GetEquipCurStrengCfg()
+    if cfg ~= nil then
+        att_growth = cfg.att_growth
+    end
+    ---没有强化等级也要算强化  可能有同五行
+    self.UPProp = self:GetUPProp(att_growth)
+end
+
+---获取  临时计算出的 指定强化等级的属性
+function EquipmentItem:GetTempUPProp(streng)
+    local cfg = self:GetEquipNextStrengCfg(streng)
+    if cfg ~= nil then
+        local tUpProp = self:GetUPProp(cfg.att_growth)
+        return _G.AttributeClassManager:GetInstance():AddAttributeByNew(self.prop, tUpProp)
+    end
+    return nil
+end
+
+---获取  指定强化等级 增加的属性
+function EquipmentItem:GetUPProp(att_growth)
+    ---先设定空属性
+    local tUpProp = _G.AttributeClassManager:GetInstance():GetAttribtueClass(0, _G.PowerType.equipment)
+    local growth = att_growth * 0.0001
+    local teleGrowth = 0
+    ---true算上同五行加成 (必须一起算 好四舍五入 否则分开算强化0.2 五形0.3会被舍去)
+    -- 镇魂街ZHJ-34446 Beta_1.0.0公测BuglistZHJ-36566
+    -- 【装备】装备4阶突破界面属性展示错误      装备4阶的五行加成已经算进基础属性数值
+    if self.IscardElement and self.Grade ~= 11 then
+        --- 同五行加成
+        teleGrowth = eleGrowth
+    end
+    local sumGrowth = teleGrowth + growth
+    if sumGrowth > 0 then
+        ---拷贝基础属性 乘系数
+        tUpProp = self.prop:Clone()
+        tUpProp:AddBaseMultiply((sumGrowth))
+        local num
+        for _, v in pairs(self.showAttrType) do
+            num = tUpProp:GetValueByName(v.key)
+
+            if num ~= nil and num > 0 then
+                if _G.AttrType[v.key].percentage == 0 then
+                    ---数值类型四舍五入
+                    num = Mathf.RoundToInt(num)
+                end
+                tUpProp:SetValueByName(v.key, num)
+            end
+        end
+    end
+    return tUpProp
+end
+
+-----获取装备战力
+---@return number 装备战力
+function EquipmentItem:GetPower(isUpdate)
+    if self.power == 0 or isUpdate then
+        self.power = self:CalculateEquipmentPower()
+    end
+    return self.power
+end
+
+---获取装备位 头衣鞋
+function EquipmentItem:GetParts()
+    return self.cfg.parts
+end
+
+---获取装备类型 板皮布
+function EquipmentItem:GetProfessional()
+    return self.cfg.professional
+end
+
+---@param streng number streng==nil 则当前强化等级 (用于快速获取 强化sid)
+function EquipmentItem:GetStrengSid(streng)
+    if streng == nil then
+        streng = self.streng
+    end
+    return 10000 + self.Grade * 100 + streng
+end
+
+---是否强化到最大等级
+function EquipmentItem:IsMAxStreng()
+    local maxlv = self.cfg.strengthen_level
+    return self.streng >= maxlv
+end
+
+---获取下一个装备强化等级的配置表  或指定强化等级
+function EquipmentItem:GetEquipNextStrengCfg(streng)
+    if streng == nil then
+        streng = self.streng + 1
+    end
+    local maxlv = self.cfg.strengthen_level
+    ---如果 当前强化等级 已达到上限
+    if maxlv == 0 or streng > maxlv then
+        return nil
+    end
+
+    return _G.ConfigManager.equipment_stren_cfg[self:GetStrengSid(streng)]
+end
+
+---获取当前装备强化等级的配置表
+function EquipmentItem:GetEquipCurStrengCfg()
+    return self.streng > 0 and _G.ConfigManager.equipment_stren_cfg[self:GetStrengSid()] or nil
+end
+
+-----获取装备配置
+---@return EquipmentCfg_Item 装备配置
+function EquipmentItem:GetConfig()
+    return self.cfg
+end
+
+-----装备强化
+------@param exp number 当前总累计经验
+function EquipmentItem:Strength(exp)
+    if exp == 0 then
+        self:SetUPProp()
+        self:Updata()
+        return
+    end
+
+    local cfg = self:GetEquipNextStrengCfg()
+    if cfg ~= nil then
+        if exp > cfg.points_up then
+            self.streng = self.streng + 1
+            self:Strength(exp, cfg.points_up)
+        elseif exp == cfg.points_up then
+            self.streng = self.streng + 1
+            self.strengExp = exp - cfg.points_up
+            self:Strength(0)
+        else
+            cfg = self:GetEquipCurStrengCfg()
+            if cfg ~= nil then
+                exp = exp - cfg.points_up
+            end
+            self.strengExp = exp
+            exp = 0
+            self:Strength(exp)
+        end
+    else
+        ---经验超出
+        self.strengExp = 0
+        self:Strength(0)
+    end
+
+    return 0
+end
+
+-----装备洗练
+function EquipmentItem:Reset(addition)
+    self:SetAddition(addition)
+    self:Updata()
+    return 0
+end
+
+-----装备洗练属性保留
+function EquipmentItem:AddKeep()
+    self.a_sid = 0
+    self.a_num = 0
+end
+
+-----获取装备总属性
+---@return AttributeClass
+function EquipmentItem:GetAllAttr()
+    local baseProp = self.prop:Clone()
+
+    local sumProp = _G.AttributeClassManager:GetInstance():AddAttributeByNew(baseProp, self.UPProp)
+    sumProp = _G.AttributeClassManager:GetInstance():AddAttributeByNew(sumProp, self.BoundProp)
+    return sumProp
+end
+
+-----获取装备卡牌计算属性  包括五行加成 包括随机
+---@return AttributeClass
+function EquipmentItem:GetCardAddAttr()
+    local sumProp = self:GetAllAttr()
+    local sumCardEqu = sumProp:Clone()
+    sumCardEqu:AttributeToOther()
+
+    return _G.AttributeClassManager:GetInstance():AddAttributeByNew(sumCardEqu, self:GetAddPropAttr())
+end
+
+-----获取装备随机属性
+---@return AttributeClass
+function EquipmentItem:GetAddPropAttr()
+    return self.addProp
+end
+
+-----获取装备的卡牌的UID
+---@return number 卡牌uid
+function EquipmentItem:GetEquipCardUid()
+    return self.cardUid
+end
+
+-----穿戴装备
+---@param uid number 卡牌uid
+---@param element table 多种族
+---@param isTemp boolean 是否为临时装备
+function EquipmentItem:PutEquip(uid, element, isTemp, notRefreshRedPoint)
+    if uid == 0 then
+        self:UnEquip()
+        return
+    end
+    if not isTemp then
+        require("EquipmentModel"):GetInstance():AddPartsList(self, uid)
+    end
+    self.isTemp = isTemp
+    self.cardUid = uid
+    self.IscardElement = require("CardInfoManager"):GetInstance():CheckMultiMatchCOP(element, self.element)
+
+    ---同五行 刷新数据
+    self:SetUPProp()
+    ---卡牌绑定专属加成
+    self:SetBoundProp()
+    self:Updata(notRefreshRedPoint)
+end
+
+---十阶以上绑定卡牌
+function EquipmentItem:BoundCardId(sid)
+    if self.bound == 0 then
+        self.bound = sid
+    end
+    self.element = 0
+    self.streng = 0
+    self.IscardElement = false
+end
+
+-----卸下装备
+function EquipmentItem:UnEquip()
+    if self.cardUid ~= 0 then
+        require("EquipmentModel"):GetInstance():SubPartsList(self, self.cardUid)
+    end
+
+    self.cardUid = 0
+
+    self.IscardElement = false
+end
+
+-----获取装备的名字
+function EquipmentItem:GetName()
+    return _G.LangUtil.GetLangPackValue(self.cfg.name)
+end
+
+-----获取装备的描述
+function EquipmentItem:GetDescribe()
+    return _G.LangUtil.GetLangPackValue(self.cfg.describe)
+end
+
+-----获取装备类型的描述
+function EquipmentItem:GetTextProfessional()
+    return _G.LangUtil.GetLangPackValue(_G.ConfigManager.type_equipment_cfg[self.cfg.professional].name)
+end
+
+---获取词缀的评级
+function EquipmentItem:GetRandomAttrGrade(sid, v)
+    local Affix_Cfg = _G.ConfigManager.equipment_add_att_cfg
+    local cfg = Affix_Cfg[sid]
+    if cfg.value_type == _G.AdditionValueType.Fixed then
+        for n = 1, #cfg.value do
+            if cfg.value[n] == v then
+                return n
+            end
+        end
+    elseif cfg.value_type == _G.AdditionValueType.Section then
+        for n = 1, #cfg.value - 1 do
+            if cfg.value[n] <= v and cfg.value[n + 1] > v then
+                return n
+            end
+        end
+    end
+end
+
+-----通过类型和下标获取随机属性
+function EquipmentItem:GetAddition(type, index)
+    local data
+    if type == _G.AdditionType.Fixed then
+        data = _G.DeepCopy(self.addition_fixed[index])
+    else
+        data = _G.DeepCopy(self.addition[index])
+    end
+    return data
+end
+
+function EquipmentItem:GetLevel()
+    return self.cfg.level
+end
+
+--region --------------------------------------突破 --------
+
+--获取突破后sid
+function EquipmentItem:GetUpGradeSid()
+    local id = self.cfg.upgrade_equip
+    if id == nil or id == 0 then
+        return nil
+    end
+    return id
+end
+
+---获取升级装备的绑定属性
+function EquipmentItem:GetAttributeBind()
+    local upgradeEquip = self:GetUpGradeSid()
+    if upgradeEquip then
+        local attributeBind = _G.ConfigManager.equipment_cfg[upgradeEquip].attribute_bind
+        if _G.table.isEmptyOrNil(attributeBind) then
+            return nil
+        end
+        return attributeBind
+    else
+        return nil
+    end
+end
+
+--- 设定sid 装备配置
+function EquipmentItem:UpGradeSid(sid)
+    if sid == nil or sid == 0 then
+        return
+    end
+    self.sid = sid
+    ---@type equipment_cfg
+    self.cfg = _G.ConfigManager.equipment_cfg[sid]
+    self.Icon = self.cfg.icon
+    self.Grade = self.cfg.grade
+
+    self.prop = _G.AttributeClassManager:GetInstance():GetAttribtueClass(0, _G.PowerType.equipment)
+    self.UPProp = _G.AttributeClassManager:GetInstance():GetAttribtueClass(0, _G.PowerType.equipment)
+    self.BoundProp = _G.AttributeClassManager:GetInstance():GetAttribtueClass(0, _G.PowerType.equipment)
+    ---todo 角色专属属性加成
+    self:SetBoundProp()
+    self:SetProp()
+    self:SetUPProp()
+    self:Updata()
+end
+
+--endregion------------------------------------突破 --------
+
+----数据修改后 调用
+function EquipmentItem:Updata(notRefreshRedPoint)
+    self:GetPower(true)
+    if not notRefreshRedPoint then
+        self:ChangeRedPoint()
+    end
+    self.tempPowers = {}
+end
+
+function EquipmentItem:ChangeRedPoint()
+    if self.Init ~= true or self.cardUid == 0 or self.isTemp then
+        return
+    end
+    local part_uid = self.cardUid * 10 + self.cfg.parts
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RoleEquipment.id, part_uid)
+end
+
+---获取同五行战力
+---@param element number 卡牌五行
+function EquipmentItem:GetTempElementPower(element)
+    local power = self:GetPower()
+    if require("CardInfoManager"):GetInstance():CheckMultiMatchCOP(element , self.element) and not self.IscardElement then
+        if not self.tempPowers.element then
+            local tb = {}
+            tb.IscardElement = self.IscardElement
+            tb.power = self:GetPower()
+            self.IscardElement = true
+            self:SetUPProp()
+            self.tempPowers.element = self:GetPower(true)
+            self.IscardElement = tb.IscardElement
+            self:SetUPProp()
+            self.power = tb.power
+            self.IscardElement = tb.IscardElement
+        end
+        power = self.tempPowers.element
+    end
+    return power
+end
+
+---获取分解后的经验
+function EquipmentItem:GetDecompositionExp()
+    ---@type equipment_stren_cfg
+    local cfg = self:GetEquipCurStrengCfg()
+    return self.cfg.decomposition, cfg and cfg.points_up + self.strengExp or 0
+end
+
+function EquipmentItem:GetGrade()
+    return self.cfg.grade
+end
+
+return EquipmentItem

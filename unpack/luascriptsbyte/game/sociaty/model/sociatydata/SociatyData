@@ -1,0 +1,453 @@
+---定义公会主建筑(代表公会等级)
+local MasterBuildId = 1
+
+-----------------------------------------------------------------------
+-- Created by szs on 24. 二月 2021 16:51
+--
+-- @Description 公会数据
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local SociatyMemberModule = require("SociatyMemberModule")
+---@class SociatyData
+---@field Uid number 公会UID
+---@field Name string 公会名称
+---@field Level number 公会等级
+---@field Banner number 公会图标
+---@field BuildCoin number 今日已获取建筑币数量
+---@field LimitLevel number 公会限制等级
+---@field NeedApproval number 是否需要审批(0系统审核显示：自由加入,1玩家审核显示：需审批)
+---@field Declaration string 公会宣言
+---@field JoinDeclaration string 入会说明
+---@field CreateTime number 公会创建时间
+---@field SociatyMemberModule SociatyMemberModule 公会成员模块
+---@field Chairman SociatyMemberBase 公会会长
+---@field Exp number 公会经验
+---@field LevelCfg guild_level_cfg 公会等级相关配置
+---@field SevenDayLive number 七日活跃
+---@field ServerId number 服务器id
+---@field BuildStates table<number,SociatyBuildState> 公会建筑状态
+local SociatyData = _G.BaseClass("SociatyData")
+
+--region -------------静态变量-------------
+
+--endregion
+
+function SociatyData:__init()
+    self.Uid = 0
+    self.Name = ""
+    self.Level = 1
+    self.Exp = 0
+    self.Banner = 1
+    self.BuildCoin = 0
+    self.LimitLevel = 0
+    self.NeedApproval = 0
+    self.Declaration = _G.LangUtil.GetLangPackValue(90021800022)
+    self.JoinDeclaration = _G.LangUtil.GetLangPackValue(90021800022)
+    self.CreateTime = 0
+    if not self.SociatyMemberModule then
+        ---@see SociatyMemberModule#__init
+        self.SociatyMemberModule = SociatyMemberModule.New(self)
+    end
+    self.SevenDayLive = 0
+    self.ServerId = 0
+end
+
+function SociatyData:Dispose()
+    self.SociatyMemberModule:Dispose()
+end
+
+---解析服务器数据
+---@param msg guild.i_guild
+function SociatyData:Parse(msg)
+    self.Uid = msg.uid
+    self.Name = msg.name
+    self.Banner = msg.banner
+    self.LimitLevel = msg.join_lv
+    self.LimitChapter = msg.afk_chapter
+    self.Exp = msg.exp
+    self.Declaration = (msg.provate_notice and #msg.provate_notice > 0) and msg.provate_notice or
+        _G.LangUtil.GetLangPackValue(90021800022)
+    self.JoinDeclaration = (msg.public_notice and #msg.public_notice > 0) and msg.public_notice or
+        _G.LangUtil.GetLangPackValue(90021800022)
+    self.NeedApproval = msg.is_check
+    self.SevenDayLive = (msg.seven_day_live and msg.seven_day_live > 0) and msg.seven_day_live or 0
+    self.ServerId = (msg.server_id and msg.server_id > 0) and msg.server_id or 0
+    self.CreateTime = msg.create_time or 0
+    self.BuildCoin = msg.day_build_coin or 0
+    self.GuildPower = msg.guild_power or 0
+    self.guild_prefix=msg.guild_prefix or ""
+    self.prefix_time=msg.prefix_time or 0
+    self.prefix_role = msg.prefix_role or {}
+    --初始化建筑状态
+    self.BuildStates = {}
+    self:InitBuildStates(msg.builds)
+    self:InitMasterBuildStateIfNotExist(msg.level or 1)
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(msg.num, "成员数量")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(msg.roles, "解析成员数据")
+    end
+    self.SociatyMemberModule.MaxMemberNum = self.LevelCfg.num_player
+    self.curFairAwardBox = msg.award_type
+    for i = 1, #msg.roles do
+        self.SociatyMemberModule:AddMember(msg.roles[i])
+    end
+    self.SociatyMemberModule:RefreshCurMemberCount(msg.num)
+    self.SociatyMemberModule:SortMember()
+end
+
+---公会战力，由公会成员战力集合组成
+function SociatyData:Power()
+    local power = 0
+    for i = 1, #self.SociatyMemberModule.Member do
+        power = power + self.SociatyMemberModule.Member[i].Power
+    end
+    return power
+end
+
+---获取会长
+---@return SociatyMemberBase
+function SociatyData:GetChairman()
+    return self.SociatyMemberModule:GetChairman()
+end
+
+---是否满人
+function SociatyData:IsMax()
+    return self.SociatyMemberModule:GetCurMemberCount() >= self.LevelCfg.num_player
+end
+
+---获取玩家自身的人员管理模块
+---@return SociatyMemberModule
+function SociatyData.GetMemberModule()
+    local SociatyModel = require("SociatyModel")
+    local data = SociatyModel:GetInstance().SociatySelf
+    if data then
+        return data.SociatyMemberModule
+    end
+    return nil
+end
+
+--region -------------公会建筑接口---------------------
+
+---初始化公会建筑状态
+---@private
+---@param states guild.i_guild_build[]
+---@return void
+function SociatyData:InitBuildStates(states)
+    if not states then
+        return
+    end
+    local mainGuildState
+    for _,v in pairs(states) do
+        if v.sid == 1 then
+            mainGuildState = v
+            break
+        end
+    end
+    self:UpdateAllBuildState(mainGuildState)
+end
+
+---默认勾选“公会大厅”为重点建设,当前建筑满级后，重点标识自动选中下一个未满级建筑,所有建筑满级后，取消默认勾选
+function SociatyData:SetDefaultBuildState()
+    local isAllMax = true
+    local key = 0
+    local index = 0
+    for i = 1, 5 do
+        if self.BuildStates[i] then
+            local cfg = _G.ConfigManager.guild_unit_cfg[i]
+            if self.BuildStates[i].priority == true then
+                key = i
+            end
+            if self.BuildStates[i].level <= #cfg.exp then
+                isAllMax = false
+                if index == 0 then
+                    index = i
+                end
+            end
+        else
+            isAllMax = false
+            if index == 0 then
+                index = i
+            end
+        end
+    end
+    if isAllMax then
+        for i = 1, 5 do
+            if self.BuildStates[i] then
+                self.BuildStates[i].priority = false
+            end
+        end
+    else
+        if key == 0 then
+            if self.BuildStates[index] == nil then
+                self:UpdateBuildState(index, { sid = index, exp = 0, key = 1 })
+            else
+                self:SetPriorityBuild(index, true)
+            end
+        else
+            local cfg = _G.ConfigManager.guild_unit_cfg[key]
+            if self.BuildStates[key].level > #cfg.exp then
+                self:SetPriorityBuild(index, true)
+            end
+        end
+    end
+end
+
+---初始化主建筑(如果其状态不存在)
+---@private
+---@param level number
+---@return void
+function SociatyData:InitMasterBuildStateIfNotExist(level)
+    if not self.BuildStates or self.BuildStates[MasterBuildId] then
+        return
+    end
+    self.Level = level > 0 and level or 1
+    self.Exp = 0
+    self.LevelCfg = _G.ConfigManager.guild_level_cfg[self.Level]
+    self.SociatyMemberModule.MaxMemberNum = self.LevelCfg.num_player
+end
+
+---更新所有公会建筑。但现在只有公会大厅能够升级，故state参数暂时只需要传入公会大厅的状态即可
+function SociatyData:UpdateAllBuildState(state)
+    if not state then
+        return
+    end
+    self:UpdateBuildState(MasterBuildId, state)
+    for i = 2, 5 do
+        self:UpdateBuildState(i, { sid = i, exp = 0, key = 0 })
+    end
+end
+
+---更新公会建筑状态
+---@param id number    建筑id
+---@param state guild.i_guild_build
+---@return void
+function SociatyData:UpdateBuildState(id, state)
+    if not state or not self.BuildStates then
+        return
+    end
+    ---TODO
+    --ZHJH-7916 策划要求将除公会大厅以外的公会建筑取消升级，改为跟随大厅等级修改
+    --计算并获取当前累计经验对应的等级
+    local level, exp = 1, state.exp
+    if id == MasterBuildId then
+        local expList = _G.ConfigManager.guild_unit_cfg[id].exp
+        for i = #expList, 1, -1 do
+            if exp >= expList[i] then
+                level = i + 1
+                exp = exp - expList[i]
+                break
+            end
+        end
+    else
+        local mainLevel = self.BuildStates[1].level
+        local cfg = require("SociatyModel"):GetInstance():GetBuildLevelCfgByMainBuild(mainLevel)
+        ---eq: cfg = {[2] = 2, [3] = 1, [4] = 2, [5] = 1} 建筑id对应的等级
+        level = cfg and cfg[id] or 1
+    end
+    self.BuildStates[id] = {
+        level = level,
+        exp = exp,
+        totalExp = state.exp,
+        priority = state.key == 1
+    }
+    if id == MasterBuildId then
+        self.Exp = exp
+        if level > self.Level then
+            self.Level = level
+            _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.MasterBuildLevelChange, level)
+        else
+            self.Level = level
+        end
+        self.LevelCfg = _G.ConfigManager.guild_level_cfg[self.Level]
+        self.SociatyMemberModule.MaxMemberNum = self.LevelCfg.num_player
+    end
+end
+
+---是否为公会大厅建筑
+---@return boolean
+function SociatyData:IsMasterBuild(id)
+    return id == MasterBuildId
+end
+
+---是否为重点关注建筑
+---@param id number    建筑id
+---@return boolean
+function SociatyData:IsPriorityBuild(id)
+    if not self.BuildStates or not self.BuildStates[id] then
+        return false
+    end
+    return self.BuildStates[id].priority
+end
+
+---设置重点关注建筑
+---@param id number    建筑id
+---@param enable boolean    设置或取消
+---@return void
+function SociatyData:SetPriorityBuild(id, enable)
+    if not self.BuildStates then
+        return false
+    end
+    if not self.BuildStates[id] then
+        self:UpdateBuildState(id, { sid = id, exp = 0, key = 0 })
+    end
+    for _id, state in pairs(self.BuildStates) do
+        state.priority = enable and _id == id
+    end
+end
+
+---获取重点建筑id, 如果为0表示没有重点建筑
+---@return number
+function SociatyData:GetBuildPriorityId()
+    if not self.BuildStates then
+        return 0
+    end
+    for _id, state in pairs(self.BuildStates) do
+        if state.priority then
+            return _id
+        end
+    end
+    return 0
+end
+
+---获取公会建筑等级
+---@param id number    建筑id
+---@param defaultLevel number    默认返回值, 默认:1
+---@return number
+function SociatyData:GetBuildLevel(id, defaultLevel)
+    if not self.BuildStates or not self.BuildStates[id] then
+        return defaultLevel or 1
+    end
+    return self.BuildStates[id].level
+end
+
+---获取公会大厅等级(公会等级)
+---@return number
+function SociatyData:GetMasterBuildLevel()
+    return self:GetBuildLevel(MasterBuildId, 1)
+end
+
+---获取公会大厅id
+---@return number
+function SociatyData:GetMasterBuildId()
+    return MasterBuildId
+end
+
+---获取公会建筑当前经验进度
+---@param id number    建筑id
+---@return number,number,number        当前等级拥有经验丶当前等级所需经验丶总共可接收的经验
+function SociatyData:GetBuildExp(id)
+    if not self.BuildStates then
+        return 0, 0, 0
+    end
+    local expList = _G.ConfigManager.guild_unit_cfg[id].exp
+
+    local state = self.BuildStates[id]
+    local level = state and state.level or 1
+    local exp = state and state.exp or 0
+
+    local needExp = expList[level] or 0
+    if level > 1 and needExp > 0 then
+        needExp = needExp - expList[level - 1]
+    end
+
+    local maxNeedExp = expList[#expList] - exp
+    if level > 1 and maxNeedExp > 0 then
+        maxNeedExp = maxNeedExp - expList[level - 1]
+    end
+    if maxNeedExp < 0 then
+        maxNeedExp = 0
+    end
+    return exp, needExp, maxNeedExp
+end
+
+---获取公会建筑最后一级需要的经验
+---@param id number    建筑id
+---@return number 最后一级需要的经验
+function SociatyData:GetfinalLvExp(id)
+    local expList = _G.ConfigManager.guild_unit_cfg[id].exp
+    local temp = expList[#expList - 1] or 0
+    local finalLvExp = expList[#expList] - temp
+    return finalLvExp
+end
+
+--endregion
+
+--region ----------公会试炼排行
+
+function SociatyData:GetRankList(msg)
+    self.WitchTrialsRankList={}
+    local roleItem={}
+    if msg.dps_rank then
+        if table.count(self.SociatyMemberModule.Member)>0 then
+            for i = 1, #msg.dps_rank do
+                roleItem=table.find(self.SociatyMemberModule.Member,function(a)
+                    if a.Uid==msg.dps_rank[i].key then
+                        return true
+                    end
+                end)
+                if  not IsNil(roleItem) then
+                    table.insert(self.WitchTrialsRankList,{ role=roleItem,dps=msg.dps_rank[i].value})
+                end
+            end
+        end
+        table.sort(self.WitchTrialsRankList,function(a,b)
+            return a.dps>b.dps
+        end)
+    end
+    return self.WitchTrialsRankList
+end
+
+function SociatyData:RefreshRankList(damages)
+    local playerUid=_G.PlayerModel:GetInstance():GetPlayerUid()
+    local selfRankItem=table.find(self.WitchTrialsRankList,function(a)
+        return a.role.Uid==playerUid
+    end)
+    if not selfRankItem then
+        local selfrole=table.find(self.SociatyMemberModule.Member,function(a)
+            if a.Uid==playerUid then
+                return true
+            end
+        end)
+        selfRankItem={role=selfrole,dps=0}
+        table.insert(self.WitchTrialsRankList,selfRankItem)
+    end
+    if damages then
+        if damages then
+            selfRankItem.dps=selfRankItem.dps+damages
+        else
+            selfRankItem.dps=selfRankItem.dps*2
+        end
+    end
+    table.sort(self.WitchTrialsRankList,function(a,b)
+        return a.dps>b.dps
+    end)
+end
+
+function SociatyData:GetMyRank()
+    local playerUid=_G.PlayerModel:GetInstance():GetPlayerUid()
+    for i = 1, #self.WitchTrialsRankList do
+        if self.WitchTrialsRankList[i].role.Uid==playerUid then
+            return i
+        end
+    end
+    return 0
+end
+
+--endregion
+
+--region 类型定义
+
+---@class SociatyBuildState 公会建筑状态
+---@field level number 当前建筑等级
+---@field exp number 当前等级经验进度
+---@field totalExp number 总经验值
+---@field priority boolean 重点关注建筑(优先升级建筑)
+
+--endregion
+
+---@return SociatyData
+return SociatyData

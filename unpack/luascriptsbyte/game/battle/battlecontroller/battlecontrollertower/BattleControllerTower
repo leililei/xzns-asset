@@ -1,0 +1,780 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Battle.BattleController.BattleControllerTower	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/04/21
+-- Description: 爬塔战斗控制类 【死魂塔DeadSoul】 注释啊注释！找这个文件找的好辛苦
+-----------------------------------------------------------------------
+local DeadsoulTowerModel = require("DeadsoulTowerModel")
+local DeadsoulTowerNet = require("DeadsoulTowerNet")
+local AfkModelIns = require("AfkModel"):GetInstance()
+local base = require "BattleControllerBase"
+---@class BattleControllerTower:BattleControllerBase    中文描述
+local BattleControllerTower = _G.BaseClass("BattleControllerTower", base)
+
+---类的构造函数
+function BattleControllerTower:__init()
+end
+
+---类的析构函数
+function BattleControllerTower:Dispose()
+end
+
+---处理传参
+---@param towerId number 爬塔id
+---@param atkUid table 布阵数据(传入 则替换掉当前 不传则采用当前数据)
+function BattleControllerTower:OnHandleParams(towerId, monsterId, index, leftName, rightName)
+    if _G.AppSetting.DEBUG then
+        _G.Log(towerId, "死魂岛挑战id")
+    end
+    self.TowerId = towerId
+    self.monsterId = monsterId
+    self.index = index
+    self.leftName = leftName
+    self.rightName = rightName
+end
+
+function BattleControllerTower:EnterRecordFight(...)
+    local args = { ... }
+    self.leftName = args[4] or self.leftName
+    self.rightName = args[5] or self.rightName
+    base.EnterRecordFight(self, ...)
+end
+
+-----检测是否可以进入战斗
+function BattleControllerTower:CheckFight(call)
+    self.checkCall = call
+
+    local towerType = DeadsoulTowerModel:GetInstance().CurTowerType
+    ---如果种族塔已关闭
+    if towerType ~= 9 and self:OnSixClockUpdateFighting() then
+        self.checkCall(false, 390101) --日期不符合种族塔试炼开放条件
+        return
+    end
+
+    local et = _G.EmbattleType.Tower
+    if towerType ~= 9 then
+        if #_G.DeadsoulTowerManager:GetInstance():GetSceneID() > 1 then
+            et = _G.EmbattleType["Tower" .. towerType] * 1000 + self.index
+        else
+            et = _G.EmbattleType["Tower" .. towerType]
+        end
+    else
+        if #_G.DeadsoulTowerManager:GetInstance():GetSceneID() > 1 then
+            et = _G.EmbattleType["Tower"] * 1000 + self.index
+        end
+    end
+    local sits = require "EmbattleModel":GetInstance():GetEmbattleData(et)
+    local skills = require "EmbattleModel":GetInstance():GetSkillIndex(et)
+    local port =
+        require("DeadsoulTowerNet"):GetInstance():DeadSoulFight(
+        {fid = self.TowerId, monster_id = self.monsterId},
+        _G.handler(self, self.OnFightMsgCall)
+    )
+    _G.BattleManager:GetInstance():AddLuaNetEvent(port)
+end
+
+function BattleControllerTower:OnFightMsgCall(msg)
+    if msg.ack == 1 then
+        self.mgCfg = _G.ConfigManager.monster_group_cfg[msg.fight_arg.sid]
+        self.fight_arg = msg.fight_arg
+        _G.DeadsoulTowerManager:GetInstance():SetCurFightArg(msg.fight_arg, msg.fight_arg.sid)
+        _G.DeadsoulTowerManager:GetInstance():SetBattleFirst(false)
+        --_G.CS.BattleManager.Inst:StrReceiveMsg(msg.fight_arg)
+        self.checkCall(true)
+        _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.Deadsoul}, 1)
+    else
+        self.checkCall(false, msg.ack)
+    end
+    self.checkCall = nil
+end
+
+---战斗验证不通过
+---@param msg number 错误信息
+function BattleControllerTower:OnCheckFail(msg)
+    if msg and msg > 1 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(msg)
+    end
+    --关闭布阵页面
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.DeadSoulEmbattleView.Name)
+    --关闭遮罩层
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+    --退出战斗并返回死魂塔页面
+    _G.DeadsoulTowerManager:GetInstance():ExitFight()
+    if _G.MainManager:GetInstance():IsToggledWildWindow(false) then
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        --移除MainView动画(从下往上滑出)
+        ---@type MainView
+        local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+        if mainView then
+            mainView:StopAnimation(true)
+        end
+
+        _G.DeadsoulTowerManager:GetInstance():ReturnUIPage(false)
+    end
+    --_G.DeadsoulTowerManager:GetInstance():EnterEmbattle(false, self.index)
+    --清除布阵资源(布阵相关资源会延后回收)
+    _G.DelayFrameDo(function()
+        _G.WorldManager:GetInstance():DespawnRoleParent()
+        _G.BattleManager:GetInstance():DestroyBattle(false)
+    end)
+end
+
+---加载战斗(协程加载)
+function BattleControllerTower:OnLoadFight()
+    --_G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    self.Loaded = false
+    self.ShowEnd = false
+    self.State = nil
+    local uiManager = _G.UIManager:GetInstance()
+
+    local battleView = uiManager:OpenWindow(_G.ConfigManager.ui_cfg.BattleView.Name, true).View
+    -- 等待 战斗窗口 加载完成
+    while (_G.IsNil(battleView.gameObject)) do
+        _G.coroutine.waitforendofframe()
+    end
+    battleView:Hide()
+
+    --_G.BaseBattleManager:GetInstance():ClearView(false)
+    -- 获取布阵信息
+    local battleManager = _G.BattleManager:GetInstance()
+    local et = _G.EmbattleType.Tower
+    if DeadsoulTowerModel:GetInstance().CurTowerType ~= 9 then
+        et = _G.EmbattleType["Tower" .. DeadsoulTowerModel:GetInstance().CurTowerType]
+    end
+
+    local id = 0
+    if DeadsoulTowerModel:GetInstance().CurTowerType == DeadsoulTowerModel:GetInstance().MianTower then
+        id = _G.EBattleType.Tower
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 1 then
+        id = _G.EBattleType.TowerThunder
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 2 then
+        id = _G.EBattleType.TowerWind
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 3 then
+        id = _G.EBattleType.TowerWater
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 4 then
+        id = _G.EBattleType.TowerFire
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 5 then
+        id = _G.EBattleType.TowerEarth
+    end
+    local cfg = _G.ConfigManager.tower_cfg[DeadsoulTowerModel:GetInstance().CurTowerSid]
+    local isid = cfg.layer
+    local str = _G.LangUtil.GetLangPackValue(90023200002, tostring(isid))
+    battleManager:initAttackSids(
+        require("EmbattleModel"):GetInstance():GetEmbattleData(id),
+        et,
+        true,
+        0,
+        0,
+        0,
+        str,
+        0,
+        self.leftName,
+        self.rightName
+    )
+    -- 协程等待
+    while battleManager.Progress < 1 do
+        _G.coroutine.waitforendofframe()
+    end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.DeadSoulEmbattleView.Name)
+    --_G.WorldManager:GetInstance():SetCurrentWorldVisible(false, true)
+    _G.coroutine.waitforendofframe()
+    battleView:SetCanvasGroupTrue()
+end
+
+---战斗开始
+function BattleControllerTower:OnStart()
+    if _G.MainManager:GetInstance():IsToggledWildWindow(true) then
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    end
+    _G.BattleManager:GetInstance():SetBattlePause(true)
+    _G.BattleManager:GetInstance():SetBattleStart()
+    _G.BattleManager:GetInstance():ShowBattleTeam()
+
+    --是否显示跳过战斗按钮
+    ---@type BattleView
+    local battleView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.BattleView.Name)
+    if battleView then
+        local unlockCfg
+        if _G.AppSetting.IsAlipay then
+            unlockCfg = _G.ConfigManager.discrete_cfg[126102]
+        else
+            -- 达到VIP7 或者 通关第八章后解锁
+            unlockCfg = _G.ConfigManager.discrete_cfg[120008]
+        end
+        local isUnlock = false
+        if unlockCfg then
+            for i = 1, #unlockCfg do
+                isUnlock = _G.GlobalConditionManager.CheckCondition(_G.table.unpack(unlockCfg[i]))
+                if isUnlock then
+                    break
+                end
+            end
+        end
+        battleView:SetLockSkipBtnShow(isUnlock)
+        if not isUnlock then
+            if _G.AppSetting.IsAlipay then
+                battleView:SetLockSkipBtnSystemTip(3709)
+            else
+                if _G.AppSetting.IsArraigned then
+                    battleView:SetLockSkipBtnSystemTip(3706)
+                else
+                    battleView:SetLockSkipBtnSystemTip(3704)
+                end
+            end
+        end
+    end
+end
+
+---战斗结束
+---@param tab table 战斗数据
+function BattleControllerTower:OnFightResult(tab, call)
+    if _G.AppSetting.DEBUG then
+        _G.Log(tab, "爬塔战斗结束")
+    end
+    self.FightResult = tab
+    call()
+end
+
+---战斗结束，死亡动画播放之前
+---@param tab table 战斗数据
+---@param call function 完成回调
+function BattleControllerTower:OnFightOverBeforePlayDeathAni(tab, call)
+    self.FightResultData = {}
+    self.FightResultData.statistics = true
+    self.FightResultData.iSWin = tab.winner[1] or tab.skip
+    ---ZHJ-20803 自动推图规则与放置副本一致
+    self.FightResultData.autonextDisplay = AfkModelIns:CheckAutoNextDisplay()
+    self.tab = tab
+    self.fight_arg.fight_cmd = tab.cmd
+    if not _G.DeadsoulTowerManager:GetInstance():CheckBattleEnd() then
+        if tab.winner[1] or tab.skip then
+            self:GetFightResult(tab, call)
+        else
+            require "FriendHelpModel":GetInstance():OpenNpc(nil, nil, 2)
+            self.FightResultData.btnDisplay = true
+            call()
+        end
+    else
+        -- if tab.skip then
+        --     self:GetFightResult(tab, call)
+        -- else
+        if self.FightResultData.iSWin then
+            if _G.BattleManager:GetInstance():HasStatisticsCached() and #_G.DeadsoulTowerManager:GetInstance():GetSceneID() > 1 then
+                _G.DeadsoulTowerManager:GetInstance():SetCurStatisticsData(
+                    _G.BattleManager:GetInstance():GetStatistics(),
+                    self.monsterId
+                )
+            end
+            self.FightResultData.pass = true
+            call()
+        else
+            require "FriendHelpModel":GetInstance():OpenNpc(nil, nil, 2)
+            call()
+        end
+        -- end
+    end
+end
+
+function BattleControllerTower:GetFightResult(tab, call)
+    require("BattleNet"):GetInstance():NpcPVEFightResult(
+        tab,
+        function(_data)
+            if _data.md5_error == "1" then
+                _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                _G.BattleManager:GetInstance():SaveLogNew()
+            elseif _data.md5_error == "2" then
+                _G.BattleManager:GetInstance():SaveLogNew()
+            end
+            self.FightResultData.iSWin = _data.winner[1]
+            if self.FightResultData.iSWin then
+                self:HandleFightWin(call, _data)
+            else
+                self.FightResultData.btnDisplay = true
+                call()
+            end
+        end
+    )
+end
+
+function BattleControllerTower:HandleFightWin(call, _data)
+    local DeadsoulTowerManager = _G.DeadsoulTowerManager:GetInstance()
+    if _data.ack == 1 then
+        self.FightResultData.iSWin = _data.winner[1]
+        if _data.winner then
+            if _G.BattleManager:GetInstance():HasStatisticsCached() and #_G.DeadsoulTowerManager:GetInstance():GetSceneID() > 1 then
+                _G.DeadsoulTowerManager:GetInstance():SetCurStatisticsData(
+                    _G.BattleManager:GetInstance():GetStatistics(),
+                    self.monsterId
+                )
+            end
+            DeadsoulTowerManager:SetMonsterPass(self.monsterId)
+            if DeadsoulTowerManager:CheckCurChallengeIsPass() then
+                self.FightResultData.pass = true
+                call()
+            else
+                self.FightResultData.btnDisplay = false
+                call()
+            end
+        end
+    else
+        self.FightResultData.iSWin = false
+        self.FightResultData.btnDisplay = false
+        call()
+    end
+end
+
+---结算
+---@param msg table 结算数据
+function BattleControllerTower:OnSettlement(call)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    if not _G.DeadsoulTowerManager:GetInstance():CheckBattleEnd() then
+        if self.FightResultData.iSWin == true then
+            self:CreateResultEff(
+                function()
+                    call(_G.SettlementModel.SettlementType.tower, self.FightResultData, self.tab, self.monsterId)
+                end
+            )
+        else
+            self:CreateResultEff(
+                function()
+                    call(_G.SettlementModel.SettlementType.tower, self.FightResultData, self.tab, self.monsterId)
+                end
+            )
+        end
+    else
+        if self.FightResultData.iSWin == true then
+            self:CreateResultEff(
+                function()
+                    call(_G.SettlementModel.SettlementType.tower, self.FightResultData, self.tab, self.monsterId,
+                        self.fight_arg)
+                end
+            )
+        else
+            self:CreateResultEff(
+                function()
+                    call(_G.SettlementModel.SettlementType.tower, self.FightResultData, self.tab, self.monsterId,
+                        self.fight_arg)
+                end
+            )
+        end
+        -- call(_G.SettlementModel.SettlementType.tower, self.FightResultData, self.tab, self.monsterId)
+    end
+end
+
+---战斗结束播放特效
+function BattleControllerTower:CreateResultEff(call)
+    if #_G.DeadsoulTowerManager:GetInstance():GetSceneID() > 1 then
+        if call then
+            call()
+            return
+        end
+        return
+    end
+    if call then
+        call()
+        return
+    end
+    -- local eff = _G.ConfigManager.ui_effect_cfg.BattleFail
+    -- if self.FightResultData.iSWin then
+    --     eff = _G.ConfigManager.ui_effect_cfg.BattleVictory
+    -- end
+    -- _G.UIUtils.LoadEffectByCfg(eff, _G.UIManager:GetInstance():GetUILayerTrans("TopLayer"), nil, call)
+end
+
+---战斗失败-返回
+function BattleControllerTower:OnSettlementBack()
+    base.OnSettlementBack(self)
+
+    if not _G.MainManager:GetInstance():IsToggledWildWindow(true) then
+        --返回wild界面
+        _G.UIManager:GetInstance():SwitchSceneCloseWindows()
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        _G.MainManager:GetInstance():ShowWildWindow()
+
+        --DeadsoulView会隐藏MainView, 导致toggle无法触发
+        -- _G.DelayFrameDo(function()
+        --     _G.DeadsoulTowerManager:GetInstance():OpenDeadsoulView()
+        -- end)
+        --ZHJH-6521【爬塔】挂机宝箱打开的情况下等爬塔每10层强制返回的弹窗弹出，返回后下一层的布阵界面高概率穿透
+        --MainAfkPanel使用TimerManager打开GetawardView页面(延迟0.1秒), 其逻辑调用在FixedUpdate中, 在DelayFrameDo(协程)调用前, 导致意外地打开了GetawardView页面
+        local timer = _G.TimerManager:GetInstance():GetTimer(0.1, self.OpenDeadsoulView, self, true, false)
+        timer:Start()
+    end
+end
+
+function BattleControllerTower:OpenDeadsoulView()
+    _G.DeadsoulTowerManager:GetInstance():OpenDeadsoulView()
+end
+
+---战斗退出
+function BattleControllerTower:OnSettlementEnd(isWin)
+    local towerManager = _G.DeadsoulTowerManager:GetInstance()
+    if self.FightResultData and not self.FightResultData.pass then
+        if _G.MainManager:GetInstance():IsToggledWildWindow(false) then
+            --当前选中野外选项卡, 走原始的布阵相关逻辑
+            towerManager:SetFighting(false)
+            if isWin then
+                self:HandleFightV()
+            else
+                self:HandleFightFail()
+            end
+        elseif isWin and towerManager:CheckCurrentEmbattleValid() then
+            --战斗胜利且满足布阵要求, 直接进入下一场战斗
+            towerManager:UpdateNextEmbattle(function(ok, index)
+                if ok then
+                    towerManager:SetFighting(false)
+                    towerManager:EnterFight(nil, index, false)
+                else
+                    towerManager:ExitFight()
+                end
+            end)
+        else
+            --战斗失败或不满足要求, 直接退出战斗
+            towerManager:ExitFight()
+        end
+        return
+    end
+
+    _G.WorldManager:GetInstance():GetCurWorld():ChangeCameraBattle()
+    self.curSettlementMsg = nil
+    --刷新界面数据
+    -- local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DeadsoulTowerView.Name)
+    -- local window2 = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DeadsoulView.Name)
+    -- if nil == window then
+    --     _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DeadsoulTowerView.Name)
+    -- end
+    -- if nil == window2 then
+    --     _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DeadsoulView.Name)
+    -- end
+
+    towerManager:ExitFight()
+end
+
+---处理多场战斗胜利
+function BattleControllerTower:HandleFightV()
+    --TODO:直接退回布阵
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    -- ZHJ-18655【客户端】多队布阵-提示&自动下一关优化
+    base.OnSettlementEndCall(self, false, require("SettlementModel").FunctionEnum.ReEmbattle)
+end
+
+---处理战斗失败
+function BattleControllerTower:HandleFightFail()
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    if #_G.DeadsoulTowerManager:GetInstance():GetSceneID() > 1 then
+        base.OnSettlementEndCall(self, false, require("SettlementModel").FunctionEnum.ReEmbattle)
+        return
+    end
+    _G.DeadsoulTowerManager:GetInstance():ExitFight()
+end
+
+---手动停止战斗
+function BattleControllerTower:EndFight()
+    _G.BattleManager:GetInstance():SetBattlePause(true)
+    _G.CS.UnityEngine.Time.timeScale = 1
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    -- local ta = {}
+    -- ta.btnDisplay = true
+    -- --ta.statistics = true
+    -- _G.UIManager:GetInstance():OpenWindow(
+    --     _G.ConfigManager.ui_cfg.ShowAwardWithButtonView.Name,
+    --     function()
+    --         self:FightExit()
+    --         self:OnSettlementEnd()
+    --         _G.DeadsoulTowerManager:GetInstance():ExitEmbattle()
+    --     end,
+    --     ta
+    -- )
+    self:FightExit()
+    self:OnSettlementEnd()
+    _G.DeadsoulTowerManager:GetInstance():ReEmbattle(false, self.index)
+end
+
+---战斗退出
+function BattleControllerTower:FightExit()
+    base.FightExit(self)
+    _G.DeadsoulTowerManager:GetInstance():SetFighting(false)
+end
+
+---重新布阵
+function BattleControllerTower:OnReEmbattle()
+    if self.FightResultData and not self.FightResultData.iSWin then
+        --战斗失败, 停止自动开始战斗
+        _G.DeadsoulTowerManager:GetInstance():ReEmbattle(false, self.index)
+    else
+        --战斗胜利, 沿用之前的自动战斗设置
+        _G.DeadsoulTowerManager:GetInstance():ReEmbattle(true) --ZHJ-33909 多队自动进行下一场
+    end
+end
+
+---重新开始战斗
+function BattleControllerTower:ReFight()
+    _G.BattleManager:GetInstance():SetBattlePause(true)
+    _G.CS.UnityEngine.Time.timeScale = 1
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    self:FightExit()
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, false)
+    _G.DeadsoulTowerManager:GetInstance():ReEmbattle(false, self.index)
+end
+
+---挑战下一关
+function BattleControllerTower:OnChallengeNext()
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DeadsoulView.Name)
+    if require "DeadsoulTowerModel":GetInstance().CurTowerType == 9 then
+        ---获取主塔信息
+        ---@param msg dead_soul.s2c_dead_soul_island
+        DeadsoulTowerNet:GetInstance():DeadSoulIsland(
+            nil,
+            function(msg)
+                require "DeadsoulTowerModel":GetInstance().LandFloor = msg.high_floor
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DeadsoulPack.id)
+                require("RedPointManager"):GetInstance():RefreshNode(
+                    _G.ConfigManager.redpoint_cfg.DeadSoulDailyReward.id
+                )
+                require "DeadsoulTowerModel":GetInstance().target_list = msg.target_list or {}
+                require "DeadsoulTowerModel":GetInstance().award_list = msg.award_list or {}
+                ---主塔层级达到开试炼的条件
+                local isFinishFloor = msg.high_floor
+                if isFinishFloor > 0 then
+                    isFinishFloor = _G.ConfigManager.tower_cfg[isFinishFloor].layer
+                end
+
+                if _G.AppSetting.DEBUG then
+                    _G.Log(isFinishFloor, "当前塔层数")
+                end
+                _G.Events:GetInstance():Broadcast(
+                    _G.ePlayAactionEvent.PlayAaction,
+                    {
+                        _G.ActiveTaskEnum.ConditionEnum.Section.DeadsoulFoor
+                    },
+                    1
+                )
+                --首通奖励
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.DeadsoulFirst.id
+                )
+                local towerifno =
+                    require "DeadsoulTowerModel":GetInstance():InitTowerInfo(
+                    require "DeadsoulTowerModel":GetInstance().CurTowerType
+                )
+                if isFinishFloor >= #towerifno then
+                    isFinishFloor = #towerifno
+                    require "DeadsoulTowerModel":GetInstance().CurTowerSid = towerifno[isFinishFloor].id
+                    require "DeadsoulTowerModel":GetInstance().CurTowerType = towerifno[isFinishFloor].tower
+                    local window1 = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DeadsoulView.Name)
+                    if window1 then
+                        window1.View:UpdateFightFloor()
+                    else
+                        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DeadsoulView.Name)
+                    end
+                    return
+                end
+                local CurTowerSid = towerifno[isFinishFloor + 1].id
+
+                if _G.AppSetting.DEBUG then
+                    _G.Log(CurTowerSid, "下一关层数")
+                end
+                -- --更新下界面
+                if window then
+                    window.View:UpdateNextFightFloor()
+                end
+                _G.DeadsoulTowerManager:GetInstance():SetBattleFirst(true)
+                require "DeadsoulTowerModel":GetInstance().CurTowerSid = CurTowerSid
+                require "DeadsoulTowerModel":GetInstance().CurTowerType = towerifno[isFinishFloor + 1].tower
+                --点下一关直接进入战斗, 不要打开布阵
+                --_G.DeadsoulTowerManager:GetInstance():EnterEmbattle(true, 1)
+                _G.DeadsoulTowerManager:GetInstance():EnterNextFight(true)
+            end
+        )
+    else
+        ---战斗时,点击过了 6点 退出到 死魂选择界面
+        if self:OnSixClockUpdateFighting() then
+            local win = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ShowAwardWithButtonView.Name)
+            if win then
+                win.View:CloseCall(0)
+            end
+            --选中"野外"选项卡时, 才返回死魂塔页面
+            if _G.MainManager:GetInstance():IsToggledWildWindow(false) then
+                --刷新界面数据
+                local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DeadsoulTowerView.Name)
+                if window then
+                    window.View:UpdateFightFloor()
+                    window.View:Show()
+                end
+            end
+            return
+        end
+        _G.DeadsoulTowerManager:GetInstance():GetPractice(
+            function()
+                local type1 = require "DeadsoulTowerModel":GetInstance().CurTowerType
+                local PracticeFloor = require "DeadsoulTowerModel":GetInstance().PracticeFloor[type1]
+                local dayFightFloor = _G.ConfigManager.discrete_cfg[101801][1][1]
+
+                if _G.AppSetting.DEBUG then
+                    _G.Log("福塔的类型：" .. type1)
+                end
+                --首通奖励
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.DeadsoulFirst.id
+                )
+                --目标点奖励
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.DeadsoulTarget.id
+                )
+                local isFightFloor = PracticeFloor.pass_num
+                if dayFightFloor <= isFightFloor then --今日挑战次数达上限
+                    --选中"野外"选项卡时, 才返回死魂塔页面
+                    if _G.MainManager:GetInstance():IsToggledWildWindow(false) then
+                        if window then
+                            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.DeadsoulView.Name)
+                            window.View:UpdateNextFightFloor()
+                        else
+                            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DeadsoulView.Name, type1)
+                        end
+                        --五行塔 , 达到次数没有打开 主城
+                        --_G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+                    end
+                    _G.PopWindowManager:GetInstance():ShowAllTips(390102)
+                    return
+                end
+                --_G.DeadsoulTowerManager:GetInstance():EnterEmbattle()
+                local isFinishFloor = PracticeFloor.high_floor
+                if isFinishFloor > 0 then
+                    isFinishFloor = _G.ConfigManager.tower_cfg[isFinishFloor].layer
+                end
+                local towerifno = DeadsoulTowerModel:GetInstance():InitTowerInfo(type1)
+                if isFinishFloor >= #towerifno then
+                    isFinishFloor = #towerifno
+                    require "DeadsoulTowerModel":GetInstance().CurTowerSid = towerifno[isFinishFloor].id
+                    require "DeadsoulTowerModel":GetInstance().CurTowerType = towerifno[isFinishFloor].tower
+
+                    if window then
+                        window.View:UpdateFightFloor()
+                    else
+                        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DeadsoulView.Name, type1)
+                    end
+                    return
+                end
+                _G.DeadsoulTowerManager:GetInstance():SetBattleFirst(true)
+                local CurTowerSid = towerifno[isFinishFloor + 1].id
+
+                if _G.AppSetting.DEBUG then
+                    _G.Log("福塔的类型2：" .. towerifno[isFinishFloor + 1].tower)
+                end
+                require "DeadsoulTowerModel":GetInstance().CurTowerSid = CurTowerSid
+                require "DeadsoulTowerModel":GetInstance().CurTowerType = towerifno[isFinishFloor + 1].tower
+                if window then
+                    window.View:UpdateNextFightFloor()
+                end
+                --_G.DeadsoulTowerManager:GetInstance():EnterEmbattle(true, 1)
+                _G.DeadsoulTowerManager:GetInstance():EnterNextFight(true)
+            end
+        )
+    end
+end
+
+---在战斗的时候 跨天刷新六点(点击结算界面)
+function BattleControllerTower:OnSixClockUpdateFighting()
+    local type1 = require "DeadsoulTowerModel":GetInstance().CurTowerType
+    local now = _G.TimeUtil.GetServerUnixTime() - _G.TimeUtil.GAME_DAY_TIME
+    local tb = _G.TimeUtil.GetDateTime(now)
+    DeadsoulTowerModel:GetInstance().CurWeek = tb.week == 0 and 7 or tb.week
+    return not DeadsoulTowerModel:GetInstance():CheckWeek(type1)
+end
+
+---加载战斗(协程加载)
+function BattleControllerTower:OnLoadRecordFight()
+    local et = _G.EmbattleType.Tower
+    if DeadsoulTowerModel:GetInstance().CurTowerType ~= 9 then
+        et = _G.EmbattleType["Tower" .. DeadsoulTowerModel:GetInstance().CurTowerType]
+    end
+
+    local id = 0
+    if DeadsoulTowerModel:GetInstance().CurTowerType == DeadsoulTowerModel:GetInstance().MianTower then
+        id = _G.EBattleType.Tower
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 1 then
+        id = _G.EBattleType.TowerThunder
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 2 then
+        id = _G.EBattleType.TowerWind
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 3 then
+        id = _G.EBattleType.TowerWater
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 4 then
+        id = _G.EBattleType.TowerFire
+    elseif DeadsoulTowerModel:GetInstance().CurTowerType == 5 then
+        id = _G.EBattleType.TowerEarth
+    end
+    _G.BattleManager:initAttackSids(
+        require("EmbattleModel"):GetInstance():GetEmbattleData(id),
+        et,
+        true,
+        1,
+        0,
+        nil,
+        nil,
+        nil,
+        self.leftName,
+        self.rightName
+    )
+end
+
+----检测数据统计是否显示回放战斗
+function BattleControllerTower:CheckShowRecordBattle()
+    return true
+end
+
+---获取怪物组ID
+---@return number 怪物组ID
+function BattleControllerTower:GetMonsterGroupID()
+    return self.mgCfg.id
+end
+
+function BattleControllerTower:OnEndFight()
+    base.OnEndFight(self)
+    _G.DeadsoulTowerManager:GetInstance():ExitFight()
+end
+
+function BattleControllerTower:FightOverBeforePlayDeathAni(tab)
+    local showEffect = self:IsShowFighting()
+    base.FightOverBeforePlayDeathAni(self, tab, showEffect)
+end
+
+function BattleControllerTower:LoadFight()
+    local world = _G.ePoolType.World
+    _G.BattleManager:GetInstance():SetPoolName(world, world, world, world, world)
+    self.isMonsherShow = false
+
+    --判断是否显示战斗界面
+    if self:IsShowFighting() then
+        local towerManager = _G.DeadsoulTowerManager:GetInstance()
+        local mgIds = towerManager:GetSceneID()
+        local index = nil
+        if #mgIds > 1 then
+            index = 1
+            for _, mgId in pairs(mgIds) do
+                if towerManager:CheckMonsterIsPass(mgId) then
+                    index = index + 1
+                end
+            end
+        end
+        _G.GlobalInterface.OpenMonsterShow(_G.handler(self, self.StartFightNew), self:GetMonsterGroupID(), index)
+    else
+        --直接开始调用StartFightNew
+        self.isMonsherShow = true
+    end
+
+    --延时一帧的目的是为了保证布阵场景和战斗角色都放入传递到战斗的节点下
+    _G.coroutine.waitforendofframe()
+    --调用init方法c#战斗开始加载资源了
+    self:OnLoadFight()
+    self:StartFightNew()
+end
+
+function BattleControllerTower:IsShowFighting()
+    if not _G.MainManager:GetInstance():IsToggledWildWindow(true) or
+        not _G.DeadsoulTowerManager:GetInstance():IsShowFighting() then
+        return false
+    end
+    return true
+end
+
+return BattleControllerTower

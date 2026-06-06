@@ -1,0 +1,1139 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.SociatyMoba.Model.SociatyMobaModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/07/30
+-- Description 冥界纷争
+-----------------------------------------------------------------------
+local SociatyMobaNet = require("SociatyMobaNet")
+local SociatyManager = require("SociatyManager")
+
+---@class SociatyMobaModel : Singleton	中文描述
+local SociatyMobaModel = _G.BaseClass("SociatyMobaModel", _G.GameDataModelBase)
+_G.SociatyMobaModel = SociatyMobaModel
+
+---@return SociatyMobaModel SociatyMobaModel
+function SociatyMobaModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SociatyMobaModel:__init()
+    self.curFunctionOpenID = 252
+    ---比赛状态枚举
+    self.SociatyMobaBattleState = {
+        Match = 1, ---匹配阶段
+        Embattle = 2, ---布阵阶段
+        Adjustline = 3, ---锁定阵容兵调整分线阶段
+        Prepare = 4, ---准备阶段
+        Fighting = 5, ---战斗阶段
+        Settlement = 6, ---结算阶段
+        Grading = 7, ---定级阶段
+        EmbattleAllDay = 8, ---特殊阶段，一整天都是布阵
+        SeasonSettlement = 9 ---赛季结算阶段
+    }
+    ---公会等级
+    self.SociatyLevel = {
+        NotLevel = 0, ---未定级
+        YellowLevel = 1, ---黄级
+        ProfoundLevel = 2, ---玄级
+        PrefectureLevel = 3, ---地级
+        HeavenlyLevel = 4 ---天级
+    }
+    ---公会战奖励预览页签类型
+    self.PreAwardTabType = {
+        Single = 1, ---单场奖励
+        Season = 2 ---赛季奖励
+    }
+    ---周内每天对应的离散配置id
+    self.SociatyStageCfg = {
+        _G.ConfigManager.discrete_cfg[101656],
+        _G.ConfigManager.discrete_cfg[101657],
+        _G.ConfigManager.discrete_cfg[101658],
+        _G.ConfigManager.discrete_cfg[101659],
+        _G.ConfigManager.discrete_cfg[101660],
+        _G.ConfigManager.discrete_cfg[101661],
+        _G.ConfigManager.discrete_cfg[101662]
+    }
+    ---周内每天离散配置解析后的数据
+    self.SociatyStageTime = {}
+    ---当前积分
+    self.score = 0
+    self.guessDic = {} --竞猜信息
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.p2c_info_change.Cmd, self.UpdateInfo, self)
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.p2c_moba_wind.Cmd, self.UpdateMobaWind, self)
+    _G.Events:GetInstance():AddListener(_G.eCard.CardDelCard, self.RefreshGarrayData, self)
+end
+
+---周一到周三功能提前开启，需要特殊判断
+function SociatyMobaModel:GetFunctionOpen()
+    local createPlayer = _G.PlayerModel:GetInstance():CheckCreateRole()
+    if self.curFunctionOpenID > 0 then
+        if createPlayer then
+            local residue = self:GetSociatyMobaOpenTime() - _G.TimeUtil.GetServerUnixTime()
+            residue = _G.math.ceil(residue / 86400)
+            return residue <= 0
+        end
+    end
+    return createPlayer
+end
+
+---从服务器拉取数据
+function SociatyMobaModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---更新数据
+function SociatyMobaModel:UpdateInfo(msg)
+    if msg.type == 1 then
+        ---更新公告
+        _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaUpdateNotice, msg.notice)
+    end
+    if msg.uid then
+        ---更新公会uid
+        self.commander = msg.uid
+        _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaUpdateCommander)
+    end
+end
+
+---战斗结算推送
+function SociatyMobaModel:UpdateMobaWind(msg)
+    if msg.f_info then
+        ---是防止客户端拉取到最新数据后再接收到推送，导致客户端重复缓存
+        local isChange = false
+        for i, info in pairs(self.battleInfo) do
+            if info.f_season_id == msg.f_info.f_season_id and info.f_index == msg.f_info.f_index then
+                self.battleInfo[i] = msg.f_info
+                isChange = true
+                break
+            end
+        end
+        if not isChange then
+            _G.table.insert(self.battleInfo, msg.f_info)
+        end
+    end
+    _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaBattleEnd, msg)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GuildMobaAward.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaStart.id)
+end
+
+---更新阵容数据
+---@param delUid number 删除的uid
+function SociatyMobaModel:RefreshGarrayData(delUid)
+    if not _G.table.isEmptyOrNil(self.garray) then
+        local isChange = false
+        for id, v in pairs(self.garray) do
+            for i, uid in ipairs(v.sits) do
+                if uid and uid ~= 0 and uid == delUid then
+                    v.sits[i] = 0
+                    isChange = true
+                    break
+                end
+            end
+
+            if isChange then
+                if _G.table.sameByCount(v.sits, {0, 0, 0, 0, 0}) then
+                    ---阵容中最后一张卡牌被消耗掉就清除阵容
+                    self.garray[id] = nil
+                    require("RedPointManager"):GetInstance():RefreshNode(
+                        _G.ConfigManager.redpoint_cfg.GuildMobaEmbattle.id
+                    )
+                end
+                break
+            end
+        end
+    end
+end
+
+---判断第一个服务器是否开启活动
+function SociatyMobaModel:GetSociatyMobaOpenTime()
+    local ot = _G.ConfigManager.discrete_cfg[101668][1][1]
+    if ot > 999 then
+        ot = 999
+    end
+    local _time = _G.PlayerModel:GetInstance().main_open_time + ot * 86400
+    local day = _G.TimeUtil.GetWeekDay(_time)
+    if day >= 1 and day <= 3 then
+        ---周一到周三功能提前开启
+        return _time - day * 86400
+    end
+    return _time
+end
+
+---获取数据
+function SociatyMobaModel:GetInfo(isTimer)
+    local sbot = require("SociatyMobaModel"):GetInstance():GetSociatyMobaOpenTime()
+    if sbot - _G.TimeUtil.GetServerUnixTime() > 0 then
+        self.super.ParseData(self)
+        return
+    end
+    if _G.PlayerModel:GetInstance().main_open_time == 0 then
+        ---未分配赛区
+        self.super.ParseData(self)
+        return
+    end
+    if not SociatyManager:GetInstance():HasSociaty() then
+        ---未加入公会
+        self.super.ParseData(self)
+        return
+    end
+    SociatyMobaNet:GetInstance():GetInfo(_G.handlerbind(self, self.GetInfoCall, isTimer))
+    if isTimer then
+        local state, _ = self:GetMobaBattleStage()
+        if state == self.SociatyMobaBattleState.Fighting then
+            _G.PopWindowManager:GetInstance():ShowAllTips(950118)
+        end
+    end
+end
+
+---获取信息回调
+---@field battleInfo guild_moba.i_moba_fight_info 对战数据列表
+---@field garray garray.i_garray 布阵数据列表
+---@field jungleTimes number 已用打野次数
+function SociatyMobaModel:GetInfoCall(msg, isTimer)
+    if msg.ack ~= 1 then
+        self.super.ParseData(self)
+        return
+    end
+    local info = msg.info
+    if info then
+        ---赛季信息
+        self:InitSeasonInfo(info.season)
+        ---公会匹配数据
+        self:InitGuildInfo(info.guild)
+        ---赛季对战信息
+        self.battleInfo = info.f_info or {}
+        ---自己的布阵信息
+        local garrays = info.garray or {}
+        self.garray = {}
+        if not _G.table.isEmptyOrNil(garrays) then
+            for _, v in pairs(garrays) do
+                self.garray[v.id] = v
+            end
+        end
+        ---打野队伍次数{玩家uid，已用次数},非指挥只有自己的次数，指挥发所有
+        self.wild_time = info.wild_time or {} -- ZHJ-36367废弃
+        self.jungleTimes = 0 -- ZHJ-36367废弃
+        for _, v in ipairs(self.wild_time) do
+            if v.key == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                self.jungleTimes = v.value
+                break
+            end
+        end
+        self.autoWild = info.auto_wild or 0 -- ZHJ-36367废弃
+        self.guessIds = info.guess_sid or {} --随机的竞猜sid guild_moba_guess_cfg
+        self.danmuMe = info.danmu or  {} 
+        self.sociatyUid = require "SociatyManager":GetInstance():GetGuildUid()
+        local state, nextStateTime = self:GetMobaBattleStage()
+        self:SetStateTimer(nextStateTime)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaEmbattle.id)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaStart.id)
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GuildMobaAward.id)
+        if not isTimer then
+            self:GetGuessInfoFromServer()
+        else
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaGuess.id)
+        end
+        _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaBattleState, state, isTimer)
+    end
+    self.super.ParseData(self)
+end
+
+---初始化赛季信息
+---@param data guild_moba.i_moba_season
+function SociatyMobaModel:InitSeasonInfo(data)
+    ---赛季id(自增)
+    self.seasonId = data.season_id or 1
+    ---赛季开始时间
+    self.seasonStartTime = data.start_time or 0
+    ---当前赛季场次
+    self.seasonIndex = data.season_index or 1
+    ---赛季配置id(如果赛季id没有获取到配置，则取最后一条配置)
+    self.seasonCfgId = data.season_cfg_id or 1
+    self.seasonCfg = _G.ConfigManager.guild_moba_season_cfg[self.seasonCfgId]
+    self.seasonEndTime = self.seasonCfg.duration * 86400 + self.seasonStartTime
+end
+
+---初始化公会匹配信息
+---@param data guild_moba.i_moba_guild
+function SociatyMobaModel:InitGuildInfo(data)
+    ---匹配的公会,为0表示未匹配对手，为1：表示轮空
+    self.matchGuild = data.match_guild
+    self.score = data.score or 0
+    self.commander = data.commander
+end
+
+---获取赛季场次
+function SociatyMobaModel:GetSeasonIndex()
+    return self.seasonIndex or 1
+end
+
+---获取赛季对战信息
+function SociatyMobaModel:GetBattleInfo()
+    return self.battleInfo or {}
+end
+
+---获取偏好弹幕信息
+function SociatyMobaModel:GetDanmuMeList()
+    return self.danmuMe or {}
+end
+
+
+---是否匹配到公会,0表示未匹配对手，1表示轮空
+function SociatyMobaModel:IsMatchGuild()
+    return self.matchGuild ~= 0
+end
+
+---在周天的21点到24点之间因为服务器还没有匹配，但客户端表现上定段已结束，所以需要客户端自己去计算结果
+function SociatyMobaModel:IsSettleSucess()
+    local battleState = self:GetMobaBattleStage()
+    if battleState == self.SociatyMobaBattleState.Grading or battleState == self.SociatyMobaBattleState.SeasonSettlement then
+        return self:IsCanMatch()
+    end
+    return false
+end
+
+---赛季时间持续时间
+function SociatyMobaModel:GetSeasoDurationTime()
+    local stime = _G.TimeUtil.GetDateTime(self.seasonStartTime)
+    local etime = _G.TimeUtil.GetDateTime(self.seasonEndTime)
+    return _G.LangUtil.GetLangPackValue(
+        90031700007,
+        _G.string.format("%s-%s %02d:%02d", stime.month, stime.day, stime.hour, stime.minute),
+        _G.string.format("%s-%s %02d:%02d", etime.month, etime.day, etime.hour, etime.minute)
+    )
+end
+
+---设置指挥id
+function SociatyMobaModel:SetCommander(uid, call)
+    local pbData = {uid = uid}
+    SociatyMobaNet:GetInstance():SetCommander(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.commander = uid
+            if uid ~= _G.PlayerModel:GetInstance():GetPlayerUid() then
+                _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaUpdateCommander)
+            end
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---获取指挥id
+function SociatyMobaModel:GetCommander()
+    return self.commander
+end
+
+---检查自己是不是指挥
+function SociatyMobaModel:CheckSelfIsCommander()
+    if self.commander == 0 then
+        return require("SociatyModel"):GetInstance():CheckSelfIsChairman()
+    else
+        return self.commander == _G.PlayerModel:GetInstance().role_uid
+    end
+end
+
+---检查自己是不是指挥/会长/副会长
+function SociatyMobaModel:CheckSelfIsCommanderOrChairman()
+    local menber = require("SociatyModel"):GetInstance():GetSelfMember()
+    local ELocationEnum = require("MemberEnum").ELocationEnum
+    local isChairman = menber.Location == ELocationEnum.Chairman or menber.Location == ELocationEnum.CoChairman
+    return isChairman or self:CheckSelfIsCommander()
+end
+
+---检查指定uid是不是会长
+function SociatyMobaModel:CheckIsCommander(uid)
+    if uid ~= _G.PlayerModel:GetInstance().role_uid then
+        return self.commander == uid
+    else
+        return self:CheckSelfIsCommander()
+    end
+end
+
+---自己的打野剩余行动次数 ZHJ-36367废弃
+function SociatyMobaModel:GetWildTimes()
+    local totalTimes = _G.ConfigManager.discrete_cfg[101665][1][1]
+    return totalTimes - (self.jungleTimes or 0)
+end
+
+---设置打野行动次数（已使用的）ZHJ-36367废弃
+function SociatyMobaModel:SetWildTimes(times)
+    self.jungleTimes = times
+end
+
+---获取布阵信息
+function SociatyMobaModel:GetGarray()
+    return self.garray or {}
+end
+
+---获取当前比赛所在的阶段
+---@return number
+function SociatyMobaModel:GetMobaBattleStage()
+    local currentDay = _G.TimeUtil.GetWeekDay()
+    local stageList = self.SociatyStageCfg[currentDay]
+
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local beginTime = _G.TimeUtil.GetDayBegin(serverTime)
+    for _, v in ipairs(stageList) do
+        local startTime = v[2] * 3600 + v[3] * 60
+        local endTime = v[4] * 3600 + v[5] * 60
+        if serverTime >= beginTime + startTime and serverTime < beginTime + endTime then
+            return v[1], beginTime + endTime
+        end
+    end
+
+    return self.SociatyMobaBattleState.Grading, 0
+end
+
+---状态计时器
+function SociatyMobaModel:SetStateTimer(nextStateTime)
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+
+    local delay = nextStateTime - _G.TimeUtil.GetServerUnixTime()
+    if delay < 1 then
+        delay = 1 --容错，用0可能会卡
+    end
+    self.timer =
+        _G.TimerManager:GetInstance():GetTimer(
+        delay,
+        _G.handlerbind(self, self.GetInfo, true),
+        self,
+        true,
+        false,
+        false
+    )
+    self.timer:Start()
+end
+
+---检测当前是否是布阵阶段
+function SociatyMobaModel:IsEmbattleState()
+    local battleState = self:GetMobaBattleStage()
+    if battleState == self.SociatyMobaBattleState.Embattle or battleState == self.SociatyMobaBattleState.EmbattleAllDay then
+        return true
+    end
+
+    return false
+end
+
+---获取下一阶段的开始时间
+function SociatyMobaModel:GetNextStateTime()
+    local _, nextStateTime = self:GetMobaBattleStage()
+    return nextStateTime
+end
+
+---当天结算结束时间
+function SociatyMobaModel:GetSettlementEndTime()
+    local currentDay = _G.TimeUtil.GetWeekDay()
+    local stageList = self.SociatyStageCfg[currentDay]
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+
+    for _, v in ipairs(stageList) do
+        if v[1] == self.SociatyMobaBattleState.Settlement then
+            return v[4] * 3600 + v[5] * 60 + _G.TimeUtil.GetDayBegin(serverTime)
+        end
+    end
+    return serverTime
+end
+
+---获取每周第一场战斗开始时间(主要用于定段界面显示)
+function SociatyMobaModel:GetFirstBattleStartTime()
+    for day, config in ipairs(self.SociatyStageCfg) do
+        for _, v in pairs(config) do
+            if v[1] == self.SociatyMobaBattleState.Fighting then
+                local statrTime = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+                local currentDay = _G.TimeUtil.GetWeekDay()
+                if day >= currentDay then
+                    return (day - currentDay) * 86400 + statrTime + v[2] * 3600 + v[3] * 60
+                else
+                    return (7 - _G.TimeUtil.GetWeekDay() + day) * 86400 + statrTime + v[2] * 3600 + v[3] * 60
+                end
+            end
+        end
+    end
+    return _G.TimeUtil.GetServerUnixTime()
+end
+
+---战斗开始时间
+function SociatyMobaModel:GetBattleStartTime()
+    local weekDay = _G.TimeUtil.GetWeekDay()
+    local stageList = self.SociatyStageCfg[weekDay]
+
+    for _, v in pairs(stageList) do
+        if v[1] == self.SociatyMobaBattleState.Fighting then
+            local statrTime = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+            return statrTime + v[2] * 3600 + v[3] * 60
+        end
+    end
+
+    return _G.TimeUtil.GetServerUnixTime()
+end
+
+---某阶段开始时间（可跨天）
+function SociatyMobaModel:GetStateStartTimeAcrossDay(state)
+    local weekDay = _G.TimeUtil.GetWeekDay()
+    local stageList
+    local day = 0
+    for i = 0, 6 do
+        stageList = self.SociatyStageCfg[(weekDay + i - 1) % 7 + 1]
+        for _, v in pairs(stageList) do
+            if v[1] == state then
+                local startTime = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+                return startTime + v[2] * 3600 + v[3] * 60 + day * 86400
+            end
+        end
+        day = day + 1
+    end
+
+    return _G.TimeUtil.GetServerUnixTime()
+end
+
+---定段开始时间
+function SociatyMobaModel:GetGradingStartTime()
+    for day, config in ipairs(self.SociatyStageCfg) do
+        for _, v in pairs(config) do
+            if v[1] == self.SociatyMobaBattleState.Grading then
+                local statrTime = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+                local currentDay = _G.TimeUtil.GetWeekDay()
+                if day >= currentDay then
+                    return (day - currentDay) * 86400 + statrTime + v[2] * 3600 + v[3] * 60
+                else
+                    return (7 - _G.TimeUtil.GetWeekDay() + day) * 86400 + statrTime + v[2] * 3600 + v[3] * 60
+                end
+            end
+        end
+    end
+
+    return _G.TimeUtil.GetServerUnixTime()
+end
+
+---获取定段结束时间
+function SociatyMobaModel:GetGradingEndTime()
+    for day, config in ipairs(self.SociatyStageCfg) do
+        for _, v in pairs(config) do
+            if v[1] == self.SociatyMobaBattleState.Grading then
+                local currentDay = _G.TimeUtil.GetWeekDay()
+                local statrTime = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+                if day >= currentDay then
+                    return (day - currentDay) * 86400 + statrTime + v[4] * 3600 + v[5] * 60
+                else
+                    return (7 - _G.TimeUtil.GetWeekDay() + day) * 86400 + statrTime + v[4] * 3600 + v[5] * 60
+                end
+            end
+        end
+    end
+
+    return _G.TimeUtil.GetServerUnixTime()
+end
+
+---获取下一场匹配时间
+function SociatyMobaModel:GetNextMatchTime()
+    local currentDay = _G.TimeUtil.GetWeekDay()
+    local statrTime = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+    if currentDay < 7 then
+        ---先从当前时间向后找下一场匹配时间
+        for day = currentDay + 1, 7 do
+            local stageList = self.SociatyStageCfg[day]
+            for _, v in pairs(stageList) do
+                if v[1] == self.SociatyMobaBattleState.Match then
+                    return (day - currentDay) * 86400 + statrTime + v[2] * 3600 + v[3] * 60
+                end
+            end
+        end
+    end
+
+    ---后面几天没有匹配阶段，就去下一周找
+    for day = 1, currentDay - 1 do
+        local stageList = self.SociatyStageCfg[day]
+        for _, v in pairs(stageList) do
+            if v[1] == self.SociatyMobaBattleState.Match then
+                return (7 - currentDay + day) * 86400 + statrTime + v[2] * 3600 + v[3] * 60
+            end
+        end
+    end
+
+    return _G.TimeUtil.GetServerUnixTime()
+end
+
+---是否满足匹配条件
+function SociatyMobaModel:IsCanMatch()
+    local sociatySelf = require("SociatyModel"):GetInstance().SociatySelf
+    local base = _G.ConfigManager.discrete_cfg[101664][1][1]
+    if sociatySelf.SevenDayLive < base then
+        return false
+    end
+
+    return true
+end
+
+---公会等级
+function SociatyMobaModel:GetSociatyLevel()
+    local curLevel = 1
+    local configs = _G.ConfigManager.guild_moba_normal_cfg
+    for _, v in ipairs(configs) do
+        if self.score >= v.min then
+            curLevel = v.id
+        end
+    end
+
+    return curLevel
+end
+
+---通过积分计算当前公会等级（主要用于排行榜，所以最少是黄级）
+---@param score number 公会积分
+function SociatyMobaModel:GetSociatyLevelByScore(score)
+    local curLevel = self.SociatyLevel.YellowLevel
+    local configs = _G.ConfigManager.guild_moba_normal_cfg
+    for _, v in ipairs(configs) do
+        if score >= v.min then
+            curLevel = v.id
+        end
+    end
+
+    return curLevel
+end
+
+---判断当前是否显示定段界面（如果当前处于布阵阶段，需要判断当前是否和定段是同一天）
+---@param weekDay number 当前周几
+function SociatyMobaModel:IsShowSettleView(weekDay, battleState)
+    if battleState == self.SociatyMobaBattleState.EmbattleAllDay then
+        ---整天都是布阵
+        return true
+    end
+
+    ---ZHJH-8714 2025.07.10赛季结算阶段不可进入战场
+    if battleState == self.SociatyMobaBattleState.SeasonSettlement then
+        return true
+    end
+
+    if battleState == self.SociatyMobaBattleState.Embattle then
+        ---和定段在同一天的布阵阶段显示定段界面
+        local stageList = self.SociatyStageCfg[weekDay]
+        for _, v in pairs(stageList) do
+            if v[1] == self.SociatyMobaBattleState.Grading then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+---判断是否显示定段结果界面
+function SociatyMobaModel:IsShowSettleResultView(weekDay, battleState)
+    if battleState == self.SociatyMobaBattleState.Grading then
+        return true
+    end
+
+    if weekDay == 1 and battleState == self.SociatyMobaBattleState.Match then
+        return true
+    end
+
+    if battleState == self.SociatyMobaBattleState.SeasonSettlement and weekDay == 1 then
+        return true
+    end
+
+    if battleState ~= self.SociatyMobaBattleState.SeasonSettlement and self.matchGuild == 0 then
+        return true
+    end
+
+    return false
+end
+
+---进入界面
+function SociatyMobaModel:EnterView()
+    ---第一次进入后刷新红点
+    if _G.PlayerPrefsManager.GetInt("SociatyMobaBattle_Enter", 0) == 0 then
+        _G.PlayerPrefsManager.SetInt("SociatyMobaBattle_Enter", 1)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaStart.id)
+    end
+
+    local weekDay = _G.TimeUtil.GetWeekDay()
+    local battleState = self:GetMobaBattleStage()
+    if self:IsShowSettleView(weekDay, battleState) then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyMobaSettleView.Name)
+        return
+    end
+
+    if self:IsShowSettleResultView(weekDay, battleState) then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyMobaSettleResultView.Name)
+        return
+    end
+
+    ---进入主界面
+    if battleState == self.SociatyMobaBattleState.Fighting then
+        ---战斗开始时有打野次数刷新红点
+        if _G.PlayerPrefsManager.GetInt("SociatyMobaBattle_WildTimes_" .. self.seasonId, 0) ~= self.seasonIndex then
+            _G.PlayerPrefsManager.SetInt("SociatyMobaBattle_WildTimes_" .. self.seasonId, self.seasonIndex)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaStart.id)
+        end
+    end
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyMobaBattleView.Name)
+end
+
+function SociatyMobaModel:GetSeasonId()
+    return self.seasonId or 1
+end
+
+---赛季排行榜奖励
+function SociatyMobaModel:GetSeasonRankAwards()
+    if not _G.table.isEmptyOrNil(self.rankAwardList) then
+        return self.rankAwardList
+    end
+
+    self.rankAwardList = {}
+    if not self.seasonCfgId then
+        self.seasonCfgId = 1
+    end
+    local rank = _G.ConfigManager.guild_moba_season_cfg[self.seasonCfgId].rank
+    local rankConfig = _G.ConfigManager.system_rank_cfg
+    for _, v in pairs(rank) do
+        if rankConfig[v] then
+            _G.table.insert(self.rankAwardList, rankConfig[v])
+        end
+    end
+
+    --进行排序(从高到底)
+    _G.SortList(
+        self.rankAwardList,
+        function(v)
+            return -v.min_rank
+        end
+    )
+
+    return self.rankAwardList
+end
+
+---获取分线信息
+---@param type number 0：所有分线，上中下野（1,2,3,4）
+function SociatyMobaModel:GetLineInfo(type, callBack)
+    SociatyMobaNet:GetInstance():GetLineInfo(
+        type,
+        function(msg)
+            if callBack then
+                callBack(msg.line_info)
+            end
+        end
+    )
+end
+
+---调整分线（服务器要求每次更新数据需要同时包含上中下野的数据）
+---@param garrays garray.i_garray 阵容数组
+function SociatyMobaModel:UpdateGarray(garrays, callBack)
+    local pbData = {garrays = garrays}
+    SociatyMobaNet:GetInstance():UpdateGarray(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                self.garray = {}
+                for _, v in pairs(garrays) do
+                    self.garray[v.id] = v
+                end
+                if callBack then
+                    callBack()
+                end
+                require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaEmbattle.id)
+                _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaGarray)
+            end
+        end
+    )
+end
+
+---获取公会内部击杀排行
+---@param type number 1自己 2全部
+function SociatyMobaModel:GetKillRankInfo(type, callBack)
+    local pbData = {type = type}
+    SociatyMobaNet:GetInstance():GetKillRankInfo(
+        pbData,
+        function(msg)
+            local rankLis = {}
+            if not _G.table.isEmptyOrNil(msg.tar_rank) then
+                for _, v in pairs(msg.tar_rank) do
+                    _G.table.insert(rankLis, v)
+                end
+            end
+            if not _G.table.isEmptyOrNil(msg.rank) then
+                for _, v in pairs(msg.rank) do
+                    _G.table.insert(rankLis, v)
+                end
+            end
+            _G.SortList(
+                rankLis,
+                function(a)
+                    return a.value, a.rank.uid
+                end
+            )
+            if callBack then
+                callBack(rankLis)
+            end
+        end
+    )
+end
+
+---公会排行榜
+function SociatyMobaModel:GetRankInfo(callBack)
+    local pbData = {season_id = self.seasonId}
+    SociatyMobaNet:GetInstance():GetRankInfo(
+        pbData,
+        function(msg)
+            if callBack then
+                callBack(msg.ranks)
+            end
+        end
+    )
+end
+
+---领取MVP奖励/参与奖
+---@param type number 1：参与奖、2：MVP奖
+---@param seasonId number 赛季id
+---@param seasonIndex number 赛季场次
+---@param seasonCfgId number 赛季配置id
+function SociatyMobaModel:GetFightAward(type, seasonId, seasonIndex, seasonCfgId, callBack)
+    local pbData = {
+        type = type,
+        season_id = seasonId,
+        season_index = seasonIndex,
+        season_cfg_id = seasonCfgId
+    }
+    SociatyMobaNet:GetInstance():GetFightAward(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            require("SociatyModel"):GetInstance():ReceiveBuildCoin(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            for _, v in pairs(self.battleInfo) do
+                if v.f_index == seasonIndex and v.f_season_id == seasonId then
+                    if type == 1 then
+                        v.award = 2
+                    else
+                        v.award_mvp = 1
+                    end
+                    break
+                end
+            end
+            if callBack then
+                callBack()
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaAward.id, type)
+        end
+    )
+end
+
+---检测出征队伍按钮的红点,只要布阵阶段才展示红点
+function SociatyMobaModel:CheckEmbattleRedPoint()
+    local sbot = require("SociatyMobaModel"):GetInstance():GetSociatyMobaOpenTime()
+    if sbot - _G.TimeUtil.GetServerUnixTime() > 0 then
+        return 0
+    end
+
+    local battleState = self:GetMobaBattleStage()
+    if battleState == self.SociatyMobaBattleState.EmbattleAllDay or battleState == self.SociatyMobaBattleState.Embattle then
+        if battleState == self.SociatyMobaBattleState.Embattle and self.matchGuild == 0 then
+            ---匹配失败不显示红点
+            return 0
+        end
+
+        if _G.table.isEmptyOrNil(self.garray) then
+            return 1
+        end
+
+        if _G.table.count(self.garray) ~= 4 then
+            ---已上阵卡牌
+            local garrayList = {}
+            for _, v in pairs(self.garray) do
+                for _, uid in pairs(v.sits) do
+                    if uid and uid > 0 then
+                        garrayList[uid] = v.id
+                    end
+                end
+            end
+            ---判断是否有足够的卡牌上阵
+            local cardData = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+            for _, v in pairs(cardData) do
+                if not garrayList[v.uid] then
+                    return 1
+                end
+            end
+        end
+    end
+
+    return 0
+end
+
+---检测单线布阵是否未布阵
+function SociatyMobaModel:CheckSingleEmbattleUnfull(id)
+    if _G.table.isEmptyOrNil(self.garray) then
+        return 1
+    end
+    for _, v in pairs(self.garray) do
+        if v.id == id then
+            for _, uid in pairs(v.sits) do
+                if uid > 0 then
+                    return 0
+                end
+            end
+        end
+    end
+    return 1
+end
+
+---检测单线布阵是否有空缺
+function SociatyMobaModel:CheckSingleEmbattleHasEmpty(id)
+    if _G.table.isEmptyOrNil(self.garray) then
+        return true
+    end
+    local num = 0
+    for _, v in pairs(self.garray) do
+        if v.id == id then
+            for _, uid in pairs(v.sits) do
+                if uid > 0 then
+                    num = num + 1
+                end
+            end
+        end
+    end
+    return num < 3
+end
+
+---检测是否可领奖
+---@param param number 1参与奖2MVP奖励
+function SociatyMobaModel:CheckCanGetAward(param)
+    local sbot = require("SociatyMobaModel"):GetInstance():GetSociatyMobaOpenTime()
+    if sbot - _G.TimeUtil.GetServerUnixTime() > 0 then
+        return 0
+    end
+
+    if _G.table.isEmptyOrNil(self.battleInfo) then
+        return 0
+    end
+
+    local battleState = self:GetMobaBattleStage()
+    local weekDay = _G.TimeUtil.GetWeekDay()
+    ---是否可以领取参与奖
+    local showSettleView = self:IsShowSettleView(weekDay, battleState)
+    local showSettleResView = self:IsShowSettleResultView(weekDay, battleState)
+    -- local canGetAward = showSettleView or showSettleResView or false
+    local canGetMVPAward = showSettleView or not showSettleResView
+    for _, data in pairs(self.battleInfo) do
+        if param == 1 and data.award == 1 then
+            return 1
+        end
+
+        if param == 2 and data.self_mvp and data.award ~= 0 and data.award_mvp == 0 and canGetMVPAward then
+            return 1
+        end
+    end
+
+    return 0
+end
+
+---红点检测
+function SociatyMobaModel:CheckRedPoint()
+    local sbot = require("SociatyMobaModel"):GetInstance():GetSociatyMobaOpenTime()
+    if sbot - _G.TimeUtil.GetServerUnixTime() > 0 then
+        return 0
+    end
+
+    if not self.seasonId then
+        ---没有数据表示还没有拉取到服务器数据
+        return 0
+    end
+
+    if _G.PlayerPrefsManager.GetInt("SociatyMobaBattle_Enter", 0) == 0 then
+        ---功能第一次开启后
+        return 1
+    end
+    local battleState = self:GetMobaBattleStage()
+    ---检测战斗开始红点--有打野次数
+    if battleState == self.SociatyMobaBattleState.Fighting and self:GetWildTimes() > 0 and not self:CurFightIsEnd() then
+        -- if _G.PlayerPrefsManager.GetInt("SociatyMobaBattle_WildTimes_" .. self.seasonId, 0) == self.seasonIndex then
+        return 1
+    -- end
+    end
+
+    return 0
+end
+
+---当前场次已打完
+function SociatyMobaModel:CurFightIsEnd()
+    for i, info in pairs(self.battleInfo) do
+        if info.f_season_id == self.seasonId and info.f_index == self.seasonIndex then
+            return true
+        end
+    end
+    return false
+end
+
+---获取当场战斗数据
+function SociatyMobaModel:GetCurBattleInfo()
+    for i, info in pairs(self.battleInfo) do
+        if info.f_season_id == self.seasonId and info.f_index == self.seasonIndex then
+            return info
+        end
+    end
+    return nil
+end
+
+---设置自身打野托管 -- ZHJ-36367废弃
+function SociatyMobaModel:SetWildAuto(isAuto, call)
+    local newValue = isAuto and 1 or 0
+    local pbData = {type = newValue}
+    SociatyMobaNet:GetInstance():SetWildAuto(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                self.autoWild = newValue
+            end
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---获取自身打野托管 -- ZHJ-36367废弃
+---@return boolean 是否托管 true是
+function SociatyMobaModel:GetWildAuto()
+    return self.autoWild == 1
+end
+
+---记录操作托管时间，防止频繁操作
+function SociatyMobaModel:SetWildAutoTime(time)
+    self.lastSetWildAutoTime = time
+end
+
+function SociatyMobaModel:GetGuessInfoFromServer()
+    SociatyMobaNet:GetInstance():GetGuessInfo(_G.handler(self, self.GetGuessInfoHandler))
+end
+
+---@param msg guild_moba.s2c_guess_info
+function SociatyMobaModel:GetGuessInfoHandler(msg)
+    self.guessInfo = msg --数组，扩展用，暂时只有1项
+    self.curGuessInfo = msg.guess_info and msg.guess_info[1] or {}
+    self.guessDic = {}
+    if self.curGuessInfo.guess_list then
+        for _, v in pairs(self.curGuessInfo.guess_list) do
+            self.guessDic[v.key] = v.value
+        end
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaGuess.id)
+end
+
+function SociatyMobaModel:GetCurGuessInfo()
+    return self.curGuessInfo, self.guessDic
+end
+
+---@param uid1 number 公会uid
+---@param uid2 number 公会uid
+---@param sid number 竞猜项sid
+---@param chooseUid number 竞猜的uid
+function SociatyMobaModel:Guess(uid1, uid2, sid, chooseUid, call)
+    local pbData = {guild_uid1 = uid1, guild_uid2 = uid2, guess_id = sid, guess_guild_uid = chooseUid}
+    SociatyMobaNet:GetInstance():Guess(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.guessDic[sid] = chooseUid
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildMobaGuess.id)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---@param uid1 number 公会uid
+---@param uid2 number 公会uid
+---@param sids number[] 竞猜项sid数组
+function SociatyMobaModel:GetGuessSupportInfo(uid1, uid2, sids, call)
+    local pbData = {guild_uid1 = uid1, guild_uid2 = uid2, guess_ids = sids}
+    SociatyMobaNet:GetInstance():GetGuessSupportInfo(pbData, call)
+end
+
+---获取竞猜列表
+function SociatyMobaModel:GetGuessIds()
+    return self.guessIds
+end
+
+---设置弹幕
+function SociatyMobaModel:SetDanmu(sidList, call)
+    local pbData = {sids = sidList}
+    SociatyMobaNet:GetInstance():SetDanmu(pbData, call)
+end
+
+
+function SociatyMobaModel:CheckGuessRedpoint()
+    ---是否有匹配到对手
+    local isMatchGuild = require("SociatyMobaModel"):GetInstance():IsMatchGuild()
+    if not isMatchGuild then
+        return false
+    end
+    ---是否有竞猜数据
+    if self.guessIds == nil then
+        return false
+    end
+    ---状态判定
+    local state, _ = self:GetMobaBattleStage()
+    if
+        state == self.SociatyMobaBattleState.Match or state == self.SociatyMobaBattleState.Fighting or
+            state == self.SociatyMobaBattleState.Grading or
+            state == self.SociatyMobaBattleState.EmbattleAllDay or
+            state == self.SociatyMobaBattleState.SeasonSettlement
+     then
+        return false
+    elseif
+        state == self.SociatyMobaBattleState.Embattle or state == self.SociatyMobaBattleState.Adjustline or
+            state == self.SociatyMobaBattleState.Prepare
+     then
+        self.idNum = #self.guessIds
+        local flag = 0
+        for i = 1, self.idNum do
+            if self.guessDic[self.guessIds[i]] == nil then
+                flag = 1
+                break
+            end
+        end
+        if flag > 0 then
+            return true
+        end
+    elseif state == self.SociatyMobaBattleState.Settlement then
+        local today = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime()) --改为登录查看
+        if _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.SociatyMobaGuess, 0) ~= today then
+            return true
+        end
+    end
+
+    return false
+end
+
+function SociatyMobaModel:ReConnect(endcall)
+    self:InitData(endcall)
+end
+
+---销毁对象时,析构函数
+function SociatyMobaModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.battleInfo = {}
+    self.score = 0
+    self.garray = {}
+    self.jungleTimes = 0
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.p2c_info_change.Cmd, self.UpdateInfo, self)
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.p2c_moba_wind.Cmd, self.UpdateMobaWind, self)
+    _G.Events:GetInstance():RemoveListener(_G.eCard.CardDelCard, self.RefreshGarrayData, self)
+end
+
+return SociatyMobaModel

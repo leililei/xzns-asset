@@ -1,0 +1,1289 @@
+-----------------------------------------------------------------------
+-- E:.01.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DrawUp.Model.DrawUpMaindat
+--(修改路径必须修正此项!)
+-- Created by 刘畅
+-- DateTime: 2023/07/26
+-- Description 限时招募管理器
+-----------------------------------------------------------------------
+
+---@class DrawUpMaindata	中文描述
+local DrawUpMaindata = _G.BaseClass("DrawUpMaindata", _G.LogicClass)
+local DrawUpBattlePassManager = require("DrawUpBattlePassManager")
+local limited_battlecon_cfg = _G.ConfigManager.limited_battlecon_cfg
+local DrawUpBattlePassNet = require("DrawUpBattlePassNet")
+local DrawUpCoinModel = require("DrawUpCoinModel")
+local RedPointManager = require("RedPointManager")
+
+---类的构造函数
+function DrawUpMaindata:__init(data, info)
+    self:Parse(data, info)
+end
+
+---创建对象时,入口构造函数
+
+function DrawUpMaindata:__init(data, info)
+    _G.Events:GetInstance():AddListener(_G.eArena.SetDrawUp, self.AddCoins, self)
+    _G.Events:GetInstance():AddListener(
+        _G.ConfigManager.net_map.hero_trial_task_curr.Cmd,
+        self.OnMatchSuccessCall,
+        self
+    )
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.hero_trial_rank_award.Cmd, self.RankAward, self)
+    self:SetSelfData(data, info)
+end
+
+function DrawUpMaindata:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eArena.SetDrawUp, self.AddCoins, self)
+    _G.Events:GetInstance():RemoveListener(
+        _G.ConfigManager.net_map.hero_trial_task_curr.Cmd,
+        self.OnMatchSuccessCall,
+        self
+    )
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.hero_trial_rank_award.Cmd, self.RankAward, self)
+end
+
+function DrawUpMaindata:RankAward(msg)
+    if msg == nil then
+        return
+    end
+
+    if msg.con_id ~= self.coinId then
+        return
+    end
+    self:AddCoin(msg.add_coin)
+end
+
+--- 添加金币
+--- @param data table 包含金币数据的表
+function DrawUpMaindata:AddCoins(data)
+    if data[1] == self.coinId then
+        self:AddCoin(data[2])
+    end
+    if self.activity and self.activity.typeClass then--在礼包界面跨天刷新会导致没有更新到活动数据，加个容错
+        self.activity.typeClass:RefreshRedPoint()
+    end
+end
+
+function DrawUpMaindata:SetSelfData(activity, info)
+    self.self_infoId = {}
+    self.activity = activity
+    self.info = info
+    --GM配置
+    self.cfg = info.cfg
+    ---当前抽卡活动id
+    self.Id = info.cfg.sid
+    --当前保底累积次数limited_item
+    self.times = info.times or {}
+    --总招募次数
+    self.total_times = info.total_times or 0
+    ---今日抽卡次数
+    self.daY_times = info.daY_times or 0
+    self.ActivityID = activity.activityID
+    --已领取招募次数奖励
+    self.award = info.award or {}
+    --心愿单卡牌sid
+    self.wish_card = info.wish_card or 0
+
+    --招募卷数量
+    self.prop_num = info.prop_num or 0
+    local coinId = 106 --默认值
+    if self.cfg.coin_type and not _G.string.IsNullOrEmpty(self.cfg.coin_type) then
+        coinId = _G.tonumber(self.cfg.coin_type)
+    end
+    self:SetCoin(self.prop_num, coinId)
+    ---持续时间
+    self.run_time = activity.cfg.time.run_time
+    ---开始时间
+    self.start_time = activity.cfg.time.start_time
+    ---赛季奖励
+    self.limited_roller_cfg = _G.ConfigManager.limited_roller_cfg[self.Id]
+    --角色spine
+    self.role_spine = info.cfg.role_spine
+    ---角色拍脸图
+    self.word = info.cfg.word
+    ---拍脸图特效
+    self.word_effects = info.cfg.word_effects
+    ---拍脸图特效位置
+    self.word_dev = info.cfg.word_dev
+    ---限时道具及其权重（卡牌id）
+    self.limited_itemId = self.limited_roller_cfg.limited_item
+    local sid = self.limited_itemId[1][1]
+    self.spBol = _G.ConfigManager.card_cfg[sid].Order == 7
+    --ZHJH-8378 如果有多个可选项不默认选择
+    if self.wish_card <= 0 and (#self.limited_itemId == 1 or self.spBol) then
+        --如果没有选心愿角色默认选中第一个
+        self.wish_card = self.limited_itemId[1][1]
+    end
+
+    -- require "RedPointManager:GetInstance()":GetInstance():AddRedPointChild(1030, self.activity.typeClass:GetRedpointIDByIndex(1))
+
+    ---当前概率提升
+    -- self.guaranteed_init = _G.ConfigManager.limited_roller_cfg.limited_roller_cfg[self.Id].guaranteed_init
+
+    local data = _G.ConfigManager.limited_roller_cfg[info.cfg.sid]
+    if not data and _G.AppSetting.DEBUG then
+        _G.LogError("invaild limited_roller_cfg.id=" .. info.cfg.sid)
+    end
+    ---已使用魂玉召唤次数
+    self.diamond_times = info.diamond_times or 0
+    ---总共可使用魂玉次数(配置表丶服务器数据总和, 暂无服务器数据)
+    self.diamond_total_times = data and data.count_diamond or 0
+    ---魂玉单抽消耗数量
+    self.diamond_consume_num = data and data.ticket_2[1] or 0
+end
+
+---剩余保底次数
+function DrawUpMaindata:GetLeftGuaranteed()
+    local initTimes = self.limited_roller_cfg.guaranteed_init
+    if self.total_times < initTimes then
+        ---初次保底
+        return initTimes - self.times
+    end
+
+    return self.limited_roller_cfg.pseudo - self.times
+end
+
+---设置心愿卡牌sid
+function DrawUpMaindata:SetWishAward(sid)
+    self.wish_card = sid
+end
+
+function DrawUpMaindata:Role_SpineParse()
+    --角色ID|跳转ID|背景#坐标|角色名称|spine#坐标#缩放|美术字路径#坐标
+    if self.word == nil or self.word == "Test" then
+        return
+    end
+
+    self.role_spineList = {}
+    self.role_spineList.int = 2
+    local dev = _G.string.split(self.word, "|")
+    for key, value in pairs(dev) do
+        if key == 1 then
+            self.role_spineList.id = _G.tonumber(value)
+        elseif key == 2 then
+            self.role_spineList.jump_id = _G.tonumber(value)
+        elseif key == 3 then
+            self.role_spineList.bg = value
+        elseif key == 4 then
+            if _G.tonumber(value) then
+                self.role_spineList.name = _G.LangUtil.GetLangPackValue(_G.tonumber(value))
+            else
+                self.role_spineList.name = value
+            end
+        elseif key == 5 then
+            self.role_spineList.spice = value
+        elseif key == 6 then
+            self.role_spineList.slogan = value
+        end
+    end
+    self.role_spineList.word_effects = self.word_effects
+    self.role_spineList.word_dev = self.word_dev
+    return self.role_spineList
+end
+
+---赛季奖励
+function DrawUpMaindata:Getlimited_roller_cfg()
+    return self.limited_roller_cfg
+end
+
+---限时道具及其权重（卡牌id）
+function DrawUpMaindata:Getlimited_itemId()
+    return self.limited_itemId
+end
+
+---返回活动id
+function DrawUpMaindata:RetActivityID()
+    return self.ActivityID
+end
+
+---获取界面显示数据
+function DrawUpMaindata:GetCfgData()
+    local sid = (self.wish_card and self.wish_card ~= 0) and self.wish_card or self.limited_itemId[1][1]
+    if _G.ConfigManager.card_cfg[sid].Order == 7 then 
+        local spCardCfg = _G.ConfigManager.card_hall_cfg[sid]
+        self.cfg = self.cfg or {}
+        self.cfg.coin = spCardCfg.coin
+        self.cfg.coin_effects = spCardCfg.coin_effects
+        self.cfg.role_spine = spCardCfg.role_spine
+        self.cfg.role_dev = spCardCfg.role_dev
+        self.cfg.background = spCardCfg.background
+        self.cfg.background_effects = spCardCfg.background_effects
+        self.cfg.pos = spCardCfg.pos
+        self.cfg.pos_dev = spCardCfg.pos_dev
+        return self.cfg
+    else 
+        return self.cfg or nil
+    end
+end
+
+---当前抽卡活动id
+function DrawUpMaindata:GetCfgId()
+    return self.Id or nil
+end
+
+---当前保底累积次数limited_item
+function DrawUpMaindata:GetTimes()
+    return self.times or 0
+end
+
+---当前保底累积次数limited_item
+function DrawUpMaindata:AddTimes(id)
+    self.times = self.times + id
+    return self.times
+end
+
+---当日招募次数
+function DrawUpMaindata:GetTotalTimes()
+    return self.total_times or 0
+end
+
+---当日招募次数
+function DrawUpMaindata:AddTotalTimes(id)
+    self.total_times = self.total_times + id
+    return self.total_times
+end
+
+---当日招募次数
+function DrawUpMaindata:GetdaY_times()
+    return self.daY_times or 0
+end
+
+---当日招募次数
+function DrawUpMaindata:AdddaY_times(id)
+    self.daY_times = self.daY_times + id
+    return self.daY_times
+end
+
+---已领取招募次数奖励
+function DrawUpMaindata:GetAward()
+    return self.award or {}
+end
+
+---已领取招募次数奖励
+function DrawUpMaindata:InAward(id)
+    local a = true
+    for _, value in pairs(self.award) do
+        if id == value then
+            a = false
+        end
+    end
+    if a then
+        _G.table.insert(self.award, id)
+    end
+end
+
+---当前奖励是否领取
+function DrawUpMaindata:GetLingQu(id)
+    for _, value in pairs(self.award) do
+        if id == value then
+            return true
+        end
+    end
+    return false
+end
+
+--region 礼包&货币数量
+---设置coin
+function DrawUpMaindata:SetCoin(coin, coinId)
+    self.coin = coin
+    self.coinId = coinId or 106
+end
+
+---增加代币
+function DrawUpMaindata:AddCoin(num)
+    self.coin = self.coin + num
+    local tmp = {}
+    _G.table.insert(tmp, self.coinId)
+    _G.table.insert(tmp, num)
+    _G.table.insert(tmp, self.coin)
+    _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, {{type = tmp}})
+end
+
+---获取代币
+function DrawUpMaindata:GetCoin()
+    return self.coin or 0
+end
+
+---获取代币类型
+function DrawUpMaindata:GetCoinId()
+    return self.coinId or 106
+end
+
+---兑换id
+function DrawUpMaindata:SetExchangeId(id)
+    self.exchangeId = id
+end
+
+---获取兑换id
+function DrawUpMaindata:GetExchangeId()
+    return self.exchangeId or 0
+end
+
+--endregion
+
+--region 战令
+---@param msg activity.i_activity_self_info
+function DrawUpMaindata:ParseData(msg, DrawUpBattlePassModel)
+    self.DrawUpBattlePassModel = DrawUpBattlePassModel
+    self.BattlePassinfo = msg.battle
+    self.BattlePasscfgLis = self.BattlePassinfo.cfg_list
+    self.BattlePasssid = self.BattlePasscfgLis.sid
+    self.BattlePassfreeAwards = {}
+    self.BattlePasspayAwards = {}
+    if self.BattlePassinfo.free_award_list then
+        for i = 1, #self.BattlePassinfo.free_award_list do
+            self:SetAward(self.BattlePassinfo.free_award_list[i], false)
+        end
+    end
+    if self.BattlePassinfo.pay_award_list then
+        for i = 1, #self.BattlePassinfo.pay_award_list do
+            self:SetAward(self.BattlePassinfo.pay_award_list[i], true)
+        end
+    end
+
+    DrawUpBattlePassManager:GetInstance():SetActivity(self.DrawUpBattlePassModel)
+
+    if self.onSixUpdateCall then
+        for _, call in pairs(self.onSixUpdateCall) do
+            call()
+        end
+    end
+end
+
+---设置奖励已领取
+function DrawUpMaindata:SetAward(id, isUp)
+    if isUp then
+        self.BattlePasspayAwards[id] = true
+    else
+        self.BattlePassfreeAwards[id] = true
+    end
+end
+
+---是否购买高级战令
+function DrawUpMaindata:GetIsUp()
+    return self.BattlePassinfo.is_up == 1
+end
+
+---购买高级战令
+function DrawUpMaindata:BuyUp()
+    require("MallManager"):GetInstance():BuyActiveGift(
+        self.BattlePasscfgLis.price,
+        self.DrawUpBattlePassModel.curActivityClass:GetActivityID(),
+        self.BattlePasscfgLis.sid
+    )
+end
+
+---一键领取
+function DrawUpMaindata:GetAwardAll(ActivityID, unclaimed, callback)
+    if unclaimed == nil then
+        unclaimed = self:FindAllUnclaimedRewards() or {}
+    end
+    if #unclaimed == 0 then
+        return
+    end
+    local pbData = {activity_id = self.DrawUpBattlePassModel.curActivityClass:GetActivityID(), award_list = unclaimed}
+    DrawUpBattlePassNet:GetInstance():GetAward(
+        pbData,
+        function(data)
+            if data.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                self:ParseCoin(ActivityID, unclaimed, data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+                for _, v in pairs(unclaimed) do
+                    if v.type == 1 then
+                        self.BattlePasspayAwards[v.a_id] = true
+                    else
+                        self.BattlePassfreeAwards[v.a_id] = true
+                    end
+                end
+                self:RefreshRedPoint()
+                if callback then
+                    callback(data)
+                end
+            end
+        end
+    )
+end
+
+---刷新红点
+function DrawUpMaindata:RefreshRedPoint()
+    RedPointManager:GetInstance():RefreshNode(self.DrawUpBattlePassModel:GetRedpointIDByIndex(1))
+end
+
+---查找所有未领取奖励
+function DrawUpMaindata:FindAllUnclaimedRewards()
+    ---@type limited_battlecon_cfg
+    local item
+    local unclaimed = {}
+    local sum = 0
+    for _, id in pairs(self.BattlePasscfgLis.award_id_list) do
+        item = limited_battlecon_cfg[id]
+        sum = sum + item.conditions[1]
+        if self.BattlePassinfo.battle_exp >= sum then
+            if not self.BattlePassfreeAwards[id] then
+                _G.table.insert(unclaimed, {type = 0, a_id = id})
+            end
+            if self:GetIsUp() and not self.BattlePasspayAwards[id] then
+                _G.table.insert(unclaimed, {type = 1, a_id = id})
+            end
+        else
+            break
+        end
+    end
+    return unclaimed
+end
+
+---解析活动代币奖励
+function DrawUpMaindata:ParseCoin(ActivityID, unclaimed, data)
+    ---@type limited_battlecon_cfg
+    local cfg
+    local sumCoin = 0
+    for _, v in pairs(unclaimed) do
+        cfg = limited_battlecon_cfg[v.a_id]
+        if v.type == 1 then
+            sumCoin = sumCoin + cfg.rewards_pay_cur
+        else
+            sumCoin = sumCoin + cfg.rewards_free_cur
+        end
+    end
+    if sumCoin > 0 then
+        if not data.award then
+            data.award = {item = {}}
+        end
+        local coinId = DrawUpCoinModel:GetInstance():GetCoinId(ActivityID)
+        _G.table.insert(data.award.item, {type = {coinId, sumCoin, 0}})
+        DrawUpCoinModel:GetInstance():AddCoin(ActivityID, sumCoin)
+    end
+end
+
+---领取奖励
+function DrawUpMaindata:BattlePassGetAward(ActivityID, id, isUp, callback)
+    local pbData = {
+        activity_id = self.DrawUpBattlePassModel.curActivityClass:GetActivityID(),
+        award_list = {{type = isUp and 1 or 0, a_id = id}}
+    }
+    DrawUpBattlePassNet:GetInstance():GetAward(
+        pbData,
+        function(data)
+            if data.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                self:ParseCoin(ActivityID, pbData.award_list, data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+                if isUp then
+                    self.BattlePasspayAwards[id] = true
+                else
+                    self.BattlePassfreeAwards[id] = true
+                end
+                self:RefreshRedPoint()
+                if callback then
+                    callback(data)
+                end
+            end
+        end
+    )
+end
+
+--- 获取购买经验的方法
+---@param exp number 购买的经验值
+---@param consume number 消耗的资源值
+---@param callback function 回调函数
+function DrawUpMaindata:GetBuyExp(exp, consume, callback)
+    ---@type store_season_battle.c2s_store_season_battle_buy_exp
+    local pbData = {activity_id = self.DrawUpBattlePassModel.curActivityClass:GetActivityID(), exp = exp}
+    DrawUpBattlePassNet:GetInstance():GetBuyExp(
+        pbData,
+        function(data)
+            if data.ack == 1 then
+                _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, 0, consume)
+                self:AddExp(exp)
+                self:RefreshRedPoint()
+                if callback then
+                    callback(data)
+                end
+            end
+        end
+    )
+end
+
+---高级战令购买成功监听
+function DrawUpMaindata:OnMallCashListener(data)
+    if data.activity_id == self.DrawUpBattlePassModel.curActivityClass:GetActivityID() then
+        self.BattlePassinfo.is_up = 1
+        self:RefreshRedPoint()
+        local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DrawUpBattlePassView.Name)
+        if ctrl then
+            ctrl:UpdateView()
+        end
+    end
+end
+
+-- ---设置增加经验
+-- function DrawUpMaindata:AddExp(exp)
+--     self.BattlePassinfo.battle_exp = self.BattlePassinfo.battle_exp + exp
+--     local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DrawUpBattlePassView.Name)
+--     if ctrl then
+--         ctrl:UpdateView()
+--     end
+-- end
+
+---该奖励是否已领取
+function DrawUpMaindata:IsAward(id, isUp)
+    if isUp then
+        return self.BattlePasspayAwards[id] == true
+    else
+        return self.BattlePassfreeAwards[id] == true
+    end
+end
+
+---设置奖励已领取
+function DrawUpMaindata:SetAward(id, isUp)
+    if isUp then
+        self.BattlePasspayAwards[id] = true
+    else
+        self.BattlePassfreeAwards[id] = true
+    end
+end
+
+---设置增加经验
+function DrawUpMaindata:AddExp(exp)
+    self.BattlePassinfo.battle_exp = self.BattlePassinfo.battle_exp + exp
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DrawUpBattlePassView.Name)
+    if ctrl then
+        ctrl:UpdateView()
+    end
+end
+
+---获取当前等级、经验、总经验、下一等级奖励、是否满级
+function DrawUpMaindata:GetLvAndNextAward()
+    ---@type limited_battlecon_cfg
+    local item
+    local coinId = self:GetCoinId()
+    local maxLv = limited_battlecon_cfg[self.BattlePasscfgLis.award_id_list[#self.BattlePasscfgLis.award_id_list]].level
+    local sum, lv, curIndex, maxExp = 0, 0, 0, 0
+    for i = 1, #self.BattlePasscfgLis.award_id_list do
+        item = limited_battlecon_cfg[self.BattlePasscfgLis.award_id_list[i]]
+        sum = sum + item.conditions[1]
+        maxExp = item.conditions[1]
+        if self.BattlePassinfo.battle_exp >= sum then
+            lv = item.level
+            curIndex = i
+        else
+            sum = sum - item.conditions[1]
+            break
+        end
+    end
+    local isMaxLv = lv == maxLv
+    local nextAward = {free = {}, pay = {}}
+    if isMaxLv then
+        curIndex = curIndex - 1
+    end
+    item = limited_battlecon_cfg[self.BattlePasscfgLis.award_id_list[curIndex + 1]]
+    for _, v in pairs(item.rewards_free_item) do
+        _G.table.insert(nextAward.free, v)
+    end
+    if item.rewards_free_cur > 0 then
+        _G.table.insert(nextAward.free, {coinId, item.rewards_free_cur})
+    end
+    for _, v in pairs(item.rewards_pay) do
+        _G.table.insert(nextAward.pay, v)
+    end
+    if item.rewards_pay_cur > 0 then
+        _G.table.insert(nextAward.pay, {coinId, item.rewards_pay_cur})
+    end
+    local curExp = self.BattlePassinfo.battle_exp - sum
+    return lv, curExp, maxExp, nextAward, isMaxLv
+end
+
+---主界面不显示
+function DrawUpMaindata.IsShowBtn()
+    return false
+end
+
+---本赛季战令id
+function DrawUpMaindata:Getsid()
+    return self.BattlePassinfo.sid
+end
+
+--- 获取配置列表
+--- @return table 配置列表
+function DrawUpMaindata:Getcfg_list()
+    return self.BattlePassinfo.cfg_list
+end
+
+--- 获取战斗经验
+--- @return number 战斗经验
+function DrawUpMaindata:Getbattle_exp()
+    return self.BattlePassinfo.battle_exp
+end
+
+--- 获取计数配置数组
+--- @return table 计数配置数组
+function DrawUpMaindata:GetcountCfgArr()
+    return self.DrawUpBattlePassModel.countCfgArr
+end
+
+--- 获取兑换经验
+--- @return number 兑换经验
+function DrawUpMaindata:Getex_change()
+    return self.BattlePassinfo.ex_change
+end
+
+--endregion
+
+--region 战斗
+---解析英雄试炼数据
+---@param msg activity_hero_trial.i_activity_hero_trial 英雄试炼数据
+---@param HeroTrialData table 英雄试炼数据表
+---@param ActivityID number 活动ID
+function DrawUpMaindata:HeroTrialParseData(msg, HeroTrialData, ActivityID)
+    if msg == nil or msg.hero_trial == nil then
+        return
+    end
+    self.i_activity_hero_trial = msg
+
+    -- 设置英雄试炼活动ID
+    self.ActivityID_hero_trial = ActivityID
+
+    -- 设置英雄试炼数据
+    self.HeroTrialData = HeroTrialData
+
+    -- 获取当前英雄试炼活动ID
+    self.HeroTrialDataActivityID = HeroTrialData.curActivityClass.activityID
+
+    -- 设置任务信息
+    self.task_info = msg.hero_trial.task_info
+
+    -- 设置个人信息
+    self.self_info = msg.hero_trial.self_info
+    self:ArenaPeakTask()
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DrawUpPeakView.Name)
+    if ctrl then
+        ctrl.rankPanel:RefreshRankDan()
+    -- ctrl:Support()
+    end
+    --self:OnMatchSuccessCall(msg)
+end
+
+--热点任务对应卡牌sid
+function DrawUpMaindata:GetCard_sid()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return 0
+    end
+    return self.i_activity_hero_trial.hero_trial.card_sid
+end
+
+--怪物buff
+function DrawUpMaindata:GetI_buff_info()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.buff_info
+end
+
+--怪物id
+function DrawUpMaindata:GetMonster_id()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.monster_id
+end
+
+--boss展示技能
+function DrawUpMaindata:Getboss_combine()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.boss_combine
+end
+
+---挑战Boss
+---@param skipBattle boolean 是否启用跳过战斗
+function DrawUpMaindata:OnFightBoss(ExitEmbattle, HideWindow, skipBattle)
+    self.HideWindow = HideWindow
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require "EmbattleController":GetInstance():OpenEmbattle(
+        _G.EmbattleType.DrawUpPeak,
+        _G.EmbattleSaveType.server,
+        false,
+        _G.EmbattleControllerItemType.DrawUpPeak,
+        ExitEmbattle,
+        function(_, _, _skipBattle)
+            if _skipBattle then
+                self:SkipFight()
+            else
+                self:EnterFight()
+            end
+        end,
+        self:GetMonster_id(),
+        skipBattle
+    )
+end
+
+function DrawUpMaindata:OnEmbattleViewOpened()
+    self.HideWindow()
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+end
+
+function DrawUpMaindata:ReadyFight()
+    local fighterSids = require("EmbattleModel"):GetInstance():GetEmbattleSidsData(_G.EmbattleType.DrawUpPeak)
+    local is = true
+    for key, value in pairs(fighterSids) do
+        if value == self:GetCard_sid() then
+            is = false
+            self:AddQueryProgress(1)
+        end
+    end
+    if is then
+        self:AddQueryProgress(0)
+    end
+end
+
+---进入战斗
+---@return void
+function DrawUpMaindata:EnterFight()
+    self:ReadyFight()
+    local fight = {activity_id = self.HeroTrialDataActivityID}
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.DrawUpPeak, fight, self.ActivityID)
+end
+
+---跳过战斗直接显示结算页面
+---@return void
+function DrawUpMaindata:SkipFight()
+    self:ReadyFight()
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    local pbData = {activity_id = self.HeroTrialDataActivityID}
+    require("DrawUpPeakNet"):GetInstance():GetHeroTrial(
+        pbData,
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+            --计算战斗结果
+            _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+            local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+            if not record or not record.result then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+
+            ---@type BattleControllerDrawUpPeak
+            local controller = _G.require(_G.BattleControllerType.DrawUpPeak).New()
+            controller.ActivityID = self.ActivityID --设置活动id参数
+            controller.curFightState = 4 --设置战斗结束
+
+            _G.BattleManager:GetInstance():SetArgData(msg.fight_arg)
+            _G.BattleManager:GetInstance():SetStatisticsCached(record)
+            _G.BattleManager:GetInstance():SetBattleController(controller)
+            --显示结算界面
+            controller:FightResultFunc(record.result)
+        end
+    )
+end
+
+--boss_pine|X坐标#Y坐标#Z坐标|缩放值
+function DrawUpMaindata:GetBoss_info()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.boss_info
+end
+
+--任务数据
+function DrawUpMaindata:GetTask_info()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.task_info
+end
+
+--任务奖励
+function DrawUpMaindata:GetRank_info()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.rank_info
+end
+
+--任务奖励
+function DrawUpMaindata:GetSelf_info()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.self_info
+end
+
+--更新最高伤害
+function DrawUpMaindata:Atk_dps(high_dps)
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    if high_dps > self.i_activity_hero_trial.hero_trial.self_info.high_dps then
+        self.i_activity_hero_trial.hero_trial.self_info.high_dps = high_dps
+    end
+    return self.i_activity_hero_trial.hero_trial.self_info.high_dps
+end
+
+--当前最高伤害
+function DrawUpMaindata:GetHigh_dps()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.self_info.high_dps
+end
+
+--每日buff
+function DrawUpMaindata:Getbuff()
+    if self.i_activity_hero_trial == nil or self.i_activity_hero_trial.hero_trial == nil then
+        return
+    end
+    return self.i_activity_hero_trial.hero_trial.buff
+end
+
+--endregion
+
+-- region
+--任务注册
+function DrawUpMaindata:ArenaPeakTask()
+    self.taskOne = {}
+    self.taskTwo = {}
+    self.task_infoId = {}
+
+    for _, value in pairs(self.task_info) do
+        local states = _G.TaskEnum.ETaskState.Claimed
+
+        local target
+        if self:GetFinish_taskTask(value.type, value.id) then
+            states = _G.TaskEnum.ETaskState.Completed
+        end
+
+        if value.type == 1 then
+            local data = {}
+            --此区缺少类型id
+            for k, v in pairs(value.condition) do
+                if k < _G.table.count(value.condition) then
+                    _G.table.insert(data, v)
+                end
+            end
+            target = self:IsWeek_curr(data)
+
+            local taskDatas =
+                require "DrawUpPeakTaskData".New(
+                {
+                    sid = value.type,
+                    target = {target},
+                    state = states,
+                    cfg = value,
+                    id = data,
+                    info = self.ActivityID_hero_trial,
+                    Type = 1
+                }
+            )
+            _G.table.insert(self.taskOne, taskDatas)
+        elseif value.type == 2 then
+            local data = {}
+            for k, v in pairs(value.condition) do
+                if k < _G.table.count(value.condition) then
+                    _G.table.insert(data, v)
+                end
+            end
+            target = self:IsSeason_curr(data)
+            -- target = self:IsSeason_curr(value.condition)
+
+            local taskDatas =
+                require "DrawUpPeakTaskData".New(
+                {
+                    sid = value.type,
+                    target = {target},
+                    state = states,
+                    cfg = value,
+                    info = self.ActivityID_hero_trial,
+                    id = data,
+                    Type = 2
+                }
+            )
+            _G.table.insert(self.taskTwo, taskDatas)
+        -- body
+        end
+    end
+end
+
+-- 当比赛成功时的回调函数
+function DrawUpMaindata:OnMatchSuccessCall(msg)
+    -- 如果活动ID不匹配，则返回
+    if self.HeroTrialDataActivityID ~= msg.activity_id then
+        return
+    end
+    -- 如果每日任务当前信息为空，则初始化为一个空表
+    if self.self_info.day_task_curr == nil then
+        self.self_info.day_task_curr = {}
+    end
+    -- 处理每日任务当前信息
+    if msg.day_task_curr then
+        for _, value in pairs(msg.day_task_curr) do
+            local bool = true
+            for k, v in pairs(self.self_info.day_task_curr) do
+                -- 如果类型相同，则更新当前信息
+                if _G.table.sameByCount(value.type, v.type) then
+                    self.self_info.day_task_curr[k] = value
+                    bool = false
+                end
+            end
+            -- 如果类型不同，则插入新的当前信息
+            if bool then
+                _G.table.insert(self.self_info.day_task_curr, value)
+            end
+            self:OnDayCurr(value)
+        end
+    end
+    -- 如果线路任务当前信息为空，则初始化为一个空表
+    if self.self_info.line_task_curr == nil then
+        self.self_info.line_task_curr = {}
+    end
+    -- 处理线路任务当前信息
+    if msg.line_task_curr then
+        for _, value in pairs(msg.line_task_curr) do
+            local bool = true
+            for k, v in pairs(self.self_info.line_task_curr) do
+                -- 如果类型相同，则更新当前信息
+                if _G.table.sameByCount(value.type, v.type) then
+                    self.self_info.line_task_curr[k] = value
+                    bool = false
+                end
+            end
+            -- 如果类型不同，则插入新的当前信息
+            if bool then
+                _G.table.insert(self.self_info.line_task_curr, value)
+            end
+            self:Onseason_curr(value)
+        end
+    end
+    -- 刷新红点
+    self.HeroTrialData:RefreshRedPoint()
+end
+
+-- 返回任务信息ID
+function DrawUpMaindata:TaskInfoId()
+    return self.task_infoId
+end
+
+-- 查询当前进度
+function DrawUpMaindata:AddQueryProgress(id)
+    if self.self_info.buff_task_curr ~= nil then
+        for _, value in pairs(self.self_info.buff_task_curr) do
+            if value.k == 2 then
+                value.v = id
+            end
+        end
+    end
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DrawUpPeakView.Name)
+    if ctrl then
+        ctrl:CalculatePowerIncrease()
+    -- ctrl:Support()
+    end
+end
+
+-- 查询当前进度
+function DrawUpMaindata:QueryProgress(id, num)
+    local progress = 0
+    if self.self_info == nil then
+        return progress
+    end
+
+    if self.self_info.buff_task_curr ~= nil and id == 2 then
+        for _, value in pairs(self.self_info.buff_task_curr) do
+            if value.k == id then
+                if value.v == 1 then
+                    progress = 1
+                end
+            end
+        end
+    end
+    if id == 1 then
+        local star = require "IllustrationModel":GetInstance():GetCardMaxStar(self:GetCard_sid())
+        if star >= num then
+            progress = 1
+        end
+    end
+
+    return progress
+end
+
+---查询当前id是否已领取奖励
+function DrawUpMaindata:GetFinish_taskTask(type, id)
+    local Task = {}
+    if type == 1 then
+        if self.self_info == nil or self.self_info.day_task_state == nil then
+            return false
+        end
+        Task = self.self_info.day_task_state
+    elseif type == 2 then
+        if self.self_info == nil or self.self_info.line_task_state == nil then
+            return false
+        end
+        Task = self.self_info.line_task_state
+    end
+
+    for _, value in pairs(Task) do
+        if id == value.k and value.v == 2 then
+            return true
+        end
+    end
+    return false
+end
+
+---每日任务刷新
+function DrawUpMaindata:OnDayCurr(data)
+    for _, value in pairs(self.taskOne) do
+        if _G.table.sameByCount(data.type, value.idList) then
+            value:CheckTaskTarget()
+            value:CheckTaskState()
+        end
+    end
+end
+
+---赛季成就刷新
+function DrawUpMaindata:Onseason_curr(data)
+    for _, value in pairs(self.taskTwo) do
+        if _G.table.sameByCount(data.type, value.idList) then
+            value:CheckTaskTarget()
+            value:CheckTaskState()
+        end
+    end
+end
+
+---查询周任务采集信息
+function DrawUpMaindata:IsWeek_curr(Id)
+    if self.self_info == nil or self.self_info.day_task_curr == nil then
+        return 0
+    end
+
+    for _, value in pairs(self.self_info.day_task_curr) do
+        if _G.table.sameByCount(Id, value.type) then
+            return value.curr
+        end
+    end
+    return 0
+end
+
+---预完成添加
+function DrawUpMaindata:IsUidTask(id)
+    if self.self_info.day_task_state then
+        for _, value in pairs(self.self_info.day_task_state) do
+            if value.k == id and value.v == 2 then
+                return
+            end
+        end
+    end
+    if self.self_info.line_task_state then
+        for _, value in pairs(self.self_info.line_task_state) do
+            if value.k == id and value.v == 2 then
+                return
+            end
+        end
+    end
+
+    _G.table.insert(self.task_infoId, id)
+end
+
+---查询赛季采集信息
+function DrawUpMaindata:IsSeason_curr(Id)
+    if self.self_info == nil or self.self_info.line_task_curr == nil then
+        return 0
+    end
+
+    -- local id = _G.table.remove(Id)
+    for _, value in pairs(self.self_info.line_task_curr) do
+        if _G.table.sameByCount(Id, value.type) then
+            return value.curr
+        end
+    end
+    return 0
+end
+
+-- 获取任务ID列表
+function DrawUpMaindata:TaskID()
+    -- 存储任务列表
+    local tsak = {}
+    for _, value in pairs(self.taskTwo) do
+        local data = self:ListTask(tsak, value.idList)
+        -- if data then
+        -- if tsak[data].id > value.id then
+        --     if not self:GetFinish_taskTask(value.Type, value.id) then
+        --         tsak[data] = value
+        --     end
+        -- else
+        --     if self:GetFinish_taskTask(value.Type, tsak[data].id) then
+        --         tsak[data] = value
+        --     end
+        -- end
+        -- else
+        _G.table.insert(tsak, value)
+        -- end
+    end
+    local tsaks = {}
+    for _, value in pairs(tsak) do
+        _G.table.insert(tsaks, value)
+    end
+
+    return tsaks
+end
+
+-- 获取每日任务ID列表
+function DrawUpMaindata:DayID()
+    -- 存储任务列表
+    local tsak = {}
+    for _, value in pairs(self.taskOne) do
+        -- local data = self:ListTask(tsak, value.idList)
+        -- if data then
+        --     if tsak[data].id > value.id and not self:GetFinish_taskTask(value.Type, value.id) then
+        --         tsak[data] = value
+        --     end
+        -- else
+        _G.table.insert(tsak, value)
+        --end
+    end
+    local tsaks = {}
+    for _, value in pairs(tsak) do
+        _G.table.insert(tsaks, value)
+    end
+
+    return tsaks
+end
+
+-- 列出任务
+function DrawUpMaindata.ListTask(_, list, id)
+    for key, value in pairs(list) do
+        if _G.table.sameByCount(id, value.idList) then
+            return key
+        end
+    end
+    return false
+end
+
+---已完成数量计算
+function DrawUpMaindata:self_infoId()
+    return #self.task_infoId
+end
+
+---完成任务
+function DrawUpMaindata:ChessAward(id, call, num, nums)
+    local data = {}
+    data.activity_id = self.HeroTrialDataActivityID
+    data.finish_type = num
+    data.sids = id
+
+    if #id < 1 then
+        if call ~= nil then
+            call()
+        end
+        return
+    end
+    require "DrawUpPeakNet":GetInstance():GetHeroTrialFinish(
+        data,
+        function(msg)
+            if _G.table.count(id) > 1 then
+                for _, value in pairs(id) do
+                    self:IsFinishTask(value)
+                end
+                self.task_infoId = {}
+            else
+                for _, value in pairs(id) do
+                    local index = nil
+                    for k, v in pairs(self.task_infoId) do
+                        if v == value then
+                            index = k
+                        end
+                    end
+                    if index then
+                        table.remove(self.task_infoId, index)
+                    end
+                    self:IsFinishTask(value)
+                end
+            end
+
+            if msg.ack ~= 1 then
+                return
+            end
+
+            --self.is_award = 1
+
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            if nums > 0 then
+                _G.table.insert(msg.award.item, {type = {self.coinId, nums}})
+                self:AddCoin(nums)
+            end
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            self.HeroTrialData:RefreshRedPoint()
+
+            if call ~= nil then
+                call()
+            end
+        end
+    )
+end
+
+---已完成添加
+function DrawUpMaindata:IsFinishTask(id)
+    if self.self_info == nil then
+        self.self_info = {}
+        self.self_info.finish_task = {}
+    end
+
+    if self.self_info.day_task_state == nil then
+        self.self_info.day_task_state = {}
+    end
+    if self.self_info.line_task_state == nil then
+        self.self_info.line_task_state = {}
+    end
+
+    for _, value in pairs(self.taskOne) do
+        if value.id == id then
+            value.i_task.state = _G.TaskEnum.ETaskState.Completed
+            _G.table.insert(self.self_info.day_task_state, {k = id, v = 2})
+        end
+    end
+    for _, value in pairs(self.taskTwo) do
+        if value.id == id then
+            value.i_task.state = _G.TaskEnum.ETaskState.Completed
+            _G.table.insert(self.self_info.line_task_state, {k = id, v = 2})
+        end
+    end
+end
+
+---获取排行榜数据
+function DrawUpMaindata:GetRank(callback)
+    local pbData = {page = 1, id = self.HeroTrialDataActivityID}
+    require "DrawUpPeakNet":GetInstance():GetEnemyData(
+        pbData,
+        function(data)
+            if callback then
+                callback(data)
+            end
+        end
+    )
+end
+
+---获取排行榜数据
+function DrawUpMaindata:SelfRank(callback)
+    require "DrawUpPeakNet":GetInstance():SelfRank(
+        self.HeroTrialDataActivityID,
+        function(data)
+            self.playerRank = data
+            if callback then
+                callback(data)
+            end
+        end
+    )
+end
+
+function DrawUpMaindata:playerRank()
+    if self.playerRank == nil then
+        return {index = 0, value = 0}
+    end
+    return self.playerRank
+end
+
+--endregion
+
+return DrawUpMaindata

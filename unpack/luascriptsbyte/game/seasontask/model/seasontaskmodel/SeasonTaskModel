@@ -1,0 +1,299 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.SeasonTask.Model.SeasonTaskModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/11/10
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "SeasonBaseModel"
+---@class SeasonTaskModel:SeasonBaseModel
+---@field taskInfo season_task.s2c_info
+---@field dayExp number 每日任务为通行证提供的经验
+---@field weekExp number 每周任务为通行证提供的经验
+---@field taskDatas table<number,SeasonTaskData[]> 赛季任务,每日任务索引为0
+---@field finishTasks table <boolean> 任务完成
+local SeasonTaskModel = _G.BaseClass("SeasonTaskModel", base)
+local SeasonTaskData = require "SeasonTaskData"
+local Key = "SeasonTaskModelFirst"
+function SeasonTaskModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.SeasonTask
+    self.dayExp = _G.ConfigManager.discrete_cfg[105118][1][1]
+    self.weekExp = _G.ConfigManager.discrete_cfg[105118][1][2]
+    self.redPointId = _G.ConfigManager.redpoint_cfg.FirstMission.id
+end
+
+---@return SeasonTaskModel
+function SeasonTaskModel:GetInstance()
+    return self.super.super.GetInstance(self)
+end
+
+function SeasonTaskModel:GetDataFormServer()
+    require "SeasonTaskNet":GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---解析数据
+---@param data season_task.s2c_info
+function SeasonTaskModel:ParseData(data)
+    if data.ack ~= 1 then
+        base.ParseData(self)
+        return
+    end
+    self.data = data
+    base.ParseData(self)
+end
+
+function SeasonTaskModel:InitFunction()
+    if not self.data then
+        return
+    end
+    self.taskInfo = self.data
+    self:InitFinishTask()
+    self:InitTask()
+    self.data = nil
+    self:CheckIsFirst()
+    self:RefreshRedPoint()
+    _G.Events:GetInstance():Broadcast(_G.eSeasonTask.RefreshModel)
+end
+
+---检测是否为当天首次打开
+function SeasonTaskModel:CheckIsFirst()
+    if _G.PlayerPrefsManager.HasKey(Key) then
+        local time = _G.PlayerPrefsManager.GetInt(Key, 0)
+        local time2 = self:GetTime()
+        self.isFirst = time < time2
+    else
+        self.isFirst = true
+    end
+end
+
+---初始化任务
+function SeasonTaskModel:InitTask()
+    self.taskDatas = {}
+    local tb = {}
+
+    ---@type season_cfg
+    local cfgs = require "SeasonModel":GetInstance():GetCfg()
+    local cfgs2 = _G.ConfigManager.mission_extra_cfg
+    if self.taskInfo.task then
+        for _, v in pairs(self.taskInfo.task) do
+            tb[v.sid] = v
+        end
+    end
+    if self.taskInfo.finish_task then
+        for _, v in pairs(self.taskInfo.finish_task) do
+            tb[v] = {sid = v,target = {cfgs2[v].count},state = 3}
+        end
+    end
+    for week, missionList in pairs(cfgs.mission) do
+        week = week - 1
+        for _, v in pairs(missionList) do
+            local cfg = cfgs2[v]
+            if cfg == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("赛季任务id = " .. v .. " 不存在任务配置")
+                end
+                return
+            end
+            if tb[cfg.id] then
+                if not self.taskDatas[week] then
+                    self.taskDatas[week] = {}
+                end
+                _G.table.insert(
+                    self.taskDatas[week],
+                    SeasonTaskData.New(
+                        tb[cfg.id],
+                        nil,
+                        _G.MarkTaskType.SeasonTask)
+                )
+            end
+        end
+    end
+end
+
+---初始化任务完成
+function SeasonTaskModel:InitFinishTask()
+    self.finishTasks = {}
+    if self.taskInfo.finish_task then
+        for _, v in pairs(self.taskInfo.finish_task) do
+            self.finishTasks[v] = true
+        end
+    end
+end
+
+function SeasonTaskModel:UpdataTask(taskinfo)
+    if not self:CheckIsOpen() then
+        return
+    end
+    local isUpdata = false
+
+    if taskinfo == nil or taskinfo.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskDataById(taskinfo.sid)
+    if mTask == nil or not mTask.i_task then
+        return isUpdata
+    end
+    mTask:UpdataData(taskinfo)
+    return true
+end
+
+---检测是否完成任务
+function SeasonTaskModel:CheckIsFinish(sid)
+    if _G.IsNil(sid) then
+        return false
+    end
+    return self.finishTasks[sid]
+end
+
+---完成任务
+---@param sids number[] 任务sid
+function SeasonTaskModel:GetAward(sids, call)
+    require "SeasonTaskNet":GetInstance():GetAward(
+        {
+            sid = sids,
+            finish_type = 2
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local y = false
+            local RenWu = {}
+            local exp = 0
+            for _, v in pairs(sids) do
+                ---@type mission_extra_cfg
+                local cfg = _G.ConfigManager.mission_extra_cfg[v]
+                self.finishTasks[v] = true
+                if cfg.type_mission == 1 then
+                    y = true
+                    _G.table.insert(RenWu,v)
+                    exp = exp + self.dayExp
+                else
+                    exp = exp + self.weekExp
+                end
+            end
+            local task
+            for _, v in pairs(msg.task) do
+                if v.ack == 1 then
+                    task = self:GetTaskDataById(v.new_task.sid)
+                    task:UpdataData(v.new_task)
+                end
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.SeasonLv) then
+                require("SeasonLvModel"):GetInstance():ExpUpdata(exp)
+            end
+            if call then
+                call(msg)
+            end
+
+            if y and _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.SeasonWarPrinted) then
+                require("SeasonWarPrintedManager"):GetInstance():TipIDSet(RenWu)
+            end
+            self:RefreshRedPoint()
+        end
+    )
+end
+
+---获取任务数据
+function SeasonTaskModel:GetTaskDatas(week)
+    if _G.IsNil(week) then
+        return self.taskDatas
+    else
+        return self.taskDatas[week] or {}
+    end
+end
+
+---获取单个任务数据
+function SeasonTaskModel:GetTaskDataById(id,week)
+    if not week then
+        week = self:GetTaskWeekOrDay(id)
+    end
+    for _, v in pairs(self.taskDatas[week]) do
+        if v.Cfg.id == id then
+            return v
+        end
+    end
+    return nil
+end
+
+---@field id number 任务id
+---@field seasonId number 赛季id
+---获取任务所对应的周，如果是每日，则返回0
+function SeasonTaskModel:GetTaskWeekOrDay(id, seasonId)
+    local cfgs = _G.ConfigManager.season_cfg
+    if _G.IsNumber(seasonId) then
+        for k, missionList in pairs(cfgs[seasonId].mission) do
+            if _G.table.ContainsValue(missionList,id) then
+                return k - 1, seasonId
+            end
+        end
+    else
+        for sid, cfg in pairs(cfgs) do
+            for k, missionList in pairs(cfg.mission) do
+                if _G.table.ContainsValue(missionList,id) then
+                    return k - 1, sid
+                end
+            end
+        end
+    end
+    return 0, 0
+end
+
+---检测红点
+function SeasonTaskModel:CheckRedPoint(param)
+    if not self:CheckIsOpen() then
+        return
+    end
+    if param == 1 or param == 2 then
+        return self:CheckHaveGet(param)
+    else
+        return self.isFirst or self:CheckHaveGet()
+    end
+end
+
+---检测是否有可领取的奖励
+function SeasonTaskModel:CheckHaveGet(week)
+    if not self.taskDatas then
+        return false
+    end
+    if not week then
+        for _, v in pairs(self.taskDatas) do
+            for _, v2 in pairs(v) do
+                if v2.i_task.state == _G.TaskEnum.ETaskState.Submited then
+                    return true
+                end
+            end
+        end
+    else
+        if self.taskDatas[week] then
+            for _, v2 in pairs(self.taskDatas[week]) do
+                if v2.i_task.state == _G.TaskEnum.ETaskState.Submited then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function SeasonTaskModel:OnSettlement()
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonTaskView.Name)
+end
+
+function SeasonTaskModel:OpenView()
+    self.isFirst = false
+    _G.PlayerPrefsManager.SetInt(Key, self:GetTime())
+    self:RefreshRedPoint()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SeasonTaskView.Name)
+end
+function SeasonTaskModel:GetTime()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local data = _G.TimeUtil.GetDateTime(time)
+    if data.hour < _G.TimeUtil.GAME_DAY_HOUR then
+        return _G.TimeUtil.GetDayBegin(time - _G.TimeUtil.GAME_DAY_TIME) + _G.TimeUtil.GAME_DAY_TIME
+    else
+        return _G.TimeUtil.GetDayBegin(time) + _G.TimeUtil.GAME_DAY_TIME
+    end
+end
+
+return SeasonTaskModel

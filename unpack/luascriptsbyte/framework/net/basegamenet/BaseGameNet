@@ -1,0 +1,170 @@
+-----------------------------------------------------------------------
+-- Created by 此处填写你的名字
+-- DateTime: 2019/12/31
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+require "BaseGameProxy"
+
+---@class BaseGameNet : Singleton 通信基类
+---@field private MessageListenerMap table<string, function> @消息监听Map(单个模块类默认一个消息只有一个响应方法)
+---@field public IsLocal boolean @是否是单机版本
+local BaseGameNet = _G.BaseClass("BaseGameNet", _G.Singleton)
+BaseGameNet.OriginSend = {}
+--BaseGameNet.OriginReceive = {}
+BaseGameNet.MessageListenerMap = nil
+
+---需要前端隐藏提示的CMD错误
+local NotCareMsgError = {
+    [4402] = true,
+    ---除去更新战斗力错误
+    [9001] = true ---活动未开启提示
+}
+---@type Events
+local EventsSingleton = _G.Events:GetInstance()
+
+---类的构造函数
+function BaseGameNet:__init()
+    self.MessageListenerMap = {}
+    self.Call = {}
+    self:AddMessageListeners()
+    -- 单机版本
+    self.IsLocal = false
+end
+
+---发送请求
+---@param netMapItem net_map 通信协议数据
+---@param pbData table PB数据
+---@param callOK function 完成回调
+---@return number 流水号
+function BaseGameNet:Access(netMapItem, pbData, callOK)
+    if not netMapItem then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("netMapItem         ")
+        end
+        return
+    end
+
+    local sendData = BaseGameNet.OriginSend[netMapItem.Cmd]
+    if not sendData then
+        BaseGameNet.OriginSend[netMapItem.Cmd] = {}
+        sendData = BaseGameNet.OriginSend[netMapItem.Cmd]
+    end
+
+    local number = 0
+    if self.IsLocal then
+        number =
+            _G.BaseGameProxy:GetInstance():Access(netMapItem, pbData, _G.handlerbind(self, self.DelCallback, callOK))
+    else
+        number = _G.Net.SendSocket(netMapItem, pbData, _G.handlerbind(self, self.DelCallback, callOK))
+    end
+    table.insert(
+        sendData,
+        {
+            port = number,
+            Data = pbData
+        }
+    )
+
+    --_G.DumpMsgData()
+    return number
+end
+
+---处理ack
+function BaseGameNet:DelCallback(port, data, error, cmd, callback)
+    if not cmd then
+        cmd = 0
+    end
+    if data.ack ~= nil and data.ack ~= 1 and not NotCareMsgError[cmd] then
+        if _G.AppSetting.DEBUG then
+            for key, value in pairs(_G.ConfigManager.net_map) do
+                if value.PBCmd == cmd then
+                    _G.LogWarning(key, "错误ack是" .. tostring(data.ack) .. "对应消息流水号是" .. port .. "消息名是")
+                    break
+                end
+            end
+        end
+        --镇魂街ZHJ-31230 【主任务】beta_0.2.0_jttw贪玩三测ZHJ-32870
+        --【客户端】容错提示隐藏
+        if 3703 ~= data.ack then
+            self:ShowErrorAckTips(data.ack)
+        end
+    end
+    if callback then
+        callback(port, data, error)
+    end
+end
+
+---显示错误消息ack的tips
+function BaseGameNet:ShowErrorAckTips(ack)
+    if ack == 59 or ack == 135 then
+        return
+    end
+    _G.PopWindowManager:GetInstance():ShowAllTips(ack)
+end
+
+---返回一个通用的发送空PB  已经不需要了， 以前不能传空，现在可以了
+---@return public.c2s_common_empty 返回一个通用的发送空PB
+function BaseGameNet:GetEmptyPB()
+    -- local pbData = {}
+    -- pbData.req = ""
+    -- return pbData
+    return ""
+end
+
+---添加所有后端主动推的网络消息监听接口(子类重写)
+function BaseGameNet:AddMessageListeners()
+end
+
+---添加指定网络消息监听
+---@param cmd string @消息CMD
+---@param func function @消息回调
+function BaseGameNet:AddMessageListener(cmd, func)
+    if self.MessageListenerMap[cmd] ~= nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning(string.format("__cname:%s覆盖监听消息:%s!", self.__cname, cmd))
+        end
+        EventsSingleton:RemoveListener(cmd, self.MessageListenerMap[cmd], self)
+    end
+    self.MessageListenerMap[cmd] = func
+    EventsSingleton:AddListener(cmd, func, self)
+end
+
+---移除指定网络消息监听
+---@param cmd string @消息CMD
+---@return boolean @是否移除消息成功
+function BaseGameNet:RemoveMessageListener(cmd)
+    if self.MessageListenerMap[cmd] ~= nil then
+        self.MessageListenerMap[cmd] = nil
+        return true
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("__cname:%s未监听消息:%s,移除监听失败!", self.__cname, cmd))
+        end
+        return false
+    end
+end
+
+---移除所有网络消息监听
+function BaseGameNet:RemoveAllMessageListeners()
+    if self.MessageListenerMap then
+        for k, v in pairs(self.MessageListenerMap) do
+            EventsSingleton:RemoveListener(k, v, self)
+        end
+    end
+end
+
+---类的析构函数
+function BaseGameNet:Dispose()
+    self:RemoveAllMessageListeners()
+    self.MessageListenerMap = {}
+    self.Call = nil
+    BaseGameNet.OriginSend = {}
+    --BaseGameNet.OriginReceive = {}
+end
+
+---初始
+function BaseGameNet:StartUp()
+end
+
+---@type BaseMessage
+return BaseGameNet

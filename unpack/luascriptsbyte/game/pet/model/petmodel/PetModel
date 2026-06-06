@@ -1,0 +1,423 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Pet.Model.PetModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/07/03
+-- Description: 灵兽数据类
+-----------------------------------------------------------------------
+local PetNet = require("PetNet")
+local PetData = require("PetData")
+
+local base = _G.GameDataModelBase
+---@class PetModel : GameDataModelBase
+---@field pets PetData[]
+local PetModel = _G.BaseClass("PetModel", base)
+
+---@return PetModel PetModel
+function PetModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---定义宠物品质框
+local PetOrderFrame = {
+    [0] = "ui_js_txk_lan",
+    [1] = "ui_js_txk_zi",
+    [2] = "ui_js_txk_cheng",
+    [3] = "ui_js_txk_hong",
+    [4] = "ui_js_txk_cai"
+}
+PetModel.PetOrderFrame = PetOrderFrame
+
+---创建对象时,入口构造函数
+function PetModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.Pet
+    self.petUpStarRedPoint = _G.ConfigManager.redpoint_cfg.PetillustratedItem.id
+    self.pets = {}
+    self.petGetStates = {}
+
+    for _, v in pairs(_G.ConfigManager.pet_cfg) do
+        self.pets[v.id] = PetData.New(v.id)
+    end
+
+    ---提前缓存所有的灵兽碎片配置，通过配置数据去道具仓库找碎片效果比遍历所有的道具仓库要快点
+    self.petDebrisList = {}
+    for _, v in pairs(_G.ConfigManager.item_cfg) do
+        if v.Type1 == _G.ItemCfgType.PetChip then
+            self.petDebrisList[v.ID] = v
+        end
+    end
+
+    ---灵兽关系列表，list<灵兽碎片id， 灵兽id>
+    self.petRelationShipList = {}
+    for _, v in pairs(_G.ConfigManager.pet_cfg) do
+        self.petRelationShipList[v.materials_item] = v.id
+    end
+end
+
+---从服务器拉取数据
+function PetModel:GetDataFormServer()
+    PetNet:GetInstance():GetPetInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg pet.s2c_pet_info
+function PetModel:ParseData(msg)
+    local pets = msg.pets or {}
+    for _, v in pairs(pets) do
+        if self.pets[v.sid] then
+            self.pets[v.sid]:Parse(v)
+        end
+    end
+    self.super.ParseData(self)
+end
+
+function PetModel:UpStar(sid, star, active, call)
+    local pbData = { sid = sid, new_star = star }
+    PetNet:GetInstance():PetUpStar(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if star == 0 then
+                self.pets[sid]:DoActive()
+            else
+                self.pets[sid]:UpStar(star)
+            end
+            if star == 0 then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.PetShowView.Name, sid)
+            else
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.PetStarUpView.Name, sid)
+            end
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+            .PetForestPosition.id)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+            .PetForestPositionBetter.id)
+            require "PetForestModel":GetInstance():RefreshForestView()
+            _G.StorageManager:GetInstance():ConsumeItem(self.pets[sid].cfg.materials_item, 0,
+                self.pets[sid].cfg.materials_item_number[star + 1])
+            _G.Events:GetInstance():Broadcast(_G.ePetUpStar.PetUpStarRefresh, sid)
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.Pet.PetStar,
+                    sid,
+                    self.pets[sid]:GetStar()
+                },
+                1
+            )
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.Pet.PetStarNum,
+                    self.pets[sid]:GetOrder(),
+                    self.pets[sid]:GetStar()
+                },
+                1
+            )
+            ---0：所有品质
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.Pet.PetStarNum,
+                    0,
+                    self.pets[sid]:GetStar()
+                },
+                1
+            )
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.PetFetterPage.id
+            )
+            require("RedPointManager"):GetInstance():RefreshNode(self.petUpStarRedPoint, sid)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---灵兽碎片分解
+---@param sidNumLis table 碎片数组{{sid = 1, num = 1},..}
+function PetModel:DebrisDecompose(sidNumLis, call)
+    local pbData = { pet_debris = sidNumLis }
+    PetNet:GetInstance():PetDebrisDecompose(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            for _, v in pairs(sidNumLis) do
+                _G.StorageManager:GetInstance():ConsumeItem(v.sid, nil, v.num)
+            end
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+            .PetillustratedItem.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---获取灵兽数据
+function PetModel:GetPet(sid)
+    return self.pets[sid]
+end
+
+---获取所有灵兽数据
+function PetModel:GetAllPets()
+    return self.pets
+end
+
+---获取所有灵兽数据(灵兽界面排序 可合成>已激活>未激活 品质高的在前，品质相同时星级高的在前,星级一样时SID大的在前)
+function PetModel:GetAllPetsBySort()
+    local check = function(a, b, isAsc)
+        local orderA = a:GetOrder()
+        local orderB = b:GetOrder()
+        if orderA == orderB then
+            local starA = a:GetStar()
+            local starB = b:GetStar()
+            if starA == starB then
+                return a.sid > b.sid
+            else
+                return starA > starB
+            end
+        else
+            if isAsc then
+                return orderA < orderB
+            end
+            return orderA > orderB
+        end
+    end
+
+
+    --可合成>已激活>未激活
+    --可合成和已激活中品质降序排序
+    --未激活中品质升序排序
+    local petList = {}
+    local petRemainList = {}
+    local activeList = {}
+    local notActiveList = {}
+    local condition
+    for _, v in pairs(self.pets) do
+        condition = v.cfg.condition_type
+        if condition == nil or #condition == 0 or _G.GlobalConditionManager.CheckConditionByArray(condition) then
+            if not self.petGetStates[v.sid] then
+                self.petGetStates[v.sid] = v:IsCanGet()
+            end
+            if self.petGetStates[v.sid] then
+                table.insert(petList, v)
+            else
+                table.insert(petRemainList, v)
+            end
+        end
+    end
+    for _, v in pairs(petRemainList) do
+        if v:GetIsActive() then
+            table.insert(activeList, v)
+        else
+            table.insert(notActiveList, v)
+        end
+    end
+    --_G.table.sort(activeList, function(a, b)
+    --    return check(a, b)
+    --end)
+    --_G.table.sort(notActiveList, function(a, b)
+    --    return check(a, b)
+    --end)
+    for _, v in pairs(activeList) do
+        table.insert(petList, v)
+    end
+    for _, v in pairs(notActiveList) do
+        table.insert(petList, v)
+    end
+    _G.table.sort(petList, function(a, b)
+        return check(a, b)
+    end)
+    return petList
+end
+
+---获取到灵兽碎片判断是否可以激活或者升星
+function PetModel:CheckCompsePetRedPoint(addList)
+    local itemConfig = _G.ConfigManager.item_cfg
+    for _, sid in pairs(addList) do
+        if itemConfig[sid] and itemConfig[sid].Type1 == _G.ItemCfgType.PetChip then
+            local petSid = self.petRelationShipList[sid]
+            if self:CheckPointRed(petSid) then
+                require("RedPointManager"):GetInstance():RefreshNode(self.petUpStarRedPoint, petSid)
+            end
+        end
+    end
+end
+
+---合成升星红点
+---@param sid number 灵兽sid
+function PetModel:CheckPointRed(sid)
+    local data = self:GetPet(sid)
+    if data:IsCanGet() then
+        return true
+    elseif data:GetIsActive() and (not data:IsMaxStar()) then
+        local num = 0
+        local itemSid = data.cfg.materials_item
+        local itemData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Prop, itemSid)
+        if itemData then
+            num = itemData:GetCount()
+        end
+        local maxNum = data:GetUpCostNum()
+        return num >= maxNum
+    else
+        return false
+    end
+end
+
+---获取所有已激活灵兽数据
+function PetModel:GetAllActivePets()
+    local pets = {}
+    for _, v in pairs(self.pets) do
+        if v:GetIsActive() then
+            _G.table.insert(pets, v)
+        end
+    end
+    return pets
+end
+
+---获取所有的灵兽碎片配置
+function PetModel:GetDebrisCfgs()
+    return self.petDebrisList
+end
+
+---销毁对象时,析构函数
+function PetModel:Dispose()
+    for _, v in pairs(self.pets) do
+        v:Dispose()
+    end
+    self.pets = nil
+end
+
+---通过battle_skill_cfg反查pet_cfg及其星级
+---@param skillId number card_skill_cfg.id
+---@return pet_cfg,number
+function PetModel:GetPetByCardSkillId(skillId)
+    if not self.cardSkillMapiing then
+        ---@type table<any,{cfg: pet_cfg, star: number}> @缓存card_skill_cfg到pet_cfg的映射
+        self.cardSkillMapiing = {}
+
+        for _, cfg in pairs(_G.ConfigManager.pet_cfg) do
+            for star, id in pairs(cfg.skill_id) do
+                self.cardSkillMapiing[id] = { cfg = cfg, star = star - 1 }
+            end
+        end
+    end
+
+    local info = self.cardSkillMapiing[skillId]
+    if info then
+        return info.cfg, info.star
+    end
+    return nil, 0
+end
+
+---通过碎片id获取宠物的id
+function PetModel:GetPetIdByPropId(propId)
+    return self.petRelationShipList[propId]
+end
+
+---获取升星进度
+function PetModel:GetUpStarByPropId(propId)
+    local sid = self:GetPetIdByPropId(propId)
+    local petData = self.pets[sid]
+    if petData:IsMaxStar() then
+        return true, 0
+    end
+
+    return false, petData:GetUpCostNum()
+end
+
+function PetModel:BuySkillIdShowPetSkill(skillid)
+    local petcfg,star=self:GetPetByCardSkillId(skillid)
+    local petData=PetData.New(petcfg.id)
+    petData.star=star
+    petData.active=false
+    local CommonTipView=_G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.CommonTipView.Name)
+    if CommonTipView then
+        CommonTipView:ShowTips( _G.TipType.PetSkill,
+                petData,false)
+    else
+        _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonTipView.Name,
+                _G.TipType.PetSkill,
+                petData,false)
+    end
+end
+
+---是否自动分解
+---@return boolean
+function PetModel:IsAutoDecompose()
+    return _G.PlayerPrefsManager.GetInt("AutoPetDecompose", 0) == 1
+end
+
+---设置自动分解
+---@param isOn boolean
+function PetModel:SetAutoDecompose(isOn)
+    _G.PlayerPrefsManager.SetInt("AutoPetDecompose", isOn and 1 or 0)
+end
+
+---调用立即自动分解
+---@param callback fun(ok:boolean):void
+function PetModel:AutoDecompose(callback)
+    --只处理紫丶橙丶红三种品质
+    local gradeList = _G.ConfigManager.discrete_cfg[114411]
+    if not gradeList then
+        if callback then
+            callback(false)
+        end
+        return
+    end
+
+    local petDebrisList = {}
+    for _, petData in pairs(self:GetAllPets()) do
+        --已合成且满星的灵兽, 才进行分解
+        if petData:IsMaxStar() and _G.table.ContainsValue(gradeList[1], petData.cfg.Order) then
+            local data = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Prop, petData.cfg.materials_item)
+            if not table.isEmptyOrNil(data) then
+                table.insert(petDebrisList, { sid = petData.cfg.materials_item, num = data.count })
+            end
+        end
+    end
+
+    if #petDebrisList > 0 then
+        self:DebrisDecompose(petDebrisList, function(msg)
+            if not msg or msg.ack ~= 1 then
+                if callback then
+                    callback(false)
+                end
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            --对应材料id
+            local gradeCfg = _G.ConfigManager.discrete_cfg[114407]
+            if gradeCfg and gradeCfg[1] then
+                local firstGradeCfg = _G.ConfigManager.discrete_cfg[gradeCfg[1][2]]
+                local itemId = firstGradeCfg[1][1]
+                local itemNum = 0
+                if msg.award and msg.award.item then
+                    for _, v in ipairs(msg.award.item) do
+                        if v.type[1] == itemId then
+                            itemNum = itemNum + v.type[2]
+                        end
+                    end
+                end
+                if itemNum > 0 then
+                    --显示分解tip
+                    _G.PopWindowManager:GetInstance():ShowAllTips(914106, nil, nil, nil, nil, nil, itemNum)
+                end
+            end
+
+            if callback then
+                callback(true)
+            end
+        end)
+    else
+        if callback then
+            callback(false)
+        end
+    end
+end
+
+return PetModel

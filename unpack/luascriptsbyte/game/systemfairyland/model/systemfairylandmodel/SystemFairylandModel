@@ -1,0 +1,548 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.SystemFairyland.Model.SystemFairylandModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/04/23
+-- Description: 芦花幻境（新）数据类
+-----------------------------------------------------------------------
+local SystemFairylandNet = require("SystemFairylandNet")
+
+local base = _G.GameDataModelBase
+---@class SystemFairylandModel : GameDataModelBase
+---@field taskList table<number, table<number, SystemFairylandTaskData>>
+local SystemFairylandModel = _G.BaseClass("SystemFairylandModel", base)
+
+local system_fairyland_cfg = _G.ConfigManager.system_fairyland_cfg
+
+---@class FightStarEnum
+local FSE = {
+    win = 1, --战斗胜利
+    sec = 2, --x秒内胜利
+    dieNum = 3, --阵亡数不超过x
+    leastEle = 4, --至少x个y种族
+    mulEle = 5, --同时上阵x个ABCD种族
+    diffEle = 6, --使用x种不同种族
+    noPro = 7, --不使用x,y职业获得胜利
+    allPro = 8, --全是x职业
+    appoint2 = 100901, --包含x卡和y卡
+    killNum = 10, --同一角色击杀x人
+    mostEle = 11, --至多x个y种族
+    mostPro = 12, --至多x个y职业
+    highHP = 13, --队伍血量高于x%
+    leastStar = 14, --至少上阵x个y星级
+    leastOrder = 15, --至少上阵x个y品质
+    leastPro = 16 --至少x个y职业
+}
+SystemFairylandModel.fightStarEnum = FSE
+
+local starConLang = {
+    [FSE.win] = 90049010036, --战斗胜利
+    [FSE.sec] = 90049010037, --x秒内胜利
+    [FSE.dieNum] = 90049010038, --阵亡数不超过x
+    [FSE.leastEle] = 90049010039, --至少x个y种族
+    [FSE.mulEle] = 90049010040, --同时上阵ABCD种族
+    [FSE.diffEle] = 90049010041, --使用x种不同种族
+    [FSE.noPro] = 90049010042, --不使用x,y职业获得胜利
+    [FSE.allPro] = 90049010043, --不使用x,y职业获得胜利
+    [FSE.leastPro] = 90049010043, --至少x个y职业
+    [FSE.appoint2] = 90049010044, --包含x卡和y卡
+    [FSE.killNum] = 90049010045, --同一角色击杀x人
+    [FSE.mostEle] = 90049010046, --至多x个y种族
+    [FSE.mostPro] = 90049010047, --至多x个y职业
+    [FSE.highHP] = 90049010048, --队伍血量高于x%
+    [FSE.leastStar] = 90049010049, --至少上阵x个y星级
+    [FSE.leastOrder] = 90049010050 --至少上阵x个y品质
+}
+
+---@return SystemFairylandModel SystemFairylandModel
+function SystemFairylandModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SystemFairylandModel:__init()
+    self.bossCfg = {}
+    local bossGradeCount = {}
+    self.bossCount = 0
+    self.layerCount = {}
+    self.layerFinalID = {}
+    for _, v in pairs(system_fairyland_cfg) do
+        if not bossGradeCount[v.grade] then
+            bossGradeCount[v.grade] = true
+            self.layerCount[v.grade] = 0
+            self.bossCount = self.bossCount + 1
+            self.bossCfg[v.grade] = {}
+        end
+        self.layerCount[v.grade] = self.layerCount[v.grade] + 1
+        self.layerFinalID[v.grade] = self.layerFinalID[v.grade] or 0
+        self.layerFinalID[v.grade] = v.id > self.layerFinalID[v.grade] and v.id or self.layerFinalID[v.grade]
+        _G.table.insert(self.bossCfg[v.grade], v)
+        table.sort(
+            self.bossCfg[v.grade],
+            function(a, b)
+                return a.difficulty < b.difficulty
+            end
+        )
+    end
+    self.awardState = {} --奖励是否领取
+    self.sectionStar = {} --关卡星级解锁状态
+    self.fairylandLayer = {}
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+end
+
+---从服务器拉取数据
+function SystemFairylandModel:GetDataFormServer()
+    SystemFairylandNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg system_fairyland.s2c_system_fairyland_info
+function SystemFairylandModel:ParseData(msg)
+    self.awardState = {} --奖励是否领取
+    self.sectionStar = {} --关卡星级解锁状态
+    self.fairylandLayer = {}
+    for i = 1, self.bossCount do
+        self.fairylandLayer[i] = 0
+    end
+    if msg.fairyland_info then
+        local cfg
+        for _, v in pairs(msg.fairyland_info) do
+            self.sectionStar[v.sid] = {}
+            for _, idx in pairs(v.index) do
+                self.sectionStar[v.sid][idx] = true
+            end
+            cfg = system_fairyland_cfg[v.sid]
+            if v.sid > self.fairylandLayer[cfg.grade] then
+                self.fairylandLayer[cfg.grade] = v.sid
+            end
+        end
+    end
+    if msg.chapter_info then -- 奖励信息
+        for _, v in pairs(msg.chapter_info) do
+            self.awardState[v.sid] = {}
+            if v.type then
+                for _, t in pairs(v.type) do
+                    self.awardState[v.sid][t] = true
+                end
+            end
+        end
+    end
+    self.super.ParseData(self)
+end
+
+---挑战
+function SystemFairylandModel:OnChallenge(bossID, layer, autoFight)
+    -- local sid, cfg = self:GetNextLayer(bossID)
+    -- if cfg == nil then
+    --     return
+    -- end
+    -- local embattleId = _G.EmbattleType["SystemFairyland" .. bossID]
+    -- if not embattleId then
+    --     if _G.AppSetting.DEBUG then
+    --         _G.LogError("SystemFairylandModel:OnChallenge embattleId is nil, bossId=" .. tostring(bossID))
+    --     end
+    --     return
+    -- end
+    local embattleId = _G.EmbattleType.SystemFairyland1
+
+    local cfg = self:GetCfgByBossAndLayer(bossID, layer)
+    self.curChanllengeCfg = cfg
+    self.curChanllengeBoss = bossID
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.SystemFairylandEmbattleView.Name,
+        embattleId,
+        _G.handlerbind(self, self.OnExitFight, bossID, cfg.id),
+        _G.handlerbind(self, self.OnFight, bossID, cfg.id),
+        autoFight,
+        bossID,
+        cfg
+    )
+    -- require "EmbattleController":GetInstance():OpenEmbattle(
+    --     _G.EmbattleType["SystemFairyland" .. bossID],
+    --     _G.EmbattleSaveType.server,
+    --     true,
+    --     _G.EmbattleControllerItemType.SystemFairyland,
+    --     _G.handlerbind(self, self.OnExitFight, bossID, cfg.id),
+    --     _G.handlerbind(self, self.OnFight, bossID, cfg.id),
+    --     cfg.monster
+    -- )
+end
+
+---退出布阵
+function SystemFairylandModel:OnExitFight(bossID, sid)
+    self:ReturnPanel()
+end
+
+---进入战斗
+function SystemFairylandModel:OnFight(bossID, sid)
+    self.isChallenge = true
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.SystemFairyland, bossID, sid)
+end
+
+function SystemFairylandModel:ReEnterFight()
+    --local embattleId = _G.EmbattleType["SystemFairyland" .. self.curChanllengeBoss]
+    local embattleId = _G.EmbattleType.SystemFairyland1
+
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.SystemFairylandEmbattleView.Name,
+        embattleId,
+        _G.handlerbind(self, self.OnExitFight, self.curChanllengeBoss, self.curChanllengeCfg.id),
+        _G.handlerbind(self, self.OnFight, self.curChanllengeBoss, self.curChanllengeCfg.id),
+        false,
+        self.curChanllengeBoss,
+        self.curChanllengeCfg
+    )
+    -- require "EmbattleController":GetInstance():OpenEmbattle(
+    --     _G.EmbattleType["SystemFairyland" .. self.curChanllengeBoss],
+    --     _G.EmbattleSaveType.server,
+    --     true,
+    --     _G.EmbattleControllerItemType.SystemFairyland,
+    --     _G.handlerbind(self, self.OnExitFight, self.curChanllengeBoss, self.curChanllengeCfg.id),
+    --     _G.handlerbind(self, self.OnFight, self.curChanllengeBoss, self.curChanllengeCfg.id),
+    --     self.curChanllengeCfg.monster
+    -- )
+end
+
+---监听界面打开
+---@param name string 界面名称
+function SystemFairylandModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SystemFairylandView.Name)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SystemFairylandBossView.Name)
+    end
+end
+
+function SystemFairylandModel:SetLayerPass(bossID, sid, indexes)
+    if self.fairylandLayer[bossID] == nil or self.fairylandLayer[bossID] == 0 then
+        self.fairylandLayer[bossID] = sid
+    else
+        local curCfg = _G.ConfigManager.system_fairyland_cfg[self.fairylandLayer[bossID]]
+        local cfg = _G.ConfigManager.system_fairyland_cfg[sid]
+        if cfg.difficulty > curCfg.difficulty then
+            self.fairylandLayer[bossID] = sid
+        end
+    end
+    self:RefreshStarState(sid, indexes)
+end
+
+function SystemFairylandModel:ReturnPanel(isWin, id)
+    if isWin then
+        local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SystemFairylandBossView.Name)
+        if ctrl then
+            ctrl:UpdateView()
+        end
+    end
+    if id == require("SettlementModel").FunctionEnum.Next then
+        return
+    end
+    self:ShowWindows()
+end
+
+function SystemFairylandModel:ShowWindows()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SystemFairylandBossView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SystemFairylandView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+end
+
+---获取通关录影
+---@param sid number 关卡sid
+function SystemFairylandModel:GetRecommend(sid, callback)
+    local pbData = {sid = sid}
+    SystemFairylandNet:GetInstance():GetRecommend(
+        pbData,
+        function(msg)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---获取战报
+---@param sid number 关卡sid
+---@param uid number 玩家uid
+function SystemFairylandModel:GetReport(sid, uid, callback)
+    local pbData = {sid = sid, uid = uid}
+    SystemFairylandNet:GetInstance():GetReport(
+        pbData,
+        function(msg)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---获取排行榜
+function SystemFairylandModel:GetRank(bossID, page, callback)
+    ---id范围：86~89
+    local pbData = {page = page or 1, id = bossID + 85}
+    local call = function(msg)
+        if callback then
+            callback(msg)
+        end
+    end
+    if bossID == 1 then
+        SystemFairylandNet:GetInstance():GetRankWind(pbData, call)
+    elseif bossID == 2 then
+        SystemFairylandNet:GetInstance():GetRankFlower(pbData, call)
+    elseif bossID == 3 then
+        SystemFairylandNet:GetInstance():GetRankSnow(pbData, call)
+    elseif bossID == 4 then
+        SystemFairylandNet:GetInstance():GetRankMoon(pbData, call)
+    end
+end
+
+function SystemFairylandModel:GetSelfRank(bossID, callback)
+    local pbData = {type = bossID + 85}
+    SystemFairylandNet:GetInstance():SelfRank(
+        pbData,
+        function(msg)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---获取boss已挑战最高层sid
+---@param bossID number 风花雪月
+---@return number 层数sid（未通关过则为0）
+function SystemFairylandModel:GetCurLayer(bossID)
+    return self.fairylandLayer[bossID]
+end
+
+---获取boss已挑战最高层cfg
+---@param bossID number 风花雪月
+---@return system_fairyland_cfg 层数cfg（未通关过则为nil）
+function SystemFairylandModel:GetCurLayerCfg(bossID)
+    if self.fairylandLayer[bossID] == 0 then
+        return nil
+    else
+        return system_fairyland_cfg[self.fairylandLayer[bossID]]
+    end
+end
+
+---获取boss当前挑战层的sid
+---@param bossID number 风花雪月
+---@return number, system_fairyland_cfg 层数sid, 配置（全通关则为nil）
+function SystemFairylandModel:GetNextLayer(bossID)
+    local cfg
+    if self.fairylandLayer[bossID] == 0 then
+        cfg = self.bossCfg[bossID][1]
+        return cfg.id, cfg
+    end
+    local nextSid = self.fairylandLayer[bossID] + 1
+    cfg = system_fairyland_cfg[nextSid]
+    if cfg then
+        return nextSid, cfg
+    end
+    return nil, nil
+end
+
+---某一关能否挑战
+function SystemFairylandModel:CheckSectionCanChallenge(sectionId)
+    local cfg = _G.ConfigManager.system_fairyland_cfg[sectionId]
+    if cfg.pre_section > 0 then
+        local preCfg = _G.ConfigManager.system_fairyland_cfg[cfg.pre_section]
+        local curCfg = self:GetCurLayerCfg(preCfg.grade)
+        if curCfg == nil then
+            return false
+        end
+        if cfg.grade ~= preCfg.grade then
+            local bossCfg = _G.ConfigManager.system_fairyland_chapter_cfg[cfg.grade]
+            return _G.GlobalConditionManager.CheckConditionArrays(bossCfg.limit_condition)
+        end
+        return curCfg.difficulty >= preCfg.difficulty
+    end
+    local bossCfg = _G.ConfigManager.system_fairyland_chapter_cfg[cfg.grade]
+    return _G.GlobalConditionManager.CheckConditionArrays(bossCfg.limit_condition)
+end
+
+---根据boss和层数获取配置
+---@param bossID number 风花雪月
+---@param layer number 层数
+---@return system_fairyland_cfg 层数cfg（未通关过则为nil）
+function SystemFairylandModel:GetCfgByBossAndLayer(bossID, layer)
+    for _, v in pairs(self.bossCfg[bossID]) do
+        if v.difficulty == layer then
+            return v
+        end
+    end
+    -- return system_fairyland_cfg[100000 + bossID * 100 + layer]
+end
+
+---是否通关最高层
+---@param bossID number 风花雪月
+function SystemFairylandModel:CheckPassMaxLayer(bossID)
+    return self:GetNextLayer(bossID) == nil
+end
+
+---获取boss基础配置
+---@param bossID number 风花雪月
+---@return system_fairyland_cfg, system_fairyland_chapter_cfg
+function SystemFairylandModel:GetBossCfg(bossID)
+    return self.bossCfg[bossID][1], _G.ConfigManager.system_fairyland_chapter_cfg[bossID]
+end
+
+function SystemFairylandModel:GetMaxStarByBoss(bossID)
+    return self.layerCount[bossID] * 3
+end
+
+---x关第x个星是否点亮
+function SystemFairylandModel:GetSectionStarUnlock(sid, index)
+    return self.sectionStar[sid] and self.sectionStar[sid][index] or false
+end
+
+function SystemFairylandModel:GetBossStarCount(bossID)
+    local num = 0
+    for _, v in pairs(self.bossCfg[bossID]) do
+        if self.sectionStar[v.id] then
+            num = num + _G.table.count(self.sectionStar[v.id])
+        end
+    end
+    return num
+end
+
+function SystemFairylandModel:RefreshStarState(sid, indexes)
+    self.sectionStar[sid] = {}
+    for _, idx in pairs(indexes) do
+        self.sectionStar[sid][idx] = true
+    end
+end
+
+function SystemFairylandModel:GetStarConditionStr(condition)
+    local _type = condition[1]
+    if _type == FSE.win then
+        return _G.GetLangPackValue(starConLang[_type])
+    elseif _type == FSE.sec or _type == FSE.dieNum or _type == FSE.killNum or _type == FSE.diffEle then
+        return _G.GetLangPackValue(starConLang[_type], condition[2])
+    elseif _type == FSE.leastEle or _type == FSE.mostEle then
+        return _G.GetLangPackValue(
+            starConLang[_type],
+            condition[2],
+            _G.GetLangPackValue(_G.ElementStrEnum[condition[3]])
+        )
+    elseif _type == FSE.leastPro or _type == FSE.mostPro then
+        return _G.GetLangPackValue(
+            starConLang[_type],
+            condition[2],
+            _G.GetLangPackValue(_G.ProfessionalStrEnum[condition[3]])
+        )
+    elseif _type == FSE.mulEle then
+        return _G.GetLangPackValue(
+            starConLang[_type],
+            _G.GetLangPackValue(_G.ElementStrEnum[condition[3]]),
+            _G.GetLangPackValue(_G.ElementStrEnum[condition[4]]),
+            _G.GetLangPackValue(_G.ElementStrEnum[condition[5]]),
+            _G.GetLangPackValue(_G.ElementStrEnum[condition[6]])
+        )
+    elseif _type == FSE.noPro then
+        return _G.GetLangPackValue(
+            starConLang[_type],
+            _G.GetLangPackValue(_G.ProfessionalStrEnum[condition[2]]),
+            _G.GetLangPackValue(_G.ProfessionalStrEnum[condition[3]])
+        )
+    elseif _type == FSE.allPro then
+        return _G.GetLangPackValue(starConLang[_type], 5, _G.GetLangPackValue(_G.ProfessionalStrEnum[condition[3]]))
+    elseif _type == FSE.appoint2 then
+        local name1 = _G.GetLangPackValue(_G.ConfigManager.card_cfg[condition[2]].Name)
+        local name2 = _G.GetLangPackValue(_G.ConfigManager.card_cfg[condition[3]].Name)
+        return _G.GetLangPackValue(starConLang[_type], name1, name2)
+    elseif _type == FSE.highHP then
+        return _G.GetLangPackValue(starConLang[_type], _G.tostring(condition[2] / 100))
+    elseif _type == FSE.leastStar then
+        return _G.GetLangPackValue(starConLang[_type], condition[2], condition[3])
+    elseif _type == FSE.leastOrder then
+        return _G.GetLangPackValue(starConLang[_type], condition[2], _G.OrderStrEnum[condition[3]])
+    end
+    return _G.GetLangPackValue(starConLang[_type])
+end
+
+function SystemFairylandModel:CheckStarAwardIsGet(bossID, _type)
+    if self.awardState[bossID] == nil then
+        return false
+    end
+    return self.awardState[bossID][_type]
+end
+
+function SystemFairylandModel:GetAllUnlockAwardType(bossID)
+    local count = self:GetBossStarCount(bossID)
+    local cfg = _G.ConfigManager.system_fairyland_chapter_cfg[bossID]
+    local typeLis = {}
+    for i = 1, 3 do
+        if count >= cfg["star" .. i] and not self:CheckStarAwardIsGet(bossID, i) then
+            _G.table.insert(typeLis, i)
+        end
+    end
+    return typeLis
+end
+
+function SystemFairylandModel:GetStarAward(bossID, typeLis, call)
+    local pbData = {chapter_id = bossID, type = typeLis}
+    SystemFairylandNet:GetInstance():GetStarAward(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if self.awardState[bossID] == nil then
+                self.awardState[bossID] = {}
+            end
+            for _, _type in pairs(typeLis) do
+                self.awardState[bossID][_type] = true
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---六点刷新事件回调
+function SystemFairylandModel:OnSixClockUpdateCallback()
+    --刷新红点信息
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ReedCatkins.id)
+end
+
+---销毁对象时,析构函数
+function SystemFairylandModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+end
+
+---查看是否未满星
+function SystemFairylandModel:CheckNOFullStar()
+    local hasNoFull = false
+    for _, cfg in pairs(_G.ConfigManager.system_fairyland_chapter_cfg) do
+        if self:CheckNOFullStarCount(cfg.id) then
+            hasNoFull = true
+            break
+        end
+    end
+    return hasNoFull
+end
+
+---判断星数
+function SystemFairylandModel:CheckNOFullStarCount(bossID)
+    for _, v in pairs(system_fairyland_cfg) do
+        if v.grade == bossID then
+            local stars = {}
+            local starsCount = 0
+            for j = 1, 3 do
+                stars[j] = self:GetSectionStarUnlock(v.id, j)
+                if stars[j] then
+                    starsCount = starsCount + 1
+                end
+            end
+            if starsCount > 0 and starsCount < 3 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+return SystemFairylandModel

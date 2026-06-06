@@ -1,0 +1,839 @@
+-----------------------------------------------------------------------
+-- World.Object.BaseItem	(修改路径必须修正此项!)
+-- Created by csw
+-- DateTime: 2020/03/30
+-- Description: 物体基类
+-----------------------------------------------------------------------
+
+require "BaseEvent"
+require "WorldItemEvent"
+
+---@class BaseItem:BaseEvent    物体基类
+---@field public ObjectMod UnityEngine.Transform 加载的资源模型
+---@field public IdleEffetTrans UnityEngine.Transform 绑定特效
+---@field public World BaseWorld 当前世界
+---@field public Uid number
+---@field public Sid number
+---@field public InstID number 实例化唯一ID
+---@field public FinishCallB function 实例化完成回调
+---@field public ItemType WorldItemType 类型
+---@field public Cfg table 配置表
+---@field public NavNodes UnityEngine.AI.NavMeshPath 寻路对象
+---@field public Transform UnityEngine.Transform 根节点Trans
+---@field public AnimComponent RoleAnimatorController 模型动画控制器
+---@field public AnimName string 当前播放动画名称
+---@field public AnimNames table<string,string> 动画状态
+---@field public MoveStep number 移动状态 1为移动 2为静止
+---@field public DataType WorldItemDataType 区分物件和玩家（主要是数据结构不太一样）
+---@field public DynamicTriggerNode table<string,TriggerNode> 动态添加的Trigger节点
+---@field public MoveSpeed number 移动速度
+---@field public NavNodeIndex number 寻路时的数组索引
+---@field public NavCorners UnityEngine.Vector3 寻路时的数组
+---@field public NavNodesLength number 寻路时的数组长度
+local BaseItem = _G.BaseClass("BaseItem", _G.BaseEvent)
+
+local moveToPostion = {x = 0, y = 0, z = 0}
+local transPostion = {x = 0, y = 0, z = 0}
+local MAXMOVESPEED = 5
+local ShadowCastingMode = _G.CS.UnityEngine.Rendering.ShadowCastingMode
+
+---@class BaseItemParam 物体基类参数
+---@field public dataType WorldItemDataType 区分物件和玩家（主要是数据结构不太一样）
+---@field public itemType WorldItemType 类型
+---@field public uid number Uid
+---@field public sid number Sid
+---@field public cfg table 配置信息
+---@field public callback function 实例化完成回调
+---@field public world BaseWorld 当前世界
+---@field public resPath string @资源位置(动态物体资源路径--仅WorldDynamicBaseItem可用)
+---@field public worldPos UnityEngine.Vector3 @初始位置(动态物体初始位置--仅WorldDynamicBaseItem可用)
+---@field public loadCompletedCB function @资源加载完成(动态物体资源加载完成回调--仅WorldDynamicBaseItem可用)
+
+---@class BaseItemDisplayParam 物体显示参数参数
+---@field public IsHideShadow boolean 是否显示影子
+
+---类的构造函数
+---@param info BaseItemParam 类型
+function BaseItem:__init(info, data, world)
+    self.DataType = info.dataType and info.dataType or _G.WorldItemDataType.NomalItem
+    self.Uid = info.uid
+    self.Sid = info.sid
+    self.Cfg = info.cfg
+    self.InstID = nil
+    self.Transform = nil
+    self.FinishCallB = info.callback
+    self.NavNodes = _G.CS.UnityEngine.AI.NavMeshPath()
+    self.World = world or info.world
+    self.MoveSpeed = MAXMOVESPEED
+    self.MaxMoveSpeed = MAXMOVESPEED
+    self.AnimName = nil
+    self.MoveStep = 0
+    self.DynamicTriggerNode = {}
+    self.Enable = false
+    self.ObjectModActive = false
+    self.FootEffectActive = false
+    self.TitleTransformActive = false
+    self.TitleLoading = false
+    self:BubblesInit()
+end
+
+---类的析构函数
+function BaseItem:Dispose()
+    self.DataType = nil
+    self.Uid = nil
+    self.Sid = nil
+    self.Cfg = nil
+    self.InstID = nil
+    self.Transform = nil
+    self.FinishCallB = nil
+    self.NavNodes = nil
+    self.World = nil
+    self.MoveSpeed = nil
+    self.AnimName = nil
+    self.MoveStep = nil
+    self.DynamicTriggerNode = nil
+    self.Enable = nil
+    self.NavNodesLength = nil
+    self.NavCorners = nil
+    self.NavNodeIndex = nil
+    self.AnimComponent = nil
+    self.ObjectMod = nil
+    self.IdleEffetTrans = nil
+    if self.gotoPointTimer then
+        self.gotoPointTimer:Stop()
+        self.gotoPointTimer = nil
+    end
+    self:BubblesInit(true)
+    if self.setEnableTimer then
+        self.setEnableTimer:Stop()
+        self.setEnableTimer = nil
+    end
+end
+
+---初始化
+function BaseItem:Init()
+    self:LoadObject(nil)
+end
+
+---检测一下那些物件是不用碰撞的
+function BaseItem:CheckCollider(uid)
+    for i = 1, 14 do
+        if (100000000 + i) == uid then
+            return true
+        end
+    end
+    return false
+end
+
+--region 加载和清理
+---初始化和加载根节点
+---@param res_path string 根节点资源路径
+function BaseItem:LoadObject(res_path)
+    res_path = res_path and res_path or "CommonPrefab/World/ItemRootPrefab"
+    _G.PoolsManager:GetInstance():Spawn(
+        res_path,
+        _G.ePoolType.World,
+        self.World.ItemRoot,
+        function(tran)
+            self.Transform = tran
+            self.InstID = tran:GetInstanceIDE()
+            self.World.AllWorldItemsByInstId[self.InstID] = self
+            self.Transform:SetName(self.Uid)
+            if self:CheckCollider(self.Uid) then
+                self.Transform:SetColliderEnable(0)
+            else
+                self.Transform:SetColliderEnable(self.Cfg.Click_type and 0 or 1)
+            end
+            self:LoadResObj()
+        end
+    )
+end
+-----加载配置资源节点
+function BaseItem:LoadResObj()
+    if self.Cfg and self.Cfg.Res and not _G.string.IsNullOrEmpty(self.Cfg.Res) then
+        _G.PoolsManager:GetInstance():Spawn(
+            self.Cfg.Res,
+            _G.ePoolType.World,
+            self.Transform,
+            function(tran)
+                self.ObjectMod = tran
+                self.AnimComponent = _G.RoleAnimatorController.GetOrCreateAnimatorController(self.Transform)
+                self.AnimComponent:HandInit()
+                self:OnLoadResObjComplete()
+                self:InitSkinnedMeshRenderer()
+                self.ObjectMod:SetActiveE(0)
+            end
+        )
+    else
+        self:OnLoadResObjComplete()
+    end
+end
+---加载资源完成
+function BaseItem:OnLoadResObjComplete()
+    -- if _G.SystemSettingManager:GetInstance():GetImageQuality() == _G.ImageQuality.High then
+    --     self.highLight = self.Transform:RequireComponentE(_G.typeof(_G.CS.HighlightableObject))
+    -- end
+    _G.WorldCsListener.AddTriggerCall(self.InstID, _G.handler(self, self.TriggerEvent))
+    --self:InitSkinnedMeshRenderer()
+    if self.FinishCallB ~= nil then
+        self.FinishCallB(self)
+    end
+end
+
+---清理item节点下的对象
+function BaseItem:DisWorldItem()
+    _G.NavManager:GetInstance():DeleteNavItemByUid(self.Uid, true)
+    self:RemoveAllDynamicTriggerNode()
+    self:RemoveNavUpdateMove()
+    self:RemoveUpdateMoveFunction()
+    _G.WorldCsListener.RemoveTriggerCall(self.InstID)
+    if self.Transform then
+        _G.DestroyObject(self.Transform)
+    end
+    self:Dispose()
+end
+--endregion
+
+--region 触发器
+---设置自身触发器开关
+---@param isEnable boolean 开关
+function BaseItem:SetTriggerEnable(isEnable)
+    self.Transform:SetColliderEnable(isEnable and 1 or 0)
+end
+---触发函数，由子类实现具体的功能
+---@param isEnter boolean True：进入；False：离开
+---@param tarInstId number 碰撞物体InstID
+---@param tarObj UnityEngine.GameObject 碰撞物体
+function BaseItem:TriggerEvent(isEnter, tarInstId, tarObj)
+end
+--endregion
+
+--region 动画
+---播放指定名称的动画
+---@param name string 动画name
+---@param isEndCall boolean 结束是否回调
+function BaseItem:PlayAnimByName(name, isEndCall)
+    if self.AnimName then
+        if self.AnimName == name then
+            return
+        end
+    end
+    if not name or name == "" then
+        return
+    end
+    if _G.IsNil(self.AnimComponent) then
+        return
+    end
+    if not self.Transform then
+        return
+    end
+    if 0 == self.Transform:GetctiveInHierarchy() then
+        return
+    end
+    self.AnimName = name
+    self.AnimComponent:PlayForce(name, isEndCall or false)
+end
+---队列播放动画
+---@param curname string 当前动画
+---@param nextname string 下一个动画
+function BaseItem:PlayAnimQueue(curname, nextname)
+    if _G.string.IsNullOrEmpty(curname) then
+        return
+    end
+    if _G.string.IsNullOrEmpty(nextname) then
+        return
+    end
+    if _G.IsNil(self.AnimComponent) then
+        return
+    end
+    if not self.Transform then
+        return
+    end
+    if 0 == self.Transform:GetctiveInHierarchy() then
+        return
+    end
+    self.AnimName = nextname
+    self.AnimComponent:Queue(curname, nextname)
+end
+--endregion
+
+--region 寻路移动相关
+---启动移动
+function BaseItem:StartUpdateMove()
+    ---添加Update
+    if not self.UpdateMoveFunction then
+        self.UpdateMoveFunction = _G.handler(self, self.UpdateMove)
+    end
+    if not _G.UpdateManager:GetInstance():HasUpdate(self.UpdateMoveFunction, self) then
+        _G.UpdateManager:GetInstance():AddUpdate(self.UpdateMoveFunction, self)
+    end
+end
+---玩家移动
+function BaseItem:UpdateMove()
+    if self.MoveStep ~= 0 then
+        self.Transform:SetForwardPosition(self.MoveSpeed, 1, 1)
+    end
+end
+---移动
+---@param moveStep number 移动状态
+---@param speed number 速度
+function BaseItem:Move(moveStep, speed)
+    self.MoveStep = moveStep
+    if moveStep == 0 then
+        self:PlayAnimByName(_G.WorldManager.AnimNames.IDLE)
+    else
+        if not speed then
+            self:PlayAnimByName(_G.WorldManager.AnimNames.MOVE)
+        else
+            local speedFloor = math.floor(speed)
+            local aniName = self:GetAnimNameBySpeed(speedFloor)
+            self:PlayAnimByName(aniName)
+            self:SetSpeed(speed)
+        end
+    end
+end
+---设置speed
+---@param speed number
+function BaseItem:SetSpeed(speed)
+    self.MoveSpeed = speed
+end
+---设置显示物体根节点状态
+function BaseItem:SetActiveE(isactive)
+    if self.Transform ~= nil and self.Transform:GetActiveSelf() == 1 ~= isactive and 1 or 0 then
+        self.Transform:SetActiveE(isactive and 1 or 0)
+        if isactive then
+            self:StartUpdateMove()
+        else
+            self:RemoveUpdateMoveFunction()
+        end
+    end
+end
+---通过速度获取移动动画名称m并且设置速度
+---@param speed number
+function BaseItem:GetAnimNameBySpeed(speed)
+    if speed <= 3 then
+        return _G.WorldManager.AnimNames.WALK
+    else
+        return _G.WorldManager.AnimNames.MOVE
+    end
+end
+---navmesh计算路线
+function BaseItem:RemoveNavUpdateMove()
+    if self.NavUpdateMove then
+        _G.UpdateManager:GetInstance():RemoveUpdate(self.NavUpdateMove, self)
+        self.NavUpdateMove = nil
+    end
+end
+---移除物体移动
+function BaseItem:RemoveUpdateMoveFunction()
+    if self.UpdateMoveFunction then
+        _G.UpdateManager:GetInstance():RemoveUpdate(self.UpdateMoveFunction, self)
+        self.UpdateMoveFunction = nil
+    end
+end
+--region 求交点
+--两点连线到以后者点为圆心已知半径的圆的交点
+---@param to UnityEngine.Vector3 对应坐标点
+---@param radius number 半径
+function BaseItem:GetClosestPointByTwoTarget(x, y, z, radius)
+    local px, py, pz = _G.CS.UnityObjectExtends.GetClosestPointByTwoTarget(self.Transform, x, y, z, radius)
+    return _G.Vector3.New(px, py, pz)
+end
+local defaultStopDisPow = 0.25
+---玩家移动到某个指定点
+---@param to UnityEngine.Vector3 对应坐标点
+---@param gotoEnd function 到达对应坐标点后的回调
+---@param speed number 速度
+---@param stopdis number 停止范围(默认1)
+---@return boolean|boolean 是否可达
+function BaseItem:GotoPoint(to, gotoEnd, speed, stopdis, isClick)
+    if nil == isClick then
+        isClick = false
+    end
+    --TODO:这里应该区分是NavItem:DoNavByPosition调用还是GotoPoint直接调用
+    self.stopDistance = (stopdis and stopdis >= defaultStopDisPow) and stopdis * stopdis or defaultStopDisPow
+    self.curStopDistance = 0
+    local isNode, isTooClose = _G.CS.UnityObjectExtends.CalculatePath(self.Transform, to.x, to.y, to.z, self.NavNodes)
+    ---坐标差 <1              发现两对象重叠时  isNode返回false  无法进行相关处理
+    transPostion.x, transPostion.y, transPostion.z = self.Transform:GetPosition()
+    if isNode == false and _G.Vector3.DistancePow2(transPostion, to) < 1 then
+        isNode = true
+    end
+    if isNode then
+        if isTooClose == false then
+            _G.NavManager:GetInstance():RegisterNavItemByUid(self, to)
+            self.GotoEnd = gotoEnd
+            self.NavNodeIndex = 1
+            self.NavCorners = self.NavNodes.corners
+            self.NavNodesLength = self.NavCorners.Length
+            self:SetNavMoveState(speed)
+            if not self.NavUpdateMove then
+                self.NavUpdateMove = _G.handler(self, self.DoNavUpdateMove)
+            end
+            local updateInstance = _G.UpdateManager:GetInstance()
+            if not updateInstance:HasUpdate(self.NavUpdateMove, self) then
+                updateInstance:AddUpdate(self.NavUpdateMove, self)
+            end
+        else
+            if gotoEnd then
+                gotoEnd()
+            end
+        end
+        return true, isTooClose
+    else
+        if not isClick then
+            if gotoEnd then
+                gotoEnd()
+            end
+        end
+        self.NavNodes:ClearCorners()
+        return false
+    end
+end
+---设置自动寻路状态
+---@param speed number 速度
+function BaseItem:SetNavMoveState(speed)
+    if not speed then
+        speed = MAXMOVESPEED
+    end
+    --self:PlayAnimByName(_G.WorldManager.AnimNames.MOVE)
+    self:SetSpeed(speed)
+    self:PlayAnimByName(self:GetMoveAnimationName())
+
+    if self.gotoPointTimer then
+        self.gotoPointTimer:Stop()
+        self.gotoPointTimer = nil
+    end
+    -- self.MoveStep = 1
+end
+---寻路到点结束停止
+function BaseItem:NavStepMoveOver()
+    self.MoveStep = 0
+    self:PlayAnimByName(_G.WorldManager.AnimNames.IDLE)
+    self:RemoveNavUpdateMove()
+    self.gotoPointTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnNavStepMoveOverCall, self, true, true)
+    self.gotoPointTimer:Start()
+end
+---寻路到点结束停止后判断是否达到可交互范围
+function BaseItem:NavStepMoveOverPosCheck(playerPos, pos, call)
+    if _G.Vector3.DistancePow2(playerPos, pos) < (self.stopDistance) then
+        call()
+    end
+end
+function BaseItem:OnNavStepMoveOverCall()
+    if self.GotoEnd then
+        self.GotoEnd()
+    end
+    _G.Events:GetInstance():Broadcast(_G.eNav.NavComplete, self.Uid)
+    _G.NavManager:GetInstance():DeleteNavItemByUid(self.Uid, false)
+end
+---寻路移动Update
+function BaseItem:DoNavUpdateMove()
+    if self.NavNodeIndex >= self.NavNodesLength then
+        self:NavStepMoveOver()
+        return
+    end
+    local to = self.NavCorners[self.NavNodeIndex]
+    moveToPostion.x = to.x
+    moveToPostion.y = to.y
+    moveToPostion.z = to.z
+    local x, y, z = self.Transform:GetPosition()
+    transPostion.x = x
+    transPostion.y = y
+    transPostion.z = z
+    local dis = _G.Vector3.DistancePow2(transPostion, moveToPostion)
+    if self.NavNodeIndex < self.NavNodesLength - 1 then
+        self.curStopDistance = defaultStopDisPow
+    else
+        self.curStopDistance = self.stopDistance
+    end
+    if dis < self.curStopDistance then
+        if self.curStopDistance <= defaultStopDisPow then
+            self.Transform:SetPosition(moveToPostion.x, transPostion.y, moveToPostion.z)
+        end
+        self.NavNodeIndex = self.NavNodeIndex + 1
+    else
+        self.Transform:SetPosition(
+            self.Transform:SetMoveDirect(moveToPostion.x, moveToPostion.y, moveToPostion.z, self.MoveSpeed, 1)
+        )
+        self.Transform:SetDirectionByDis(moveToPostion.x, moveToPostion.y, moveToPostion.z)
+    end
+end
+---打断非遥感移动
+function BaseItem:NavInterruptMove()
+    self:PlayAnimByName(_G.WorldManager.AnimNames.IDLE)
+    self.GotoEnd = nil
+    self:RemoveNavUpdateMove()
+end
+---打断通过遥感移动
+function BaseItem:StopGoto()
+    self.GotoEnd = nil
+    self:RemoveNavUpdateMove()
+end
+---获取是否移动
+---@return boolean 是否跑动中
+function BaseItem:GetMoveState()
+    return self.AnimName and
+        (self.AnimName == _G.WorldManager.AnimNames.MOVE or self.AnimName == _G.WorldManager.AnimNames.WALK)
+end
+function BaseItem:GetMoveAnimationName()
+    if self.World.Cfg.Scene_Type == _G.SceneType.MainWorld then
+        local param = _G.ConfigManager.discrete_cfg[100003][1]
+        if table.indexof(param, self.Sid) == false then
+            return _G.WorldManager.AnimNames.MOVE
+        else
+            return _G.WorldManager.AnimNames.WALK
+        end
+    elseif self.World.Cfg.Scene_Type == _G.SceneType.Section then
+        return _G.WorldManager.AnimNames.MOVE
+    elseif self.World.Cfg.Scene_Type == _G.SceneType.Sociaty then
+        self:SetSpeed(3)
+        return _G.WorldManager.AnimNames.WALK
+    else
+        return _G.WorldManager.AnimNames.MOVE
+    end
+end
+--endregion
+
+function BaseItem:SetEnable()
+    if self.setEnableTimer then
+        self.setEnableTimer:Stop()
+        self.setEnableTimer = nil
+    end
+    self.Enable = self.Transform:GetActiveSelf() == 1
+    -- self.curSetEnable
+    if self.MoveStep == 1 then
+        self:PlayAnimByName(self:GetMoveAnimationName())
+    end
+
+    self.BubblesIsOn = true
+    if nil == self.Cnb then
+        self.Cnb = _G.DelayDo(self.intervalsSecondsDefault, _G.handler(self, self.CheckNormalBubbles))
+    end
+end
+
+function BaseItem:ShowOrHide(show)
+    -- if show == self.curSetEnable then
+    --     return
+    -- end
+    if _G.IsNil(self.Transform) then
+        return
+    end
+    self.Transform:SetActiveE(show and 1 or 0)
+    --self.curSetEnable = show
+    if show then
+        --延时一帧开启触发器
+        if self.setEnableTimer then
+            self.setEnableTimer:Stop()
+            self.setEnableTimer = nil
+        end
+        self.setEnableTimer = _G.TimerManager:GetInstance():GetTimer(1, self.SetEnable, self, true, true)
+        self.setEnableTimer:Start()
+    else
+        self.AnimName = nil
+        if self.setEnableTimer then
+            self.setEnableTimer:Stop()
+            self.setEnableTimer = nil
+        end
+        self.BubblesIsOn = false
+        if self.Cnb then
+            _G.coroutine.stopwaiting(self.Cnb)
+            self.Cnb = nil
+        end
+        _G.HUDUtilities.DestroyHUDByUid(self.Uid)
+        self:SetEnable()
+    end
+end
+
+---隐藏绑定特效
+function BaseItem:HideEffect(hide)
+end
+
+function BaseItem:ShowOrHideChild(show)
+end
+
+-----进入显示该世界时调用，会在active=true后一帧调用，避免触发器触发。由子类重写
+function BaseItem:OnEnterWorld()
+    self:ShowOrHide(true)
+end
+
+-----退出世界时调用，由子类重写
+function BaseItem:OnExitWorld()
+    self:ShowOrHide(false)
+    self.AnimName = nil
+end
+
+--region 常态气泡
+function BaseItem:BubblesInit(isNil)
+    if isNil then
+        self.intervalsSeconds = nil
+        self.intervalsSecondsDefault = nil
+
+        if self.Cnb then
+            _G.coroutine.stopwaiting(self.Cnb)
+            self.Cnb = nil
+        end
+        if self.Cnb_Next then
+            _G.coroutine.stopwaiting(self.Cnb_Next)
+            self.Cnb_Next = nil
+        end
+
+        self.BubblesIsOn = nil
+        self.BubblesUnixTime = nil
+    else
+        ---常态气泡间隔时间初始化
+        self.intervalsSeconds = nil
+        self.intervalsSecondsDefault = 1
+
+        if not self.intervalsSeconds then
+            local cfg = _G.ConfigManager.discrete_cfg[100602]
+            self.intervalsSeconds = {cfg[1][1], cfg[1][2]} or {1, 1}
+        end
+    end
+end
+function BaseItem:BubblesOn()
+    -- body
+end
+
+function BaseItem:BubblesOff()
+    -- body
+end
+
+---@field npcType number 默认0NPC 1玩家
+---@field intervalArr number[] 间隔数组 [min,max] 方便设置临时气泡间隔(剧情行为)
+---@class Params_PlayBubbles
+
+---播放常态气泡
+---@param hudid table 气泡组
+---@param intervalid number  间隔 离散表id
+---@param npc BaseItem obj
+---@param Data Params_PlayBubbles
+function BaseItem:CheckNormalBubbles(hudid, interval, npc, Data)
+    if _G.IsNil(self) then
+        return
+    end
+    if _G.IsNil(self.Cfg) then
+        return
+    end
+    local bubblesArr = self.Cfg.default_bubbles_plot
+    if _G.IsNil(bubblesArr) then
+        return
+    end
+    Data = Data or {}
+    local npcType = Data.npcType or 0
+    local thudid = nil
+    local t_interval
+    local t_eventInterval
+    local _intervalsSeconds
+    local len
+    if _G.IsNil(hudid) and self.BubblesIsOn then
+        len = #bubblesArr
+        if len <= 0 then
+            return
+        end
+        if not self.RandomNum then
+            self.RandomNum = _G.GetRandomNum(1, len)
+        else
+            local tmp = _G.GetRandomNum(1, len)
+            if tmp == self.RandomNum then
+                tmp = self.RandomNum + 1
+                if tmp > len then
+                    tmp = tmp % len
+                end
+            end
+            self.RandomNum = tmp
+        end
+        thudid = bubblesArr[self.RandomNum]
+    else
+        if _G.IsNil(hudid) then
+            return
+        end
+        len = #hudid
+        if len <= 0 then
+            return
+        end
+
+        local intervalArr = Data.intervalArr
+        if intervalArr == nil then
+            intervalArr = _G.ConfigManager.discrete_cfg[interval][1]
+        end
+
+        local time1 = intervalArr[1]
+        local time2 = intervalArr[2]
+        local RandomTime = _G.GetRandomNum(time1, time2)
+        t_eventInterval = RandomTime
+
+        local tmp = _G.GetRandomNum(1, len)
+        if tmp == self.EventRandomNum then
+            tmp = self.EventRandomNum + 1
+            if tmp > len then
+                tmp = tmp % len
+            end
+        end
+        self.EventRandomNum = tmp
+        thudid = hudid[self.EventRandomNum]
+    end
+
+    local hudInfo = _G.ConfigManager.hud_cfg[thudid]
+    if _G.IsNil(hudInfo) then
+        return
+    end
+
+    ---加上当前气泡持续时间
+    if t_eventInterval then
+        t_interval = t_eventInterval + hudInfo.Duration
+    else
+        if not self.intervalsSeconds[1] or not self.intervalsSeconds[2] then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("策划没有正确配气泡间隔时间,discrete_cfg 100602")
+            end
+        end
+        _intervalsSeconds = _G.GetRandomNum(self.intervalsSeconds[1], self.intervalsSeconds[2])
+        t_interval = _intervalsSeconds + hudInfo.Duration
+    end
+    local UnixTime = _G.TimeUtil.GetServerUnixTime()
+    self.BubblesUnixTime = UnixTime
+    ---永久的常态气泡 不显示下次
+    if hudInfo.Duration > 0 then
+        ---下次气泡显示总间隔
+        self.Cnb_Next =
+            _G.DelayDo(
+            t_interval,
+            function()
+                ---如果 气泡另外显示  就不执行
+                if self.BubblesUnixTime ~= UnixTime then
+                    return
+                end
+                self:CheckNormalBubbles(hudid, interval, npc, Data)
+            end
+        )
+    end
+
+    --如果没显示主界面  不显示常态气泡
+    local IsActiveWindow, MainView = _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    ---怪物攻城
+    local IsActiveWindow1, MainViewSiege =
+        _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name)
+    --该NPC 当前有气泡(交互产生等)  不显示常态气泡
+    local isHave = _G.HUDUtilities.GetTagetIsHud(self.Uid)
+    --自身没被隐藏 显示气泡
+    if npc and self.Transform:GetctiveInHierarchy() == 1 then
+        local uid = npc.Uid
+        if npcType == 1 then
+            ---0主角播放气泡
+            uid = 0
+        end
+        _G.HUDUtilities.ShowHudID(thudid, nil, uid)
+    elseif
+        IsActiveWindow and MainView.gameObject and MainView.gameObject:GetctiveInHierarchy() == 1 and isHave == false and
+            not _G.IsNil(self.Transform) and
+            self.Transform:GetctiveInHierarchy() == 1
+     then
+        _G.HUDUtilities.ShowHudID(thudid, nil, self.Uid)
+    elseif
+        IsActiveWindow1 and MainViewSiege.gameObject and MainViewSiege.gameObject:GetctiveInHierarchy() == 1 and
+            isHave == false and
+            not _G.IsNil(self.Transform) and
+            self.Transform:GetctiveInHierarchy() == 1
+     then
+        _G.HUDUtilities.ShowHudID(thudid, nil, self.Uid)
+    end
+end
+
+---关闭气泡
+function BaseItem:SetBubblesActive(isOn, hudid)
+    if self.BubblesIsOn == true and isOn == false then
+        self.BubblesIsOn = false
+    elseif self.BubblesIsOn == false and isOn == true then
+        self.BubblesIsOn = true
+        self:CheckNormalBubbles(hudid)
+    end
+end
+
+--endregion
+
+function BaseItem:InitFootShadow()
+    if self.footEffect then
+        return
+    end
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.prf_fakeshadow,
+        self.Transform,
+        function(obj)
+            if _G.IsNil(self.Transform) or not self.IsHideShadow then
+                _G.DestroyObject(obj)
+                return
+            end
+            obj:SetActiveE(0)
+            self.footEffect = obj
+        end
+    )
+end
+
+function BaseItem:Reset()
+end
+--region 阴影
+function BaseItem:InitSkinnedMeshRenderer()
+    if _G.IsNil(self.ObjectMod) and not self.IsHideShadow then
+        return
+    end
+    local tb = {}
+    self.RendererTb = self.ObjectMod:GetComponentsInChildrenE(_G.typeof(_G.CS.UnityEngine.Renderer))
+    for i = 1, self.RendererTb.Length do
+        tb[i] = self.RendererTb[i - 1]
+    end
+    self.RendererTb = tb
+    if self.initHideShadow then
+        self:HideShadow(true)
+        if
+            self.ItemType == _G.WorldItemType.NPC or self.ItemType == _G.WorldItemType.Enemy or
+                self.ItemType == _G.WorldItemType.Ghost or
+                self.DataType == _G.WorldItemDataType.Player
+         then
+            self:InitFootShadow()
+        end
+    end
+end
+---隐藏影子
+function BaseItem:HideShadow(force)
+    if not self.RendererTb or (not force and self.IsHideShadow) then
+        return
+    end
+    self.IsHideShadow = true
+    for _, v in pairs(self.RendererTb) do
+        v.shadowCastingMode = ShadowCastingMode.Off
+    end
+end
+---显示影子
+function BaseItem:ShowShadow(force)
+    if not self.RendererTb or (not force and not self.IsHideShadow) then
+        return
+    end
+    self.IsHideShadow = false
+    for _, v in pairs(self.RendererTb) do
+        v.shadowCastingMode = ShadowCastingMode.On
+    end
+    if not _G.IsNil(self.footEffect) then
+        _G.DestroyObject(self.footEffect)
+        self.footEffect = nil
+    end
+end
+
+---设置显示参数
+---@param params BaseItemDisplayParam
+function BaseItem:SetDisplayParams(params)
+    if not params then
+        return
+    end
+    self.initHideShadow = params.IsHideShadow
+end
+--endregion
+
+function BaseItem:CheckMoveing()
+    if self.MoveStep == 1 then
+        self.AnimName = nil
+        self:PlayAnimByName(self:GetMoveAnimationName())
+    end
+end
+
+return BaseItem

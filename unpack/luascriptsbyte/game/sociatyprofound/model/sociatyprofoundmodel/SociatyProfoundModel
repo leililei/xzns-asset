@@ -1,0 +1,519 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.SociatyProfound.Model.SociatyProfoundModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/01/17
+-- Description: 公会奥义数据类
+-----------------------------------------------------------------------
+local SociatyProfoundNet = require("SociatyProfoundNet")
+
+local base = _G.GameDataModelBase
+---@class SociatyProfoundModel : GameDataModelBase
+---@field data table 奥义数据
+---@field pointMaxLv table 各节点最大等级
+local SociatyProfoundModel = _G.BaseClass("SociatyProfoundModel", base)
+
+---@return SociatyProfoundModel SociatyProfoundModel
+function SociatyProfoundModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+local guild_skill_cfg = _G.ConfigManager.guild_skill_cfg
+local DiscreteID = {
+    LvDelta = 101624 --公会五行奥义总等级最大差值
+}
+
+---创建对象时,入口构造函数
+function SociatyProfoundModel:__init()
+    self.pointMaxLv = {}
+    self.data = {}
+    for i = 1, 6 do
+        self.data[i] = { sumLv = 0, points = { 0, 0, 0, 0, 0, 0, 0, 0 } }
+        self.data[i].attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    end
+    local step = {}
+    for _, v in pairs(guild_skill_cfg) do
+        if self.pointMaxLv[v.type1] == nil then
+            self.pointMaxLv[v.type1] = 0
+        end
+        if v.level > self.pointMaxLv[v.type1] then
+            self.pointMaxLv[v.type1] = v.level
+        end
+        if v.type1 == 1 then
+            step[v.pre_level[2]] = true
+        end
+    end
+    self.circleStep = _G.table.KeyToTable(step)
+    _G.table.sort(self.circleStep)
+    -- _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.PlayAaction, self.OnJoinSociaty, self)
+    _G.Events:GetInstance():AddListener(_G.eSociatyEvent.BeKicked, self.OnQuitSociaty, self)
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClock, self)
+end
+
+---从服务器拉取数据
+function SociatyProfoundModel:GetDataFormServer()
+    if require("SociatyModel"):GetInstance().SociatySelf then
+        self:GetInfo()
+    else
+        self.super.ParseData(self)
+    end
+end
+
+---获取信息
+function SociatyProfoundModel:GetInfo(isJoin)
+    SociatyProfoundNet:GetInstance():GetInfo(
+        function(msg)
+            self:ParseData(msg)
+            if isJoin then
+                self:OnJoinSociaty()
+            end
+        end
+    )
+end
+
+---@param msg guild_mysteries.s2c_info
+function SociatyProfoundModel:ParseData(msg)
+    local profound = msg.guile_mysteries
+    if profound then
+        local element
+        for _, v in pairs(profound) do
+            element = self.data[v.elements]
+            element.sumLv = v.all_level
+            for _, pt in pairs(v.detail) do
+                element.points[pt.k] = pt.v
+            end
+        end
+    end
+    self:UpdateAttibute()
+    self.super.ParseData(self)
+end
+
+function SociatyProfoundModel:UpdateAttibute()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local tonumber = _G.tonumber
+    local cfg, lv, name, value, aType
+    for i = 1, 6 do
+        self.data[i].attribute = AttributeClassManager:GetAttribtueClass()
+        for j = 1, 8 do
+            lv = self.data[i].points[j]
+            if lv > 0 then
+                cfg = guild_skill_cfg[j * 1000 + lv]
+                value = tonumber(cfg.attribute[3])
+            else
+                cfg = guild_skill_cfg[j * 1000 + 1]
+                value = 0
+            end
+            name = cfg.attribute[1]
+            aType = cfg.attribute[2] == "1" and _G.AttCountType.other or tonumber(cfg.attribute[2])
+            self.data[i].attribute:AddValueByName(
+                name,
+                AttributeClassManager:GetValueWithName(name, value, aType),
+                false,
+                aType
+            )
+        end
+    end
+end
+
+---检查前一点位是否满足要求
+---@param element number 五行
+---@param point number 点位
+---@return boolean,number 是否满足，需求等级
+function SociatyProfoundModel:CheckPrePoint(element, point)
+    local nextLv = self.data[element].points[point] + 1
+    if nextLv > self.pointMaxLv[point] then
+        return false, ""
+    end
+    local cfg = guild_skill_cfg[point * 1000 + nextLv]
+    local preLv = cfg.pre_level
+    if self.data[element].points[preLv[1]] >= preLv[2] then
+        return true, ""
+    else
+        return false, preLv[2]
+    end
+end
+
+---检查其它奥义盘否满足要求
+---@param element number 五行
+function SociatyProfoundModel:CheckOtherProfound(element, lv)
+    lv = lv or 1
+    local stepDelta = _G.ConfigManager.discrete_cfg[DiscreteID.LvDelta][1][1]
+    local maxDelta = _G.ConfigManager.discrete_cfg[DiscreteID.LvDelta][1][2]
+    for k, v in pairs(self.data) do
+        if k ~= element and self.data[element].sumLv + lv > maxDelta + v.sumLv - v.sumLv % stepDelta then
+            local tipLv = self.data[element].sumLv - maxDelta
+            return false, tipLv - tipLv % stepDelta + stepDelta
+        end
+    end
+    return true, ""
+end
+
+---检查某五行的某点位是否达到最大等级
+---@param element number 五行
+---@param point number 点位
+function SociatyProfoundModel:CheckPointIsMaxLv(element, point)
+    return self.data[element].points[point] >= self.pointMaxLv[point]
+end
+
+---计算材料差（消耗）
+---@param material1 table 当前等级累计材料 {{sid, num}}
+---@param material2 table 下一等级累计材料
+function SociatyProfoundModel:CalCostMaterial(material1, material2)
+    local cost = {}
+    for _, v in pairs(material1) do
+        cost[v[1]] = v[2]
+    end
+    for _, v in pairs(material2) do
+        if cost[v[1]] then
+            cost[v[1]] = v[2] - cost[v[1]]
+            if cost[v[1]] <= 0 then
+                cost[v[1]] = nil
+            end
+        else
+            cost[v[1]] = v[2]
+        end
+    end
+    return cost
+end
+
+function SociatyProfoundModel:CheckEnoughMaterial(cost, openWay)
+    for k, n in pairs(cost) do
+        if not _G.StorageManager:GetInstance():CheckItem(k, n) then
+            if openWay then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, k)
+            end
+            return false
+        end
+    end
+    return true
+end
+
+---点位升级
+---@param element number 五行
+---@param point number 点位
+---@param lvNum number 提升的等级数
+---@param callback number 升级回调
+function SociatyProfoundModel:UpLevel(element, point, lvNum, callback)
+    local other, _ = self:CheckOtherProfound(element, lvNum)
+    if not other then
+        return
+    end
+    local curLv = self.data[element].points[point]
+    if curLv + lvNum > self.pointMaxLv[point] then
+        return
+    end
+    local pre, _ = self:CheckPrePoint(element, point)
+    if not pre then
+        return
+    end
+    local id = point * 1000 + curLv
+    local material1 = curLv > 0 and guild_skill_cfg[id].material or {}
+    local material2 = guild_skill_cfg[id + lvNum].material
+    local cost = self:CalCostMaterial(material1, material2)
+    if not self:CheckEnoughMaterial(cost, true) then
+        return
+    end
+    self:OnUpLevel(element, point, lvNum, cost, callback)
+end
+
+---升到能升的最大等级
+function SociatyProfoundModel:TryBestUpLevel(element, point, callback)
+    local lvNum, cost = self:GetCanUpMaxLevel(element, point, true)
+    if lvNum == 0 then
+        return
+    end
+    _G.PlayerPrefsManager.SetInt("LastUpAoYi", element, false)
+    self:OnUpLevel(element, point, lvNum, cost, callback)
+end
+
+---执行升级
+function SociatyProfoundModel:OnUpLevel(element, point, lvNum, cost, callback)
+    local pbData = { elements = element, pos = point, up = lvNum }
+    SociatyProfoundNet:GetInstance():UpLevel(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                self.data[element].sumLv = self.data[element].sumLv + lvNum
+                self.data[element].points[point] = self.data[element].points[point] + lvNum
+                for sid, num in pairs(cost) do
+                    _G.StorageManager:GetInstance():ConsumeItem(sid, 0, num)
+                end
+                self:UpdateAttibute()
+                _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.SociatyProfound)
+                -- _G.Events:GetInstance():Broadcast(_G.GlobalEvents.PlayerPowerChange)
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+---重置所有奥义等级
+function SociatyProfoundModel:ResetAll(element, callback)
+    local pbData = { elements = element }
+    SociatyProfoundNet:GetInstance():ResetAll(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                --self.data = {}
+                --for i = 1, 6 do
+                self.data[element] = { sumLv = 0, points = { 0, 0, 0, 0, 0, 0, 0, 0 } }
+                self.data[element].attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+                --end
+                self:UpdateAttibute()
+                _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.SociatyProfound)
+                -- _G.Events:GetInstance():Broadcast(_G.GlobalEvents.PlayerPowerChange)
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+---计算进度条(旧，弃)
+---@param element number 五行
+function SociatyProfoundModel:CalFillAmountByPre(element)
+    if self.data[element].points[8] >= self.pointMaxLv[8] then
+        return 0
+    end
+    local lvP1 = self.data[element].points[1]
+    local step = 0
+    for _, v in pairs(self.circleStep) do
+        if lvP1 > v then
+            step = v
+        end
+    end
+    local num = 1
+    for i = 2, 8 do
+        if self.data[element].points[i] > step then
+            num = i
+        else
+            break
+        end
+    end
+    if num == 8 then
+        num = num + 1
+    end
+    return (num - 1) / 8
+end
+
+---计算进度条
+---@param element number 五行
+function SociatyProfoundModel:CalFillAmount(element)
+    local num = 1
+    for i = 1, 8 do
+        if self.data[element].points[i] > 0 then
+            num = i
+        else
+            break
+        end
+    end
+    if num == 8 then
+        return 1
+    end
+    return (num - 1) / 8
+end
+
+---获取能提升到的最大等级
+function SociatyProfoundModel:GetCanUpMaxLevel(element, point, openWay)
+    local curLv = self.data[element].points[point]
+    -- local minProLv = self:GetMinProfoundLevel(element)
+    -- local stepDelta = _G.ConfigManager.discrete_cfg[DiscreteID.LvDelta][1][1]
+    -- local maxDelta = _G.ConfigManager.discrete_cfg[DiscreteID.LvDelta][1][2]
+    -- local delta = maxDelta + minProLv - minProLv % stepDelta - self.data[element].sumLv
+    local delta = 10
+    if delta > self.pointMaxLv[point] - curLv then
+        delta = self.pointMaxLv[point] - curLv
+    end
+    if delta <= 0 then
+        return 0, {}
+    end
+    -- if delta > 10 then
+    -- delta = 10
+    -- end
+    local baseId = point * 1000 + curLv
+    local curCfg = curLv > 0 and guild_skill_cfg[baseId] or { material = {} }
+    local cfg, cost
+    local lvNum = 0
+    local finalCost = {}
+    local oneCost = {}
+    for i = 1, delta do
+        cfg = guild_skill_cfg[baseId + i]
+        if self.data[element].points[cfg.pre_level[1]] < cfg.pre_level[2] then
+            break
+        end
+        cost = self:CalCostMaterial(curCfg.material, cfg.material)
+        if not self:CheckEnoughMaterial(cost, i == 1 and openWay) then
+            break
+        end
+        if i == 1 then
+            oneCost = cost
+        end
+        finalCost = cost
+        lvNum = i
+    end
+    if 0 < lvNum and lvNum < 10 then
+        lvNum = 1
+        finalCost = oneCost
+    end
+    return lvNum, finalCost
+end
+
+---获取最小奥义盘等级
+---@param exceptEle number 不计算的元素
+function SociatyProfoundModel:GetMinProfoundLevel(exceptEle)
+    local minLv
+    for k, v in pairs(self.data) do
+        if k ~= exceptEle and (minLv == nil or v.sumLv < minLv) then
+            minLv = v.sumLv
+        end
+    end
+    return minLv or 0
+end
+
+---获取总等级
+function SociatyProfoundModel:GetSumLv()
+    local sumLv = 0
+    for _, v in pairs(self.data) do
+        sumLv = sumLv + v.sumLv
+    end
+    return sumLv
+end
+
+---获取某个五行奥义总等级
+---@param element number 五行
+function SociatyProfoundModel:GetElementSumLv(element)
+    return self.data[element].sumLv
+end
+
+---获取某个五行奥义某个点位的等级
+---@param element number 五行
+---@param point number 点位
+function SociatyProfoundModel:GetElementPointLv(element, point)
+    return self.data[element].points[point]
+end
+
+---获取某个点位的最大等级
+---@param point number 点位
+function SociatyProfoundModel:GetPointMaxLv(point)
+    return self.pointMaxLv[point]
+end
+
+---获取某个五行的第一个前置满足的点位
+---@param point number 点位
+function SociatyProfoundModel:GetFirstChoosePoint(element)
+    local point = 1
+    for i = 1, 8 do
+        if self:CheckPrePoint(element, i) then
+            return i
+        end
+    end
+    return point
+end
+
+---检测指定五行是否可提升
+function SociatyProfoundModel:CheckCanUpLevel(element)
+    local point
+    for i = 1, 8 do
+        if self:CheckPrePoint(element, i) then
+            point = i
+        end
+    end
+    if point == nil then
+        return false
+    end
+    local lvNum, cost = self:GetCanUpMaxLevel(element, point)
+    return lvNum > 0
+end
+
+---获取某个五行奥义的属性加成
+---@param elements number 多种族五行
+function SociatyProfoundModel:GetAllAttribute(elements)
+    elements = require "CardInfoManager":GetInstance():GetElementsMulti(elements)
+    local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(self.data[elements[1]].attribute)
+    local changeAttrTypes_new = changeAttrTypes
+    local attribute_new = self.data[elements[1]].attribute
+    if #elements > 1 then
+        for i = 2, #elements do
+            attribute_new = _G.AttributeClassManager:GetInstance():AddAttributeByNew(attribute_new,
+                self.data[elements[i]].attribute)
+
+            local changeAttrTypes2 = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(self.data[elements[i]]
+            .attribute)
+            changeAttrTypes_new = _G.AttributeClassManager:GetInstance():AddAttributeByNew(changeAttrTypes_new,
+                changeAttrTypes2)
+        end
+    end
+
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return _G.AttributeClassManager:GetInstance():GetAttribtueClass(), changeAttrTypes_new
+    end
+    if #changeAttrTypes_new == 0 then
+        for _, value in pairs(_G.AttrType) do
+            _G.table.insert(changeAttrTypes_new, value)
+        end
+    end
+    return attribute_new, changeAttrTypes_new
+end
+
+function SociatyProfoundModel:CheckRedPoint()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return false
+    end
+    if _G.PlayerPrefsManager.GetInt("SociatyProfound") == _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime()) then
+        return false
+    end
+    local material1, material2, cost, id
+    local minPtLv = {}
+    for _, e in pairs(self.data) do
+        for p, pLv in pairs(e.points) do
+            if minPtLv[p] == nil or pLv < minPtLv[p] then
+                minPtLv[p] = pLv
+            end
+        end
+    end
+    for p, pLv in pairs(minPtLv) do
+        if pLv < self.pointMaxLv[p] then
+            id = p * 1000 + pLv
+            material1 = pLv > 0 and guild_skill_cfg[id].material or {}
+            material2 = guild_skill_cfg[id + 1].material
+            cost = self:CalCostMaterial(material1, material2)
+            if self:CheckEnoughMaterial(cost) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---创建/加入公会刷新红点和战力
+function SociatyProfoundModel:OnJoinSociaty()
+    -- if type[1] == _G.ActiveTaskEnum.ConditionEnum.Guild.joinOrCreate then
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildSkill.id)
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.SociatyProfound)
+    -- end
+end
+
+---退出公会刷新红点和战力
+function SociatyProfoundModel:OnQuitSociaty(uid)
+    if uid == _G.PlayerModel:GetInstance().role_uid then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildSkill.id)
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.SociatyProfound)
+    end
+end
+
+---销毁对象时,析构函数
+function SociatyProfoundModel:Dispose()
+    -- _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.PlayAaction, self.OnJoinSociaty, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSociatyEvent.BeKicked, self.OnQuitSociaty, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClock, self)
+end
+
+function SociatyProfoundModel:OnSixClock()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GuildSkill.id)
+end
+
+return SociatyProfoundModel

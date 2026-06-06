@@ -1,0 +1,240 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Pet.Model.PetDrawModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/07/03
+-- Description: 灵兽抽卡数据类
+-----------------------------------------------------------------------
+local PetNet = require("PetNet")
+
+local base = _G.GameDataModelBase
+---@class PetDrawModel : GameDataModelBase
+local PetDrawModel = _G.BaseClass("PetDrawModel", base)
+
+---@return PetDrawModel PetDrawModel
+function PetDrawModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function PetDrawModel:__init()
+    -- self.curFunctionOpenID = _G.FunctionID.Pet
+    self.cfgid = 20100
+    self.awardState = {}
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+---从服务器拉取数据
+function PetDrawModel:GetDataFormServer()
+    PetNet:GetInstance():GetPetDrawInfo(_G.handler(self, self.ParseData))
+end
+
+function PetDrawModel:OnUpData(data)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PetDraw.id)
+end
+
+---@param msg
+function PetDrawModel:ParseData(msg)
+    self.day_count = msg.day_count or 0
+    self.total_times = msg.total_count or 0
+    self.diamond_times = msg.diamond_times or 0
+    self.need_count = msg.need_count or 0
+    self.wish_sids = msg.wish_sids or { 0, 0, 0 }
+    self.drawScore = msg.score or 0
+    self.awardState = msg.award or {}
+    self.super.ParseData(self)
+end
+
+function PetDrawModel:GetTotalTimes()
+    return self.total_times
+end
+
+---获取心愿单
+function PetDrawModel:GetWishsids()
+    return self.wish_sids or { 0, 0, 0 }
+end
+
+---获取心愿剩余次数
+function PetDrawModel:GetWishNeedCounts()
+    return self.need_count
+end
+
+---获取召唤积分
+function PetDrawModel:GetDrawScore()
+    return self.drawScore
+end
+
+---获取召唤积分
+function PetDrawModel:IsGetAwardByIndex(index)
+    return _G.table.ContainsValue(self.awardState, index)
+end
+
+---增加已使用魂玉召唤次数
+---@param num number 次数
+---@return number   当前次数
+function PetDrawModel:AddDiamondTimes(num)
+    self.diamond_times = (self.diamond_times or 0) + num
+    return self.diamond_times
+end
+
+---获取已使用魂玉召唤次数
+---@return number
+function PetDrawModel:GetDiamondTimes()
+    return self.diamond_times or 0
+end
+
+---获取魂玉召唤次数上限
+---@return number
+function PetDrawModel:GetDiamondTotalTimes()
+    self.diamond_total_times = self.diamond_total_times or _G.ConfigManager.item_roller_cfg[self.cfgid].count_diamond
+    local num = self.diamond_total_times
+    local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.LimitedTimePrivilege.ShopNumAdd, 3 })
+    if data[1] then
+        num = data[1] + num
+    end
+    return num
+end
+
+---获取剩余魂玉召唤次数
+function PetDrawModel:GetLastDiamondTimes()
+    return self:GetDiamondTotalTimes() - self:GetDiamondTimes()
+end
+
+---@param data number[]
+function PetDrawModel:SetWish(data, callback)
+    local pbData = { wish_list = data }
+    PetNet:GetInstance():PetDrawSetWish(pbData, function(msg)
+        if msg.ack == 1 then
+            self.wish_sids = { data[1] }
+            _G.Events:GetInstance():Broadcast(_G.ePetDraw.PetDrawWishRefresh)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PetDrawWish.id)
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---抽卡
+---@param num number 抽奖次数
+---@param consume_type number 消耗类型（1:道具 2:魂玉）
+function PetDrawModel:Draw(drawNum, consume_type, callback)
+    local pbData = { draw_times = drawNum, consume_type = consume_type }
+    PetNet:GetInstance():PetDrawExecute(pbData, function(msg)
+        if msg.ack == 1 then
+            _G.StorageManager:GetInstance():ReceiveAwardData({ award = msg.award })
+            if msg.award.overflow then 
+                _G.PopWindowManager:GetInstance():ShowAllTips(380104)
+            end
+            self.need_count = msg.need_count
+            if msg.score then
+                self.drawScore = msg.score
+            end
+            local sid
+            local num
+            if consume_type == 1 then
+                sid = _G.ConfigManager.item_roller_cfg[self.cfgid].ticket[1]
+                num = drawNum
+            else
+                self:AddDiamondTimes(drawNum)
+                sid, num = self:GetDiamondCurrencyByType(drawNum)
+            end
+            _G.StorageManager:GetInstance():ConsumeItem(sid, 0, num)
+
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                { _G.ActiveTaskEnum.ConditionEnum.Pet.DrawNum },
+                drawNum
+            )
+            _G.PlayerPrefsManager.SetInt("PetFirstDraw", 1)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PetDraw.id)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PetDrawAward.id)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PetillustratedItem.id)
+            if require("PetModel"):GetInstance():IsAutoDecompose() then
+                require("PetModel"):GetInstance():AutoDecompose()
+            end
+	    if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---获取魂玉抽卡的sid和num
+---@param drawNum number 抽奖次数
+---@return number,number,number 消耗id，消耗值，折扣
+function PetDrawModel:GetDiamondCurrencyByType(drawNum)
+    local sid
+    local num
+    sid = _G.ConfigManager.item_roller_cfg[self.cfgid].ticket_2[1]
+    local baseNum = _G.ConfigManager.item_roller_cfg[self.cfgid].ticket_2[2]
+    num = drawNum * baseNum
+    local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.LimitedTimePrivilege.ConsumeReduce, self.cfgid })
+    local discount = 1
+    if data[1] then
+        discount = data[1] * 0.0001
+        num = num - num * discount
+    end
+    return sid, _G.math.ceil(num), 1 - discount
+end
+
+---@param score number
+function PetDrawModel:GetAward(score, callback)
+    local pbData = { index_list = { score } }
+    PetNet:GetInstance():PetDrawGetAward(pbData, function(msg)
+        if msg.ack == 1 then
+            _G.table.insert(self.awardState, score)
+            if #self.awardState == 4 then
+                self.awardState = {}
+                local maxScore = _G.ConfigManager.item_roller_cfg[self.cfgid].rewards_count[#_G.ConfigManager.item_roller_cfg[self.cfgid].rewards_count]
+                self.drawScore = self.drawScore - maxScore
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PetDrawAward.id)
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---灵兽抽奖红点（包含道具和魂玉都满足时）
+function PetDrawModel:CheckDrawPointRed()
+    local sid = _G.ConfigManager.item_roller_cfg[self.cfgid].ticket[1]
+    local itemNum = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.Prop, sid)
+    if itemNum ~= nil and itemNum > 0 then
+        --ZHJH-3174 有足够道具时，打开招募界面红点消失
+        if _G.PlayerPrefsManager.HasKey("PetDrawRedPoint") then
+            return false
+        end
+        return true
+        -- elseif itemNum == 0 and (self:GetDiamondTotalTimes() - self:GetDiamondTimes()) > 10 then
+        --     local sidCurrency,num = self:GetDiamondCurrencyByType(10)
+        --     local curNum = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.ResProp, sidCurrency)
+        --     return curNum >= num
+    end
+    return false
+end
+
+---灵兽抽奖奖励红点
+function PetDrawModel:CheckDrawAwardPointRed(index)
+    local isGet = self:IsGetAwardByIndex(index)
+    if isGet then
+        return false
+    else
+        local score = _G.ConfigManager.item_roller_cfg[self.cfgid].rewards_count[index]
+        return self.drawScore >= score
+    end
+end
+
+---灵兽抽奖心愿单红点
+function PetDrawModel:CheckDrawWishPointRed(index)
+    return self.wish_sids[index] == 0
+end
+
+---销毁对象时,析构函数
+function PetDrawModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+return PetDrawModel

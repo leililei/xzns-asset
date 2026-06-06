@@ -1,0 +1,1840 @@
+-------------------------------------------------------
+-- File Name:       SDKManager.lua
+-- Description:     SDK管理器，尽量保证只做收发逻辑
+-- Author:          csw
+-- Create Date:     2020/07/09
+-------------------------------------------------------
+
+local SDKDef = require("SDKDef")
+local Messenger = require("Messenger")
+local SDKProxy = require("SDKProxy")
+local PlatformDef = require("PlatformDef")
+
+---@class SDKManager SDK管理器
+---@field GetInstance fun():SDKManager
+---@field public loginChannelInfo LoginChannelInfo 登录渠道得到的数据
+---@field platformImpl PlatformBase         --平台接口实现
+---@field adIds string[]                    --广告位id列表
+local SDKManager = _G.BaseClass("SDKManager")
+_G.SDKManager = SDKManager
+---@field SendMsg cs SDKManager
+---创建对象时,入口构造函数
+function SDKManager:__init()
+    self.message = Messenger.New()
+    self:InitParser()
+    self.mIsChannelLoginOk = false
+    SDKProxy:Init(
+            function()
+                self.ifSdkInterfaceInitComplete = true
+                self:SetLogoutCallBack()
+                self:SetShareAppMessageCallBack()
+                self:SetLoginChannelCall()
+                self:SetShareAppMessage()
+            end
+    )
+
+    if _G.AppSetting.IsAlipay then
+        self.platformImpl = require("PlatformImplAlipay").New(self)
+    end
+
+    --初始化广告位id
+    local wxAdUnitId = _G.CS.Launcher.Inst.wxAdUnitId
+    if wxAdUnitId and type(wxAdUnitId) == "string" then
+        self.adIds = _G.string.split(wxAdUnitId, "|")
+    end
+
+    ---解析挂接上配置的额外参数
+    self.extraData = {}
+    if _G.CS.WechatGameCore.WechatGameApp.Instance.GetSDKExtraData then
+        local eData = _G.CS.WechatGameCore.WechatGameApp.Instance:GetSDKExtraData()
+        if not _G.string.IsNullOrEmpty(eData) then
+            self.extraData = _G.json.decode(eData)
+        end
+    end
+
+    ---初始化时的扩展参数
+    self.initExtraData = {}
+    local initExtraData = _G.CS.FastSDKEx.SDKManager.initExtraData
+    if not _G.string.IsNullOrEmpty(initExtraData) then
+        self.initExtraData = _G.json.decode(initExtraData)
+    end
+
+    self.checkTime = 10
+end
+
+---获取额外参数值
+function SDKManager:GetExtraDataField(key, defValue)
+    return self.extraData[key] or defValue
+end
+
+---打点或者扩展方法的基础参数
+function SDKManager:GetBaseParams()
+    local model = _G.PlayerModel:GetInstance()
+    local curServer = _G.ServerManager:GetInstance().CurServer
+    local dict = {
+        roleId = "",
+        roleName = "",
+        roleLevel = "",
+        roleVipLevel = "1",
+        serverId = curServer and curServer.Sid or "",
+        serverName = curServer and curServer.ServerName or "",
+    }
+    if model:CheckCreateRole() then
+        dict.roleId = model:GetPlayerUid() or ""
+        dict.roleName = model:GetName() or ""
+        dict.roleLevel = model:GetLevel() or ""
+        dict.roleVipLevel = model:GetVipLevel() or "1"
+    end
+    return dict
+end
+
+---设置被动分享信息
+function SDKManager:SetShareAppMessage()
+    local channelId = _G.tonumber(self:GetChannelId())
+    if _G.AppSetting.IsXzns then
+        if _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.shareSwitch, channelId) then
+            local shareImage = _G.GameUtil.GetFunctionData(_G.FunctionBlock.shareImage, channelId)
+            local params
+            if #shareImage == 1 then
+                params = {
+                    imageUrl = shareImage[1][1],
+                    imageUrlId = shareImage[1][2]
+                }
+            else
+                params = {
+                    imageUrl = {},
+                    imageUrlId = {}
+                }
+                for i = 1, #shareImage do
+                    local imageData = shareImage[i]
+                    _G.table.insert(params.imageUrl, imageData[1])
+                    _G.table.insert(params.imageUrlId, imageData[2])
+                end
+            end
+            SDKProxy:SendExtend("setShareAppMessage", nil, params)
+        end
+    else
+        if _G.AppSetting.IsWeiXin and not _G.AppSetting.IsHuaWei and not _G.AppSetting.IsFastRpkGame then
+            if channelId == 13153 then
+                local params = {
+                    tille = _G.GetLangPackValue(90032900026),
+                    imageUrl = "https://mmocgame.qpic.cn/wechatgame/uibpkgO2H3rYhUogyXyYkFhcVItLiboLqRNyjDRkUfZsyGG09CuN8nNqicWt8lzIeLE/0",
+                    imageUrlId = "/xOCXIUgQEyFfzKpLoqE2w=="
+                }
+                SDKProxy:SendExtend("setShareAppMessage", nil, params)
+            end
+        end
+    end
+end
+
+function SDKManager:GetInstance()
+    if rawget(self, "Instance") == nil then
+        local ins = self.New()
+        rawset(self, "Instance", ins)
+    end
+    assert(self.Instance ~= nil)
+    return self.Instance
+end
+
+---重设sdkmanager
+function SDKManager:Reset()
+    self:Dispose()
+    SDKProxy:Clear()
+    self:__init()
+end
+
+--region -------------Base-------------
+
+---发送消息
+-- function SDKManager:SendSDKMsg(msg, ...)
+--     CSSDKManager:SendMsg(msg, ...)
+-- end
+
+---接收消息
+function SDKManager:OnGetMessage(head, body)
+    if self.ParseMsgFuns[head] then
+        --("sdk回调调用对应枚举回调函数")
+        self.ParseMsgFuns[head](body)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("暂无此类解析方式:" .. head .. ">>>" .. json.encode(body))
+        end
+    end
+end
+
+--endregion
+
+--region -------------Events-------------
+
+---AddListener 添加事件
+---@param event string 事件key值
+---@param func function 响应函数
+---@param obj table 包含响应函数的Lua对象，参数2必须为为参数3的成员方法
+function SDKManager:AddListener(event, func, obj)
+    _G.Guard.NotNull(obj, "参数错误： self 为必传项")
+    assert(func, "func为空")
+    assert(type(func) == "function", "func不为 function类型")
+    --(self.message, "sdk监听事件")
+    if self.message then
+        --(event, "sdk监听了一个事件")
+        --(func, "sdk监听了一个事件")
+        --(obj, "sdk监听了一个事件")
+        self.message:AddListener(event, func, obj)
+    end
+end
+
+---Broadcast 派发事件
+---@param event string 事件key值
+---@param ... Object[] 参数数组
+function SDKManager:Broadcast(event, ...)
+    --(self.message, "sdk派发事件")
+    if self.message then
+        --(event, "sdk派发了一个事件")
+        self.message:Broadcast(event, ...)
+    end
+end
+
+---RemoveListener 移除事件
+---@param event string 事件key值
+---@param func function 响应函数
+---@param obj table 包含响应函数的Lua对象，参数2必须为为参数3的成员方法
+function SDKManager:RemoveListener(event, func, obj)
+    _G.Guard.NotNull(obj, "参数错误： self 为必传项")
+    if self.message then
+        self.message:RemoveListener(event, func, obj)
+    end
+end
+
+--endregion
+
+--region -------------实现-------------
+
+--region -------------登录-------------
+
+---用户登录,登录渠道
+---@param callback fun (b:boolean,info:LoginChannelInfo|string)
+function SDKManager:SendLoginEx(callback)
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.SendLogin)
+    _G.SDKManager:GetInstance():MiniGameTrack(SDKDef.DotMsg.ShuShu.login_sdk)
+    self.mChannelId = nil
+    self.mUserId = nil
+    self.mChannelUserId = nil
+    self.mFangChenMiFlag = 0
+    if _G.AppSetting.DEBUG then
+        _G.Log("正在拉取渠道SDK!")
+    end
+    SDKProxy:LoginChannel(
+            self:CheckRusChannel(),
+            function(ret, info)
+                if ret then
+                    self:LoginChannelSuc(info)
+                else
+                    self:LoginChannelFail(info)
+                end
+                if callback then
+                    callback(ret, info)
+                end
+            end
+    )
+end
+
+---登录渠道失败的监听(如俄罗斯渠道会只发登录渠道失败的消息)
+function SDKManager:SetLoginChannelCall()
+    if not self:CheckRusChannel() then
+        return
+    end
+
+    SDKProxy:PushLoginChannelListener(function(ret, code, info)
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Ru OnLoginChannelCallBack", code)
+        end
+        if ret then
+            self:LoginChannelSuc(info)
+        else
+            if not self.channelFailTimes then
+                self.channelFailTimes = 1
+            else
+                self.channelFailTimes = self.channelFailTimes + 1
+            end
+            if self.channelFailTimes > 3 then
+                ---如果连续失败三次，再次调起切换账号的接口
+                local accountSwitch = _G.GameUtil.GetFunctionData(_G.FunctionBlock.account_switch)
+                self:SendChangeAccount(accountSwitch)
+            else
+                self:LoginChannelFail(code)
+            end
+        end
+    end)
+end
+
+---渠道登录成功
+function SDKManager:LoginChannelSuc(info)
+    self.mIsChannelLoginOk = true
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.SDKLoginSuccess)
+    self.loginChannelInfo = info
+    ---fast_uid挂接中心的用户唯一id
+    self.mUserId = info.fast_uid
+    self.mChannelUserId = info.channel_uid
+    self.mFangChenMiFlag = info.fangchenmi_flag
+    if _G.AppSetting.DEBUG then
+        _G.Log(info.extension, "登录类型login")
+    end
+    self.mLoginType = ""
+    if _G.SDKManager:GetInstance():CheckRusChannel() then
+        if not _G.string.IsNullOrEmpty(info.extension) then
+            local tempext = _G.json.decode(info.extension)
+            if _G.AppSetting.DEBUG then
+                _G.Log(tempext, "登录类型login扩展信息")
+                _G.Log(tempext.loginType, "登录类型loginType")
+            end
+            self.mLoginType = tempext.loginType or ""
+            if _G.AppSetting.DEBUG then
+                _G.Log(self.mLoginType, "登录类型最终loginType")
+            end
+        end
+    end
+    self.channelFailTimes = 0
+    self:OnGetMessage(SDKDef.GetMsg.login_success)
+end
+
+---渠道登录失败
+function SDKManager:LoginChannelFail(code)
+    self.mIsChannelLoginOk = false
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.SDKLoginFailed)
+    if _G.AppSetting.DEBUG then
+        _G.LogError("OnLoginChannelFail", code)
+    end
+    self:OnGetMessage(SDKDef.GetMsg.login_failed)
+    --这里判断是否是海外用的是语言判断，那么这种方式需要避免玩家切换语言
+    if _G.GameUtil.GetIsUseChinese() then
+        if not _G.AppSetting.IsHuaWei then
+            --华为快游戏, 登录失败后不再自动重试
+            self:ShowSDKFailDialog(code, _G.handler(self, self.SendLoginEx))
+        end
+    end
+end
+
+---IsChannelLoginOk 渠道登錄成功
+---@return boolean
+function SDKManager:IsChannelLoginOk()
+    return self.mIsChannelLoginOk
+end
+
+---挂接中心的用户唯一id，请使用此值作为用户的唯一id
+---@return string 挂接中心的用户唯一id
+function SDKManager:GetFastUid()
+    if not self.mUserId then
+        self.mUserId = "0"
+    end
+    return self.mUserId
+end
+
+---渠道SDK的用户唯一id
+---@return string 渠道SDK的用户唯一id
+function SDKManager:GetChannelUid()
+    if not self.mChannelUserId then
+        self.mChannelUserId = "0"
+    end
+    return self.mChannelUserId
+end
+
+---获取渠道id
+---@return string 渠道id
+function SDKManager:GetChannelId()
+    if _G.AppSetting.IsEditor and not _G.string.IsNullOrEmpty(_G.AppSetting.EditorChannelId) then
+        return _G.AppSetting.EditorChannelId
+    end
+
+    if not self.mChannelId then
+        self.mChannelId = SDKProxy:GetChannelId()
+    end
+
+    return self.mChannelId
+end
+
+---获取渠道子id
+---@return string 渠道子id
+function SDKManager:GetChannelChildId()
+    if not self.mChannelChildId then
+        if self.initExtraData then
+            self.mChannelChildId = tonumber(self.initExtraData.chid) or 1
+        else
+            self.mChannelChildId = 1
+        end
+    end
+    return self.mChannelChildId
+end
+
+---用户登录成功
+local login_success = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.login_success, args)
+end
+
+---用户登录失败
+local login_failed = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.login_failed)
+end
+
+---用户登录取消
+local login_cancle = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.login_cancle)
+end
+
+---GetServerList 获取服务器列表
+function SDKManager:GetServerList()
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.GetServerList)
+    _G.SDKManager:GetInstance():MiniGameTrack(SDKDef.DotMsg.ShuShu.server_list)
+    SDKProxy:GetServerList(
+            function(ret, info)
+                if ret then
+                    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.GetServerListOK)
+                    self:OnGetMessage(SDKDef.GetMsg.get_server_list_success, info)
+                else
+                    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.GetServerListFailed)
+                    self:ShowSDKFailDialog(info, _G.handler(self, self.GetServerList))
+                end
+            end
+    )
+end
+
+---获取服务器列表成功
+local get_server_list_success = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_server_list_success, args)
+end
+
+---获取服务器大区列表成功
+local get_allgroup_success = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_allgroup_success, args)
+end
+
+---获取服务器大区列表失败
+local get_allgroup_failed = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_allgroup_failed, args)
+end
+
+---获取服务器某个大区的所有消息
+local get_groupserver_success = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_groupserver_success, args)
+end
+
+---获取服务器某个大区的所有消息失败
+local get_groupserver_failed = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_groupserver_failed, args)
+end
+
+---获取设备分数
+function SDKManager:SendPhoneInfo()
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.GetPhoneInfo)
+    SDKProxy:GetDeviceInfo(
+            function(info)
+                _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.GetPhoneInfoOk)
+                self:OnGetMessage(SDKDef.GetMsg.get_phone_info, info)
+            end
+    )
+end
+
+---登录挂接中心
+---@param serverSid string 服务器sid
+function SDKManager:SendLoginServer(serverSid)
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.SendLoginSdkServer)
+    SDKProxy:LoginServer(
+            serverSid,
+            function(ret, info)
+                if ret then
+                    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.LoginSdkServerOk)
+                    self:OnGetMessage(SDKDef.GetMsg.auth_success, info)
+                else
+                    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.LoginSdkServerError)
+                    self:OnGetMessage(SDKDef.GetMsg.auth_failed)
+
+                    self:ShowSDKFailDialog(info, _G.handler(self, self.SendLoginServer))
+                end
+            end
+    )
+end
+
+---登录挂接中心成功
+local auth_success = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.auth_success, args)
+end
+
+---登录挂接中心失败
+local auth_failed = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.auth_failed)
+end
+
+---得到当服务器维护的维护信息，产品在挂接中心后台填写的信息
+local get_maintainnotice = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_maintainnotice, args)
+end
+
+---获得了设备信息
+local get_phone_info = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_phone_info, args)
+end
+
+---获得所有区服和名字成功
+local get_servernames_success = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_servernames_success, args)
+end
+
+---获得所有区服和名字失败
+local get_servernames_failed = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_servernames_failed, args)
+end
+
+---打开用户协议窗口
+function SDKManager:ShowUserAgreement()
+    -- self:SendSDKMsg(SDKDef.SendMsg.showUserAgreement)
+end
+
+--endregion
+
+---新数数打点
+function SDKManager:GameStepInfo(step)
+    SDKProxy:GameStepInfo(step)
+end
+
+---俄罗斯渠道打点
+function SDKManager:TrackEvent(eventName)
+    if self:CheckRusChannel() then
+        local playerModel = _G.PlayerModel:GetInstance()
+        local isCreateRole = playerModel:CheckCreateRole()
+        local curServer = _G.ServerManager:GetInstance().CurServer
+
+        local roleId = isCreateRole and tostring(playerModel:GetPlayerUid()) or ""
+        local roleName = isCreateRole and tostring(playerModel.role_name) or ""
+        local roleLevel = isCreateRole and tostring(playerModel.role_lv) or ""
+        local serverId = curServer and tostring(curServer.Sid) or ""
+        local serverName = curServer and tostring(curServer.ServerName) or ""
+
+        SDKProxy:SendExtend("trackEvent", nil, {
+            eventName = eventName,
+            roleId = roleId,
+            roleName = roleName,
+            roleLevel = roleLevel,
+            serverId = serverId,
+            serverName = serverName
+        })
+    end
+end
+
+---抖音，微信，支付宝数数打点（只有星耀）
+function SDKManager:MiniGameTrack(eventName)
+    if self:CheckRusChannel() then
+        self:TrackEvent(eventName)
+        return
+    end
+
+    if _G.AppSetting.IsWeiXin or _G.AppSetting.IsDouYin or _G.AppSetting.IsAlipay then
+        if _G.table.indexof(require("PlatformDef").xyChannelList, _G.tonumber(self:GetChannelId())) then
+            SDKProxy:SendExtend("trackEvent", nil, { trackName = eventName })
+        end
+    end
+end
+
+--region -------------退出-------------
+
+function SDKManager:SetLogoutCallBack()
+    SDKProxy:SetLogoutCallBack(
+            function(ret, code)
+                if ret then
+                    if self:CheckRusChannel() then
+                        self:ReportRoleLogout()
+                    end
+                    self:OnGetMessage(SDKDef.GetMsg.auth_logout)
+                else
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("Logout_Fail")
+                    end
+                    self:ShowSDKFailDialog(code, _G.handler(self, self.SetLogoutCallBack))
+                end
+            end
+    )
+end
+---监听一下wx分享的被动推送
+function SDKManager:SetShareAppMessageCallBack()
+    SDKProxy:SetListener(
+            "onShareAppMessage",
+            function(b, result)
+                if b then
+                    self:OnGetMessage(SDKDef.GetMsg.onShareAppMessage, result)
+                end
+            end
+    )
+end
+
+---注销请求
+function SDKManager:SendLogOut()
+    SDKProxy:LogoutChannel()
+end
+
+---注销
+local auth_logout = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.auth_logout)
+end
+
+---退出:showExit后，如果返回show_exit，说明渠道没有退出框，需要调用游戏内的
+function SDKManager:SendShowExit()
+    if SDKProxy:ShowExitDialog() then
+        -- 该渠道有自己的退出确认框，游戏请勿弹出自己的弹窗
+        return
+    end
+    self:OnGetMessage(SDKDef.GetMsg.show_exit)
+end
+
+function SDKManager:SendExit()
+    SDKProxy:Exit()
+end
+
+---清楚热更资源
+function SDKManager:SendClearUpdateCache()
+    --self:SendSDKMsg(SDKDef.SendMsg.clearUpdateCache)
+    --_G.CS.FastSpace.FastSDK.Init()
+    _G.CS.FastSpace.FastSDK.ClearCache2()
+    SDKProxy:Exit()
+end
+
+---showExit后，如果返回show_exit，说明渠道没有退出框，需要调用游戏内的
+local show_exit = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.show_exit)
+end
+
+--endregion
+
+--region -------------防沉迷-------------
+
+---查询是否未成年（通过这个可以查询是否已登记实名制）
+function SDKManager:SendIsMinor()
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.SendIsMinor)
+    self:OnGetMessage(SDKDef.GetMsg.fangchenmi_flag, self.mFangChenMiFlag)
+end
+
+---返回是否未成年
+local fangchenmi_flag = function(self, args)
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.MinorOk)
+    self:Broadcast(SDKDef.GetMsg.fangchenmi_flag, args)
+end
+
+--endregion
+
+--region -------------商品-------------
+
+---获取充值商品列表
+function SDKManager:SendGetGoodsList()
+    SDKProxy:GetProductList(
+            function(ret, info)
+                if ret then
+                    self:OnGetMessage(SDKDef.GetMsg.pay_goods_list, info)
+                end
+            end
+    )
+end
+
+---得到充值商品列表
+local pay_goods_list = function(self, args)
+    --("得到充值商品列表")
+    self:Broadcast(SDKDef.GetMsg.pay_goods_list, args)
+end
+
+---获取限时商品列表
+function SDKManager:SendGetProGoodsList()
+    self:SendSDKMsg(SDKDef.SendMsg.getGoodsList_pro)
+end
+
+---得到限时商品列表
+local pay_goods_list_pro = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.pay_goods_list_pro, args)
+end
+
+---购买充值商品
+---@param goodsID string 商品ID
+function SDKManager:SendBuy(goodsData, extra)
+    local isrecharge = _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.recharge)
+    if isrecharge then
+        _G.PopWindowManager:GetInstance():ShowAllTips(470103)
+        return
+    end
+    if self.checkTime < 8 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(470106)
+        return
+    end
+    ---参数：https://doc.youkia.net/docs/fast_sdk/fast_sdk-1diptoar1btl0
+    local payInfo = {}
+    payInfo.Id = goodsData.sdk_id or goodsData.id
+    ---该笔订单会给玩家增加多少游戏内货币数量-Sdk文档上说通常也用不到，设置为1即可
+    payInfo.CoinNum = goodsData.amount
+    payInfo.CpExtra = _G.json.encode({ active_item_sid = extra or "0" })
+    payInfo.CpOrderId = ""
+
+    local model = _G.PlayerModel:GetInstance()
+    local roleInfo = {
+        RoleName = model:GetName(),
+        RoleLevel = model:GetLevel(),
+        RoleId = model:GetPlayerUid(),
+        ServerId = _G.ServerManager:GetInstance().CurServer.Sid,
+        ServerName = _G.ServerManager:GetInstance().CurServer.ServerName,
+        VipLevel = model:GetVipLevel() or "1",
+        Power = model:GetPower() or "0",
+        MoneyNum = _G.StorageManager:GetInstance():GetItemCountBySid(_G.ResPropID.Diamond),
+        CreateRoleTime = model:GetCreateRoleTime(),
+        Extra = ""
+    }
+
+    SDKProxy:Pay(
+            roleInfo,
+            payInfo,
+            function(ret, info)
+                if ret then
+                    if self.timer ~= nil then
+                        self.timer:Stop()
+                        self.timer = nil
+                    end
+                    self.checkTime = 0
+                    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false)
+                    self.timer:Start()
+                    self:OnGetMessage(SDKDef.GetMsg.pay_success, info)
+                else
+                    self:OnGetMessage(SDKDef.GetMsg.pay_failed)
+                end
+            end
+    )
+end
+
+function SDKManager:UpdateTime(elapsed)
+    self.checkTime = self.checkTime + elapsed
+    if self.checkTime > 8 then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+
+function SDKManager:SendPayAmount()
+    self:SendSDKMsg(SDKDef.SendMsg.payAmount)
+end
+
+---购买限时商品
+---@param goodsID string 商品ID
+---@param extra string 礼包ID或者活动ID#礼包ID
+function SDKManager:SendBuyPro(goodsData, extra)
+    self:SendBuy(goodsData, extra)
+end
+
+---在调用充值页面的时候，发送youkia唯一充值订单号，主要为了处理 活动在0点之前点击充值，0点之后完成充值导致活动问题
+local get_change_order = function(self, args)
+    --前端无用
+end
+
+---支付成功
+local pay_success = function(self, args)
+    if _G.AppSetting.DEBUG then
+        _G.Log("sdk通知支付成功")
+    end
+    --self.clock = {}
+    self:Broadcast(SDKDef.GetMsg.pay_success)
+end
+
+---支付失败
+local pay_failed = function(self, args)
+    --self.clock = {}
+    if _G.AppSetting.DEBUG then
+        _G.Log("sdk通知支付失败")
+    end
+    self:Broadcast(SDKDef.GetMsg.pay_failed)
+end
+
+-- 版署模拟充值成功
+local can_recharge_true = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.can_recharge_true, args)
+end
+
+-- 版署模拟充值失败
+local can_recharge_false = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.can_recharge_false, args)
+end
+
+--endregion
+
+---游客帐号绑定
+function SDKManager:SendBindTourist()
+    SDKProxy:SetGuestLogin()
+end
+
+---游客帐号绑定成功
+local bind_success = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.bind_success)
+end
+
+---游客帐号绑定失败
+local bind_failed = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.bind_failed)
+end
+
+---游客帐号绑定
+function SDKManager:GetIphoneInfo()
+    -- self:SendSDKMsg(SDKDef.SendMsg.isiPhonetype)
+end
+
+---游客帐号绑定失败
+local iphone_info = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.iphone_info, args)
+end
+
+---获取维护公告
+local get_notice = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_notice, args)
+end
+
+local onShareAppMessage = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.onShareAppMessage, args)
+end
+
+---获取公告内容
+---@param retry boolean     失败后弹窗重试(默认:true)
+---@param callback fun(info:GameNoticesInfo) 获取公告成功之后的公告内容
+function SDKManager:GetGameNotices(retry)
+    if retry == nil then
+        retry = true
+    end
+    SDKProxy:GetGameNotices(
+            function(b, info)
+                if b then
+                    self:OnGetMessage(SDKDef.GetMsg.get_notice, info)
+                elseif retry then
+                    self:ShowSDKFailDialog(info, _G.handler(self, self.GetGameNotices))
+                end
+            end
+    )
+end
+
+--region -------------数据上传-------------
+local ReportType = {
+    SELECT_SERVER = 1,
+    CREATE_ROLE = 2,
+    ENTER_GAME = 3,
+    LEVEL_UP = 4,
+    EXIT_GAME = 5,
+    REFRESH_INFO = 6
+}
+---创建角色数据上传,俄罗斯渠道下会创建悬浮窗
+---@param roleId string 角色id（游戏内角色id）
+---@param roleName string 角色名字
+---@param roleLevel string 角色等级
+---@param zoneId string 服务器id
+---@param zoneName string 服务器名字
+---@param createRoletime string 角色创建时间
+---@param extra string 额外参数(map格式数据，k=v结构)
+function SDKManager:SendCreateRole(roleId, roleName, roleLevel, zoneId, zoneName, createRoletime, power, vipLevel, extra)
+    extra = extra or ""
+    local reportInfo = {
+        ReportType = ReportType.CREATE_ROLE,
+        RoleId = roleId or "0",
+        RoleName = roleName or "",
+        RoleLevel = roleLevel,
+        ServerId = zoneId,
+        ServerName = zoneName,
+        VipLevel = vipLevel or "0",
+        Power = power or "0",
+        MoneyNum = "0",
+        CreateRoleTime = createRoletime,
+        Extra = extra
+    }
+    SDKProxy:ReportRoleInfo(reportInfo)
+end
+
+---创建角色数据上传(sdk那边没有这个接口了)
+---@param roleId string 角色id（游戏内角色id）
+---@param roleName string 角色名字
+---@param roleLevel string 角色等级
+---@param zoneId string 服务器id
+---@param zoneName string 服务器名字
+---@param createRoletime string 角色创建时间
+---@param extra string 额外参数(map格式数据，k=v结构)
+function SDKManager:SendEnterGame(roleId, roleName, roleLevel, zoneId, zoneName, createRoletime, power, vipLevel, extra)
+    extra = extra or ""
+    local reportInfo = {
+        ReportType = ReportType.ENTER_GAME,
+        RoleId = roleId,
+        RoleName = roleName,
+        RoleLevel = roleLevel,
+        ServerId = zoneId,
+        ServerName = zoneName,
+        VipLevel = vipLevel or "1",
+        Power = power or "0",
+        MoneyNum = "0",
+        CreateRoleTime = createRoletime,
+        Extra = extra
+    }
+    SDKProxy:ReportRoleInfo(reportInfo)
+end
+
+---@param roleId string 角色id（游戏内角色id）
+---@param roleName string 角色名字
+---@param roleLevel string 角色等级
+---@param zoneId string 服务器id
+---@param zoneName string 服务器名字
+---@param createRoletime string 角色创建时间
+---@param extra string 额外参数(map格式数据，k=v结构)
+function SDKManager:SendExitGame()
+    local model = _G.PlayerModel:GetInstance()
+    local hasrole = model:CheckCreateRole()
+    local roleId = ""
+    local roleName = ""
+    local roleLevel = "0"
+    if hasrole then
+        roleId = model:GetPlayerUid() or "0"
+        roleName = model:GetName() or ""
+        roleLevel = model:GetLevel() or "0"
+    end
+
+    local serverSid = ""
+    local serverName = ""
+    local moneyNum = 0
+    local curserver = _G.ServerManager:GetInstance().CurServer
+    if curserver then
+        serverSid = curserver.Sid
+        serverName = curserver.ServerName
+        moneyNum = _G.StorageManager:GetInstance():GetItemCountBySid(_G.ResPropID.Diamond)
+    end
+    local reportInfo = {
+        ReportType = ReportType.EXIT_GAME,
+        RoleId = roleId,
+        RoleName = roleName,
+        RoleLevel = roleLevel,
+        ServerId = serverSid,
+        ServerName = serverName,
+        VipLevel = model:GetVipLevel() or "0",
+        Power = model:GetPower() or "0",
+        MoneyNum = moneyNum,
+        CreateRoleTime = model:GetCreateRoleTime() or "0",
+        Extra = ""
+    }
+    SDKProxy:ReportRoleInfo(reportInfo)
+end
+
+---接口在登录完成后需要游戏调用（因为挂接这边没有游戏信息。部分第三方需要游戏内信息，故需要调用）
+function SDKManager:SendGameRoleInfo(
+        roleId,
+        roleName,
+        roleLevel,
+        zoneId,
+        zoneName,
+        createRoletime,
+        power,
+        vipLevel,
+        extra)
+    self:SendEnterGame(roleId, roleName, roleLevel, zoneId, zoneName, createRoletime, power, vipLevel, extra)
+end
+
+---玩家升级
+---@param level string 角色等级
+function SDKManager:SendLevelUp(level)
+    local model = _G.PlayerModel:GetInstance()
+    local serverId = _G.tostring(_G.ServerManager:GetInstance().CurServer.Sid)
+    local serverName = _G.ServerManager:GetInstance().CurServer.ServerName
+    local reportInfo = {
+        ReportType = ReportType.LEVEL_UP,
+        RoleId = _G.tostring(model:GetPlayerUid()),
+        RoleName = model:GetName(),
+        RoleLevel = _G.tostring(model:GetLevel()),
+        ServerId = serverId,
+        ServerName = serverName,
+        VipLevel = _G.tostring(model:GetVipLevel()) or "1",
+        Power = _G.tostring(model:GetPower()) or "0",
+        MoneyNum = "0",
+        CreateRoleTime = _G.tostring(model:GetCreateRoleTime()),
+        Extra = ""
+    }
+    SDKProxy:ReportRoleInfo(reportInfo)
+end
+
+---玩家信息刷新,用于刷新FastSDK后台所存储的用户信息，如：玩家修改角色名称等情况
+function SDKManager:RefreshRoleInfo()
+    local model = _G.PlayerModel:GetInstance()
+    local serverId = _G.tostring(_G.ServerManager:GetInstance().CurServer.Sid)
+    local serverName = _G.ServerManager:GetInstance().CurServer.ServerName
+    local reportInfo = {
+        ReportType = ReportType.REFRESH_INFO,
+        RoleId = _G.tostring(model:GetPlayerUid()),
+        RoleName = model:GetName(),
+        RoleLevel = _G.tostring(model:GetLevel()),
+        ServerId = serverId,
+        ServerName = serverName,
+        VipLevel = _G.tostring(model:GetVipLevel()) or "1",
+        Power = _G.tostring(model:GetPower()) or "0",
+        MoneyNum = "0",
+        CreateRoleTime = _G.tostring(model:GetCreateRoleTime()),
+        Extra = ""
+    }
+    SDKProxy:ReportRoleInfo(reportInfo)
+end
+
+--endregion
+
+--region -------------功能-------------
+
+---重新激活游戏
+local show_game = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.show_game)
+end
+
+---获取内存
+function SDKManager:GetMemory()
+    self:SendSDKMsg(SDKDef.SendMsg.getMemory)
+end
+
+---获取内存成功
+local get_memory = function(self, args)
+    local json_data = _G.Json2Table(args)
+
+    local temp = json_data["totalMem"]
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(temp, "总内存:")
+    end
+    local totalMem = 0
+    if temp then
+        totalMem = _G.tonumber(temp) / 1024
+    end
+
+    temp = json_data["availMem"]
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(temp, "可用内存:")
+    end
+    local availMem = 0
+    if temp then
+        availMem = _G.tonumber(temp) / 1024
+    end
+
+    self:Broadcast(SDKDef.GetMsg.get_memory, totalMem, availMem)
+end
+
+---获取电量
+function SDKManager:GetBattery()
+    self:SendSDKMsg(SDKDef.SendMsg.getBattery)
+end
+
+---获取电量成功
+local current_battery = function(self, args)
+    local json_data = _G.Json2Table(args)
+
+    local temp = json_data["level"]
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(temp, "battery level:")
+    end
+    local level = 0
+    if temp then
+        level = _G.tonumber(temp)
+    end
+
+    temp = json_data["availMem"]
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(temp, "battery scale:")
+    end
+    local scale = 0
+    if temp then
+        scale = _G.tonumber(temp)
+    end
+
+    self:Broadcast(SDKDef.GetMsg.current_battery, level, scale)
+end
+
+---分享内容
+---num是分享固定分享的第几张图片，title 标题 message 是消息内容
+function SDKManager:SharePlatform(num, tille, message)
+    self:SendSDKMsg(SDKDef.SendMsg.sharePlatform, num, tille, message)
+end
+
+---分享成功
+local share_success = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.share_success)
+end
+
+---分享失败
+local share_fail = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.share_fail)
+end
+
+---热更检测长度
+local get_dynamic_update_total_size = function(self, args)
+    self:Broadcast(SDKDef.GetMsg.get_dynamic_update_total_size, args)
+end
+
+---获取用户类型（游客还是正常帐号）
+function SDKManager:GetUserType()
+    self:SendSDKMsg(SDKDef.SendMsg.getUserType)
+end
+
+---设置屏幕亮度
+function SDKManager:SetWindowBrightness(brightness)
+    self:SendSDKMsg(SDKDef.SendMsg.setWindowBrightness, brightness)
+end
+
+---获取用户类型（游客还是正常帐号）
+local get_user_type = function(self, args)
+    -- body
+    self:Broadcast(SDKDef.GetMsg.get_user_type, args)
+end
+
+---解绑用户
+function SDKManager:DeleteUserId()
+    self:SendSDKMsg(SDKDef.SendMsg.deleteUserId)
+end
+
+---用户解绑成功
+local delete_success = function(self, args)
+    -- body
+    self:Broadcast(SDKDef.GetMsg.delete_success, args)
+end
+
+---用户解绑失败
+local delete_failed = function(self, args)
+    -- body
+    self:Broadcast(SDKDef.GetMsg.delete_failed, args)
+end
+
+---复制可粘贴内容
+---content 内容
+function SDKManager:SetClipboard(content)
+    SDKProxy:SetClipboardData(
+            content,
+            function(info)
+                _G.PopWindowManager:GetInstance():ShowAllTips(200105)
+            end
+    )
+end
+
+---获取微信游戏圈数据
+---content 内容
+function SDKManager:GetGameClubData(callback)
+    SDKProxy:SendExtend(
+            "getGameClubData",
+            function(b, info)
+                if callback then
+                    callback(b, info)
+                end
+            end
+    )
+end
+
+---显示游戏圈按钮
+function SDKManager:ShowGameButton(data, callback)
+    SDKProxy:SendExtend(
+            "showGameButton",
+            function(b, info)
+                if callback then
+                    callback(b, info)
+                end
+            end,
+            data
+    )
+end
+
+---隐藏游戏圈按钮
+function SDKManager:HideGameButton(callback)
+    SDKProxy:SendExtend(
+            "hideGameButton",
+            function(b, info)
+                if callback then
+                    callback(b, info)
+                end
+            end
+    )
+end
+
+---打开游戏站
+function SDKManager:OpenGameClub(data, callback)
+    SDKProxy:SendExtend(
+            "navigateToMiniProgram",
+            function(b, info)
+                if callback then
+                    callback(b, info)
+                end
+            end,
+            data
+    )
+end
+
+---FacebookEvent打点
+function SDKManager:SendFacebookEvent(value)
+    --TODO 实现层面需要优化
+    self:SendExtend("FacebookEvent", nil, { event = value })
+end
+
+---安卓-凯撒-Google-渠道上报时间
+---@param type number 1：资源加载完成；2：新手引导完成
+function SDKManager:ReportExtraEvent(type)
+    if _G.tonumber(self:GetChannelId()) ~= require("PlatformDef").PlatformIdDef.KSGoogle then
+        return
+    end
+    self:SendExtend("reportExtraEvent", nil, {
+        type = type,
+        roleId = _G.tostring(_G.PlayerModel:GetInstance():GetPlayerUid()),
+        roleName = _G.PlayerModel:GetInstance():GetName(),
+        serverId = _G.tostring(_G.ServerManager:GetInstance().CurServer.Sid),
+        serverName = _G.ServerManager:GetInstance().CurServer.ServerName
+    })
+end
+
+---打开一个内置网页
+---@param url string 地址
+---@param msg string 1 为问卷调查页面   非1 为其他页面
+function SDKManager:DoykOpenUrl(url, msg)
+    -- if _G.AppSetting.IsIos then
+    --     local iosmsg = msg or ""
+    --     self:SendSDKMsg(SDKDef.SendMsg.ykOpenUrl, url, iosmsg)
+    -- elseif _G.AppSetting.IsAndriod then
+    --     self:SendSDKMsg(SDKDef.SendMsg.ykOpenUrl, url)
+    -- end
+end
+
+---数数打点
+function SDKManager:DoShushuData_track(eventName, propertiesJson)
+    SDKProxy:DoShushuData_track(eventName, propertiesJson)
+end
+
+---adjustfirebase打点
+---@param type AdjustFirebaseType 那种类型打点，不传就两种都发
+function SDKManager:AdjustOrFirebase(eventName, value, type)
+    if _G.AppSetting.IsOverseas then
+        local eventValue
+        if value then
+            eventValue = _G.tostring(value)
+        else
+            eventValue = ""
+        end
+
+        if _G.AppSetting.DEBUG then
+            _G.Log(eventName, "adjustEvent")
+            _G.Log(eventValue, "adjustValue")
+        end
+
+        if type == SDKDef.AdjustFirebaseType.Adjust then
+            self:SendSDKMsg(SDKDef.SendMsg.adjustEvent, eventName, eventValue)
+        elseif type == SDKDef.AdjustFirebaseType.Firebase then
+            self:SendSDKMsg(SDKDef.SendMsg.firebaseEvent, eventName, eventValue)
+        else
+            self:SendSDKMsg(SDKDef.SendMsg.adjustEvent, eventName, eventValue)
+            self:SendSDKMsg(SDKDef.SendMsg.firebaseEvent, eventName, eventValue)
+        end
+    end
+end
+
+-- endregion
+
+---初始化SDK数据解析方式
+function SDKManager:InitParser()
+    self.ParseMsgFuns = {}
+    self.ParseMsgFuns[SDKDef.GetMsg.login_success] = _G.handler(self, login_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.login_failed] = _G.handler(self, login_failed)
+    self.ParseMsgFuns[SDKDef.GetMsg.login_cancle] = _G.handler(self, login_cancle)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_server_list_success] = _G.handler(self, get_server_list_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_allgroup_success] = _G.handler(self, get_allgroup_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_allgroup_failed] = _G.handler(self, get_allgroup_failed)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_groupserver_success] = _G.handler(self, get_groupserver_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_groupserver_failed] = _G.handler(self, get_groupserver_failed)
+    self.ParseMsgFuns[SDKDef.GetMsg.auth_success] = _G.handler(self, auth_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.auth_failed] = _G.handler(self, auth_failed)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_maintainnotice] = _G.handler(self, get_maintainnotice)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_phone_info] = _G.handler(self, get_phone_info)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_servernames_success] = _G.handler(self, get_servernames_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_servernames_failed] = _G.handler(self, get_servernames_failed)
+    self.ParseMsgFuns[SDKDef.GetMsg.auth_logout] = _G.handler(self, auth_logout)
+    self.ParseMsgFuns[SDKDef.GetMsg.show_exit] = _G.handler(self, show_exit)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.fangchenmi_flag] = _G.handler(self, fangchenmi_flag)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.pay_goods_list] = _G.handler(self, pay_goods_list)
+    self.ParseMsgFuns[SDKDef.GetMsg.pay_goods_list_pro] = _G.handler(self, pay_goods_list_pro)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_change_order] = _G.handler(self, get_change_order)
+    self.ParseMsgFuns[SDKDef.GetMsg.pay_success] = _G.handler(self, pay_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.pay_failed] = _G.handler(self, pay_failed)
+    self.ParseMsgFuns[SDKDef.GetMsg.can_recharge_true] = _G.handler(self, can_recharge_true)
+    self.ParseMsgFuns[SDKDef.GetMsg.can_recharge_false] = _G.handler(self, can_recharge_false)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.show_game] = _G.handler(self, show_game)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_memory] = _G.handler(self, get_memory)
+    self.ParseMsgFuns[SDKDef.GetMsg.current_battery] = _G.handler(self, current_battery)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.share_success] = _G.handler(self, share_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.share_fail] = _G.handler(self, share_fail)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.get_dynamic_update_total_size] = _G.handler(self, get_dynamic_update_total_size)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.delete_success] = _G.handler(self, delete_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.delete_failed] = _G.handler(self, delete_failed)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.get_user_type] = _G.handler(self, get_user_type)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.bind_success] = _G.handler(self, bind_success)
+    self.ParseMsgFuns[SDKDef.GetMsg.bind_failed] = _G.handler(self, bind_failed)
+
+    self.ParseMsgFuns[SDKDef.GetMsg.iphone_info] = _G.handler(self, iphone_info)
+    self.ParseMsgFuns[SDKDef.GetMsg.get_notice] = _G.handler(self, get_notice)
+    self.ParseMsgFuns[SDKDef.GetMsg.onShareAppMessage] = _G.handler(self, onShareAppMessage)
+end
+
+---发送额外接口信息
+---@param methodName string 额外的信息名
+---@param callback fun (b:boolean, info:string|table) 调用完成回调
+---@param data table 参数
+function SDKManager:SendExtend(methodName, callback, data)
+    SDKProxy:SendExtend(methodName, callback, data)
+end
+
+---发送屏蔽字检测
+function SDKManager:SecCheck(nameStr, scene,callback)
+    local model = _G.PlayerModel:GetInstance()
+    local server = _G.ServerManager:GetInstance().CurServer
+    local serverId = _G.tostring(server.Sid)
+    local serverName = server.ServerName
+
+    local data = {
+        --1 资料；2 评论；3 论坛；4 社交日志；5 聊天
+        Scene = scene,
+        RoleId = _G.tostring(model:GetPlayerUid()),
+        RoleName = model:GetName(),
+        ServerId = serverId,
+        ServerName = serverName,
+        RoleLevel = model:GetLevel(),
+        Content = nameStr
+    }
+    self:SendExtend(
+            "msgSecCheck",
+            function(b,str)
+                if callback then
+                    callback(b,str)
+                end
+            end,
+            data
+    )
+end
+
+---看激励广告
+function SDKManager:VideoAD(callback, name, sid)
+    require("AdvertisementModel"):GetInstance():ReportAD(SDKDef.AdStep.AdRequest, sid, false)
+    if _G.AppSetting.IsWebGl then
+        local model = _G.PlayerModel:GetInstance()
+        local serverId = _G.tostring(_G.ServerManager:GetInstance().CurServer.Sid)
+        local serverName = _G.ServerManager:GetInstance().CurServer.ServerName
+        local data = {
+            Name = name,
+            RoleId = _G.tostring(model:GetPlayerUid()),
+            RoleName = model:GetName(),
+            ServerId = serverId,
+            ServerName = serverName,
+            RoleLevel = model:GetLevel(),
+            VipLevel = _G.tostring(model:GetVipLevel()) or "1"
+        }
+        local adUnitId = self:GetRandomAdId()
+        if adUnitId and adUnitId ~= "" then
+            -- 微信原生广告接入 https://doc.youkia.net/docs/fast_sdk/fast_sdk-1er5lvruc0q08
+            data.adUnitId = adUnitId
+            data.multiton = "false"
+        end
+        require("AdvertisementModel"):GetInstance():ReportAD(SDKDef.AdStep.ShowAd, sid, false)
+        self:SendExtend("createRewardedVideoAd", callback, data)
+    else
+        ---SDK的反馈说广告位目前的渠道都不需要传，传空字符串就行
+        ---@type string 如果配了广告位id, 则随机传一个
+        --海外繁体adId传固定值reward
+        local channelId = _G.tonumber(self:GetChannelId())
+        local adId = self:GetRandomAdId()
+        if PlatformDef.OverseasFT[channelId] then
+            adId = "reward"
+        end
+        SDKProxy:PreloadRewardedAD(adId, function(preInfo)
+            ---预加载完成返回广告内容
+            require("AdvertisementModel"):GetInstance():ReportAD(SDKDef.AdStep.GetAdContent, sid, false)
+            if preInfo.code == _G.CS.FastSpace.ToolSDK.AD_LOAD_SUC then
+                SDKProxy:ShowRewardedAD(preInfo.adId or "", function(showAdInfo)
+                    if showAdInfo.code == _G.CS.FastSpace.ToolSDK.AD_EARNED then
+                        ---广告正常播放完成
+                        if callback then
+                            callback(true, { state = "reward" })
+                        end
+                    elseif showAdInfo.code == _G.CS.FastSpace.ToolSDK.AD_SHOWN then
+                        ---广告开始展示
+                        require("AdvertisementModel"):GetInstance():ReportAD(SDKDef.AdStep.ShowAd, sid, true)
+                    elseif showAdInfo.code == _G.CS.FastSpace.ToolSDK.AD_CLICKED then
+                        ---广告被点击
+                        require("AdvertisementModel"):GetInstance():ReportAD(SDKDef.AdStep.ClickAd, sid, true)
+                    elseif showAdInfo.code == _G.CS.FastSpace.ToolSDK.AD_DISMISSED then
+                        ---可能被用户提前关闭，也可能是播放完成关闭
+                        require("AdvertisementModel"):GetInstance():ReportAD(SDKDef.AdStep.CloseAd, sid, true)
+                    else
+                        if _G.AppSetting.DEBUG then
+                            _G.LogError(showAdInfo.code, "ShowRewardedAD广告加载状态：")
+                        end
+                    end
+                end)
+            else
+                if _G.AppSetting.DEBUG then
+                    _G.LogError(preInfo.code, "PreloadRewardedAD广告加载状态：")
+                end
+            end
+        end)
+    end
+end
+
+---@private 获取一个随机广告位id
+---@return string
+function SDKManager:GetRandomAdId()
+    if not self.adIds or #self.adIds == 0 then
+        return ""
+    end
+    local size = #self.adIds
+    local index = size > 1 and (math.floor(math.random() * size) + 1) or 1
+    return self.adIds[index] or self.adIds[size]
+end
+
+---打开抖音侧边栏
+function SDKManager:NavigateToScene(callback)
+    self:SendExtend("navigateToScene", callback)
+end
+
+---抖音拉起客服
+function SDKManager:OpenCustomerService(callback, type)
+    local data = {
+        --type 1 小6客服  2 IM客服
+        type = type
+    }
+    self:SendExtend("openCustomerService", callback, data)
+end
+
+---抖音创建桌面图标
+function SDKManager:CreateShortcut(callback, data)
+    self:SendExtend("createShortcut", callback, data)
+end
+
+---检测游戏是否支持跳转到某场景（现只支持检测「侧边栏」）
+function SDKManager:Douyin_checkScene(callback)
+    self:SendExtend("douyin_checkScene", callback)
+end
+
+---在游戏重新回到前台时获取相关参数
+function SDKManager:GetOnShowRes(callback, data)
+    self:SendExtend("getOnShowRes", callback, data)
+end
+
+---请求数娱转端配置
+function SDKManager:RequestZDConfig(callback)
+    self:SendExtend("getZdConfig", callback)
+end
+
+---提示：网络连接失败，请检查网络后重新尝试(code = code),此提示会返回对应的错误码，方便查是哪里触发的提示
+---主要是用来查SDK返回失败的情况
+function SDKManager:ShowSDKFailDialog(code, callback)
+    if _G.AppSetting.IsWebGl then
+        local content = _G.GetLangPackValue(90021100020) .. _G.string.format(" (code = %d)", code)
+        self:ShowWXDialog(_G.GetLangPackValue(90021100019), content)
+    else
+        local cfg = _G.ConfigManager.tips_system_cfg[180105]
+        if cfg then
+            local content = _G.GetLangPackValue(cfg.content) .. _G.string.format(" (code = %d)", code)
+            local extendParam = { notCall = true }
+            _G.PopWindowManager:GetInstance():ShowAllTipsExtend(180105, content, callback, nil, nil, nil, extendParam)
+        end
+    end
+end
+
+---提示弹窗
+---@param title string 标题
+---@param content string 提示内容
+---@param confirmText string 确认按钮文本
+---@param confirmAction function 确认按钮点击事件
+---@param cancelText string 取消按钮文本
+---@param cancelAction function 取消按钮点击事件
+function SDKManager:ShowWXDialog(title, content, confirmText, confirmAction, cancelText, cancelAction)
+    if not title then
+        title = _G.GetLangPackValue(90021100019)
+    end
+    if not confirmText then
+        confirmText = _G.GetLangPackValue(90021300084)
+    end
+    if not content then
+        content = _G.GetLangPackValue(90021100020)
+    end
+    if not confirmAction then
+        confirmAction = function()
+            _G.CS.FastSDKEx.FastSDKExtra.Restart()
+        end
+    end
+    _G.CS.FastSDKEx.NativeUtils.ShowDialog(title, content, confirmText, confirmAction, cancelText, cancelAction)
+end
+
+-- endregion
+
+--region ========================平台相关接口========================
+
+---上报游戏加载完成(游戏资源加载丶版本检测更新等, 一般在C#进行调用)
+---@return void
+function SDKManager:ReportLoadingCompleted()
+    if _G.AppSetting.DEBUG then
+        _G.Log("ReportLoadingCompleted")
+    end
+    if not self.platformImpl then
+        return
+    end
+    self.platformImpl:ReportLoadingCompleted()
+end
+
+---上报玩家登录账号
+---@return void
+function SDKManager:ReportAuthorized()
+    if _G.AppSetting.DEBUG then
+        _G.Log("ReportAuthorized")
+    end
+    if not self.platformImpl then
+        return
+    end
+    self.platformImpl:ReportAuthorized()
+end
+
+---上报玩家创建角色
+---@param initial boolean 是否初次创角
+---@return void
+function SDKManager:ReportCreateRole(initial)
+    if _G.AppSetting.DEBUG then
+        _G.Log("ReportCreateRole initial=" .. tostring(initial))
+    end
+    if not self.platformImpl then
+        return
+    end
+    self.platformImpl:ReportCreateRole(initial)
+end
+
+---上报玩家进入游戏/游戏画面加载完成
+---@return void
+function SDKManager:ReportGamePlay()
+    if _G.AppSetting.DEBUG then
+        _G.Log("ReportGamePlay")
+    end
+    if not self.platformImpl then
+        return
+    end
+    self.platformImpl:ReportGamePlay()
+end
+
+---游戏行为上报
+---@param action SDKDef.GameAction|string|number
+---@param data any  行为数据
+function SDKManager:GameAction(action, ...)
+    if not self.platformImpl then
+        return
+    end
+    self.platformImpl:GameAction(action, ...)
+end
+
+---支付宝游戏中心/抖音侧边栏行为上报
+---@param action SDKDef.GameLauncher|string|number
+---@param data any  行为数据
+function SDKManager:FollowUpReport(action)
+    if not self.platformImpl then
+        return
+    end
+    self.platformImpl:FollowUpReport(action)
+end
+
+---桌面访问行为上报
+---@param action SDKDef.GameLauncher|string|number
+---@param data any  行为数据
+function SDKManager:SetHeadReport(action)
+    if not self.platformImpl then
+        return
+    end
+    self.platformImpl:SetHeadReport(action)
+end
+
+---客服中心
+function SDKManager:ShowUserCenter()
+    local model = _G.PlayerModel:GetInstance()
+    local dict = {
+        roleId = "",
+        roleName = "",
+        roleLevel = "",
+        roleVipLevel = "1",
+        serverId = _G.ServerManager:GetInstance().CurServer.Sid or "",
+        serverName = _G.ServerManager:GetInstance().CurServer.ServerName or "",
+        sex = "0"
+    }
+    if model:CheckCreateRole() then
+        dict.roleId = model:GetPlayerUid() or ""
+        dict.roleName = model:GetName() or ""
+        dict.roleLevel = model:GetLevel() or ""
+        dict.roleVipLevel = model:GetVipLevel() or "1"
+    end
+    self:SendExtend("showUserCenter", nil, dict)
+end
+
+---查询是否应该展示二楼订阅
+function SDKManager:FetchSecondFloorIcon(callBack, data)
+    self:SendExtend("fetchSecondFloorIcon", callBack, data)
+end
+
+---二楼订阅
+function SDKManager:UpdateSecondFloorChannel(callBack, data)
+    self:SendExtend("updateSecondFloorChannel", callBack, data)
+end
+
+---查询是否二次复访
+function SDKManager:QueryRepeat(callBack, data)
+    self:SendExtend("queryRepeat", callBack, data)
+end
+
+---获取第三方SDK数据
+function SDKManager:GetThirdSDKInfo(callBack)
+    self:SendExtend("getThirdSDKInfo", callBack)
+end
+
+---创建转端二维码
+function SDKManager:ShowImage(data)
+    self:SendExtend("showImage", nil, data)
+end
+
+---移除转端二维码
+function SDKManager:HideImage()
+    self:SendExtend("hideImage")
+end
+
+---显示用户中心
+function SDKManager:LoadSetting()
+    self:SendExtend("loadSetting")
+end
+
+---切换账号-综合多个渠道的接口
+function SDKManager:SendChangeAccount(type)
+    if _G.string.IsNullOrEmpty(type) then
+        self:SendLogOut()
+        return
+    end
+
+    if type == "showUserCenter" then
+        self:ShowUserCenter()
+    else
+        self:SendExtend(type)
+    end
+end
+
+---繁体打点接口
+function SDKManager:ReportData(eventName)
+    if not PlatformDef.OverseasFT[_G.tonumber(self:GetChannelId())] then
+        return
+    end
+    local model = _G.PlayerModel:GetInstance()
+    local roleInfo = {
+        eventName = eventName,
+        roleId = model:GetPlayerUid(),
+        roleName = model:GetName(),
+        roleLevel = model:GetLevel(),
+        roleVipLevel = model:GetVipLevel() or "1",
+        serverId = _G.ServerManager:GetInstance().CurServer.Sid,
+        serverName = _G.ServerManager:GetInstance().CurServer.ServerName,
+        extraInfo = {},
+    }
+    self:SendExtend("reportData", nil, roleInfo)
+end
+
+---转端活动打点
+function SDKManager:ZDActReport(key)
+    local data = {
+        Event_key = key,
+        RoleName = _G.PlayerModel:GetInstance():GetName() or "1",
+        RoleId = _G.PlayerModel:GetInstance():GetPlayerUid() or "1",
+        ServerId = _G.ServerManager:GetInstance().CurServer.Sid,
+        ServerName = _G.ServerManager:GetInstance().CurServer.ServerName
+    }
+    self:SendExtend("zdActReport", nil, data)
+end
+
+---查询是否应该显示svip按钮
+---@param callback function 回调函数
+function SDKManager:IsShowSvip(callback)
+    self:SendExtend("isShowSvip", callback, nil)
+end
+
+---用户点击svip按钮
+function SDKManager:ClickSvip()
+    self:SendExtend("clickSvip", nil, nil)
+end
+
+--endregion
+---添加进入游戏前台和进入游戏后台事件检测
+function SDKManager:PushResumeAndPauseListener(code, callback, remove)
+    SDKProxy:PushListener(code, callback, remove)
+end
+
+--region 俄罗斯相关接口
+---是否是俄罗斯的渠道
+function SDKManager:CheckRusChannel()
+    local channelId = _G.tonumber(self:GetChannelId())
+    return PlatformDef.RusChannel.Android == channelId or PlatformDef.RusChannel.IOS == channelId
+end
+
+---角色登出时进行上报,调用改接口会消耗悬浮窗
+function SDKManager:ReportRoleLogout()
+    local level = 1
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        level = _G.PlayerModel:GetInstance():GetLevel()
+    end
+    self:SendExtend("roleLogout", nil, { role_level = level })
+end
+
+---拍脸图，应用评价（安卓），精选活动，热门活动-在游戏内弹出界面
+function SDKManager:OpenWebPage()
+    local model = _G.PlayerModel:GetInstance()
+    local paramsDic = {
+        roleId = model:GetPlayerUid(),
+        roleName = model:GetName(),
+        roleLevel = model:GetLevel(),
+        serverId = _G.ServerManager:GetInstance().CurServer.Sid,
+        vipLevel = model:GetVipLevel(),
+        present_condition_key = "level",
+        present_actual_value = model:GetLevel()
+    }
+    self:SendExtend("openWebPage", nil, paramsDic)
+end
+
+---打开原生评论弹窗
+--TODO:该功能只存在于iOS SDK，且只支持iOS 10.3.0或以上版本的系统使用。调用后会触发iOS系统的应用内评分功能，在不跳转到AppStore也能完成评星及评论的操作，系统会自动同步到AppStore
+function SDKManager:ReviewInApp()
+    if not _G.AppSetting.IsWebGl and _G.AppSetting.IsIos then
+        self:SendExtend("reviewInApp");
+    end
+end
+
+---系统浏览器打开URL（IOS）,使用此接口的链接必现带（http://或https://）
+---@param url string 地址
+function SDKManager:OpenThirdUrl(url)
+    if (_G.string.contains(url, "http") or _G.string.contains(url, "https")) then
+        self:SendExtend("openThirdUrl", nil, { url = url })
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("SDKManager:OpenThirdUrl url格式错误,必须带http://或https://")
+        end
+    end
+end
+
+---打开客服
+function SDKManager:CustomerService()
+    local model = _G.PlayerModel:GetInstance()
+    local paramsDic = {
+        roleId = model:GetPlayerUid(),
+        roleName = model:GetName(),
+        roleLevel = model:GetLevel(),
+        serverId = _G.ServerManager:GetInstance().CurServer.Sid,
+        serverName = _G.ServerManager:GetInstance().CurServer.ServerName
+    }
+    self:SendExtend("customerService", nil, paramsDic)
+end
+
+---IOSATT友好弹窗功能,调用后会触发iOS系统的用户追踪授权弹窗,只存在于iOSSDK，且只支持iOS14或以上版本的系统使用
+---@param event string 弹窗事件名称
+function SDKManager:AttTip(event)
+    if _G.AppSetting.IsIos and self:CheckRusChannel() then
+        self:SendExtend("attTip", nil, { name = event })
+    end
+end
+
+function SDKManager:Share()
+    if _G.AppSetting.IsXzns then
+        local channelId = tonumber(self:GetChannelId())
+        if _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.shareSwitch, channelId) then
+            local shareImage = _G.GameUtil.GetFunctionData(_G.FunctionBlock.shareImage, channelId)
+            local params
+            if #shareImage == 1 then
+                params = {
+                    imageUrl = shareImage[1][1],
+                    imageUrlId = shareImage[1][2]
+                }
+            else
+                params = {
+                    imageUrl = {},
+                    imageUrlId = {}
+                }
+                for i = 1, #shareImage do
+                    local imageData = shareImage[i]
+                    _G.table.insert(params.imageUrl, imageData[1])
+                    _G.table.insert(params.imageUrlId, imageData[2])
+                end
+            end
+            self:SendExtend("shareAppMessage", nil, params)
+        else
+            self:SendExtend("shareChannel")
+        end
+    else
+        self:SendExtend("shareChannel")
+    end
+end
+
+--endregion
+
+--region 繁体
+---打开客服-繁体IOS的接口
+function SDKManager:ShowCS()
+    self:SendExtend("showCS");
+end
+
+--endregion
+function SDKManager:GoToTAPTAPDiscuss()
+    self:SendExtend("showTapTapReview");
+end
+---获取分享类型
+function SDKManager:SendGetShareTypes(callback)
+    SDKProxy:SendExtend(
+            "getShareTypes",
+            function(b, info)
+                if callback then
+                    callback(b, info)
+                end
+            end
+    )
+end
+
+---多媒体分享
+---shareType    String    分享类型，对应输入FACEBOOK LINE DISCORD等，更多见文末表格
+---contentType    Int    分享内容类型：
+---0：分享图片，imageData不能为空
+---1：分享链接，shareLink字段不能为空
+---2：分享视频，mediaPath不能为空
+---3：分享文本，shareContent不能为空
+---imageData    String    要分享的本地图片路径
+---shareLink    String    要分享的链接地址
+---shareContent    String    要分享的文本内容
+function SDKManager:ShareMultimedia(type, contentType, shareContent, shareLink)
+    if nil == contentType then
+        contentType = 3
+    end
+    local data = {
+        shareType = type,
+        contentType = contentType,
+        shareContent = shareContent,
+        shareLink = shareLink
+    }
+    self:SendExtend("share", nil, data)
+end
+
+---ios单机支付(用户未登录/审核模式)
+---@param productId string
+---@param callback fun(ok:boolean, data:any):void
+function SDKManager:ArraignedPay(productId, callback)
+    self:SendExtend("FastAppleBuy", callback, {
+        productId = productId
+    })
+end
+
+---销毁对象时,析构函数
+function SDKManager:Dispose()
+    if self.message then
+        self.message:Dispose()
+        self.message = nil
+    end
+    if self.timer ~= nil then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.ParseMsgFuns = nil
+end

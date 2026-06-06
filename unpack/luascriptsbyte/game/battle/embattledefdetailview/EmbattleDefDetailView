@@ -1,0 +1,344 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Battle.EmbattleDefDetailView	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/01/11
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local EmbattleController = require "EmbattleController"
+---@field public go_table EmbattleDefDetailView_GoTable GoTable
+---@class EmbattleDefDetailView : Component	敌方布阵情报
+local EmbattleDefDetailView = _G.BaseClass("EmbattleDefDetailView", _G.Component)
+local Woff = _G.CS.Launcher.Inst.Woff
+---界面的入口函数
+function EmbattleDefDetailView:OnCreate(obj, ...)
+    self.go_table = _G.GetAutoGoTable(obj, _G.handler(self, self.OnClickBtn))
+    ---@type boolean 是否展开
+    self.isUnfold = false
+    ---@type boolean 是否有物体在移动
+    self.isMoving = false
+    ---@type boolean 按钮是否在移动
+    self.isAnniuMove = false
+    ---@type boolean 框是否在移动
+    self.isKuangMove = false
+    ---@type number 总共阶段数量
+    self.maxStateCount = 3
+    ---@type number 开阶段间隔天数
+    self.stateOffsetDay = 1
+    ---@type number 首次失败时间
+    self.curFailTime = require("AfkModel"):GetInstance().CurFailTime
+    ---@type table ItemCardStorageView卡牌item
+    self.itemCards = {}
+    ---适配刘海屏
+    local x, y, z = self.go_table.obj_move_kuang:GetLocalPosition()
+    self.go_table.obj_move_kuang:SetLocalPosition(x + Woff, y, z)
+    x, y, z = self.go_table.aorimage_bot:GetLocalPosition()
+    self.go_table.aorimage_bot:SetLocalPosition(x + Woff, y, z)
+    _G.Events:GetInstance():AddListener(_G.eEmBattleGroup.ClickEmBattleGroup, self.OnRefreshAll, self)
+
+    --_G.UIUtils.LoadEffectByCfg(_G.ConfigManager.ui_effect_cfg.ef_jiantou_R, self.go_table.obj_eff)
+end
+function EmbattleDefDetailView:OnDestroy()
+    self.isUnfold = false
+    self.isMoving = false
+    self.isAnniuMove = false
+    self.isKuangMove = false
+    self.itemCards = nil
+    if self.anniuMoveDoTween ~= nil then
+        self.anniuMoveDoTween:Kill()
+    end
+    if self.kuangMoveDoTween ~= nil then
+        self.kuangMoveDoTween:Kill()
+    end
+    if self.unlockTimer then
+        self.unlockTimer:Stop()
+        self.unlockTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eEmBattleGroup.ClickEmBattleGroup, self.OnRefreshAll, self)
+end
+function EmbattleDefDetailView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_unfold then
+        self.go_table.obj_eff:SetActiveE(0)
+        self:DoMove()
+        local AfkModel = require("AfkModel"):GetInstance()
+        if self.curState > AfkModel.ClickDefDetailStage then
+            AfkModel:SetClickDefDetailStage(self.curState)
+        end
+    elseif go == self.go_table.aorbtn_empty then
+        if self.isUnfold then
+            self:DoMove()
+        end
+    end
+end
+---初始化数据
+---@param monster_group_id number
+function EmbattleDefDetailView:InitData(monster_group_id)
+    ---@type monster_group_cfg 配置
+    self.monster_group_cfg = _G.ConfigManager.monster_group_cfg[monster_group_id]
+    ---@type number 当前选择的card的index
+    self.chooseIndex = 1
+    ---@type number 当前阶段
+    self.curState = 1
+    ---@type table 卡牌部分数据
+    self.cardDatas = {}
+    ---@type table 敌方monsterid
+    self.defaultDefenserSids = {}
+    local defenserSids = self.monster_group_cfg.DefaultDefenserSids[1]
+    for k, v in pairs(defenserSids) do
+        if v > 0 then
+            local cardData = {}
+            local monsterCfg = _G.ConfigManager.monster_cfg[v]
+            local cardCfg = require "CardCommentManager":GetInstance():CardData(monsterCfg.CardID)
+            if cardCfg then
+                cardData.sid = cardCfg.id
+                cardData.star = monsterCfg.Stars
+                cardData.lv = monsterCfg.Level
+                cardData.MonsterType = monsterCfg.MonsterType
+                cardData.MonsterId = monsterCfg.id
+                table.insert(self.cardDatas, cardData)
+            end
+        end
+    end
+    _G.SortList(
+        self.cardDatas,
+        function(list)
+            return list.MonsterType
+        end
+    )
+    for key, value in pairs(self.cardDatas) do
+        ---把占位的0过滤掉
+        table.insert(self.defaultDefenserSids, value.MonsterId)
+    end
+    self:InitView()
+end
+---初始化界面
+function EmbattleDefDetailView:InitView()
+    self:RefreshStage()
+    self:ShowTeam(self.go_table.trans_card_view, self.cardDatas)
+    self:RefreshStageView()
+    if self.unlockTimer then
+        self.unlockTimer:Stop()
+        self.unlockTimer = nil
+    end
+    self.unlockTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnUnlockTimer, self)
+    self.unlockTimer:Start()
+end
+---刷新阶段1的UI
+function EmbattleDefDetailView:RefreshStageView()
+    local monsterSid = self.defaultDefenserSids[self.chooseIndex]
+    local monsterCfg = _G.ConfigManager.monster_cfg[monsterSid]
+    local cardCfg = require "CardCommentManager":GetInstance():CardData(monsterCfg.CardID)
+
+    if monsterCfg.MonsterType == 4 or monsterCfg.MonsterType == 5 then
+        local nameStr = _G.LangUtil.GetLangPackValue(cardCfg.Name) .. _G.LangUtil.GetLangPackValue(90000010788)
+        self.go_table.aortext_name_power.text = _G.LangUtil.GetLangPackValue(90000010425, nameStr, monsterCfg.Power)
+    else
+        self.go_table.aortext_name_power.text =
+            _G.LangUtil.GetLangPackValue(90000010425, _G.LangUtil.GetLangPackValue(cardCfg.Name), monsterCfg.Power)
+    end
+    self.go_table.aortext_hp.text = _G.LangUtil.GetLangPackValue(90000010426, monsterCfg.max_hp)
+    self.go_table.aortext_atk.text = _G.LangUtil.GetLangPackValue(90000010428, monsterCfg.atk)
+    self.go_table.aortext_def.text = _G.LangUtil.GetLangPackValue(90000010427, monsterCfg.def)
+    self.go_table.aortext_bre.text = _G.LangUtil.GetLangPackValue(90000010429, monsterCfg.bre)
+    self.go_table.aortext_tedian.text = _G.LangUtil.GetLangPackValue(cardCfg.battlestyle)
+    self.go_table.aortext_fangshi.text = _G.LangUtil.GetLangPackValue(cardCfg.copeway)
+    _G.CS.UnityEngine.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(
+        self.go_table.aortext_tedian:GetComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform))
+    )
+    _G.CS.UnityEngine.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(
+        self.go_table.aortext_fangshi:GetComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform))
+    )
+    _G.CS.UnityEngine.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(
+        self.go_table.obj_tedian:GetComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform))
+    )
+    _G.CS.UnityEngine.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(
+        self.go_table.obj_fangshi:GetComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform))
+    )
+    _G.CS.UnityEngine.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(
+        self.go_table.aorimage_bg:GetComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform))
+    )
+end
+---刷新阶段
+function EmbattleDefDetailView:RefreshStage()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local day = _G.TimeUtil.GetInterValDayByGame(self.curFailTime, time)
+    self.curState = math.floor(day / self.stateOffsetDay) + 1
+    self.curState = math.min(self.maxStateCount, self.curState)
+    if self.curState == 1 then
+        self.go_table.obj_stage2:SetActiveE(1)
+        self.go_table.obj_stage3:SetActiveE(0)
+        self.go_table.obj_unlock1:SetActiveE(1)
+        self.go_table.obj_unlock2:SetActiveE(0)
+        self.go_table.aortext_stage2.text = _G.LangUtil.GetLangPackValue(90000010786)
+        --self.go_table.aortext_stage3.text = _G.LangUtil.GetLangPackValue(90000010787)
+        local nextStateTime = (self.stateOffsetDay - 1) * 86400 + _G.TimeUtil.GetSixClockTimer()
+        self.go_table.aortext_unlock1.text =
+            _G.LangUtil.GetLangPackValue(90000010432, _G.TimeUtil.TranslateSecondForStr(nextStateTime))
+    elseif self.curState == 2 then
+        self.go_table.obj_stage2:SetActiveE(1)
+        self.go_table.obj_stage3:SetActiveE(1)
+        self.go_table.obj_unlock1:SetActiveE(0)
+        self.go_table.obj_unlock2:SetActiveE(1)
+        self.go_table.aortext_stage2.text = _G.LangUtil.GetLangPackValue(90000010423)
+        self.go_table.aortext_stage3.text = _G.LangUtil.GetLangPackValue(90000010787)
+        local nextStateTime = (self.stateOffsetDay - 1) * 86400 + _G.TimeUtil.GetSixClockTimer()
+        self.go_table.aortext_unlock2.text =
+            _G.LangUtil.GetLangPackValue(90000010432, _G.TimeUtil.TranslateSecondForStr(nextStateTime))
+    else
+        self.go_table.obj_stage2:SetActiveE(1)
+        self.go_table.obj_stage3:SetActiveE(1)
+        self.go_table.obj_unlock1:SetActiveE(0)
+        self.go_table.obj_unlock2:SetActiveE(0)
+        self.go_table.aortext_stage2.text = _G.LangUtil.GetLangPackValue(90000010423)
+        self.go_table.aortext_stage3.text = _G.LangUtil.GetLangPackValue(90000010424)
+    end
+end
+function EmbattleDefDetailView:OnUnlockTimer()
+    self:RefreshStage()
+end
+---刷新阵容
+---@param parent Transform
+---@param data table
+function EmbattleDefDetailView:ShowTeam(parent, data)
+    if parent:GetChildCountE() > 0 then
+        for i = 1, parent:GetChildCountE() do
+            self.itemCards[i]:ShowSelected(false)
+            _G.PoolsManager:GetInstance():Despawn(parent:GetChildE(0), _G.ePoolType.UIItem)
+        end
+    end
+    self.itemCards = {}
+    local teamcard = data
+    if teamcard then
+        for i = 1, 5 do
+            if teamcard[i] then
+                local cardData = teamcard[i]
+                local index = i
+                _G.ItemCardFactory:GetInstance():GetItemCard(
+                    _G.ItemCardFactory.itemCardType.ItemCardStorageView,
+                    parent,
+                    function(item)
+                        ---考虑此处先加载的是否一定先回调，如果不是则可能出现bug
+                        table.insert(self.itemCards, item)
+                        item:Show(
+                            cardData.sid,
+                            _G.handler(self, self.OnClickCard),
+                            cardData.star,
+                            cardData.soulLink_lv,
+                            cardData.lv,
+                            nil,
+                            false,
+                            nil,
+                            nil,
+                            index
+                        )
+                        if cardData.MonsterType == 4 or cardData.MonsterType == 5 then
+                            item:ShowFrame(true)
+                        else
+                            item:ShowFrame(false)
+                        end
+                        self.itemCards[i]:ShowSelected(index == self.chooseIndex)
+                    end
+                )
+            end
+        end
+    end
+end
+---点击卡牌
+---@param index number 卡牌索引
+function EmbattleDefDetailView:OnClickCard(index)
+    self.chooseIndex = index[1]
+    for i = 1, #self.itemCards do
+        if i == self.chooseIndex then
+            self.itemCards[i]:ShowSelected(true)
+        else
+            self.itemCards[i]:ShowSelected(false)
+        end
+    end
+    self:RefreshStageView()
+end
+---移动
+function EmbattleDefDetailView:DoMove()
+    if self.isMoving then
+        return
+    end
+    self.isMoving = true
+    if self.anniuMoveDoTween ~= nil then
+        self.anniuMoveDoTween:Kill()
+    end
+    if self.kuangMoveDoTween ~= nil then
+        self.kuangMoveDoTween:Kill()
+    end
+    if self.isUnfold then
+        self.isUnfold = false
+        self.go_table.aorbtn_empty:SetActiveE(0)
+        self.isKuangMove = true
+        self.isAnniuMove = true
+        self.anniuMoveDoTween =
+            self.go_table.obj_move_anniu:DOLocalMoveX(514, 0.5):OnComplete(_G.handler(self, self.OnAnniuMoveComplete))
+        if Woff > 0 then
+            self.kuangMoveDoTween =
+                self.go_table.obj_move_kuang:DOLocalMoveX(514 + Woff, 0.5):OnComplete(
+                _G.handler(self, self.OnKuangMoveComplete)
+            )
+        else
+            self.kuangMoveDoTween =
+                self.go_table.obj_move_kuang:DOLocalMoveX(514, 0.5):OnComplete(
+                _G.handler(self, self.OnKuangMoveComplete)
+            )
+        end
+    else
+        self:OnUnfold()
+        self.isUnfold = true
+        self.go_table.aorbtn_empty:SetActiveE(1)
+        self.isKuangMove = true
+        self.isAnniuMove = true
+        if Woff > 0 then
+            self.kuangMoveDoTween =
+                self.go_table.obj_move_anniu:DOLocalMoveX(514, 0.1):OnComplete(
+                _G.handler(self, self.OnLeftKuangMoveComplete)
+            )
+        else
+            self.anniuMoveDoTween =
+                self.go_table.obj_move_anniu:DOLocalMoveX(0, 0.5):OnComplete(_G.handler(self, self.OnAnniuMoveComplete))
+            self.kuangMoveDoTween =
+                self.go_table.obj_move_kuang:DOLocalMoveX(0, 0.5):OnComplete(_G.handler(self, self.OnKuangMoveComplete))
+        end
+    end
+end
+---移动完成回调
+function EmbattleDefDetailView:OnLeftKuangMoveComplete()
+    self.anniuMoveDoTween =
+        self.go_table.obj_move_anniu:DOLocalMoveX(0, 0.5):OnComplete(_G.handler(self, self.OnAnniuMoveComplete))
+    self.kuangMoveDoTween =
+        self.go_table.obj_move_kuang:DOLocalMoveX(0, 0.5):OnComplete(_G.handler(self, self.OnKuangMoveComplete))
+end
+---移动完成回调
+function EmbattleDefDetailView:OnRightKuangMoveComplete()
+    self.kuangMoveDoTween =
+        self.go_table.obj_move_kuang:DOLocalMoveX(514 + Woff, 0.1):OnComplete(
+        _G.handler(self, self.OnKuangMoveComplete)
+    )
+end
+---移动完成回调
+function EmbattleDefDetailView:OnAnniuMoveComplete()
+    self.isAnniuMove = false
+    if not self.isKuangMove then
+        self.isMoving = false
+    end
+end
+---移动完成回调
+function EmbattleDefDetailView:OnKuangMoveComplete()
+    self.isKuangMove = false
+    if not self.isAnniuMove then
+        self.isMoving = false
+    end
+end
+---展开刷新界面
+function EmbattleDefDetailView:OnUnfold()
+    self:RefreshStage()
+end
+---刷新所有内容
+---@param monster_group_id number
+function EmbattleDefDetailView:OnRefreshAll(monster_group_id)
+    self:InitData(monster_group_id)
+end
+return EmbattleDefDetailView

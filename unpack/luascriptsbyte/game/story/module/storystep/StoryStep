@@ -1,0 +1,167 @@
+-- 包路径:        Game.Story.Module.StoryStep
+-- File Name:    StoryStep.lua
+-- Description:    剧情单步抽象
+-- Author:       TangHuan
+-- Create Date:    2020/02/26
+
+---@class StoryStep @剧情单步抽象
+---@field StoryOwner Story @所属Story
+---@field StepID number @剧情步骤ID
+---@field AllStoryActions BaseStoryAction[] @单步包含的所有剧情行为列表
+---@field StepCompleteCB function<StoryStep> @剧情步骤完成回调
+---@field AllCompletedActionMap table<number, BaseStoryAction> @已完成的动作Map(Key为动作ID，Value为动作对象)
+---@field ActionDelayTimerList table<Timer> @剧情行为延迟Timer列表
+---@field WaitCompletedActionNumber number @步骤里等待完成的行为数量
+local StoryStep = _G.BaseClass("StoryStep")
+StoryStep.StoryOwner = nil
+StoryStep.StepID = nil
+StoryStep.AllStoryActions = nil
+StoryStep.StepCompleteCB = nil
+StoryStep.AllCompletedActionMap = nil
+StoryStep.ActionDelayTimerList = nil
+StoryStep.WaitCompletedActionNumber = nil
+
+---StoryStep的构造函数
+---@param storyowner Story @所属Story
+---@param storystepid number @剧情步骤ID
+function StoryStep:__init(storyowner, storystepid)
+    self.StoryOwner = storyowner
+    self.StepID = storystepid
+    self.AllStoryActions = {}
+    self.StepCompleteCB = nil
+    self.AllCompletedActionMap = {}
+    self.ActionDelayTimerList = {}
+    self.WaitCompletedActionNumber = 0
+    self:ParseData()
+end
+
+---解析数据
+function StoryStep:ParseData()
+    local stepcfg = _G.ConfigManager.story_step_cfg[self.StepID]
+    if _G.IsNil(stepcfg) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(
+                "story_step_cfg[self.StepID]为空 StoryStep:ParseData() StepID:" ..
+                    tostring(self.StepID) .. " cfgid:" .. tostring(self.StoryOwner.StoryID)
+            )
+        end
+        return
+    end
+    --@type number actionid
+    for i, actionid in ipairs(stepcfg.ActionIDs) do
+        ---@type BaseStoryAction
+        local action = _G.StoryUtilities.CreateStoryAction(self, actionid)
+        if action == nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(
+                    string.format("actionid 有错 StepID:%s actionid:%s", tostring(self.StepID), tostring(actionid))
+                )
+            end
+            return
+        end
+        table.insert(self.AllStoryActions, action)
+        if action.ActionData.IgoreStepWaitExecuteComplete == false then
+            self.WaitCompletedActionNumber = self.WaitCompletedActionNumber + 1
+        end
+    end
+end
+
+---播放当前
+---@param stepcompletecb function<StoryStep> @剧情步骤完成回调
+function StoryStep:Play(stepcompletecb)
+    self.StepCompleteCB = stepcompletecb
+    --@type action BaseStoryAction
+    for i, action in ipairs(self.AllStoryActions) do
+        action.OnActionEnterCompleteCB = _G.handler(self, self.OnActionEnterCompleteCB)
+        action.OnActionExecuteCompleteCB = _G.handler(self, self.OnActionExecuteCompleteCB)
+        if action.ActionData.DelayTime == 0 then
+            action:Enter()
+        else
+            --Timer延迟支持Action延迟播放
+            local delaytimer =
+                _G.TimerManager:GetInstance():GetTimer(
+                action.ActionData.DelayTime,
+                self.OnActionDelayEnterCB,
+                self,
+                true,
+                false,
+                true,
+                action
+            )
+            table.insert(self.ActionDelayTimerList, delaytimer)
+            delaytimer:Start()
+        end
+    end
+end
+
+---动作延迟进入定时器回调
+---@param action BaseStoryAction @剧情行为
+function StoryStep:OnActionDelayEnterCB(action)
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("步骤ID:%s 行为ID:%s达到延时:%s秒进入条件!", self.StepID, action.ActionID, action.ActionData.DelayTime)
+    )
+    action:Enter()
+end
+
+---剧情动作准备完成
+---@param action BaseStoryAction @进入完成动作
+function StoryStep:OnActionEnterCompleteCB(action)
+    if _G.AppSetting.DEBUG then
+        _G._G.LogUtilities.LogError(_G.EModuleName.StoryModule, string.format(" 当前行为Id:%s", tostring(action.ActionID)))
+    end
+    action:Excute()
+end
+
+---剧情动作执行完成事件回调
+---@param action BaseStoryAction @执行完成的动作
+function StoryStep:OnActionExecuteCompleteCB(action)
+    if self.AllCompletedActionMap[action.ActionID] ~= nil then
+        --if _G.table.ContainsValue(self.AllCompletedActionMap, action) then
+        return
+    end
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("剧情ID:%s 剧情步骤ID:%s 剧情行为ID:%s执行完成!", self.StoryOwner.StoryID, self.StepID, action.ActionID)
+    )
+    --table.insert(self.AllCompletedActionMap, action)
+    self.AllCompletedActionMap[action.ActionID] = action
+    action:Exit()
+    if table.count(self.AllCompletedActionMap) == #self.AllStoryActions then
+        if self.StepCompleteCB ~= nil then
+            _G.LogUtilities.Log(
+                _G.EModuleName.StoryModule,
+                string.format("剧情ID:%s 剧情步骤ID:%s执行完成!", self.StoryOwner.StoryID, self.StepID)
+            )
+            self.StepCompleteCB(self)
+        end
+    end
+end
+
+---跳过剧情步骤播放
+function StoryStep:Skip()
+    for i, tm in ipairs(self.ActionDelayTimerList) do
+        tm:Stop()
+        tm = nil
+    end
+    for i, action in ipairs(self.AllStoryActions) do
+        --- 只跳过还未完成的行为
+        if self.AllCompletedActionMap[action.ActionID] == nil then
+            action:Skip()
+        end
+    end
+    self:ResetData()
+end
+
+---重置剧情步骤播放数据
+function StoryStep:ResetData()
+    self.StepCompleteCB = nil
+    self.AllCompletedActionMap = {}
+    self.ActionDelayTimerList = {}
+    self.WaitCompletedActionNumber = 0
+end
+
+---@type StoryStep @剧情单步抽象
+_G.StoryStep = StoryStep
+---@type StoryStep @剧情单步抽象
+return StoryStep

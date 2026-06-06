@@ -1,0 +1,404 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.GrowthFund.Model.MaidFundModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/04/18
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+---@class MaidFundModel : GameDataModelBase	成长基金
+local MaidFundModel = _G.BaseClass("MaidFundModel", _G.GameDataModelBase)
+
+---@return MaidFundModel MaidFundModel
+function MaidFundModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function MaidFundModel:__init()
+    ---true功能开放
+    self.curFunctionOpenID = 305
+    self.fundType = require("FundModel").FundType.Maid
+    self.sid = _G.CfgEnum_store_battle_pass.npjj
+    -- ---@type store_battle_pass_cfg
+    -- self.cfg = _G.ConfigManager.store_battle_pass_cfg[self.sid]
+    -- if self.cfg == nil then
+    --     (" store_battle_pass_cfg 未找到配置 id:" .. tostring(self.sid))
+    -- end
+    -- self.curFunctionOpenID = self.cfg.function_open
+    -- ---@type FundModel_storeinfo
+    -- self.store = {
+    --     ---基金的id
+    --     sid = self.sid,
+    --     ---是否是豪华 （0:不是 1：是）
+    --     unlock_rmb = 0,
+    --     ---已经领取的普通奖励id
+    --     normal_award_list = {},
+    --     ---已经领取的豪华奖励id
+    --     up_award_list = {}
+    -- }
+end
+function MaidFundModel:InitDateStart()
+    ---@type store_battle_pass_cfg
+    local cfg = _G.ConfigManager.store_battle_pass_cfg[self.sid]
+    if cfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" store_battle_pass_cfg 未找到配置 id:" .. tostring(self.sid))
+        end
+    end
+    self.curFunctionOpenID = cfg.function_open
+
+    ---@type FundModel_storeinfo
+    self.store = {
+        ---基金的id
+        sid = self.sid,
+        ---是否是豪华 （0:不是 1：是）
+        unlock_rmb = 0,
+        ---已经领取的普通奖励id
+        normal_award_list = {},
+        ---已经领取的豪华奖励id
+        up_award_list = {}
+    }
+end
+function MaidFundModel:InitStoreData(data)
+    if self.store.sid ~= data.store.sid then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("基金id 不一致")
+        end
+    end
+    self.store.sid = data.store.sid
+    self.store.unlock_rmb = data.store.unlock_rmb
+    if data.store.normal_award_list ~= nil then
+        for i = 1, #data.store.normal_award_list do
+            self:SetAward(data.store.normal_award_list[i], false)
+        end
+    end
+
+    if data.store.up_award_list ~= nil then
+        for i = 1, #data.store.up_award_list do
+            self:SetAward(data.store.up_award_list[i], true)
+        end
+    end
+end
+--region 重写父类方法
+--- 网络请求初始化
+function MaidFundModel:GetInfo(callback)
+    -- local data = {}
+    require "FundModel":GetInstance():GetInfoPass(
+        function(data)
+            local pass_list = {}
+            if data and data.pass then
+                local cfg = _G.ConfigManager.store_battle_pass_cfg
+                for i = 1, #data.pass do
+                    local id = data.pass[i]
+                    if cfg[id].display_priority == 6 then
+                        _G.table.insert(pass_list, cfg[id])
+                    end
+                end
+            end
+            if not _G.table.isEmptyOrNil(pass_list) then
+                _G.SortList(
+                    pass_list,
+                    function(list)
+                        return list.id
+                    end
+                )
+                if pass_list[1].re_sid > 0 then
+                    self.sid = pass_list[1].re_sid
+                else
+                    self.sid = pass_list[1].id
+                end
+            end
+            require("FundModel"):GetInstance():GetInfo(
+                self.sid,
+                function(data)
+                    self:ParseData(data, callback)
+                    self:CheckNext()
+                end
+            )
+        end
+    )
+end
+function MaidFundModel:ReConnect(endcall)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        if endcall then
+            endcall()
+        end
+        return
+    end
+    require("FundModel"):GetInstance():GetInfo(
+        self.sid,
+        function(data)
+            self:InitDateStart()
+            self:InitStoreData(data)
+            self:RedCheck()
+            -- local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MaidFundView.Name)
+            -- if window then
+            --     window.View:UpdataView()
+            -- end
+        end
+    )
+    if endcall then
+        endcall()
+    end
+end
+---数据解析完成
+function MaidFundModel:ParseData(data, callback)
+    self:InitDateStart()
+    if data.store then
+        self:InitStoreData(data)
+    end
+    if callback then
+        callback()
+    end
+end
+---初始化功能逻辑
+function MaidFundModel:InitFunction()
+    self:RedCheck()
+    self:AddListener()
+end
+
+--endregion
+
+--region --------------------------------------红点 奖励解锁--------
+function MaidFundModel:RedCheck()
+    ---@type store_battle_pass_cfg
+    local cfg = _G.ConfigManager.store_battle_pass_cfg[self.sid]
+
+    ---True有可领取
+    self.isHaveGet = false
+    ---可领取 索引 方便显示跳转  [0,]
+    self.HaveGetIndex = nil
+
+    local store_battle_content_cfg = _G.ConfigManager.store_battle_content_cfg
+
+    ---@type store_battle_content_cfg
+    local cfgitem
+    local cType, cValue, id
+    local oIndex = 0
+    local seType = true
+    for i = 1, #cfg.content do
+        ---奖励内容id
+        id = cfg.content[i]
+        cfgitem = store_battle_content_cfg[id]
+        ---条件类型
+        cType = cfgitem.conditions[1]
+        ---条件参数
+        cValue = cfgitem.conditions[2]
+        if cType == _G.GlobalConditionManager.ConditionType.MaidFinishNum then
+            ----如果没解锁 就标记
+            if _G.GlobalConditionManager.CheckCondition(cType, cValue) == false then
+                if seType then
+                    seType = false
+                    oIndex = i
+                end
+            else
+                ---如果解锁了 就记录是否已领取
+                if self.isHaveGet == false then
+                    ---如果 有一个奖励没领 就标记
+                    if not self:IsAward(id, false) then
+                        self.isHaveGet = true
+                        self.HaveGetIndex = i
+                    elseif self:GetIsUp() and not self:IsAward(id, true) then
+                        self.isHaveGet = true
+                        self.HaveGetIndex = i
+                    end
+                end
+            end
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log("", "<color=red>" .. "不是设定的 通用检测类型" .. "</color>")
+            end
+            break
+        end
+    end
+    if self.HaveGetIndex == nil then
+        self.HaveGetIndex = oIndex > 1 and oIndex - 1 or 1
+    end
+    self:RefreshRedPoint()
+end
+---设置红点刷新
+function MaidFundModel:SetFreshRedPoint(RefreshRedPointCall)
+    self.RefreshRedPointCall = RefreshRedPointCall
+end
+function MaidFundModel:RefreshRedPoint()
+    if self.RefreshRedPointCall ~= nil then
+        self.RefreshRedPointCall()
+    end
+end
+function MaidFundModel:IsHaveGet()
+    return self.isHaveGet == true
+end
+
+function MaidFundModel:GetHaveGetIndex()
+    --- or nil
+    return self.HaveGetIndex
+end
+
+function MaidFundModel:AddListener()
+    _G.Events:GetInstance():AddListener(_G.eMaidUpdate.MaidUpdate, self.OnMaidUpdate, self)
+    _G.Events:GetInstance():AddListener(_G.eMaidUpdate.MaidInit, self.OnMaidUpdate, self)
+end
+
+---监听玩家操作
+function MaidFundModel:OnMaidUpdate()
+    self:RedCheck()
+end
+
+function MaidFundModel:RemoveListener()
+    _G.Events:GetInstance():RemoveListener(_G.eMaidUpdate.MaidUpdate, self.OnMaidUpdate, self)
+    _G.Events:GetInstance():RemoveListener(_G.eMaidUpdate.MaidInit, self.OnMaidUpdate, self)
+end
+
+--endregion------------------------------------红点 奖励解锁--------
+
+---@return boolean true已购买豪华
+function MaidFundModel:GetIsUp()
+    return self.store.unlock_rmb == 1
+end
+
+function MaidFundModel:SetIsUp()
+    self.store.unlock_rmb = 1
+    self:RedCheck()
+end
+
+---是否领取奖励
+function MaidFundModel:IsAward(id, isUp)
+    if not self.store then
+        return false
+    end
+    if isUp then
+        return self.store.up_award_list[id] == true
+    else
+        return self.store.normal_award_list[id] == true
+    end
+end
+
+---设置已领取
+function MaidFundModel:SetAward(id, isUp)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("MaidFundModel:SetAward id无效:" .. tostring(id))
+        end
+        return
+    end
+    if isUp then
+        self.store.up_award_list[id] = true
+    else
+        self.store.normal_award_list[id] = true
+    end
+end
+
+---设置一键领取奖励状态为已领取
+function MaidFundModel:SetOneKeyAward(id)
+    if self:GetIsUp() and not self.store.up_award_list[id] then
+        self.store.up_award_list[id] = true
+    end
+
+    if not self.store.normal_award_list[id] then
+        self.store.normal_award_list[id] = true
+    end
+end
+
+function MaidFundModel:CheckUpArawd(id)
+    if self:GetIsUp() and not self.store.up_award_list[id] then
+       return true
+    end
+
+    return false
+end
+
+---获取未领取的奖励id列表
+---@param countCfgArr store_battle_content_cfg 配置
+---@return aidList 奖励id列表
+function MaidFundModel:GetAwardList(countCfgArr)
+    local aidList = {}
+    for _, v in ipairs(countCfgArr) do
+        local isPass = _G.GlobalConditionManager.CheckCondition(v.conditions[1],v.conditions[2])
+        if isPass and (not self:IsAward(v.id) or self:CheckUpArawd(v.id)) then
+            _G.table.insert(aidList, v.id)
+        end
+    end
+    return aidList
+end
+
+---@return boolean true奖励已全部领完
+function MaidFundModel:CheckIsOvers()
+    local cfg = _G.ConfigManager.store_battle_pass_cfg[self.sid]
+    local count = #cfg.content
+    local c1 = table.count(self.store.normal_award_list)
+    local c2 = table.count(self.store.up_award_list)
+    return count == c1 and count == c2
+end
+
+function MaidFundModel:CheckIsShow()
+    return self:CheckIsOvers() == false
+end
+---是否开启下一轮
+function MaidFundModel:CheckNext(call)
+    if self:CheckIsOvers() then
+        local cfg = _G.ConfigManager.store_battle_pass_cfg[self.sid]
+        if cfg.re_sid > 0 then
+            require "FundModel":GetInstance():OpenNextBattle(
+                self.sid,
+                function()
+                    self.sid = cfg.re_sid
+                    require("FundModel"):GetInstance():GetInfo(
+                        self.sid,
+                        function(data)
+                            self:InitDateStart()
+                            self:InitStoreData(data)
+                            self:RedCheck()
+                            local window =
+                                _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.FundMainView.Name)
+                            if window then
+                                window.View.FundView[require("FundModel").FundType.Login]:UpdataView()
+                            end
+                            if call then
+                                call()
+                            end
+                        end
+                    )
+                end
+            )
+        else
+            if call then
+                call()
+            end
+        end
+    else
+        if call then
+            call()
+        end
+    end
+end
+
+function MaidFundModel:InitSidStage()
+    self.sidStage = {}
+    self.sbpCfgs = {}
+    for _, cfg in pairs(_G.ConfigManager.store_battle_pass_cfg) do
+        if cfg.display_priority == 6 then
+            _G.table.insert(self.sbpCfgs, cfg)
+        end
+    end
+    _G.table.sort(self.sbpCfgs, 
+        function(a, b)
+            return a.id < b.id
+        end
+    )
+    local stage = 1
+    for _, cfg in pairs(self.sbpCfgs) do
+        self.sidStage[cfg.id] = stage
+        stage = stage + 1
+    end
+end
+
+---获取当前是第几阶段
+function MaidFundModel:GetCurStage()
+    return 0
+end
+
+---销毁对象时,析构函数
+function MaidFundModel:Dispose()
+end
+
+return MaidFundModel

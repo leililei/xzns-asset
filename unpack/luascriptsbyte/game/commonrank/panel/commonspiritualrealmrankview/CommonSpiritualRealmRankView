@@ -1,0 +1,720 @@
+---@type numebr 默认初始化节点数量
+local DEFAULT_INIT_COUNT = 0
+---@type numebr 顶级玩家展示数量
+local TOP_PLAYER_COUNT = 3
+---红点奖励ID
+local AWARD_RED_POINT_ID = 206202
+
+---@type string[] 前三排名图标
+local RANK_ICON_IMAGES = {
+    "tz_qjhs_phb_mingci_01",
+    "tz_qjhs_phb_mingci_02",
+    "tz_qjhs_phb_mingci_03"
+}
+
+--- 工具类方法
+local utils = {
+    ---获取段位徽章
+    ---@param score number
+    ---@return string
+    getBadgeIcon = function(score)
+        for _, v in pairs(_G.ConfigManager.arena_layer_league_cfg) do
+            if score >= v.min_score and score <= v.max_score then
+                return v.icon
+            end
+        end
+        return nil
+    end,
+    ---创建空的顶级玩家数据
+    ---@return RankTop3Role
+    createTopEmptyData = function()
+        return {sid = 0}
+    end,
+    ---添加一些数据
+    ---@generic T
+    ---@param target T[]
+    ---@param source T[]
+    insertMany = function(target, source)
+        if not target or not source then
+            return
+        end
+        for _, v in ipairs(source) do
+            table.insert(target, v)
+        end
+    end
+}
+
+---@class CommonSpiritualRealmRankView : CommonRankBasePanel @问鼎灵域排行榜
+---@field private go_table _obj_CommonRankSpiritualRealm_GoTable
+---@field private joinType number                           @加入的灵域类别: 1繁星丶2皎月丶3浩日
+---@field private rankList RankData[]                       @排行榜数据
+---@field private rankAwardList arena_rank_cfg[]            @排行奖励数据
+---@field private scoreAwardList arena_layer_league_cfg[]   @分数奖励数据
+---@field private rankItems table<any,_obj_CommonRankSpiritualRealm._obj_rank_GoTable>              @排行节点
+---@field private rankAwardItems table<any,_obj_CommonRankSpiritualRealm._obj_rankAward_GoTable>    @排行奖励节点
+---@field private scoreAwardItems table<any,_obj_CommonRankSpiritualRealm._obj_scoreAward_GoTable| {data : any, award: any, state: number}>  @分数奖励节点
+---@field private selfRankAwardItem _obj_CommonRankSpiritualRealm._obj_rankAward_GoTable            @我的排行奖励节点
+---@field private selfScoreAwardItem _obj_CommonRankSpiritualRealm._obj_scoreAward_GoTable          @我的分数奖励节点
+---@field private selfData {score:number, index:number}     @我的排名状态
+---@field private initRankParam  RankTgData                 @初始化排名参数
+---@field private scoreAwardScrollloopvectical  ScrollLoopVertical                                  @分数奖励滚动容器
+local CommonSpiritualRealmRankView = _G.BaseClass("CommonRankArenaPeakPanel", require("CommonRankBasePanel"))
+
+---初始化参数
+function CommonSpiritualRealmRankView:OnInitParams()
+    self.initRankParam = {
+        type = 1,
+        title = 90029400117,
+        tip = nil,
+        func = self.InitRank,
+        itemName = "obj_rank",
+        selfName = "obj_rankSelf",
+        rolse = {},
+        hideSelf = false
+    }
+
+    self.awardRedPoint = {AWARD_RED_POINT_ID}
+    self.joinType = require("SpiritualRealmModel"):GetInstance():GetJoinType()
+    self.itemPath = "UI/CommonRank/$_obj_CommonRankSpiritualRealm"
+    self.rankTgLis = {self.initRankParam}
+    self.awardTgLis = {
+        {
+            label = 90010050171,
+            title = 90029400119,
+            tip = 90029400114,
+            func = self.InitRankAward,
+            itemName = "obj_rankAward",
+            selfName = "obj_rankAwardSelf",
+            hideSelf = false
+        },
+        {
+            label = 90023300009,
+            title = 90029400118,
+            tip = 90029400120,
+            func = self.InitScoreAward,
+            itemName = "obj_scoreAward",
+            selfName = "obj_scoreAwardSelf",
+            hideSelf = false,
+            redPoint = {AWARD_RED_POINT_ID, -1}
+        }
+    }
+    --self.stageId = ArenaPeakModel:GetInstance().danID
+end
+
+---通过类型查找物品
+---@param list number[][]
+---@return number[][]
+function CommonSpiritualRealmRankView:FindManyItemByType(list)
+    if not list or #list == 0 then
+        return nil
+    end
+    --TODO: 循环查找效率太慢, 考虑字典缓存!!!
+    local results = {}
+    for _, v in pairs(list) do
+        local type, sid = table.unpack(v)
+        sid = tostring(sid)
+        for _, item in pairs(_G.ConfigManager.item_cfg) do
+            if item.UseType == type and item.UseParameter[1][1] == sid then
+                _G.table.insert(results, {item.ID, 1})
+                break
+            end
+        end
+    end
+    return results
+end
+---加载奖励列表(排名奖励)
+---@param item _obj_CommonRankSpiritualRealm._obj_rankAward_GoTable
+---@param lstAward number[][]
+function CommonSpiritualRealmRankView:ShowRankAwardList(item, lstAward)
+    ---@type any[] 存储奖励节点列表
+    local lstAwardItems = item.lstAwardItems
+    if lstAwardItems then
+        --回收旧的节点
+        for i = 1, #lstAwardItems do
+            _G.ItemFactory:GetInstance():SetItemCard(lstAwardItems[i])
+        end
+    end
+    if not lstAward or #lstAward == 0 then
+        item.lstAwardItems = nil
+        return
+    end
+
+    lstAwardItems = {}
+    item.lstAwardItems = lstAwardItems
+    --显示奖励
+    for i = 1, #lstAward do
+        _G.ItemFactory:GetInstance():GetItemCard(
+            _G.ItemFactory.itemType.ItemBaseWithCount,
+            item.trans_awardRoot,
+            function(awardItem)
+                if _G.IsNil(self) or item.lstAwardItems ~= lstAwardItems then
+                    _G.ItemFactory:GetInstance():SetItemCard(awardItem)
+                    return
+                end
+                table.insert(lstAwardItems, awardItem)
+                awardItem.gameObject:SetLocalScale(0.65, 0.65, 0.65)
+                awardItem:Show(lstAward[i][1], nil, lstAward[i][2])
+            end
+        )
+    end
+end
+
+--region 排行榜视图
+
+---初始化排行榜
+---@param tb _obj_main._obj_scrollPrefab_GoTable
+function CommonSpiritualRealmRankView:InitRank(tb)
+    --默认初始化n个空位
+    tb.scrollloopvectical_listBase:InitItemData(DEFAULT_INIT_COUNT, _G.handler(self, self.RefreshRankItem))
+    self.initRankParam.roles = {}
+    for _ = 1, TOP_PLAYER_COUNT do
+        table.insert(self.initRankParam.roles, utils.createTopEmptyData())
+    end
+    self:OnInitRankEnd()
+
+    --玩家当前信息
+    ---@type _obj_CommonRankSpiritualRealm._obj_rank_GoTable self
+    local selfItem = _G.GetAutoGoTable(tb.obj_player:GetChildE(tb.obj_player:GetChildCountE() - 1))
+    ---@type RankData
+    local selfData = {score = 0, role_info = _G.PlayerModel:GetInstance():GetIRroleTable() or {}}
+    self:ShowRankItem(selfItem, -1, selfData)
+
+    ---将自己的数据插入排行榜中
+    ---@param list RankData[]
+    ---@param selfData RankData
+    local function insertSelfToList(list, selfData)
+        if not list or not selfData then
+            return
+        end
+        local count = #list
+        if count < 3 then
+            count = 3
+        end
+
+        local selfUid = selfData.role_info.uid
+        local selfScore = selfData.score
+        --从排行榜中移除自己的数据
+        for i = 1, count do
+            if list[i] and selfUid == list[i].role_info.uid then
+                table.remove(list, i)
+                break
+            end
+        end
+        --将当前数据插入排行榜
+        local rank = -1
+        for i = 1, count do
+            if not list[i] or not list[i].role_info or selfScore > list[i].score then
+                rank = i
+                table.insert(list, i, selfData)
+                break
+            end
+        end
+        --之后的玩家重新进行排名
+        if rank > 0 then
+            for i = rank, #list do
+                list[i].rank = i
+            end
+        end
+    end
+
+    ---展示排行榜列表和前三玩家形象
+    local function showRankList()
+        local count = #self.rankList
+        if count < DEFAULT_INIT_COUNT then
+            count = DEFAULT_INIT_COUNT
+        end
+        tb.scrollloopvectical_listBase:UpdateCount(count)
+
+        ---@type RankTop3Role[]
+        local roles = {}
+        --拉取前三玩家角色形象
+        ---@type number[]
+        local pbData = {roles = {}}
+        for i = 1, TOP_PLAYER_COUNT do
+            local d = self.rankList[i]
+            if d then
+                table.insert(pbData.roles, d.role_info.uid)
+                table.insert(
+                    roles,
+                    {
+                        sid = 0,
+                        uid = d.role_info.uid,
+                        name = d.role_info.name,
+                        score = _G.GetLangPackValue(90030700030, d.score)
+                    }
+                )
+            else
+                table.insert(roles, utils.createTopEmptyData())
+            end
+        end
+        self.initRankParam.roles = roles
+        self:GetRoleStyle(pbData, roles)
+    end
+
+    --拉取数据
+    ---玩家形象回调
+    local function onStyleResponse(data)
+        ---@type table<number,number>
+        local skins = {}
+        if data and data.roles then
+            for _, v in pairs(data.roles) do
+                skins[v.uid] = v.skin
+            end
+        end
+
+        ---@type RankTop3Role[]
+        local roles = {}
+        for i = 1, TOP_PLAYER_COUNT do
+            local d = self.rankList and self.rankList[i]
+            if d then
+                table.insert(
+                    roles,
+                    {
+                        sid = skins[d.role_info.uid] or 0,
+                        uid = d.role_info.uid,
+                        name = d.role_info.name,
+                        score = _G.GetLangPackValue(90030700030, d.score)
+                    }
+                )
+            else
+                table.insert(roles, utils.createTopEmptyData())
+            end
+        end
+        self.initRankParam.roles = roles
+        self:OnInitRankEnd()
+    end
+    ---排行榜数据回调
+    ---@param data any
+    local function onRankListResponse(data)
+        self.rankList = (data and data.ranks) or {}
+        insertSelfToList(self.rankList, selfData)
+        showRankList()
+    end
+    ---自身排行回调
+    ---@param data any
+    local function onSelfResponse(data)
+        if not data or data.ack ~= 1 then
+            if data then
+                _G.PopWindowManager:GetInstance():ShowAllTips(data.ack)
+            end
+            return
+        end
+        local index, score = data.index, data.value
+        selfData.score = score
+        if self.rankList then
+            insertSelfToList(self.rankList, selfData)
+            showRankList()
+            index = selfData.rank or index
+        end
+
+        self:ShowRankItem(selfItem, index, selfData)
+
+        --自身奖励数据
+        self.selfData = {score = score, index = index}
+        self:ShowSelfRankAwardItem(self.selfRankAwardItem, index)
+        self:ShowSelfScoreAwardItem(self.selfScoreAwardItem, score)
+        self:JumpScoreAwardIndex(score)
+    end
+
+    local net = require("SpiritualRealmNet"):GetInstance()
+    if self.joinType == 1 then
+        net:GetFirstRankList(1, onRankListResponse)
+        net:SelfRank(83, onSelfResponse)
+    elseif self.joinType == 2 then
+        net:GetTwoRankList(1, onRankListResponse)
+        net:SelfRank(84, onSelfResponse)
+    elseif self.joinType == 3 then
+        net:GetThirdRankList(1, onRankListResponse)
+        net:SelfRank(85, onSelfResponse)
+    end
+end
+---刷新排行榜数据
+---@param index number      数据序号(C#从0开始)
+---@param obj UnityEngine.GameObject
+function CommonSpiritualRealmRankView:RefreshRankItem(index, obj)
+    if not self.rankItems then
+        self.rankItems = {}
+    end
+    --初始化item节点
+    local item = self.rankItems[obj:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(obj:GetChildE(obj:GetChildCountE() - 1))
+        self.rankItems[obj:GetInstanceIDE()] = item
+    end
+
+    index = index + 1
+    --设置节点属性
+    self:ShowRankItem(item, index, self.rankList and self.rankList[index])
+end
+---展示节点数据
+---@param item _obj_CommonRankSpiritualRealm._obj_rank_GoTable|_obj_CommonRankSpiritualRealm._obj_rankSelf_GoTable
+---@param index number
+---@param data RankData
+function CommonSpiritualRealmRankView:ShowRankItem(item, index, data)
+    --排名
+    if index > 3 then
+        item.aortext_rank.text = tostring(index)
+    elseif index >= 1 then
+        item.aorimage_rank.SpriteName = RANK_ICON_IMAGES[index]
+    end
+    item.aorimage_rank:SetActiveE(index >= 1 and index <= 3 and 1 or 0)
+    item.obj_rankBg2:SetActiveE(index <= 3 and 0 or 1)
+    if item.obj_noRank then
+        item.obj_noRank:SetActiveE(index >= 1 and 0 or 1)
+    end
+    --人物数据
+    if data then
+        item.aortext_name.text = data.role_info.name or "???"
+        item.aortext_score.text = _G.GetLangPackValue(90000010438, tostring(data.score))
+        _G.UIUtils.SetPlayerHeadItemNew(
+            item.obj_head,
+            data.role_info,
+            1,
+            true,
+            nil,
+            nil,
+            function()
+                if not self.gameObject or self.gameObject:IsNull() then
+                    return
+                end
+                if data.role_info.type == 1 then
+                    _G.SystemSettingManager:GetInstance():OpenRobotPlayInfo(data.role_info.uid, nil, _G.RobotType.Arena)
+                    return
+                end
+                if data.role_info.uid ~= _G.PlayerModel:GetInstance():GetPlayerUid() then
+                    _G.SystemSettingManager:GetInstance():OpenView(data.role_info.uid)
+                    return
+                end
+                _G.PopWindowManager:GetInstance():ShowAllTips(620109)
+            end
+        )
+        --段位徽章
+        local badgeIcon = utils.getBadgeIcon(data.score)
+        if badgeIcon then
+            item.aorrawimage_badge:LoadImage(badgeIcon)
+        end
+        item.aorrawimage_badge:SetActiveE(badgeIcon and 1 or 0)
+    end
+    item.obj_content:SetActiveE(data and 1 or 0)
+    if item.obj_noBody then
+        item.obj_noBody:SetActiveE(data and 0 or 1)
+    end
+end
+--endregion
+
+--region 排行榜奖励视图
+
+---初始化排行奖励
+---@param tb _obj_main._obj_scrollPrefab_GoTable
+function CommonSpiritualRealmRankView:InitRankAward(tb)
+    --初始化数据
+    self.rankAwardList = {}
+    local cfg = _G.ConfigManager.arena_layer_up_cfg[self.joinType]
+    if cfg and cfg.rank_season then
+        for _, id in pairs(cfg.rank_season) do
+            local d = _G.ConfigManager.arena_rank_cfg[id]
+            if d then
+                table.insert(self.rankAwardList, d)
+            end
+        end
+    end
+    --进行排序(从高到底)
+    _G.SortList(
+        self.rankAwardList,
+        function(v)
+            return -v.min_rank
+        end
+    )
+    --初始化列表显示
+    tb.scrollloopvectical_listBase:InitItemData(#self.rankAwardList, _G.handler(self, self.RefreshRankAwardItem))
+
+    --初始化自身Item状态
+    self.selfRankAwardItem = _G.GetAutoGoTable(tb.obj_player:GetChildE(tb.obj_player:GetChildCountE() - 1))
+    if self.selfData then
+        self:ShowSelfRankAwardItem(self.selfRankAwardItem, self.selfData.index)
+    end
+end
+---刷新排行榜数据
+---@param index number      数据序号(C#从0开始)
+---@param obj UnityEngine.GameObject
+function CommonSpiritualRealmRankView:RefreshRankAwardItem(index, obj)
+    if not self.rankAwardItems then
+        self.rankAwardItems = {}
+    end
+    --初始化item节点
+    local item = self.rankAwardItems[obj:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(obj:GetChildE(obj:GetChildCountE() - 1))
+        self.rankAwardItems[obj:GetInstanceIDE()] = item
+    end
+
+    index = index + 1
+    --设置节点属性
+    self:ShowRankAwardItem(item, self.rankAwardList and self.rankAwardList[index])
+end
+---展示节点数据
+---@param item _obj_CommonRankSpiritualRealm._obj_rankAward_GoTable
+---@param data arena_rank_cfg
+function CommonSpiritualRealmRankView:ShowRankAwardItem(item, data)
+    if not item or not data then
+        return
+    end
+    --排名信息
+    if data.max_rank >= 9999 then
+        item.aortext_rank.text = _G.GetLangPackValue(90029400146, data.min_rank)
+    elseif data.min_rank == data.max_rank then
+        item.aortext_rank.text = _G.GetLangPackValue(90029400144, data.min_rank)
+    else
+        item.aortext_rank.text = _G.GetLangPackValue(90029400145, data.min_rank, data.max_rank)
+    end
+
+    --显示奖励
+    local lstAward = {}
+    utils.insertMany(lstAward, data.reward_daily)
+    utils.insertMany(lstAward, self:FindManyItemByType(data.reward_appearance))
+    self:ShowRankAwardList(item, lstAward)
+end
+---展示自己的节点数据
+---@param item _obj_CommonRankSpiritualRealm._obj_rankAward_GoTable
+---@param data arena_rank_cfg
+function CommonSpiritualRealmRankView:ShowSelfRankAwardItem(item, index)
+    if not item then
+        return
+    end
+
+    --查找自己的排名信息
+    ---@type arena_rank_cfg
+    local data
+    for _, v in pairs(self.rankAwardList) do
+        if index >= v.min_rank and index <= v.max_rank then
+            data = v
+            break
+        end
+    end
+    if not data then
+        return
+    end
+
+    self:ShowRankAwardItem(item, data)
+    --我的信息
+    item.aortext_rank.text = tostring(index)
+end
+--endregion
+
+--region 段位(分数)奖励视图
+
+---初始化段位(分数)奖励
+---@param tb _obj_main._obj_scrollPrefab_GoTable
+function CommonSpiritualRealmRankView:InitScoreAward(tb)
+    --初始化数据
+    self.scoreAwardList = {}
+    for _, v in pairs(_G.ConfigManager.arena_layer_league_cfg) do
+        _G.table.insert(self.scoreAwardList, v)
+    end
+    --进行排序(从高到底)
+    _G.SortList(
+        self.scoreAwardList,
+        function(v)
+            return v.min_score
+        end
+    )
+    --初始化列表显示
+    tb.scrollloopvectical_listBase:InitItemData(#self.scoreAwardList, _G.handler(self, self.RefreshScoreAwardItem))
+    self.scoreAwardScrollloopvectical = tb.scrollloopvectical_listBase
+
+    --初始化自身Item状态
+    self.selfScoreAwardItem = _G.GetAutoGoTable(tb.obj_player:GetChildE(tb.obj_player:GetChildCountE() - 1))
+    if self.selfData then
+        self:ShowSelfScoreAwardItem(self.selfScoreAwardItem, self.selfData.score)
+        self:JumpScoreAwardIndex(self.selfData.score)
+    end
+end
+---刷新排行榜数据
+---@param index number      数据序号(C#从0开始)
+---@param obj UnityEngine.GameObject
+function CommonSpiritualRealmRankView:RefreshScoreAwardItem(index, obj)
+    if not self.scoreAwardItems then
+        self.scoreAwardItems = {}
+    end
+    --初始化item节点
+    local item = self.scoreAwardItems[obj:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(obj:GetChildE(obj:GetChildCountE() - 1), _G.handler(self, self.GetAllScoreAwards))
+        self.scoreAwardItems[obj:GetInstanceIDE()] = item
+    end
+
+    index = index + 1
+    --设置节点属性
+    self:ShowScoreAwardItem(item, self.scoreAwardList and self.scoreAwardList[index])
+end
+---展示节点数据
+---@param item _obj_CommonRankSpiritualRealm._obj_scoreAward_GoTable | {data : any, award: any, state: number}
+---@param data arena_layer_league_cfg
+function CommonSpiritualRealmRankView:ShowScoreAwardItem(item, data)
+    if not item or not data then
+        return
+    end
+    --标题
+    item.aortext_name.text = _G.GetLangPackValue(data.describe[2])
+    --分数信息
+    if data.min_score == data.max_score then
+        item.aortext_score.text = tostring(data.min_score)
+    else
+        item.aortext_score.text = data.min_score .. "~" .. data.max_score
+    end
+    --徽章
+    local badgeIcon = utils.getBadgeIcon(data.min_score)
+    if badgeIcon then
+        item.aorrawimage_badge:LoadImage(badgeIcon)
+    end
+    item.aorrawimage_badge:SetActiveE(badgeIcon and 1 or 0)
+
+    --显示奖励
+    local isInitAward = item.award
+    local award = data["reward_season" .. self.joinType] or {}
+    --获取奖励状态: 0可领取, 1不可领取(未达成目标), 2已领取
+    local state =
+        item ~= self.selfScoreAwardItem and require("SpiritualRealmModel"):GetInstance():GetStageAwardState(data.id) or
+        -1
+    item.aorbtn_getAward:SetActiveE(state == 0 and 1 or 0)
+
+    --将数据缓存在item上, scrollloophorizontal回调时从item缓存上读取
+    item.data = data
+    item.award = award
+    item.state = state
+    if isInitAward then
+        item.scrollloophorizontal_award:UpdateCount(#award)
+    else
+        ---注册刷新函数
+        local itemViewMapping, gotableMapping = {}, {}
+        item.scrollloophorizontal_award:InitItemData(
+            #award,
+            ---@param obj UnityEngine.GameObject
+            function(index, obj)
+                local instanceId = obj:GetInstanceIDE()
+                ---获取奖励奖励
+                ---@type itemViewNewWithCount
+                local awardItem = itemViewMapping[instanceId]
+                if not awardItem then
+                    awardItem = require("itemViewNewWithCount").New(obj:GetChildE(0))
+                    itemViewMapping[instanceId] = awardItem
+                end
+                local o, state = item.award[index + 1], item.state
+                awardItem:Show(o[1], nil, o[2])
+                ---奖励状态
+                ---@type _obj_CommonRankSpiritualRealm._obj_scoreAwardItem_GoTable
+                local gotable = gotableMapping[instanceId]
+                if not gotable then
+                    gotable = _G.GetAutoGoTable(obj) or {}
+                    gotableMapping[instanceId] = gotable
+                end
+                gotable.obj_alreadyGet:SetActiveE(state == 2 and 1 or 0)
+            end
+        )
+    end
+end
+---展示自己的节点数据
+---@param item _obj_CommonRankSpiritualRealm._obj_scoreAward_GoTable
+---@param score number
+function CommonSpiritualRealmRankView:ShowSelfScoreAwardItem(item, score)
+    if not item or not self.scoreAwardList then
+        return
+    end
+
+    --查找自己的分数信息
+    ---@type arena_layer_league_cfg
+    local data
+    for _, v in pairs(self.scoreAwardList) do
+        if score >= v.min_score and score <= v.max_score then
+            data = v
+            break
+        end
+    end
+    if not data then
+        return
+    end
+
+    self:ShowScoreAwardItem(item, data)
+    --我的信息
+    item.aortext_name.text = _G.GetLangPackValue(data.describe[1])
+    item.aortext_score.text = tostring(score)
+end
+---如果有可领取的奖励, 跳转到指定位置
+---@param score number
+function CommonSpiritualRealmRankView:JumpScoreAwardIndex(score)
+    if not self.scoreAwardList or not self.scoreAwardScrollloopvectical then
+        return
+    end
+
+    local len, lastIndex = #self.scoreAwardList, -1
+    for i = 1, len do
+        local index = len - i + 1 --倒序查找
+        local d = self.scoreAwardList[index]
+        if d.min_score <= score then
+            local state = require("SpiritualRealmModel"):GetInstance():GetStageAwardState(d.id) or -1
+            if state == 0 then
+                lastIndex = index
+                break
+            elseif state == 2 then
+                lastIndex = index - 1 --显示已领取奖励的顺序下一个(从高到底排序, 因此减1)
+            end
+        else
+            break
+        end
+    end
+    if lastIndex >= 1 then
+        self.scoreAwardScrollloopvectical:ScrollToIndex(lastIndex - 1) --C#下标从0开始
+    end
+end
+---领取所有奖励
+function CommonSpiritualRealmRankView:GetAllScoreAwards()
+    if not self.scoreAwardList then
+        return
+    end
+    if not self.scoreAwardItems then
+        return
+    end
+    ---@type number[]   可以领取奖励的项
+    local lstAwardIds = {}
+    for _, d in pairs(self.scoreAwardList) do
+        local state = require("SpiritualRealmModel"):GetInstance():GetStageAwardState(d.id)
+        if state == 0 then
+            table.insert(lstAwardIds, d.id)
+        end
+    end
+    if #lstAwardIds == 0 then
+        return
+    end
+
+    require("SpiritualRealmModel"):GetInstance():GetStageAward(
+        lstAwardIds,
+        function(resp)
+            if not resp or resp.ack ~= 1 then
+                return
+            end
+            --刷新界面显示
+            if self.scoreAwardList and self.scoreAwardScrollloopvectical then
+                self.scoreAwardScrollloopvectical:UpdateCount(#self.scoreAwardList)
+            end
+            if self.selfData then
+                self:JumpScoreAwardIndex(self.selfData.score)
+            end
+        end
+    )
+end
+--endregion
+
+--region 类型声明
+
+---@class RankData 排行榜数据
+---@field score number
+---@field role_info.uid number
+---@field role_info.level number
+---@field role_info.power number
+---@field role_info.style number
+---@field role_info.name string
+---@field role_info.frame string
+
+--endregion
+
+return CommonSpiritualRealmRankView

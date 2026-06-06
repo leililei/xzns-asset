@@ -1,0 +1,931 @@
+require "AppSetting"
+require "init"
+
+local WXPlayerPrefs = _G.CS.WechatGameCore.PlayerPrefs
+
+---@class GameMain:GameMain 游戏的主入口，一般由C#端调用
+---@field reportLoadingCompleted boolean    是否已上报资源加载完成
+---@field reportGamePlay boolean    是否已上报进入游戏页面
+local GameMain = {}
+_G.GameMain = GameMain
+
+-- 主入口函数。从这里开始lua逻辑
+function GameMain:Start()
+    if AppSetting.IsH5 then
+        _G.SDKManager:GetInstance():PushResumeAndPauseListener(require("SDKDef").GetMsg.onAppResume, _G.handler(self, self.onAppResume), {})
+        _G.SDKManager:GetInstance():PushResumeAndPauseListener(require("SDKDef").GetMsg.onAppPause, _G.handler(self, self.onAppPause), {})
+    end
+    local version = _G.ConfigManager.discrete_cfg[200002] and _G.ConfigManager.discrete_cfg[200002][1][1] or 1
+    _G.AppSetting.IsXzns = version == _G.ConfigVersion.xzns
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.StartLoginMain)
+    if not _G.AppSetting.DEBUG and not _G.CS.WechatGameCore.WechatGameApp.Instance.isDebugMod then
+        _G.CS.UnityEngine.Debug.unityLogger.filterLogType = _G.CS.UnityEngine.LogType.Exception
+    end
+    --这里由于线上出了debug包，说以这里改为用产品配置为主，自己打的debug无用了
+    if _G.CS.WechatGameCore.WechatGameApp.Instance.isDebugMod then
+        _G.Log("<color=red><size=20>" .. "Lua GameMain:" .. "Start" .. "</size></color>")
+        _G.CS.Launcher.Inst:AddComponentE(_G.typeof(_G.CS.Reporter))
+    end
+    if not _G.IsNil(_G.CS.Reporter.Inst) then
+        _G.CS.Reporter.Inst.DebugCallBack = self.AddLog
+    end
+    --设置音乐及音效的临时代码
+    local settingType = _G.SystemSettingManager:GetInstance().SettingType
+    if WXPlayerPrefs.HasKey("Setting" .. settingType.BGMusic_is) then
+        if WXPlayerPrefs.GetFloat("Setting" .. settingType.BGMusic_is) > 0 then
+            _G.AudioManager.SetMusicVolume(WXPlayerPrefs.GetFloat("Setting" .. settingType.BGMusic))
+        else
+            _G.AudioManager.SetMusicVolume(0)
+        end
+    else
+        ---没有点击过 关闭音乐按钮儿
+        if WXPlayerPrefs.HasKey("Setting" .. settingType.BGMusic) then
+            _G.AudioManager.SetMusicVolume(WXPlayerPrefs.GetFloat("Setting" .. settingType.BGMusic))
+        else
+            _G.AudioManager.SetMusicVolume(0.5)
+            WXPlayerPrefs.SetFloat("Setting" .. settingType.BGMusic, 0.5)
+        end
+    end
+    if WXPlayerPrefs.HasKey("Setting" .. settingType.BGAudio_is) then
+        if WXPlayerPrefs.GetFloat("Setting" .. settingType.BGAudio_is) > 0 then
+            _G.AudioManager.SetAudioVolume(WXPlayerPrefs.GetFloat("Setting" .. settingType.BGAudio))
+        else
+            _G.AudioManager.SetAudioVolume(0)
+        end
+    else
+        ---没有点击过 关闭 音效
+        if WXPlayerPrefs.HasKey("Setting" .. settingType.BGAudio) then
+            _G.AudioManager.SetAudioVolume(WXPlayerPrefs.GetFloat("Setting" .. settingType.BGAudio))
+        else
+            _G.AudioManager.SetAudioVolume(0.5)
+            WXPlayerPrefs.SetFloat("Setting" .. settingType.BGAudio, 0.5)
+        end
+    end
+    _G.AudioManager.RefreshCurMusicVolume()
+    if _G.AppSetting.DEBUG then
+        _G.Log(_G.AppSetting.IsEditor, "editor模式启动")
+        _G.Log(_G.AppSetting.IsIos, "ios模式启动")
+        _G.Log(_G.AppSetting.IsAndriod, "android模式启动")
+    end
+
+    if _G.AppSetting.IsEditor then
+        if _G.AppSetting.DEBUG then
+            _G.Log("editor直接开始游戏")
+        end
+        self:GameContinue()
+    else
+        if _G.AppSetting.IsIos then
+            if _G.AppSetting.DEBUG then
+                _G.Log("ios请求设备信息")
+            end
+            --_G.SDKManager:GetInstance():AddListener(require("SDKDef").GetMsg.iphone_info, self.GetDIphoneInfo, self)
+            -- _G.SDKManager:GetInstance():GetIphoneInfo()
+            ---ios没有游客登录，所以去掉该流程，直接开始游戏
+            self:GameContinue()
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log("安卓直接开始游戏")
+            end
+            self:GameContinue()
+        end
+    end
+    _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.LaunchApp)
+end
+
+function GameMain:GetDIphoneInfo(json)
+    local json_data = _G.Json2Table(json)
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(json_data, "<color=red>" .. "iphone_info" .. "</color>")
+    end
+
+    self:GameContinue()
+    _G.SDKManager:GetInstance():RemoveListener(require("SDKDef").GetMsg.iphone_info, self.GetDIphoneInfo, self)
+end
+
+---播放开场视频后再进行登录游戏
+---@return void
+function GameMain:PlayVideoIfFirstEnterGame()
+    local isPlaying = false
+    --播放开场视频
+    ---部分平台不显示开场视频
+    local videoKey = _G.GameUtil.GetFunctionData(_G.FunctionBlock.Video)
+    if _G.AppSetting.IsXzns or not videoKey or not _G.ConfigManager.video_cfg[videoKey] then
+        isPlaying = false
+        _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.StartJumpVideo)
+    elseif _G.ConfigManager.video_cfg[videoKey] then
+        local isFirstOpenGame = _G.PlayerPrefsManager.GetInt("FirstOpenGame")
+        if isFirstOpenGame ~= 1 then
+            _G.PlayerPrefsManager.SetInt("FirstOpenGame", 1)
+            isPlaying = true
+            -- _G.UIUtils.PlayVideo(_G.ConfigManager.video_cfg.zhenhunjie_open_movie, nil, function()
+            --     _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoginView.Name)
+            --     CS.Launcher.Inst:CloseLoading()
+            -- end)
+            _G.SDKManager:GetInstance():MiniGameTrack(require("SDKDef").DotMsg.ShuShu.opening_anim)
+            _G.UIUtils.PlayVideo(_G.ConfigManager.video_cfg[videoKey],
+                    function()
+                        self:EnterServerIfEmptyRoles()
+                    end,
+                    function()
+                        --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoginView.Name)
+                        CS.Launcher.Inst:CloseLoading()
+                    end)
+        end
+    end
+
+    if not isPlaying then
+        --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoginView.Name)
+        _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.StartLogin)
+        self:EnterServerIfEmptyRoles()
+    end
+end
+
+---如果是新账户, 自动登录进入服务器
+function GameMain:EnterServerIfEmptyRoles()
+    self.loginRequestId = nil
+    if self:CheckOpenMiniGame() then
+        return
+    end
+    --非WebGL平台没有自动登录, 直接跳转LoginView页面
+    if _G.CS.UnityEngine.Application.platform ~= _G.CS.UnityEngine.RuntimePlatform.WebGLPlayer or _G.AppSetting.IsArraigned or _G.AppSetting.IsTuoGuan
+            or _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.SpecialCheck1) then
+        if not _G.IsNil(CS.Launcher.Inst.loadingWin) then
+            CS.Launcher.Inst.loadingWin:SetProgress(100)
+            CS.Launcher.Inst.loadingWin:LauncherComplete()
+        end
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoginView.Name)
+        return
+    end
+    --_G.CS.Launcher.Inst:CloseLoading()
+
+    local SDKDef = require("SDKDef")
+
+    _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.auth_failed, self.SDKLoginFailure, self)
+    _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.login_failed, self.SDKLoginFailure, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.GetServerListSuccess, self.EnterServerIfEmptyRoles, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.GetUserInfoCall, self.EnterServerLoginSuccessed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.NewPlayer, self.EnterServerLoginSuccessed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.FangchenmiFlag, self.SendEnterServer, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.LoginFailure, self.EnterServerLoginFailure, self)
+    _G.Events:GetInstance():RemoveListener(_G.eYKNetEvent.ConnectFail, self.EnterServerLoginFailure, self)
+
+    --未登录,先发起登录请求
+    if not _G.LoginManager:GetInstance().isSDKLoginSuccess then
+        if self.sendLoginRequested then
+            --如果已经请求过登录, 不再重复请求
+            _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.LoginView.Name,
+                    _G.AppSetting.IsHuaWei --登录失败后, 华为rpk快游戏禁用自动登录
+            )
+            return
+        end
+        _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.SendLoginFunction)
+        self.sendLoginRequested = true
+
+        --sdk登录后将自动拉取服务器列表
+        _G.Events:GetInstance():AddListener(_G.eLoginEvent.GetServerListSuccess, self.EnterServerIfEmptyRoles, self)
+        --sdk登录失败监听
+        _G.SDKManager:GetInstance():AddListener(SDKDef.GetMsg.auth_failed, self.SDKLoginFailure, self)
+        _G.SDKManager:GetInstance():AddListener(SDKDef.GetMsg.login_failed, self.SDKLoginFailure, self)
+        --登录请求超时处理
+        local requestId = "requestLogin" .. tostring(math.random())
+        self.loginRequestId = requestId
+        _G.DelayDo(3, function()
+            if self.loginRequestId ~= requestId then
+                return
+            end
+            self:SDKLoginFailure()
+        end)
+
+        --发送SDK登录请求
+        _G.SDKManager:GetInstance():SendLoginEx()
+        return
+    end
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.CheckPlayer)
+    --如果登录任何服务器, 则进入登录页面
+    if not _G.CS.Launcher.Inst.IsSDK then
+        _G.ServerManager:GetInstance():InitLocalServerList()
+    end
+    if _G.ServerManager:GetInstance():CheckHasPlayer() then
+        _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.HasPlayer)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoginView.Name)
+        return
+    end
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.NoPlayer)
+    --获取推荐服务器
+    local recommendServer = _G.ServerManager:GetInstance():GetLastServer()
+    if not recommendServer then
+        _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.Norecommend)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoginView.Name)
+        return
+    end
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.Hasrecommend)
+    if _G.AppSetting.DEBUG then
+        --测试选择使用alpha公共服务器,
+        local all = _G.ServerManager:GetInstance():GetAllServerList() or {}
+        for _, v in pairs(all) do
+            if v.ServerName == "alpha公共" then
+                recommendServer = v
+                break
+            end
+        end
+    end
+
+    --登录服务器
+    _G.Events:GetInstance():AddListener(_G.eLoginEvent.GetUserInfoCall, self.EnterServerLoginSuccessed, self)
+    _G.Events:GetInstance():AddListener(_G.eLoginEvent.NewPlayer, self.EnterServerLoginSuccessed, self)
+    _G.Events:GetInstance():AddListener(_G.eLoginEvent.LoginFailure, self.EnterServerLoginFailure, self)
+    _G.Events:GetInstance():AddListener(_G.eYKNetEvent.ConnectFail, self.EnterServerLoginFailure, self)
+    if _G.CS.Launcher.Inst.IsSDK then
+        --sdk登录需额外的防沉迷认证
+        _G.Events:GetInstance():AddListener(_G.eLoginEvent.FangchenmiFlag, self.SendEnterServer, self)
+    end
+    local constKey = _G.LoginManager:GetInstance().ConstKey --初始化LoginManager
+    _G.ServerManager:GetInstance():SetCurServer(recommendServer)
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.BeginLoginServer)
+    _G.LoginManager:GetInstance():DoLoginGameServer("")
+end
+
+---登录防沉迷年龄认证
+---@return void
+function GameMain:SendEnterServer(args)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.FangchenmiFlag, self.SendEnterServer, self)
+    _G.PlayerModel:GetInstance().SDK_AgeState = tonumber(args)
+    _G.LoginManager:GetInstance():LoginServer("")
+end
+
+---sdk登录失败, 进入LoginView
+---@return void
+function GameMain:SDKLoginFailure()
+    self.loginRequestId = nil
+    local SDKDef = require("SDKDef")
+    _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.auth_failed, self.SDKLoginFailure, self)
+    _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.login_failed, self.SDKLoginFailure, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.GetServerListSuccess, self.EnterServerIfEmptyRoles, self)
+
+    _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.LoginView.Name,
+            _G.AppSetting.IsHuaWei --登录失败后, 华为rpk快游戏禁用自动登录
+    )
+end
+
+---登录成功
+---@return void
+function GameMain:EnterServerLoginSuccessed()
+    self.loginRequestId = nil
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.GetUserInfoCall, self.EnterServerLoginSuccessed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.NewPlayer, self.EnterServerLoginSuccessed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.FangchenmiFlag, self.SendEnterServer, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.LoginFailure, self.EnterServerLoginFailure, self)
+    _G.Events:GetInstance():RemoveListener(_G.eYKNetEvent.ConnectFail, self.EnterServerLoginFailure, self)
+
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        _G.LoginManager:GetInstance():StartLoginInfo()
+        _G.CS.Launcher.Inst:CloseLoading()
+    else
+        _G.PlayerModel:GetInstance():CreateRole(function()
+            _G.LoginManager:GetInstance():StartLoginInfo()
+            _G.CS.Launcher.Inst:CloseLoading()
+        end)
+    end
+end
+
+---登录失败, 进入LoginView
+---@return void
+function GameMain:EnterServerLoginFailure()
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.GetUserInfoCall, self.EnterServerLoginSuccessed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.NewPlayer, self.EnterServerLoginSuccessed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.FangchenmiFlag, self.SendEnterServer, self)
+    _G.Events:GetInstance():RemoveListener(_G.eLoginEvent.LoginFailure, self.EnterServerLoginFailure, self)
+    _G.Events:GetInstance():RemoveListener(_G.eYKNetEvent.ConnectFail, self.EnterServerLoginFailure, self)
+
+    _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.LoginView.Name,
+            _G.AppSetting.IsHuaWei         --登录失败后, 华为rpk快游戏禁用自动登录
+    )
+end
+
+function GameMain:GameContinue()
+    self:ReportLoadingCompleted()
+    -- self.V2 = _G.Vector2.zero
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.StartGameContinue)
+    self:StartUp()
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.StartPlayVideo)
+    self:PlayVideoIfFirstEnterGame()
+
+    self.shengdianTime = _G.ConfigManager.discrete_cfg[101404][1][1]
+    self.brightness = _G.ConfigManager.discrete_cfg[101404][1][2]
+    local settingType = _G.SystemSettingManager:GetInstance().SettingType
+    if WXPlayerPrefs.HasKey("Setting" .. settingType.ShengDian) then
+        if WXPlayerPrefs.GetFloat("Setting" .. settingType.ShengDian) > 0 then
+            self.ShengDianFlag = true
+        end
+    end
+    _G.CS.Main.GlobalClickHandler = function(x, y, z)
+        --("全局点击>>>>>", "x" .. x .. "y" .. y .. "z" .. z)
+        self:DoDianJiEffect(x, y, z)
+        --self:SetShengDianActive()
+    end
+    -- _G.CS.Main.GlobalStandbyHandler = function()
+    --     self:ShengDianStandby()
+    -- end
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.InitGuideView)
+    ---启动添加引导界面
+    _G.GuideManager:GetInstance():InitGuideView()
+
+    _G.CS.Main.SelectSystemCurrent = function(systemCurrentName)
+        _G.GuideManager:GetInstance():UpdateSystemCurrentName(systemCurrentName)
+        _G.Events:GetInstance():Broadcast(_G.eSelectSystemCurrent.SelectCurrent, systemCurrentName)
+    end
+
+    local vl = _G.FindObject("UIRoot/VideoLayer")
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.InitAndroidBackInput)
+    _G.CS.Main.AndroidBackInput = function(systemCurrentName)
+        local mask = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GameNetTipsView.Name)
+        if mask and mask.gameObject and mask.gameObject:GetActiveSelf() == 1 then
+            _G.Log("网络通信期间无法响应android退出")
+            return
+        end
+        mask = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+        if mask and mask.gameObject and mask.gameObject:GetActiveSelf() == 1 then
+            _G.Log("蒙版开启期间无法响应android退出")
+            return
+        end
+        mask = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ShadowTopView.Name)
+        if mask and mask.gameObject and mask.gameObject:GetActiveSelf() == 1 then
+            _G.Log("蒙版开启期间无法响应android退出")
+            return
+        end
+        if _G.AppSetting.IsShowTeach and _G.GuideManager:GetInstance().IsGuideing then
+            local vlChildNum = vl:GetChildCountE()
+            if vlChildNum > 1 then
+                _G.UIUtils.EscCloseVideo()
+                return
+            end
+            _G.Log("引导期间无法响应android退出")
+            return
+        end
+
+        local vlChildNum = vl:GetChildCountE()
+        if vlChildNum > 1 then
+            _G.UIUtils.EscCloseVideo()
+            return
+        end
+        local win = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.MaskTipsLayer.Name)
+        _G.Log(win, "层级MaskTipsLayer值")
+        if win and win.gameObject and win.View then
+            self:DoCloseBtn(win.View)
+        else
+            win = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.TopLayer.Name)
+            _G.Log(win, "层级TopLayer值")
+            if win and win.gameObject and win.View then
+                self:DoCloseBtn(win.View)
+            else
+                win = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.NormalLayer.Name)
+                _G.Log(win, "层级NormalLayer值")
+                if win and win.gameObject and win.View then
+                    if win.Name == "BattleView" then
+                        local sv = win.gameObject:FindE("SettingView")
+                        if sv:GetctiveInHierarchy() == 0 then
+                            local settingBtn = win.gameObject:FindE("UIRoot/CommRoots/Content/Setting"):GetComponentE(
+                                    _G.typeof(_G.CS.AorButton)
+                            )
+                            if settingBtn:GetctiveInHierarchy() == 1 then
+                                settingBtn.onClick:Invoke()
+                            end
+                        else
+                            local settingBtn = win.gameObject:FindE("SettingView/SectionStopView/@_aorbtn_CloseView"):GetComponentE(
+                                    _G.typeof(_G.CS.AorButton)
+                            )
+                            settingBtn.onClick:Invoke()
+                        end
+                    elseif win.Name == "LoginView" then
+                        --     end
+                        -- )
+                        -- _G.PopWindowManager:GetInstance():ShowAllTips(
+                        --     290310,
+                        --     nil,
+                        --     function()
+                        if _G.CS.Launcher.Inst.IsSDK then
+                            if _G.AppSetting.DEBUG then
+                                _G.Log("LoginView 调用DoSDKQuit退出游戏！")
+                            end
+                            _G.GameUtil.DoSDKQuit()
+                        end
+                    else
+                        self:DoCloseBtn(win.View)
+                    end
+                else
+                    win = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.SceneLayer.Name)
+                    _G.Log(win, "层级SceneLayer值")
+                    if win and win.gameObject and win.View then
+                        if win.Name == "MainView" then
+                            if
+                            _G.WorldManager:GetInstance():CheckSceneType(_G.SceneType.Section) and
+                                    _G.PlayerModel:GetInstance():CheckCreateRole()
+                            then
+                                _G.PopWindowManager:GetInstance():ShowAllTips(
+                                        110104,
+                                        nil,
+                                        function()
+                                            _G.ChapterRoomManager:GetInstance():ExitSectionSelf(
+                                                    function(call)
+                                                        ---@type MainOpenViewFunItem
+                                                        local MainOpenViewFunItem = {}
+                                                        MainOpenViewFunItem.OpenViewFun = function()
+                                                            _G.UIManager:GetInstance():OpenWindow(
+                                                                    _G.ConfigManager.ui_cfg.SelectSectionMapNewView.Name
+                                                            )
+                                                        end
+                                                        _G.MainManager:GetInstance():AddMainFunQueue(
+                                                                MainOpenViewFunItem,
+                                                                _G.MainViewShowOrder.SelectSectionViewOpen
+                                                        )
+                                                        if call ~= nil then
+                                                            call()
+                                                        end
+                                                    end
+                                            )
+                                            if win.View.exitSectionTimer then
+                                                win.View.exitSectionTimer:Stop()
+                                                win.View.exitSectionTimer = nil
+                                            end
+                                            _G.GameUtil.SetActiveByCondition(win.View.go_table.obj_exitSection, false)
+                                        end
+                                )
+                            else
+                                --     end
+                                -- )
+                                -- _G.PopWindowManager:GetInstance():ShowAllTips(
+                                --     290310,
+                                --     nil,
+                                --     function()
+                                if _G.CS.Launcher.Inst.IsSDK then
+                                    if _G.AppSetting.DEBUG then
+                                        _G.Log("MainView 调用DoSDKQuit退出游戏！")
+                                    end
+                                    _G.GameUtil.DoSDKQuit()
+                                end
+                            end
+                        else
+                            if _G.AppSetting.DEBUG then
+                                _G.Log("调用DoCloseBtn！")
+                            end
+                            self:DoCloseBtn(win.View)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    ---焦点和暂停状态变化
+    _G.CS.Main.GameFocusAndPauseState = function(gtype, state)
+        self:UpdateGameFocusAndPauseState(gtype, state)
+    end
+
+    self:UpdataGlobalDefine()
+    if not _G.AppSetting.IsSdk then
+        ---初始化画面设置
+        _G.SystemSettingManager:GetInstance():InitImageOtherSet()
+    end
+    require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_Loading)
+end
+
+---焦点函数
+---@param gtype number 1是焦点存在与否，2是暂停状态与否
+---@param state boolean 状态
+function GameMain:UpdateGameFocusAndPauseState(gtype, state)
+    --镇魂街ZHJ-29702 【主任务】【0301】涉及程序单号ZHJ-29894
+    --【客户端】断线重连若时间较长则直接重新登录
+    --pc用焦点，手机平台使用暂停接口处理
+    if _G.AppSetting.IsEditor or _G.AppSetting.IsWebGl then
+        if gtype == 1 and state == false then
+            self.DoBackGroundTime = _G.CS.UnityEngine.Time.realtimeSinceStartup
+            if _G.AppSetting.DEBUG then
+                _G.Log(self.DoBackGroundTime, "检测到失去焦点")
+            end
+            ---失去焦点暂停引导自动进入下一步的计时器
+            if not _G.AppSetting.IsEditor then
+                _G.GuideManager:GetInstance():StopNextTimer()
+            end
+        end
+        if gtype == 1 and state then
+            local timeNow = _G.CS.UnityEngine.Time.realtimeSinceStartup
+            --按小时计
+            local bgtime = _G.ConfigManager.discrete_cfg[100126][1][1]
+            if _G.AppSetting.DEBUG then
+                _G.Log(bgtime, "配置焦点检测间隔时间")
+                _G.Log(timeNow, "检测到获得焦点")
+            end
+            if nil == self.DoBackGroundTime then
+                self.DoBackGroundTime = timeNow
+            end
+            if _G.CS.YoukiaCore.TimeKit.LoginServerTime ~= 0 and
+                    _G.PlayerModel:GetInstance():CheckCreateRole() and
+                    _G.LoginManager:GetInstance().GotoMainFinish then
+                require "DouyinModel":GetInstance():GetOnShowRes()
+                require "MeituanModel":GetInstance():GetRepeat()
+            end
+            ----如果切到后台已超过配置时间就直接提示并退回到登录
+            if timeNow - self.DoBackGroundTime >= 3600 * bgtime then
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                        200310,
+                        nil,
+                        function()
+                            self.DoBackGroundTime = timeNow
+                            self:ResetGame()
+                        end
+                )
+            end
+            if not _G.AppSetting.IsEditor and timeNow - self.DoBackGroundTime >= 10 then
+                ---微信十秒后会自动断开所有的网络链接,超过十秒回来直接断开链接重连
+                _G.Net.CheckSocketActive()
+            end
+        end
+    else
+        if gtype == 2 and state then
+            self.DoBackGroundTime = _G.CS.UnityEngine.Time.realtimeSinceStartup
+            if _G.AppSetting.DEBUG then
+                _G.Log(self.DoBackGroundTime, "移动平台检测到失去焦点")
+            end
+            ---失去焦点暂停引导自动进入下一步的计时器
+            if not _G.AppSetting.IsEditor then
+                _G.GuideManager:GetInstance():StopNextTimer()
+            end
+        end
+        if gtype == 2 and state == false then
+            local timeNow = _G.CS.UnityEngine.Time.realtimeSinceStartup
+            --按小时计
+            local bgtime = _G.ConfigManager.discrete_cfg[100126][1][1]
+            if _G.AppSetting.DEBUG then
+                _G.Log(bgtime, "配置焦点检测间隔时间")
+                _G.Log(timeNow, "移动平台检测到获得焦点")
+            end
+            if _G.CS.YoukiaCore.TimeKit.LoginServerTime ~= 0 and
+                    _G.PlayerModel:GetInstance():CheckCreateRole() and
+                    _G.LoginManager:GetInstance().GotoMainFinish then
+                require "DouyinModel":GetInstance():GetOnShowRes()
+                require "MeituanModel":GetInstance():GetRepeat()
+            end
+            if nil == self.DoBackGroundTime then
+                self.DoBackGroundTime = timeNow
+            end
+            ----如果切到后台已超过配置时间就直接提示并退回到登录
+            if timeNow - self.DoBackGroundTime >= 3600 * bgtime then
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                        200310,
+                        nil,
+                        function()
+                            self.DoBackGroundTime = timeNow
+                            self:ResetGame()
+                        end
+                )
+            else
+                _G.Net.CheckTcpSocketActive()
+            end
+        end
+    end
+end
+
+function GameMain:DoCloseBtn(view)
+    local btn
+    if view.go_table.aorbtn_CloseView and view.go_table.aorbtn_CloseView:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_CloseView
+    elseif view.go_table.aorbtn_closeView and view.go_table.aorbtn_closeView:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_closeView
+    elseif view.go_table.aorbtn_close and view.go_table.aorbtn_close:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_close
+    elseif view.go_table.aorbtn_colse and view.go_table.aorbtn_colse:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_colse
+    elseif view.go_table.aorbtn_Close and view.go_table.aorbtn_Close:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_Close
+    elseif view.go_table.aorbtn_guanbi and view.go_table.aorbtn_guanbi:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_guanbi
+    elseif view.go_table.aorbtn_back and view.go_table.aorbtn_back:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_back
+    elseif view.go_table.aorbtn_Back and view.go_table.aorbtn_Back:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_Back
+    elseif view.go_table.aorbtn_fanhui and view.go_table.aorbtn_fanhui:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_fanhui
+    elseif view.go_table.aorbtn_SkipDialogue and view.go_table.aorbtn_SkipDialogue:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_SkipDialogue
+    elseif view.go_table.aorbtn_x and view.go_table.aorbtn_x:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_x
+    elseif view.go_table.aorbtn_btnClose and view.go_table.aorbtn_btnClose:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_btnClose
+    elseif view.go_table.aorbtn_BG and view.go_table.aorbtn_BG:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_BG
+    elseif view.go_table.aorbtn_bg and view.go_table.aorbtn_bg:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_bg
+    elseif view.go_table.aorbtn_closeBtn and view.go_table.aorbtn_closeBtn:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_closeBtn
+    elseif view.go_table.aorbtn_close_mask and view.go_table.aorbtn_close_mask:GetctiveInHierarchy() == 1 then
+        btn = view.go_table.aorbtn_close_mask
+    end
+    if btn then
+        _G.Log(btn.name, "当前响应按钮是>>>>>>>>>")
+        btn.onClick:Invoke()
+    else
+        view:EscClose()
+    end
+end
+
+function GameMain:CreateDianJiEffect()
+    if not _G.IsNil(self.DianJiEffect) then
+        return
+    end
+    self.effectParent = _G.UIManager:GetInstance():GetUILayerTrans("TopLayer")
+    _G.PoolsManager:GetInstance():Spawn(
+            _G.ConfigManager.ui_effect_cfg.Click_effect.Path,
+            _G.ePoolType.UIEffect,
+            self.effectParent,
+            function(tran)
+                self.DianJiEffect = tran
+            end
+    )
+end
+
+function GameMain:DoDianJiEffect(x, y, z)
+    if not _G.IsNil(self.DianJiEffect) then
+        -- self.V2:Set(x, y)
+        local outPosx, outPosy = _G.CS.UnityObjectExtends.ScreenPointToLocalPointInRectangle(
+                self.effectParent,
+                x,
+                y,
+                _G.UIManager:GetInstance().UICamera
+        )
+        self.DianJiEffect:SetActiveE(0)
+        self.DianJiEffect:SetActiveE(1)
+        self.DianJiEffect:SetLocalPosition(outPosx, outPosy, 0)
+    end
+end
+
+function GameMain:HideDianJiEff()
+    if _G.IsNil(self.DianJiEffect) then
+        return
+    end
+    self.DianJiEffect:GetChildE(0):SetActiveE(0)
+end
+
+function GameMain:ShowDianJiEff()
+    if _G.IsNil(self.DianJiEffect) then
+        return
+    end
+    self.DianJiEffect:GetChildE(0):SetActiveE(1)
+end
+
+function GameMain:SetShengDianFlag(flag)
+    self.ShengDianFlag = flag
+end
+
+--触屏打断倒计时
+function GameMain:SetShengDianActive()
+    if self.ShengDianTimer then
+        self.ShengDianTimer:Stop()
+        self.ShengDianTimer = nil
+    end
+    if self.isDark then
+        self.isDark = false
+        _G.SDKManager:GetInstance():SetWindowBrightness(tostring(1.0))
+    end
+end
+
+--待机开始计时
+function GameMain:ShengDianStandby()
+    if _G.CS.Launcher.Inst.IsSDK and self.ShengDianFlag then
+        self.ShengDianTimer = _G.TimerManager:GetInstance():GetTimer(self.shengdianTime, self.ShengDianTimerFunc, self, true)
+        self.ShengDianTimer:Start()
+    end
+end
+
+function GameMain:ShengDianTimerFunc()
+    _G.SDKManager:GetInstance():SetWindowBrightness(tostring(self.brightness))
+    self.isDark = true
+    if self.ShengDianTimer then
+        self.ShengDianTimer:Stop()
+        self.ShengDianTimer = nil
+    end
+end
+
+function GameMain:AddLog()
+    _G.CS.YoukiaCore.Log.Level = _G.CS.YoukiaCore.Log.LogLevel.Debug
+    _G.CS.Launcher.Inst.AppSetting_DEBUG = true
+    _G.AppSetting.DEBUG = true
+    _G.AppSetting.LogLevel = _G.eLogLevel.All
+    _G.CS.BattleSystem.BattleDef.DebugLog = true
+    _G.CS.UnityEngine.Debug.unityLogger.filterLogType = _G.CS.UnityEngine.LogType.Log
+end
+
+function GameMain:SetLogFalse()
+    _G.CS.YoukiaCore.Log.Level = _G.CS.YoukiaCore.Log.LogLevel.Off
+    _G.CS.Launcher.Inst.AppSetting_DEBUG = false
+    _G.AppSetting.DEBUG = false
+    _G.AppSetting.LogLevel = _G.eLogLevel.Off
+    _G.CS.BattleSystem.BattleDef.DebugLog = false
+    _G.CS.UnityEngine.Debug.unityLogger.filterLogType = _G.CS.UnityEngine.LogType.Exception
+end
+
+function GameMain:StartUp()
+    _G.GameNetTipsManager:GetInstance():Startup()
+end
+
+------重置游戏，返回登录
+---@param 变量名 变量类型 中文描述
+---@return 变量类型 中文描述
+------重置游戏，返回登录
+
+function GameMain:ResetGame()
+    -- _G.CSLauncher:ShowUI(true)
+
+    _G.LoginManager:GetInstance().GotoMainFinish = false
+    _G.ServerManager:GetInstance().canClick = true
+    _G.ServerManager:GetInstance().isInitSuccess = false
+
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+
+    _G.Events:GetInstance():Broadcast(_G.GlobalEvents.GlobalResetGame)
+
+    _G.Net.CloseAllConnects()
+
+    -- _G.CSXLuaManager:StopLuaEnv()
+
+    --清理静态委托
+    -- self:ClearCallCS()
+
+    --单独优先处理
+    -- _G.TimerManager:GetInstance():Dispose()
+    -- _G.Events:GetInstance():Dispose()
+
+    -- require("SDKManager"):GetInstance():Dispose()
+    _G.UIManager:GetInstance():CloseAllWindows()
+    _G.WorldManager:GetInstance():ExitCurrentWorld()
+    _G.WorldManager:GetInstance():ClearCache()
+    --- 关闭视频CG
+    _G.UIUtils.CloseVideo()
+    _G.BattleManager:GetInstance():DestroyBattle()
+    ---部分委托要在清除主世界之后才能置空(比如AI行为树的，否则某些世界对象的委托绑定无法正常清理)
+    -- self:ClearCallCSAfterExitWorld()
+
+    _G.SDKManager:GetInstance():Reset()
+
+    --统一处理
+    _G.Singleton.ALLDispose()
+    _G.Component.ALLDispose()
+    _G.LogicClass.ALLDispose()
+    _G.GameInit.ALLDispose()
+
+    --重载
+    --_G.Time.timeScale = 1
+    _G.CSMain.Inst:ReleaseGame()
+    ---逻辑管理模块清理重置
+    _G.require = _G.realRequire
+    package.loaded["GameInit"] = nil
+    _G.GameInit = nil
+    _G.require("GameInit")
+    --懒加载
+    _G.require = require "lazyRequire"
+    ---
+    ---重新设置音乐
+    --设置音乐及音效的临时代码
+    local settingType = _G.SystemSettingManager:GetInstance().SettingType
+    if WXPlayerPrefs.HasKey("Setting" .. settingType.BGMusic_is) then
+        if WXPlayerPrefs.GetFloat("Setting" .. settingType.BGMusic_is) > 0 then
+            _G.AudioManager.SetMusicVolume(WXPlayerPrefs.GetFloat("Setting" .. settingType.BGMusic))
+        else
+            _G.AudioManager.SetMusicVolume(0)
+        end
+    else
+        ---没有点击过 关闭音乐按钮儿
+        if WXPlayerPrefs.HasKey("Setting" .. settingType.BGMusic) then
+            _G.AudioManager.SetMusicVolume(WXPlayerPrefs.GetFloat("Setting" .. settingType.BGMusic))
+        else
+            _G.AudioManager.SetMusicVolume(0.5)
+            WXPlayerPrefs.SetFloat("Setting" .. settingType.BGMusic, 0.5)
+        end
+    end
+    if WXPlayerPrefs.HasKey("Setting" .. settingType.BGAudio_is) then
+        if WXPlayerPrefs.GetFloat("Setting" .. settingType.BGAudio_is) > 0 then
+            _G.AudioManager.SetAudioVolume(WXPlayerPrefs.GetFloat("Setting" .. settingType.BGAudio))
+        else
+            _G.AudioManager.SetAudioVolume(0)
+        end
+    else
+        ---没有点击过 关闭 音效
+        if WXPlayerPrefs.HasKey("Setting" .. settingType.BGAudio) then
+            _G.AudioManager.SetAudioVolume(WXPlayerPrefs.GetFloat("Setting" .. settingType.BGAudio))
+        else
+            _G.AudioManager.SetAudioVolume(0.5)
+            WXPlayerPrefs.SetFloat("Setting" .. settingType.BGAudio, 0.5)
+        end
+    end
+
+    --_G.CS.VideoManager.Instance:CreatePrefab()
+
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+    if self:CheckOpenMiniGame() then
+        return
+    end
+    self:NormalOpenLoginView()
+end
+
+---常规登陆（非特殊提审模式）
+function GameMain:NormalOpenLoginView()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoginView.Name)
+    _G.Net.CloseAllTimer()
+    --异步回收   延迟两帧 再创建点击效果
+    local timer = _G.TimerManager:GetInstance():GetTimer(2, self.StartUp, self, true, true)
+    timer:Start()
+end
+
+-- 全局配置  依据配置表  修改
+function GameMain:UpdataGlobalDefine()
+    self:UpdataGlobalDefine_AttrType()
+end
+
+-- 全局配置  依据配置表  修改  AttrType
+function GameMain:UpdataGlobalDefine_AttrType()
+    local type_attribute_cfg = _G.ConfigManager.type_attribute_cfg
+    for _, value_AttrType in pairs(_G.AttrType) do
+        ---@type AttrTypeInfo
+        local attrinfo = value_AttrType
+        local attrCfg = type_attribute_cfg[attrinfo.ID]
+        if attrCfg ~= nil then
+            attrinfo.des = _G.LangUtil.GetLangPackValue(attrCfg.name)
+            attrinfo.icon = attrCfg.icon
+            attrinfo.percentage = (attrCfg.value_type or 1) - 1
+            attrinfo.sortid = attrCfg.display_priority
+        end
+    end
+end
+
+function GameMain:CheckOpenMiniGame()
+    if _G.AppSetting.IsArraigned then
+        if _G.AppSetting.ArraignedType == _G.ArraignedStartType.RedPaper then
+            --2接红包
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RedPaperView.Name)
+        elseif _G.AppSetting.ArraignedType == _G.ArraignedStartType.TakeOut then
+            --3送外卖
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.TakeOutGameView.Name)
+        elseif _G.AppSetting.ArraignedType == _G.ArraignedStartType.TakeOutToMain then
+            --4送外卖转正常启动
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.TakeOutGameView.Name, nil, _G.handler(self, self.NormalOpenLoginView))
+        elseif _G.AppSetting.ArraignedType == _G.ArraignedStartType.Music then
+            --5音游
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.eventcureview.Name)
+        elseif _G.AppSetting.ArraignedType == _G.ArraignedStartType.SwordCasual then
+            --6剑之修行
+            require("SwordCasualModel"):GetInstance():ArraignedChallenge()
+        else
+            return false
+        end
+        _G.CS.Launcher.Inst:CloseLoading()
+        return true
+    end
+    return false
+end
+
+function GameMain:Stop()
+    _G.require = _G.realRequire
+end
+
+---上报资源加载完成
+---@return void
+function GameMain:ReportLoadingCompleted()
+    if self.reportLoadingCompleted then
+        return
+    end
+    self.reportLoadingCompleted = true
+    _G.SDKManager:GetInstance():ReportLoadingCompleted()
+end
+
+---上报资源加载完成
+---@return void
+function GameMain:ReportGamePlay()
+    if self.reportGamePlay then
+        return
+    end
+    self.reportGamePlay = true
+    _G.SDKManager:GetInstance():ReportGamePlay()
+end
+
+local frontMusicVolume = 0
+local frontAudioVolume = 0
+
+function GameMain:onAppPause()
+    frontMusicVolume = AudioManager.GetMusicVolume()
+    frontAudioVolume = AudioManager.GetAudioVolume()
+    AudioManager.SetMusicVolume(0)
+    AudioManager.SetAudioVolume(0)
+end
+
+---进入app前台
+function GameMain:onAppResume()
+    AudioManager.SetMusicVolume(frontMusicVolume)
+    AudioManager.SetAudioVolume(frontAudioVolume)
+end
+
+function IsViewLuaFile()
+    return true, true
+end

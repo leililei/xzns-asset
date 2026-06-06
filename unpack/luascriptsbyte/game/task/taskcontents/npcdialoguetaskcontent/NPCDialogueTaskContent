@@ -1,0 +1,158 @@
+-- 包路径:        UI.Task.TaskContents.NPCDialogueTaskContent
+-- File Name:    NPCDialogueTaskContent.lua
+-- Description:  NPC对话任务内容
+-- Author:       TangHuan
+-- Create Date:  2020/01/07
+
+require "BaseTaskContent"
+
+---@class NPCDialogueTaskContent : BaseTaskContent @NPC对话任务内容
+---@field NpcUid number @NPC ID
+---@field DialogueID nunber @对话ID
+local NPCDialogueTaskContent = _G.BaseClass("NPCDialogueTaskContent", _G.BaseTaskContent)
+NPCDialogueTaskContent.NpcUid = nil
+NPCDialogueTaskContent.DialogueID = nil
+
+---NPCDialogueTaskContent构造函数
+---@param ownertask BaseTask @任务内容所属子任务
+---@param taskcontentid number @任务内容id
+---@param index number @所属任务的任务内容索引号
+function NPCDialogueTaskContent:__init(ownertask, taskcontentid, index)
+    --初始化当前任务类型相关的数据
+end
+
+---解析任务内容参数
+---@param taskcontentparams string @条件详细参数
+function NPCDialogueTaskContent:ParseParam(taskcontentparams)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "NPCDialogueTaskContent:ParseParam()")
+    self.NpcUid = tonumber(taskcontentparams[2]) or 0
+    self.DialogueID = tonumber(taskcontentparams[3]) or 0
+
+    self.TaskContentTotalProgress = 1
+end
+
+---更新任务内容状态
+---@return bool @是否改变状态成功
+function NPCDialogueTaskContent:UpdateTaskState()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "NPCDialogueTaskContent:UpdateTaskState()")
+    --对话任务没有进度以服务器端发送的父任务状态为准
+    if self.OwnerTask:IsDone() == false then
+        self:ChangeState(_G.TaskEnum.ETaskState.Executing)
+    else
+        self:ChangeState(_G.TaskEnum.ETaskState.Completed)
+    end
+    _G.LogUtilities.Log(
+        _G.EModuleName.TaskModule,
+        string.format("NPC对话任务数据: NPC ID:%d 对话ID:%d 当前任务状态:%d", self.NpcUid, self.DialogueID, self.TaskContentState)
+    )
+
+    if self:IsAvalibleExecute() then
+        _G.coroutine.start(_G.handler(self, self.CheckTaskTarget))
+    end
+end
+
+---打断任务内容执行
+function NPCDialogueTaskContent:DoInterruptTaskContent()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "打断NPC对话任务内容!")
+end
+
+---真正开始做任务内容
+function NPCDialogueTaskContent:RealDoTaskContent()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "开始执行NPC对话任务内容!")
+    local worldmanager = _G.WorldManager:GetInstance()
+    ---@type WorldNPCItem
+    local npcitem = worldmanager:GetCurWorld():GetItemInfo(self.NpcUid)
+    if npcitem == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 当前世界 没有该NPCid " .. self.NpcUid)
+        end
+        return
+    end
+
+    ---@type NavParam
+    local navparam = {}
+    navparam.Object = worldmanager:GetCurWorldPlayer()
+    -- 为了保证玩家和目标对象不重叠，这里默认选择当前对象和目标对象方向上往后移动一点距离来避免
+    -- 潜在问题：偏移的位置可能存在以外不可达的情况
+    local targetdir =
+        _G.Vector3.New(npcitem.Transform:GetPosition()) -
+        _G.Vector3.New(worldmanager:GetCurWorldPlayer().Transform:GetPosition())
+    targetdir.y = 0
+    local targetdirnormalize = targetdir.normalized
+    navparam.Position = _G.Vector3.New(npcitem.Transform:GetPosition()) - targetdirnormalize
+    local navitem, navstate = _G.NavManager:GetInstance():DoNavMove(navparam)
+    if navstate == _G.NavState.Success then
+        navitem:AddListener(
+            _G.NavItemEvent,
+            _G.NavItemEvent.EnumValue.NavComplete,
+            self.OnMoveToNPCComplete,
+            self,
+            true
+        )
+    elseif navstate == _G.NavState.TooClose then
+        self:OnMoveToNPCComplete()
+    end
+    _G.LogUtilities.Log(
+        _G.EModuleName.TaskModule,
+        string.format("NPC目标位置:x%s-y%s-z%s", npcitem.Transform:GetPosition())
+    )
+end
+
+---移动到NPC完成
+function NPCDialogueTaskContent:OnMoveToNPCComplete()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "NPCDialogueTaskContent:OnMoveToNPCComplete()")
+    local worldmanager = _G.WorldManager:GetInstance()
+    --矫正玩家朝向NPC
+    ---@type WorldNPCItem
+    local npcitem = worldmanager:GetCurWorld():GetItemInfo(self.NpcUid)
+    worldmanager:GetCurWorldPlayer().Transform:SetTowardsToTarget(npcitem.Transform)
+
+    _G.StoryManager:GetInstance():PlayDialogueView(self.DialogueID, _G.handler(self, self.OnDialogueComplete))
+end
+
+---NPC对话完成
+function NPCDialogueTaskContent:OnDialogueComplete(isShowEff)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "NPCDialogueTaskContent:OnDialogueComplete()")
+
+    local taskinfo = self.OwnerTask:GetTaskInfo()
+    if taskinfo.target == nil then
+        taskinfo.target = {}
+    end
+    taskinfo.state = _G.TaskEnum.ETaskState.Completed
+    taskinfo.target[1] = self.TaskContentTotalProgress
+
+    self:OnTaskContentComplete(isShowEff)
+    ---处理后端主动推送的任务数据更新
+    _G.TaskModule:GetInstance():UpdateTaskInfo(taskinfo)
+end
+
+---检测任务目标   检测类任务(检测某个关卡是否通关)
+function NPCDialogueTaskContent:CheckTaskTarget()
+    if self:IsAvalibleExecute() == false then
+        return
+    end
+    local mainv = nil
+
+    --- 等待主界面显示后 等task创建完成  再检测
+    while _G.IsNil(mainv) or _G.MainManager == nil or _G.IsNil(mainv.isInMainView) do
+        if _G.MainManager ~= nil then
+            mainv = _G.MainManager:GetInstance()
+        end
+        _G.coroutine.waitforendofframe()
+    end
+    -- _G.coroutine.waitforseconds(1)
+
+    if self.NpcUid == 0 or self.DialogueID == 0 then
+        --- 空对话 就直接完成
+        self:OnDialogueComplete(false)
+    elseif _G.StoryManager:GetInstance():GetPlayerPrefs_PlayDialogueid(self.DialogueID) then
+        -- 播放过的对话 直接完成
+        self:OnDialogueComplete(false)
+    end
+end
+
+---@type NPCDialogueTaskContent @NPC对话任务内容
+_G.NPCDialogueTaskContent = NPCDialogueTaskContent
+
+---@type NPCDialogueTaskContent @NPC对话任务内容
+return NPCDialogueTaskContent

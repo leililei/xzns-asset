@@ -1,0 +1,215 @@
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleBlackSource : AIHelperModuleBaseNumberMock	    @AI助手-黑暗本源
+---@field index number                  @已执行次数
+---@field count number                  @剩余挑战次数
+local AIHelperModuleBlackSource = _G.BaseClass("AIHelperModuleBlackSource", base)
+
+---是否显示此模块(功能是否开启)
+function AIHelperModuleBlackSource:IsEnabled()
+    if not base.IsEnabled(self) then
+        return false
+    end
+    return true
+end
+
+---是否满足模块使用条件
+function AIHelperModuleBlackSource:IsActive()
+    return self.index <= self.number and self.count > 0
+end
+
+---重置状态
+function AIHelperModuleBlackSource:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.count = 1
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleBlackSource:Check(callback)
+    self.index = 1
+    self.count = 0
+
+    --判断是否在结算期间
+    local model = require("BlackSourceModel"):GetInstance()
+    if not model:IsSettlement() then
+        self.count = model:GetFightNum()
+    end
+
+    if callback then
+        callback(true)
+    end
+end
+
+---获取当前执行状态
+function AIHelperModuleBlackSource:GetExecuteState()
+    local bossId = require("BlackSourceModel"):GetInstance():GetCurBossId()
+    return {
+        total = self.number,
+        index = self.index,
+        bossId = bossId
+    }
+end
+
+---执行逻辑
+function AIHelperModuleBlackSource:Execute(callback)
+    self.index = self.index + 1
+    self.count = self.count - 1
+
+    ---检测是否正在战斗中
+    if _G.MainManager:GetInstance():IsFighting(false) then
+        if callback then
+            callback(false, self:CreateFailureResults(90028010143, _G.GetLangPackValue(self.cfg.name)))
+        end
+        return
+    end
+
+    ---@type BlackSourceModel
+    local model = require "BlackSourceModel":GetInstance()
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+
+    local function response(success, results)
+        if not callback then
+            return
+        end
+        callback(success, results)
+    end
+
+    --检测布阵是否为空(只能上阵在共鸣神石上的卡牌)
+    ---@type number[]
+    local cardUids = embattleModel:GetEmbattleData(_G.EmbattleType.BlackSource) or { 0, 0, 0, 0, 0 }
+    --是否有任何有效上阵卡牌
+    local haveCard = false
+    for i, uid in pairs(cardUids) do
+        ---@type CardData
+        local data = uid and uid > 0 and _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid) or nil
+        if data and data.shenshiPosType ~= _G.StonePosType.PosZero then
+            haveCard = true
+        else
+            --不在共鸣神石中的卡牌, 自动下阵
+            cardUids[i] = 0
+        end
+    end
+    if not haveCard then
+        response(false, self:CreateFailureResults(self.cfg.fail_tip))
+        return
+    end
+    -- if not embattleModel:CheckBattle(_G.EmbattleType.BlackSource) then
+    --     response(false, nil)
+    --     return
+    -- end
+
+    --发起战斗结算
+    ---@param data any 结算数据
+    local function fightResult(data)
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            data,
+            function(msg)
+                if msg.md5_error == "1" then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                elseif msg.md5_error == "2" then
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                end
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+                --获取奖励
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+                local dps = msg.atk_dps or 0
+                --缓存数据
+                msg.dps = dps
+                msg.lastMaxDps = model.dps or 0
+                model:FightEnd()
+
+                --发送消息
+                local maxDamage = math.max(dps, msg.lastMaxDps, 1)
+                _G.Events:GetInstance():Broadcast(
+                    _G.ePlayAactionEvent.PlayAaction,
+                    {
+                        _G.ActiveTaskEnum.ConditionEnum.BlackSource.BossSingleMaxDPS
+                    },
+                    maxDamage
+                )
+
+                response(true, msg)
+            end
+        )
+    end
+    --发起战斗请求
+    local function fightBegine()
+        require("BlackSourceNet"):GetInstance():FightBoss(
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+
+                --计算战斗结果
+                -- _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+                -- local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+                -- if not record or not record.result then
+                --     response(false, nil)
+                --     return
+                -- end
+                -- local tab = record.result
+                local tab = nil
+                --发起战斗结算
+                fightResult(tab)
+            end
+        )
+    end
+    ---更新布阵阵容
+    ---@param embattleId number 布阵id
+    local function updateEmbattle(embattleId, sits)
+        embattleModel:SaveEmbattleDataNew(
+            embattleId,
+            function(respCode)
+                if respCode ~= 0 then
+                    response(false, nil)
+                    return
+                end
+                fightBegine()
+            end,
+            _G.EmbattleSaveType.server,
+            true,
+            sits
+        )
+    end
+
+    updateEmbattle(_G.EmbattleType.BlackSource, cardUids)
+end
+
+---显示执行状态
+function AIHelperModuleBlackSource:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    if state and state.bossId then
+        local cfg = _G.ConfigManager.guild_boss_cfg[state.bossId]
+        item.aortext_tip.text = cfg and _G.GetLangPackValue(cfg.name) or ""
+    else
+        item.aortext_tip.text = ""
+    end
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleBlackSource:ShowExecuteResult(item, success, results)
+    base.ShowExecuteResult(self, item, success, results)
+    if not success or not results then
+        return
+    end
+
+    item.scrollloophorizontal_award:SetActiveE(0)
+    item.obj_damage:SetActiveE(1)
+    --设置展示信息
+    local dps, lastMaxDps = results.dps, results.lastMaxDps
+    item.obj_damageNew:SetActiveE(dps > lastMaxDps and 1 or 0)
+    item.aortext_damageLevel.text = ""
+    item.aortext_damage.text = _G.GameUtil.NumberToUnitStrFight(dps)
+    item.slider_damage.value = 1
+end
+
+return AIHelperModuleBlackSource

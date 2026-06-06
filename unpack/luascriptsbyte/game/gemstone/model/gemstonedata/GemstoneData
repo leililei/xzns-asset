@@ -1,0 +1,461 @@
+-----------------------------------------------------------------------
+-- F:.H5.Client.Assets.Resources.LuaScripts.Game.Gemstone.Model.GemstoneData	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2026/03/24
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+local TypeName = {
+    [1] = _G.GetLangPackValue(93010010015),
+    [2] = _G.GetLangPackValue(93010010016),
+    [3] = _G.GetLangPackValue(93010010017),
+    [4] = _G.GetLangPackValue(93010010018)
+}
+
+---@class GemstoneData	中文描述
+---@field public professional number 装备类型，部位
+---@field public randomAttr table 随机属性
+---@field public isResonance boolean 是否是共鸣槽位上的复制品(复制品只能提供属性加成)
+local GemstoneData = _G.BaseClass("GemstoneData")
+---类的构造函数
+function GemstoneData:__init()
+    self.sid = 0
+    self.uid = 0
+    self.level = 0
+    self.star = 0
+    self.grade = 1
+    self.professional = 1
+    self.isResonance = false
+    self.cardUid = 0
+    self.randomAttr = {}
+end
+
+function GemstoneData:Parse(msg)
+    self.cfg = _G.ConfigManager.gem_cfg[msg.sid]
+    self.sid = msg.sid
+    self.uid = msg.uid
+    self.level = msg.level or 0
+    self.star = msg.star or 0
+    self.grade = self.cfg.grade
+    self.professional = self.cfg.professional
+    self.cardUid = msg.card_uid or 0
+    self.randomAttr = msg.random_attrs or {}
+    _G.SortList(
+        self.randomAttr,
+        function(a)
+            return -a.index
+        end
+    )
+    -- 上一次没有选择的随机属性，重连后自动选择评分更高的组合
+    self.reset = msg.rest_attrs or {}
+    self:SelectReset()
+end
+
+---@param cfg gem_cfg
+function GemstoneData:ParseCfg(cfg, level, star)
+    self.cfg = cfg
+    self.sid = cfg.sid
+    self.grade = cfg.grade
+    self.professional = cfg.professional
+    self:SetLevel(level)
+    self:SetStar(star)
+end
+
+function GemstoneData:ParseExtend(extend)
+    
+end
+
+--- 选择随机属性组合中评分最高的
+function GemstoneData:SelectReset()
+    if _G.table.isEmptyOrNil(self.reset) then
+        return
+    end
+    local model = require("GemstoneModel"):GetInstance()
+    local score = model:GetAdditionsScore(self.randomAttr)
+    local index = 0
+    local attr = self.randomAttr
+    for k, v in pairs(self.reset) do
+        local tempscore = model:GetAdditionsScore(v.addition)
+        if tempscore > score then
+            tempscore = score
+            index = k
+            attr = v.addition
+        end
+    end
+    _G.SortList(
+        attr,
+        function(a)
+            return -a.index
+        end
+    )
+    model:SelectResetAttr(self.uid, index, index == 0 and 1 or 2, attr, function()
+        self.randomAttr = attr
+    end)
+    self.reset = {}
+end
+
+--- 属性叠加
+function GemstoneData:AddAttr(attrTable, addAttribute)
+    local key = addAttribute[1]
+    local attrType = addAttribute[2]
+    local value = addAttribute[3]
+    if not attrTable[key] then
+        attrTable[key] = {}
+    end
+    if not attrTable[key][attrType] then
+        attrTable[key][attrType] = { key, attrType, 0 }
+    end
+    attrTable[key][attrType][3] = attrTable[key][attrType][3] + value
+end
+
+function GemstoneData:Dispose()
+    self.cfg = nil
+    self.randomAttr = nil
+end
+
+--region 对外接口
+
+function GemstoneData:GetName()
+    return _G.GetLangPackValue(self.cfg.name)
+end
+
+function GemstoneData:GetType()
+    return TypeName[self.professional]
+end
+
+function GemstoneData:GetDesc()
+    return _G.GetLangPackValue(self.cfg.describe)
+end
+
+function GemstoneData:GetNextStarConsume()
+    if self.star == self.cfg.star_limit then
+        return 1
+    end
+    local consume1 = _G.ConfigManager.gem_star_cfg[1000 + self.grade * 10 + self.star].materials_oneself
+    local consume2 = _G.ConfigManager.gem_star_cfg[1000 + self.grade * 10 + self.star + 1].materials_oneself
+    return consume2 - consume1
+end
+
+function GemstoneData:GetLevel()
+    return self.level
+end
+
+function GemstoneData:GetStar()
+    return self.star
+end
+
+function GemstoneData:SetLevel(level)
+    level = level or 0
+    if self.cfg then
+        if self.cfg.strengthen_level < level then
+            level = self.cfg.strengthen_level
+        end
+    end
+    self.level = level
+end
+
+function GemstoneData:SetStar(star)
+    star = star or 0
+    if self.cfg then
+        if self.cfg.star_limit < star then
+            star = self.cfg.star_limit
+        end
+    end
+    self.star = star
+end
+
+--- 获取属性（不包含随机属性）
+---@return table<string, table<number, table<number, any>>> attr 属性表
+--- 格式为 {attrName: {attrType: {attrName, attrType, value}}}
+function GemstoneData:GetAttr()
+    local attr = {}
+    local baseAttr = self:GetBaseAttr()
+    local extraAttr = self:GetExtraAttr()
+    for _, v in pairs(baseAttr) do
+        for _, attrTb in pairs(v) do
+            self:AddAttr(attr, attrTb)
+        end
+    end
+    for _, v in pairs(extraAttr) do
+        if v then
+            for _, attrTb in pairs(v) do
+                self:AddAttr(attr, attrTb)
+            end
+        end
+    end
+    return attr
+end
+
+--- 获取基础属性
+function GemstoneData:GetBaseAttr()
+    local attr = {}
+
+    -- 获取等级倍率
+    local levelMultiplier = 1
+    if self.level > 0 then
+        local levelCfg = _G.ConfigManager.gem_level_cfg[self.level]
+        if levelCfg then
+            levelMultiplier = levelCfg.att_growth / 10000
+        end
+    end
+
+    -- 获取星级倍率
+    local starMultiplier = 1
+    if self.star > 0 then
+        -- gem_star_cfg的键为100+星级，如100=0星，101=1星
+        local starCfg = _G.ConfigManager.gem_star_cfg[1000 + self.grade * 10 + self.star]
+        if starCfg and starCfg.att_growth then
+            starMultiplier = starCfg.att_growth / 10000
+        end
+    end
+
+    -- 计算胚子基础属性（星级属性）
+    for _, v in pairs(self.cfg.attribute) do
+        local key = v[1]
+        local attrType = _G.tonumber(v[2])
+        local value = _G.tonumber(v[3])
+        -- 如果星级>0，乘以星级倍率；否则保持不变（0星时不乘倍率）
+        if self.star > 0 then
+            value = value * starMultiplier
+        end
+        self:AddAttr(attr, { key, attrType, value })
+    end
+
+    -- 计算强化基础属性
+    if self.level > 0 then
+        for _, upCfg in pairs(self.cfg.attribute_up) do
+            local key = upCfg[1]
+            local attrType = _G.tonumber(upCfg[2])
+            local value = _G.tonumber(upCfg[3]) * levelMultiplier
+            self:AddAttr(attr, { key, attrType, value })
+        end
+    end
+
+    return attr
+end
+--- 获取额外属性
+function GemstoneData:GetExtraAttr()
+    local attr = {}
+    local extraLevelMultiplier = 0
+    if self.level > 0 then
+        local levelCfg = _G.ConfigManager.gem_level_cfg[self.level]
+        if levelCfg then
+            extraLevelMultiplier = levelCfg.extra_growth / 10000
+        end
+    end
+    if extraLevelMultiplier > 0 then
+        for _, v in pairs(self.cfg.extra_attribute) do
+            local key = v[1]
+            local attrType = _G.tonumber(v[2])
+            local value = _G.tonumber(v[3]) * extraLevelMultiplier
+            self:AddAttr(attr, {key, attrType, value})
+        end
+    end
+    return attr
+end
+
+--- 获取随机属性
+function GemstoneData:GetRandomAttr()
+    return self.randomAttr
+end
+
+--- 宝石评分 =
+---（
+---     宝石攻击atk *【type_attribute_cfg中atk对应的params_power字段/10000】
+---     +宝石破甲bre*【type_attribute_cfg中bre对应的params_power字段/10000】
+---     +宝石防御def*【type_attribute_cfg中def对应的params_power字段/10000】
+---     +宝石生命max_hp*【type_attribute_cfg中max_hp对应的params_power字段/10000】
+--- ）*（
+---     1 + 20 
+---    *（
+---         宝石命中率hit_rate
+---        +宝石闪避率avd_rate
+---        +宝石暴击率cri_rate
+---        +宝石抗暴率cri_r_rate
+---        +附加属性1评分/10000
+---        +附加属性2评分/10000
+---        +附加属性3评分/10000
+---        +0.5 * (宝石攻击%atk + 宝石破甲%bre + 宝石防御%def + 宝石生命%max_hp)
+---     ）
+---    ）
+
+--- 获取属性评分
+---@return number 属性评分
+function GemstoneData:GetAttrScore()
+    local attr = self:GetBaseAttr()
+
+    -- 基础属性映射
+    local baseAttrMap = {
+        atk = 0,
+        bre = 0,
+        def = 0,
+        max_hp = 0,
+        hit_rate = 0,
+        avd_rate = 0,
+        cri_rate = 0,
+        cri_r_rate = 0
+    }
+
+    -- 从attr结构中提取属性值
+    ---@type table<string, table<number, table<number, any>>>
+    local attrTyped = attr
+    for _, attrData in pairs(attrTyped) do
+        if type(attrData) == "table" then
+            -- 处理嵌套结构
+            for _, valueData in pairs(attrData) do
+                if type(valueData) == "table" and #valueData >= 3 then
+                    local attrName = tostring(valueData[1])
+                    local attrValue = valueData[3] or 0
+                    if baseAttrMap[attrName] ~= nil then
+                        baseAttrMap[attrName] = baseAttrMap[attrName] + attrValue
+                    end
+                end
+            end
+        end
+    end
+
+    -- 计算基础评分部分
+    local baseScore = 0
+    local attrConfig = _G.ConfigManager.type_attribute_cfg or {}
+
+    for attrName, attrValue in pairs(baseAttrMap) do
+        local cfg = attrConfig[_G.AttrType[attrName].ID]
+        if cfg and cfg.params_power then
+            local power = cfg.params_power / 10000
+            baseScore = baseScore + attrValue * power
+        end
+    end
+
+    -- 附加属性评分
+    local randomArr = self:GetRandomAttrScore()
+    local randomAttrScore = 0
+    for _, v in pairs(randomArr) do
+        randomAttrScore = randomAttrScore + v
+    end
+
+    local extraAttr = self:GetExtraAttr()
+    local extraAttrScore = 0
+    -- 额外属性为百分比
+    for _, v in pairs(extraAttr) do
+        for _, value in pairs(v) do
+            extraAttrScore = extraAttrScore + value[3] / 100
+        end
+    end
+
+    -- 计算总基础评分（不含随机属性加成）
+    local param = _G.ConfigManager.discrete_cfg[153001][1]
+    local score = baseScore * (1 + param[1] * (
+        baseAttrMap.hit_rate +
+        baseAttrMap.avd_rate +
+        baseAttrMap.cri_rate +
+        baseAttrMap.cri_r_rate +
+        randomAttrScore / 10000 +
+        extraAttrScore / 100 * 0.5
+    ))
+
+    return math.floor(score + 0.5) -- 四舍五入取整
+end
+
+--- 获取随机属性评分
+---@return number 随机属性评分
+function GemstoneData:GetRandomAttrScore()
+    local scoreArr = {}
+
+    local gem_add_att_cfg = _G.ConfigManager.gem_add_att_cfg
+    ---@type gem_add_att_cfg
+    local cfg
+
+    local num, sid, score
+    for _, attr in pairs(self.randomAttr) do
+        sid = attr.sid
+        cfg = gem_add_att_cfg[sid]
+        num = attr.value
+        score = num * cfg.score_base
+        table.insert(scoreArr, score)
+    end
+    return scoreArr
+end
+
+--- 镶嵌宝石
+function GemstoneData:Mosaic(uid)
+    self.cardUid = uid
+end
+
+---卸下宝石，自动重生
+function GemstoneData:Unload()
+    self.cardUid = 0
+    self.level = 0
+end
+
+---替换已镶嵌宝石，替换后等级继承，卸下宝石等级为0
+---@param gem GemstoneData 替换的宝石
+function GemstoneData:Replace(gem)
+    self.cardUid = gem.cardUid
+    local lv = self.level
+    self.level = gem.level
+    gem.level = lv
+end
+
+---重生
+function GemstoneData:Reborn(call)
+    require("GemstoneNet"):GetInstance():ManualReborn({ gem_uid = self.uid }, function(msg)
+        self.level = 0
+        if call then
+            call(msg)
+        end
+    end)
+end
+
+function GemstoneData:CheckCanStarUp()
+    if self.star ~= self.cfg.star_limit then
+        return true
+    end
+    if _G.ConfigManager.gem_cfg[self.cfg.upgrade_equip] then
+        return true
+    end
+    return false
+end
+
+---@param upStar number 指定的星级
+function GemstoneData:StarUp(upStar)
+    if not upStar then
+        upStar = 1
+    end
+
+    for i = 1, upStar do
+        if self.star ~= self.cfg.star_limit then
+            self.star = self.star + 1
+        elseif self.cfg.upgrade_equip ~= 0 then
+            self.star = 0
+            self.grade = self.grade + 1
+            self.sid = self.cfg.upgrade_equip
+            self.cfg = _G.ConfigManager.gem_cfg[self.sid]
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log("uid:" .. self.uid .. "宝石超出升星限制")
+            end
+        end
+    end
+end
+
+function GemstoneData:Copy(data)
+    self.cfg = _G.ConfigManager.gem_cfg[data.sid]
+    self.sid = data.sid
+    self.uid = data.uid
+    self.level = data.level or 0
+    self.star = data.star or 0
+    self.grade = self.cfg.grade
+    self.professional = self.cfg.professional
+    self.cardUid = data.cardUid or 0
+    self.randomAttr = data.randomAttr or {}
+    _G.SortList(
+        self.randomAttr,
+        function(a)
+            return -a.index
+        end
+    )
+end
+
+--endregion
+
+return GemstoneData

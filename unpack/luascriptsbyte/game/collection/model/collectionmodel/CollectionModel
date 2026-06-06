@@ -1,0 +1,420 @@
+-----------------------------------------------------------------------
+-- zhenhunjie-s\client\trunk\alpha\Client\Assets\Resources\LuaScripts\Game\Collection\Model
+--	(修改路径必须修正此项!)
+-- Created by s
+-- DateTime: 20223/2/15
+-- Description 藏品数据
+-----------------------------------------------------------------------
+local base = require "GameDataModelBase"
+local CollectionNet = require "CollectionNet"
+
+---@class CollectionModel : GameDataModelBase
+---@field GetInstance fun():CollectionModel
+local CollectionModel = _G.BaseClass("CollectionModel", base)
+---@return CollectionModel CollectionModel
+
+local collection_cfg = _G.ConfigManager.collection_cfg
+local collection_lv = _G.ConfigManager.collection_level_cfg
+local mission_extra_cfg = _G.ConfigManager.mission_extra_cfg
+local missionState = _G.TaskEnum.ETaskState
+---@type AttributeClassManager
+local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+local StorageManager = _G.StorageManager:GetInstance()
+
+function CollectionModel:__init()
+    ---已获得的藏品列表
+    self.GetList = {}
+    ---任务列表
+    self.MissionList = {}
+    ---任务进度
+    self.MissionProgress = {}
+    ---任务数据
+    self.MissionDatas = {}
+    ---所有藏品列表
+    self.AllCollection = {}
+    --藏品等级信息
+    self.CollectionLv = {}
+    --当前品质需要显示的排数
+    self.CurLen = 0
+    --当前收藏等级
+    self.CurLv = 0
+    --当前收藏进度总值
+    self.CurValue = 0
+    --功能解锁id
+    self.curFunctionOpenID = 112
+    --红点id
+    self.redPointId = 201605
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.RefreshRedPoint, self)
+end
+
+function CollectionModel:Dispose()
+    self.GetList = nil
+    self.MissionList = nil
+    self.MissionProgress = nil
+    self.AllCollection = nil
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.RefreshRedPoint, self)
+end
+
+---初始化藏品数据
+function CollectionModel:CollectionData()
+    local insert = _G.table.insert
+    local data = {}
+    ---@param value collection_cfg
+    for _, value in pairs(collection_cfg) do
+        if value.is_display == 1 then
+            data = {}
+            data.cfg = value
+            data.level = self.GetList[value.id] or 0
+            data.maxLevel = #value.currency + 1
+            insert(self.AllCollection, data)
+
+            if data.level > 0 and value.privilege[data.level] then
+                require "PrivilegeManager":GetInstance():AddPrivilege(value.privilege[data.level], false, true)
+            end
+        end
+    end
+    for _, value in pairs(collection_lv) do
+        insert(self.CollectionLv, value)
+    end
+    --对藏品按照配置display_priority进行升序排序
+    _G.SortList(
+        self.AllCollection,
+        function(list)
+            return list.cfg.quality, -list.cfg.display_priority
+        end
+    )
+end
+
+function CollectionModel:GetDataFormServer()
+    CollectionNet:GetInstance():CollectionInfo(_G.handlerbind(self, self.GetInfo))
+end
+
+function CollectionModel:UpdataTask(task)
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask:UpdataData(task)
+    self:RefreshRedPoint()
+    return true
+end
+
+function CollectionModel:GetTaskByTaskid(taskid)
+    if self.MissionDatas[taskid] ~= nil then
+        return self.MissionDatas[taskid]
+    end
+    return nil
+end
+
+---解析藏品信息
+function CollectionModel:GetInfo(data)
+    if data ~= nil then
+        self:__init()
+        if data.unlock_collect_list ~= nil then
+            if not self.GetList then
+                self.GetList = {}
+            end
+            for i, v in ipairs(data.unlock_collect_list) do
+                self.GetList[v.cid] = v.lv
+            end
+        end
+        self:CollectionData(data)
+        self:RefreshRedPoint()
+        self:GetAllAttribute(true)
+        self:ParseData()
+        self:GetActiveCount(true)
+    end
+    --self:RefreshRedPoint()
+end
+
+---激活藏品
+---@param cid number 藏品id
+function CollectionModel:ActivateCollection(cid, level, Call)
+    CollectionNet:GetInstance():ActivateCollection(
+        cid,
+        level,
+        function(data)
+            if 1 == data.ack then
+                self:UpdataData(cid, level)
+                self:RefreshRedPoint()
+                --self:GetAllAttribute(true)
+                self:UpdateCardAttr()
+                if Call then
+                    Call()
+                end
+            end
+        end
+    )
+end
+
+---激活藏品后更新数据s
+---@param id number 被激活藏品的sid
+---@param level number 被激活藏品的激活等级level
+function CollectionModel:UpdataData(id, level)
+    --将已获取的数据插入已获取藏品列表
+    for _, value in pairs(self.AllCollection) do
+        if id == value.cfg.id then
+            value.level = level
+            self.GetList[id] = level
+            break
+        end
+    end
+    if level == 1 then
+        self:GetActiveCount(true)
+        self:BroadcastUnlockNum()
+    end
+end
+
+---获取已激活藏品数量
+---@param force boolean 是否强制更新数量信息
+---@return number
+function CollectionModel:GetActiveCount(force)
+    if not self.GetList then
+        return 0
+    end
+    if not self.activeCount or force then
+        --GetList结构为table<id,level>, 下标并不是连续的从1开始的, 不能使用#table取长度
+        local count = 0
+        for _, level in pairs(self.GetList) do
+            if level >= 1 then
+                count = count + 1
+            end
+        end
+        self.activeCount = count
+    end
+    return self.activeCount
+end
+
+---对外接口，检测藏品是否激活
+---@param cid number 藏品Id
+---@return boolean true解锁,false未解锁
+function CollectionModel:CheckIsLock(cid)
+    local curCid = cid
+    if self.GetList ~= nil and self.GetList[cid] then
+        return true
+    end
+    return false
+end
+
+function CollectionModel:CheckLevel(cid)
+    if self.GetList ~= nil then
+        for _, v in pairs(self.GetList) do
+            if v.cid == cid then
+                return v.lv
+            end
+        end
+    end
+    return 0
+end
+
+---获取所有藏品的表
+---@return table 所有藏品的内容表
+function CollectionModel:GetAllCollections()
+    return self.AllCollection
+end
+
+function CollectionModel:GetMissionDatas()
+    return self.MissionDatas
+end
+
+---是否显示红点
+---@return boolean 红点显示与否
+function CollectionModel:CheckRedPoint()
+    local currency = {}
+
+    local checkList = _G.PlayerPrefsManager.GetTable("CollectionRedPoint", false) or {}
+    local data = {}
+
+    ---@param value CollectionData
+    for _, value in pairs(self.AllCollection) do
+        if value.level == 0 then
+            currency = value.cfg.unlock_params
+            if StorageManager:CheckItem(currency[1], currency[2]) then
+                return true
+            end
+        end
+        if _G.table.ContainsValue(checkList, value.cfg.id) then
+            _G.table.insert(data, value)
+        end
+    end
+    ---@param value CollectionData
+    for _, value in ipairs(data) do
+        if value.level < value.maxLevel then
+            currency = value.level == 0 and value.cfg.unlock_params or value.cfg.currency[value.level]
+            if StorageManager:CheckItem(currency[1], currency[2]) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---刷新红点显示
+function CollectionModel:RefreshRedPoint()
+    if self.redPointId > 0 then
+        require "RedPointManager":GetInstance():RefreshNode(self.redPointId)
+    end
+end
+
+---@private
+function CollectionModel:BroadcastUnlockNum()
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.Collection.UnlockNum
+        },
+        self:GetActiveCount(),
+        false,
+        true
+    )
+end
+
+function CollectionModel:GetShowProp(name, type, num, languageId)
+    local desc = _G.GetLangPackValue(_G.ConfigManager.type_attribute_cfg[_G.AttrType[name].ID].name)
+    local value = AttributeClassManager:GetShowProp(name, type, num, 0.01, 1)
+    return _G.GetLangPackValue(languageId, desc, value)
+end
+
+function CollectionModel:GetAllAttribute(isRefresh)
+    if not self.attribute or isRefresh then
+        local attributeManager = _G.AttributeClassManager:GetInstance()
+        self.attribute = attributeManager:GetAttribtueClass()
+        ---@param v CollectionData
+        for i, v in ipairs(self.AllCollection) do
+            if v.level > 0 then
+                self.attribute:AddValueByName("atk", v.cfg.atk[v.level], nil, _G.AttCountType.other)
+                self.attribute:AddValueByName("bre", v.cfg.bre[v.level], nil, _G.AttCountType.other)
+                self.attribute:AddValueByName("def", v.cfg.def[v.level], nil, _G.AttCountType.other)
+                self.attribute:AddValueByName("max_hp", v.cfg.max_hp[v.level], nil, _G.AttCountType.other)
+                if v.cfg.type1 == 1 then
+                    self.attribute:AddValueByName(
+                        v.cfg.att[v.level][1],
+                        v.cfg.att[v.level][3] * 0.0001,
+                        nil,
+                        _G.tonumber(v.cfg.att[v.level][2])
+                    )
+                end
+            end
+        end
+
+        self.attributeChangeTypes = attributeManager:GetChangeAttrTypes(self.attribute)
+    end
+
+    return self.attribute, self.attributeChangeTypes
+end
+
+function CollectionModel:UpdateCardAttr()
+    --local cardDataList = _G.StorageManager:GetInstance():GetCardDataSortList()
+    -----@param v CardData
+    --for i,v in ipairs(cardDataList) do
+    --    if v then
+    --        v:CalcNowSumProp(_G.AttrFunType.Collection)
+    --    end
+    --end
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Collection)
+end
+
+return CollectionModel
+
+---@class CollectionData
+---@field cfg collection_cfg 配置表
+---@field level number 当前等级
+---@field maxLevel number 最大等级
+
+---2023年3月14日策划说不要区分品质，望周知
+---2023年3月20日策划说不要藏品收集等级，望周知
+-- ---获取稀有藏品表
+-- ---@return table 稀有藏品的内容表
+-- function CollectionModel:GetOneCollections()
+--     return self.OneCollection
+-- end
+
+-- ---获取珍藏藏品表
+-- ---@return table 珍藏藏品的内容表
+-- function CollectionModel:GetTwoCollections()
+--     return self.TwoCollection
+-- end
+
+-- ---获取传世藏品表
+-- ---@return table 传世藏品的内容表
+-- function CollectionModel:GetThreeCollections()
+--     return self.ThreeCollection
+-- end
+
+-- ---获取当前藏品等级
+-- ---@return number 当前藏品等级
+-- function CollectionModel:GetCurLv()
+--     return self.CurLv
+-- end
+
+-- ---获取当前藏品进度值
+-- ---@return number 当前藏品等级
+-- function CollectionModel:GetCurValue()
+--     return self.CurValue or 0
+-- end
+
+-- ---获取下一藏品等级所需要的进度值
+-- ---@return number 当前藏品等级
+-- function CollectionModel:GetCurAllValue()
+--     return self.CurAllValue or 1
+-- end
+
+-----增加属性,获取藏品属性
+-----@param lv number 藏品等级
+-----@param attribute table _G.AttributeClass
+--function CollectionModel:CurCollectionAttribution(lv)
+--    local attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+--    if lv ~= 0 then
+--        for _, v in pairs(collection_lv[lv].att) do
+--            attribute:AddValueByName(
+--                v[1],
+--                _G.AttributeClassManager:GetInstance():GetValueWithName(v[1], v[3], _G.tonumber(v[2])),
+--                nil,
+--                _G.tonumber(v[2])
+--            )
+--        end
+--    end
+--    return attribute or {}
+--end
+
+-- ---增加属性
+-- ---@param attribute table _G.AttributeClass
+-- function CollectionModel:GetCollectionAttribution()
+--     local attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+--     if self.CurLv ~= 0 then
+--         for _, v in pairs(collection_lv[self.CurLv].att) do
+--             attribute:AddValueByName(
+--                 v[1],
+--                 _G.AttributeClassManager:GetInstance():GetValueWithName(v[1], v[3], _G.tonumber(v[2])),
+--                 nil,
+--                 _G.tonumber(v[2])
+--             )
+--         end
+--     end
+--     return attribute or {}
+-- end
+
+-- ---获取藏品属性
+-- ---@param id number 藏品id
+-- ---@return AttributeClass
+-- function CollectionModel:GetAttribute(id)
+--     local Attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+--     local attributeManager = _G.AttributeClassManager:GetInstance()
+--     ---@type player_title_effect_cfg
+--     local cfg = _G.ConfigManager.player_title_effect_cfg[id]
+--     if cfg then
+--         for _, v in pairs(cfg.base_att) do
+--             Attribute:AddValueByName(
+--                 v[1],
+--                 attributeManager:GetValueWithName(v[1], v[3], _G.tonumber(v[2])),
+--                 false,
+--                 _G.tonumber(v[2])
+--             )
+--         end
+--     end
+--     return Attribute
+-- end

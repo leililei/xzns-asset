@@ -1,0 +1,220 @@
+-----------------------------------------------------------------------
+-- UI.Storage.Data.SpiritualStorage.lua
+-- Created by liyi
+-- DateTime: 2024/04/11
+-- Description 灵契仓库
+-----------------------------------------------------------------------
+local SpiritualData = require("SpiritualData")
+---@class SpiritualStorage:BaseStorage	灵契仓库
+local SpiritualStorage = _G.BaseClass("SpiritualStorage", require "BaseStorage")
+local table = _G.table
+
+---构造函数
+function SpiritualStorage:__init()
+    self.sidTable = {}
+    self.noWearList = {}
+    self.ownedList = {}
+end
+
+---类的析构函数
+function SpiritualStorage:Dispose()
+    self.noWearList = nil
+    self.sidTable = nil
+end
+
+---仓库数据解析(类重写数据解析)
+---@param msg storage.s2c_storage_get 物品PB数据
+function SpiritualStorage:ParseInit(msg)
+    local datas = msg.spiritual
+    if not table.isEmptyOrNil(datas) then
+        for _, value in pairs(datas) do
+            self:AddItemByData(value)
+        end
+    end
+end
+
+---解析单条奖励
+---@param msg award.i_award_item 单条灵契数据[灵契sid, 灵契uid, 数量, 是否锁锁定]
+function SpiritualStorage:ParseSingle(msg)
+    local data = {}
+    data.sid = msg[1]
+    data.uid = msg[2]
+    data.num = msg[3] or 1
+    data.unlock = msg[4]
+
+    if not self.list[data.uid] then
+        self:AddItemByData(data)
+    else
+        self:ChangeCount(data.uid, data.num)
+    end
+
+    if table.count(self.sidTable[data.sid]) <= 1 then
+        self.list[data.uid].isNew = true
+    end
+    return self.list[data.uid]
+end
+
+---重连
+---@param msg storage.s2c_storage_get 物品PB数据
+function SpiritualStorage:ParseReconnectInit(msg)
+    local datas = msg.spiritual or {}
+    for _, v in pairs(datas) do
+        if not self:GetItemByKey(v.uid) then
+            self:AddItemByData(v)
+        end
+    end
+end
+
+---新增物品
+---@param data table 动态参数
+---@return number, BaseItemData, boolean 返回添加的对象ID(0 为失败)|数据对象|是否穿戴
+function SpiritualStorage:AddItem(data)
+    local SpiritualData = SpiritualData.New()
+    SpiritualData:Parse(data)
+    self:AddItemToSidTable(SpiritualData)
+    if SpiritualData.uid == SpiritualData.sid and SpiritualData.cardUid and SpiritualData.cardUid > 0 then
+        return self:GetKey(SpiritualData.uid, data.cardUid, data.index), SpiritualData
+    end
+    return SpiritualData.uid, SpiritualData
+end
+
+---获得灵契
+function SpiritualStorage:AddItemByData(data)
+    local id, item = self:AddItem(data)
+    if id then
+        self.list[id] = item
+        if not item.cardUid or item.cardUid <= 0 then
+            self.noWearList[id] = item
+        end
+        self.ownedList[id] = true
+        table.insert(self.idList, id)
+    end
+end
+
+---@param spiritualData SpiritualData
+function SpiritualStorage:AddItemToSidTable(spiritualData)
+    if not self.sidTable[spiritualData.sid] then
+        self.sidTable[spiritualData.sid] = {}
+    end
+    self.sidTable[spiritualData.sid][spiritualData.uid] = true
+end
+
+function SpiritualStorage:RemoveItem(id)
+    local item = self.list[id]
+    item:Dispose()
+    self.list[id] = nil
+    self.noWearList[id] = nil
+    self.ownedList[id] = nil
+    local index = table.indexof(self.idList, id)
+    if index then
+        table.remove(self.idList, index)
+    end
+end
+
+---获取仓库所有灵契数据
+---@param type Enum 类型
+---@return table
+function SpiritualStorage:GetAllItems(type)
+    if type == _G.ArtifactType.NoWear then
+        return self.noWearList
+    else
+        return self.list
+    end
+end
+
+---获得仓库剩余空间（穿戴的堆叠灵契不占背包格子,但是背包内要占一格独立显示）
+function SpiritualStorage:GetFreeSize()
+    return self.capacity - table.count(self.ownedList)
+end
+
+---穿上灵契
+---@param spiritual SpiritualData
+function SpiritualStorage:OnPutOnSpiritual(spiritual)
+    local id = spiritual.uid
+    if spiritual.uid == spiritual.sid then
+        id = self:GetKey(spiritual.uid, spiritual.cardUid, spiritual.index)
+    end
+    self.noWearList[id] = nil
+end
+
+---脱下灵契
+---@param spiritual SpiritualData
+function SpiritualStorage:OnTakeOffSpiritual(spiritual)
+    local id = spiritual.uid
+    local cardUid = spiritual.cardUid
+    local index = spiritual.index
+    spiritual:UnbindCard()
+    if spiritual.uid == spiritual.sid then
+        if not self.list[spiritual.uid] then
+            self:AddItemByData(spiritual)
+        else
+            self:ChangeCount(spiritual.uid, 1)
+        end
+        id = self:GetKey(spiritual.uid, cardUid, index)
+        if self.list[id] then
+            self:RemoveItem(id)
+        end
+    else
+        self.noWearList[id] = spiritual
+        self.list[id] = spiritual
+    end
+end
+
+---新增灵契对象
+---@param spiritualData SpiritualData 灵契对象
+function SpiritualStorage:AddItemBySpiritualData(spiritualData)
+    if spiritualData.sid == spiritualData.uid then
+        if spiritualData.cardUid and spiritualData.cardUid > 0 then
+            local id = self:GetKey(spiritualData.uid, spiritualData.cardUid, spiritualData.index)
+            if self.list[id] then
+                return
+            end
+            self.list[id] = spiritualData
+            self.ownedList[spiritualData.uid] = true
+            table.insert(self.idList, id)
+        else
+            if not self.list[spiritualData.uid] then
+                self.list[spiritualData.uid] = spiritualData
+                self.noWearList[spiritualData.uid] = spiritualData
+                self.ownedList[spiritualData.uid] = true
+                table.insert(self.idList, spiritualData.uid)
+            else
+                self:ChangeCount(spiritualData.uid, spiritualData:GetCount())
+            end
+        end
+    else
+        if not self.list[spiritualData.uid] then
+            self.list[spiritualData.uid] = spiritualData
+            if spiritualData.cardUid == 0 then
+                self.noWearList[spiritualData.uid] = spiritualData
+            end
+            self.ownedList[spiritualData.uid] = true
+            table.insert(self.idList, spiritualData.uid)
+        end
+    end
+    self:AddItemToSidTable(spiritualData)
+end
+
+---拼接key
+function SpiritualStorage:GetKey(uid, cardUid, index)
+    return uid .. "_" .. cardUid .. "_" .. index
+end
+
+---改变数量
+---@param uid number uid
+---@param num number 数量
+---@param fact boolean 是否是实际数量
+function SpiritualStorage:ChangeCount(uid, num, fact, spiritualData)
+    if spiritualData and spiritualData.sid == uid and spiritualData.cardUid > 0 then
+        uid = self:GetKey(spiritualData.uid, spiritualData.cardUid, spiritualData.index)
+    end
+    local item = self:GetItemByKey(uid)
+    if item ~= nil then
+        item:ChangeCount(num, fact)
+        if item:GetCount() == 0 then
+            self:RemoveItem(uid)
+        end
+    end
+end
+
+return SpiritualStorage

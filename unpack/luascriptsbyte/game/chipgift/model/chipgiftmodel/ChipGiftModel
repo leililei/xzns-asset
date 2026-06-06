@@ -1,0 +1,436 @@
+--region 工具类
+local utils = {
+    ---寻找数组序号
+    ---@param lst T[]
+    ---@param value T
+    ---@return number   返回-1表示不存在
+    findIndex = function(lst, value)
+        if not lst then
+            return -1
+        end
+        for i, v in ipairs(lst) do
+            if value == v then
+                return i
+            end
+        end
+        return -1
+    end,
+    ---插入所有成员
+    ---@param target T[]
+    ---@param source T[]
+    insertMany = function(target, source)
+        if not target or not source then
+            return
+        end
+        for _, v in ipairs(source) do
+            table.insert(target, v)
+        end
+    end,
+    ---插入所有成员
+    ---@param arg1 T[]
+    ---@param arg2 T[]
+    ---@vararg T[][]
+    ---@return T[]   返回一个全新集合
+    conect = function(arg1, arg2, ...)
+        ---@type T[]
+        local results = {}
+        for _, lst in ipairs({arg1, arg2, ...}) do
+            if lst and type(lst) == "table" then
+                for _, v in ipairs(lst) do
+                    table.insert(results, v)
+                end
+            end
+        end
+        return results
+    end
+}
+--enregion
+
+---@class ChipGiftModel : GameDataModelBase
+---@field GetInstance fun():ChipGiftModel
+---@field currentCardSid number                     当前选择英雄id
+---@field lstProducts ChipGiftProductData[]                 礼包列表
+---@field freeProduct ChipGiftProductData                   免费礼包
+---@field allBoughtProduct ChipGiftProductData              购买所有礼包后获取的奖励(其配置有自选卡牌信息)
+---@field cacheCardList number[]                            缓存自选卡牌信息
+---@field cardIndexes table<number,number>                  一般卡牌id序号映射
+---@field godCardIndexes table<number,number>               神卡牌id序号映射
+local ChipGiftModel = _G.BaseClass("ChipGiftModel", _G.GameDataModelBase)
+
+---创建对象时,入口构造函数
+function ChipGiftModel:__init()
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+---销毁对象时,析构函数
+function ChipGiftModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+--初始化配置
+function ChipGiftModel:InitCfg()
+    self.lstProducts = {}
+    self.freeProduct = nil
+    self.allBoughtProduct = nil
+    self.currentCardSid = 0
+    self.cacheCardList = nil
+    self.cardIndexes = nil
+    self.godCardIndexes = nil
+
+    for _, data in pairs(_G.ConfigManager.store_piece_cfg) do
+        if data.type_2 == 1 then --获取角色碎片礼包(type_2 == 1的配置)
+            ---@type ChipGiftProductData
+            local d = {
+                cfg = data,
+                remainCount = data.count_limit,
+                cardSid = 0
+            }
+            if data.type_1 == 1 then
+                --单次购买
+                table.insert(self.lstProducts, d)
+                if data.price_id > 0 then
+                    local finalPrice = require "MallManager":GetInstance():GetFinalPrice(data.price_id)
+                    if finalPrice <= 0 then
+                        self.freeProduct = d
+                    end
+                else
+                    self.freeProduct = d
+                end
+            elseif data.type_1 == 2 then
+                --全部礼包购买后
+                self.allBoughtProduct = d
+            end
+        end
+    end
+    --对商品列表进行排序
+    _G.SortList(
+        self.lstProducts,
+        function(d)
+            return -d.cfg.display_priority
+        end
+    )
+
+    --获取自选卡牌信息
+    if self.allBoughtProduct then
+        self.cacheCardList = {}
+        self.godCardIndexes = {}
+        self.cardIndexes = {}
+        for index, cardId in pairs(self.allBoughtProduct.cfg.card_god) do
+            self.godCardIndexes[cardId] = index
+            table.insert(self.cacheCardList, cardId)
+        end
+
+        for index, cardId in pairs(self.allBoughtProduct.cfg.card) do
+            self.cardIndexes[cardId] = index
+            table.insert(self.cacheCardList, cardId)
+        end
+    end
+end
+---寻找礼包配置
+---@private
+---@param sid number        礼包id
+---@return ChipGiftProductData
+function ChipGiftModel:FindProductData(sid)
+    if self.allBoughtProduct and sid == self.allBoughtProduct.cfg.id then
+        return self.allBoughtProduct
+    end
+    if self.lstProducts then
+        for _, d in pairs(self.lstProducts) do
+            if sid == d.cfg.id then
+                return d
+            end
+        end
+    end
+    return nil
+end
+---寻找卡牌排序序号以及是否神卡
+---@param cardId number     卡牌id
+---@return boolean,number   是否神卡, 排序序号(-1表示不存在)
+function ChipGiftModel:FindCardIndex(cardId)
+    if self.godCardIndexes and self.godCardIndexes[cardId] then
+        return true, self.godCardIndexes[cardId]
+    end
+    if self.cardIndexes and self.cardIndexes[cardId] then
+        return false, self.cardIndexes[cardId]
+    end
+    return false, -1
+end
+
+function ChipGiftModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+function ChipGiftModel:GetInfo(callback)
+    self:InitCfg()
+    require "ChipGiftNet":GetInstance():GetInfo(_G.handlerbind(self, self.ParseData, callback))
+end
+function ChipGiftModel:ReConnect(callback)
+    self.reconnectEndCall = callback
+    self:GetInfo()
+end
+---@param data daily_store.s2c_daily_store_info
+function ChipGiftModel:ParseData(data, callback)
+    if data.ack == 1 and data.info then
+        --是否已领取免费礼包
+        if data.info.is_award == 1 and self.freeProduct then
+            self.freeProduct.remainCount = 0
+        end
+        --已购买的礼包列表
+        if data.info.buy_list then
+            for _, v in pairs(data.info.buy_list) do
+                local d = self:FindProductData(v.sid)
+                if d then
+                    d.remainCount = 0
+                    d.cardSid = v.card_sid
+                end
+            end
+        end
+        --当前选择的英雄
+        self.currentCardSid = data.info.sid or 0
+        if self.currentCardSid ~= 0 and self.lstProducts then
+            for _, d in pairs(self.lstProducts) do
+                if d.remainCount > 0 then
+                    d.cardSid = self.currentCardSid
+                end
+            end
+        end
+
+        if self.allBoughtProduct and self.allBoughtProduct.remainCount <= 0 then
+            self:SetProductsSoldout()
+        end
+    end
+    if self.reconnectEndCall then
+        self.reconnectEndCall()
+        self.reconnectEndCall = nil
+    end
+    if callback then
+        callback()
+    end
+    self:RefreshRedPoint()
+    self.super.ParseData(self)
+end
+---设置红点刷新
+function ChipGiftModel:SetFreshRedPoint(RefreshRedPointCall)
+    self.RefreshRedPointCall = RefreshRedPointCall
+end
+function ChipGiftModel:RefreshRedPoint()
+    if self.RefreshRedPointCall ~= nil then
+        self.RefreshRedPointCall()
+    end
+end
+
+---领取每日免费礼包
+function ChipGiftModel:GetFreeAward(sid, callback)
+    require "ChipGiftNet":GetInstance():GetFreeAward(sid, _G.handlerbind(self, self.GetFreeAwardSuccess, callback))
+end
+function ChipGiftModel:GetFreeAwardSuccess(msg, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    if self.freeProduct then
+        self.freeProduct.remainCount = 0
+    end
+
+    self:RefreshRedPoint()
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    require "CommonTipManager".OpenCommonAwardView(
+        msg,
+        function()
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---切换英雄
+function ChipGiftModel:ChangeCard(sid, callback)
+    if self.CurSelectCard == sid then
+        return
+    end
+    require "ChipGiftNet":GetInstance():ChangeCard(sid, _G.handlerbind(self, self.OnChangeCardSuccess, sid, callback))
+end
+function ChipGiftModel:OnChangeCardSuccess(msg, sid, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.currentCardSid = sid
+    if self.lstProducts then
+        for _, d in pairs(self.lstProducts) do
+            if d.remainCount > 0 then
+                d.cardSid = self.currentCardSid
+            end
+        end
+    end
+    if callback then
+        callback()
+    end
+end
+
+---监听礼包购买回调
+function ChipGiftModel:OnMallCashListener(data)
+    local d = self:FindProductData(data.sid)
+    if not d then
+        return
+    end
+    d.cardSid = self.currentCardSid
+    d.remainCount = 0
+
+    if d == self.allBoughtProduct then
+        self:SetProductsSoldout()
+    end
+end
+---设置所有礼包售罄(不包含免费礼包)
+function ChipGiftModel:SetProductsSoldout()
+    if not self.lstProducts then
+        return
+    end
+    for _, d in pairs(self.lstProducts) do
+        local finalPrice = require "MallManager":GetInstance():GetFinalPrice(d.cfg.price_id)
+        if d.remainCount > 0 and finalPrice > 0 then
+            d.cardSid = self.currentCardSid
+            d.remainCount = 0
+        end
+    end
+end
+
+---刷新界面
+function ChipGiftModel:RefreshView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MallView.Name)
+    if view then
+        --view:UpdateCurPageView(_G.MallViewPage.chipGift)
+        --现在特惠礼包放到礼包商城的子界面了
+        view.Lua_chipGift:InitView()
+    end
+end
+---是否显示红点
+function ChipGiftModel:CheckRed()
+    return self.freeProduct and self.freeProduct.remainCount > 0 and 1 or 0
+end
+
+---获得当前选择卡牌的sid
+---@return number
+function ChipGiftModel:GetCurrentCard()
+    return self.currentCardSid
+end
+---获取卡牌选择列表
+---@return number[]
+function ChipGiftModel:GetCardList()
+    return self.cacheCardList
+end
+---获取礼包列表数据
+function ChipGiftModel:GetProducts()
+    return self.lstProducts
+end
+---获取指定序号的礼包数据
+---@param index number
+function ChipGiftModel:GetProductByIndex(index)
+    if not self.lstProducts then
+        return nil
+    end
+    return self.lstProducts[index]
+end
+
+---获取一键购买数据
+---@return ChipGiftProductData
+function ChipGiftModel:GetAllBoughtProduct()
+    return self.allBoughtProduct
+end
+---能否一键购买
+---@return boolean
+function ChipGiftModel:CanBuyAll()
+    if not self.allBoughtProduct or self.allBoughtProduct.remainCount <= 0 or not self.lstProducts then
+        return false
+    end
+
+    --没有购买任何礼包时可用(免费礼包不计算)
+    for _, d in pairs(self.lstProducts) do
+        local finalPrice = require "MallManager":GetInstance():GetFinalPrice(d.cfg.price_id)
+        if d.remainCount <= 0 and finalPrice > 0 then
+            return false
+        end
+    end
+    return true
+end
+---一键购买所有
+function ChipGiftModel:BuyAll()
+    if not self.allBoughtProduct or self.allBoughtProduct.remainCount <= 0 then
+        return
+    end
+    require("MallManager"):GetInstance():BuyActiveGift(
+        self.allBoughtProduct.cfg.price_id,
+        nil,
+        self.allBoughtProduct.cfg.id
+    )
+end
+
+---检测礼包能否购买(非一键购买, 一键购买需要额外的判断条件)
+---@return boolean
+function ChipGiftModel:CanBuyProduct(sid)
+    local d = self:FindProductData(sid)
+    if not d or d.remainCount <= 0 then
+        return false
+    end
+    return true
+end
+---购买单个
+function ChipGiftModel:BuyProduct(sid)
+    local d = self:FindProductData(sid)
+    if not d or d.remainCount <= 0 then
+        return
+    end
+    require("MallManager"):GetInstance():BuyActiveGift(d.cfg.price_id, nil, d.cfg.id)
+end
+
+---获取礼包内容
+----@return number[][]   物品信息, 对应[sid:number, num:number][]
+function ChipGiftModel:GetGift(sid)
+    local d = self:FindProductData(sid)
+    if not d then
+        return nil
+    end
+
+    --如果礼包已被购买, 则显示购买时选择的英雄内容, 否则显示当前选择中的英雄内容
+    local cardSid = d.remainCount <= 0 and d.cardSid or self.currentCardSid or 0
+    --根据英雄是否为神卡, 获取不同的礼包内容
+    local isGodCard, cardIndex = self:FindCardIndex(cardSid)
+
+    ---@type number[][]
+    local results = {}
+    if cardIndex > 0 then
+        --免费礼包,获取固定奖励
+        local finalPrice = require "MallManager":GetInstance():GetFinalPrice(d.cfg.price_id)
+        if finalPrice <= 0 then
+            return d.cfg.goods
+        end
+
+        --卡牌碎片
+        local cardPiece = (isGodCard and d.cfg.piece_god or d.cfg.piece)[cardIndex]
+        if cardPiece then
+            table.insert(results, cardPiece)
+        end
+        utils.insertMany(results, isGodCard and d.cfg.goods_god or d.cfg.goods_ele)
+    else
+        --未选卡牌时, 使用自定义配置, 格式为{礼包1: id#数量#id#数量#...},{礼包2: id#数量#id#数量#...}
+        local giftIndex = self.lstProducts and utils.findIndex(self.lstProducts, d) or -1
+        local cfg = giftIndex > 0 and _G.ConfigManager.discrete_cfg[109301]
+        if cfg and cfg[giftIndex] then
+            local gd = cfg[giftIndex]
+            for i = 1, #gd, 2 do
+                table.insert(results, {gd[i], gd[i + 1]})
+            end
+        end
+    end
+
+    return results
+end
+
+--region 类型声明
+
+---@class ChipGiftProductData
+---@field cfg store_piece_cfg
+---@field remainCount number    剩余可购买次数
+---@field cardSid number        购买礼包时选择的英雄ID
+
+--enregion
+
+return ChipGiftModel

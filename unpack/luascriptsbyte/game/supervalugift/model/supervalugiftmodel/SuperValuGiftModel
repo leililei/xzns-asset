@@ -1,0 +1,245 @@
+-----------------------------------------------------------------------
+-- zhenhunjie-s\client\trunk\alpha\Client\Assets\Resources\LuaScripts\Game\SuperValuGift\Model
+--	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/03/06
+-- Description 赛季礼包数据
+-----------------------------------------------------------------------
+local base = require("SeasonBaseModel")
+local SeasonModel = require("SeasonModel")
+local MallManager = require("MallManager")
+local SeasonNet = require("SeasonNet")
+
+---@class SuperValuGiftModel : SeasonBaseModel
+---@field GetInstance fun():SuperValuGiftModel
+---@field curFunctionOpenID number 功能ID
+---@field model_cfg store_active_cfg[] 礼包配置
+---@field redPointId number 红点ID
+local SuperValuGiftModel = _G.BaseClass("SuperValuGiftModel", base)
+
+---@return SuperValuGiftModel
+function SuperValuGiftModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+local ActiveNum = 100 --活跃礼包活跃值需求
+local FreeGiftId = _G.ConfigManager.discrete_cfg[105115][1] ---活跃礼包id,取数组防止策划以后配多个
+
+function SuperValuGiftModel:__init()
+    self.curFunctionOpenID = 111
+    self.day_liveness = 0
+    self.liveness = 0
+    self.model_cfg = {}
+    self.redPointId = _G.ConfigManager.redpoint_cfg.SuperValuGift.id
+    self.buyTimes = nil
+
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+function SuperValuGiftModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+function SuperValuGiftModel:GetDataFormServer()
+    self:GetDataFromCfg()
+    self:GetBuyTimes()
+    self:InitFunction()
+end
+
+function SuperValuGiftModel:UpdataDayLiveness(num)
+    if self.liveness then
+        self.liveness = self.liveness + num
+        if self.liveness >= ActiveNum then
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SuperValuGift.id)
+        end
+    end
+end
+
+---获取所有礼包的购买次数
+function SuperValuGiftModel:GetBuyTimes(callback)
+    ---@field data season_gift.s2c_season_gift_info
+    SeasonNet:GetInstance():GetSeasonSuperValueGiftBuyTimes(
+        function(data)
+            self.buyTimes = {}
+            self.liveness = data.day_liveness or 0
+            ---已购买的次数
+            if data.times then
+                for _, item in pairs(data.times) do
+                    self.buyTimes[item.k] = item.v
+                end
+            end
+            if callback then
+                callback()
+            end
+            self:ParseData()
+        end
+    )
+end
+
+function SuperValuGiftModel:OnMallCashListener(data)
+    if not self.buyTimes then
+        return
+    end
+    if self.buyTimes[data.sid] then
+        self.buyTimes[data.sid] = self.buyTimes[data.sid] + 1
+    else
+        self.buyTimes[data.sid] = 1
+    end
+end
+
+---从配置表读取数据
+---@private
+function SuperValuGiftModel:GetDataFromCfg()
+    self.model_cfg = {}
+    local SeasonModelIns = require "SeasonModel":GetInstance()
+    ---@type season_cfg
+    local cfg = SeasonModelIns:GetCfg()
+    ---@type store_active_cfg[]
+    local cfgs = _G.ConfigManager.store_active_cfg
+
+    local startTime = SeasonModelIns:GetTime().startTime
+    local delta = _G.TimeUtil.GetInterValDayByGame(startTime, _G.TimeUtil.GetServerUnixTime())
+    local duration = _G.ConfigManager.discrete_cfg[105114][1][1]
+    local week = _G.Mathf.Floor(delta / duration) + 1
+    local active = cfg.active[week] and cfg.active[week] or cfg.active[#cfg.active]
+    ---@type store_active_cfg
+    local tempCfg
+    for _, v in pairs(active) do
+        tempCfg = cfgs[v]
+        if tempCfg and tempCfg.type_1 == 2 then
+            _G.table.insert(self.model_cfg, tempCfg)
+        end
+    end
+    self.model_cfg = _G.table.toArray(self.model_cfg)
+end
+
+function SuperValuGiftModel:InitFunction()
+    self.type_num = 1 --GM（同一个界面，2 = 是GM 1 = 配置）
+    local nowtime = _G.TimeUtil.GetServerUnixTime()
+    local uid = _G.PlayerModel:GetInstance().role_uid
+    local key1 = uid .. "SuperValuGift_time"
+    local key2 = uid .. "SuperValuGift"
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key1) then
+        local login_time = _G.CS.WechatGameCore.PlayerPrefs.GetInt(key1)
+        if not _G.TimeUtil.CheckTheSameDay(login_time, nowtime) then
+            if self:CheckOtherConditionExtra() then
+                _G.CS.WechatGameCore.PlayerPrefs.SetInt(key1, nowtime)
+                _G.CS.WechatGameCore.PlayerPrefs.SetInt(key2, 1)
+            end
+        end
+    else
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key1, nowtime)
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key2, 1)
+    end
+    if not self:CheckOtherConditionExtra() then
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key2, 0)
+    end
+    self:RefreshRedPoint()
+end
+
+---是否存在可/未充值项
+---@return boolean 是否存在可充值项
+function SuperValuGiftModel:CheckOtherConditionExtra()
+    local flag = false
+    for i = 1, #self.model_cfg do
+        local data = self.model_cfg[i]
+        local buyNum = MallManager:GetInstance():GetItemBuyTimes(data.id, data.type_reset)
+        if buyNum ~= data.count_limit then
+            flag = true
+            break
+        end
+    end
+    return flag
+end
+
+---返回礼包sid的购买次数
+---@param sid number 礼包Sid
+---@return number 已购买次数
+function SuperValuGiftModel:GetItemBuyTimes(sid)
+    if self.buyTimes and self.buyTimes[sid] then
+        return self.buyTimes[sid]
+    end
+    return 0
+end
+
+---充值
+function SuperValuGiftModel:Recharge(giftInfo, call)
+    if _G.table.ContainsValue(FreeGiftId, giftInfo.id) then ---日常活跃礼包
+        require "SeasonNet":GetInstance():GetAward(
+            {req = giftInfo.id},
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                if call then
+                    call(true)
+                end
+            end
+        )
+    else
+        local cfg = _G.ConfigManager.store_active_cfg[giftInfo.id]
+        MallManager:GetInstance():BuyActiveGift(cfg.price_id, nil, cfg.id)
+    end
+end
+
+---初始化红点
+function SuperValuGiftModel:InitRedPointTree()
+    self.checkRedPointFunc = {self.CheckFirstLogin}
+    self.redpointTree = {false, false}
+end
+
+---是否 每日的首次登录
+function SuperValuGiftModel:CheckFirstLogin()
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "SuperValuGift"
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) and _G.CS.WechatGameCore.PlayerPrefs.GetInt(key) ~= 1 then
+        return 0
+    else
+        return 1
+    end
+end
+
+---赛季开始
+function SuperValuGiftModel:OnSeasonStart()
+end
+
+---进入结算期（关闭界面）
+function SuperValuGiftModel:OnSettlement()
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SuperValuGiftView.Name)
+end
+
+---赛季结束
+function SuperValuGiftModel:OnSeasonEnd()
+end
+
+---检查红点
+function SuperValuGiftModel:CheckRedPoint()
+    if require("SeasonModel"):GetInstance():GetSeasonTimeLeft() <= 0 then
+        return false
+    end
+    for _, v in pairs(FreeGiftId) do
+        if _G.ConfigManager.store_active_cfg[v] then
+            if self:GetItemBuyTimes(v) < _G.ConfigManager.store_active_cfg[v].count_limit then
+                return true
+            end
+            --if self.liveness >= ActiveNum and self:GetItemBuyTimes(v) < _G.ConfigManager.store_active_cfg[v].count_limit then
+            --    return true
+            --end
+        end
+    end
+    -- local startTime = _G.PlayerPrefsManager.GetInt("SuperValuGift")
+    -- if startTime == nil or startTime ~= require("SeasonModel"):GetInstance():GetTime().startTime then
+    --     return true
+    -- end
+    return false
+end
+
+---打开界面
+function SuperValuGiftModel:OpenView(hideFun, openFun, ...)
+    --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SuperValuGiftView.Name)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SeasonGiftPackView.Name)
+end
+
+---@type SuperValuGiftModel
+return SuperValuGiftModel

@@ -1,0 +1,244 @@
+-----------------------------------------------------------------------
+-- G:.zhenhunjie.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Battle.BattleController.BattleControllerArenaElement	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/09/27
+-- Description: 五行联赛战斗控制器
+-----------------------------------------------------------------------
+local ArenaNet = require "ArenaNet"
+local ArenaManager = require "ArenaManager"
+local base = require("BattleControllerBase")
+---@class BattleControllerArenaElement	中文描述
+local BattleControllerArenaElement = _G.BaseClass("BattleControllerArenaElement", base)
+
+---类的构造函数
+function BattleControllerArenaElement:__init()
+    self.arenaClass = ArenaManager:GetInstance():GetArenaClass(ArenaManager.arenaType.element)
+end
+
+---类的析构函数
+function BattleControllerArenaElement:Dispose()
+    self.onCheckCall = nil
+    self.mgCfg = nil
+    self.arenaClass = nil
+    self.enemy = nil
+    self.lastRank = nil
+    self.curWinNum = nil
+end
+--region 子类重写
+---处理参数
+---@param rank number 当前排名
+---@param enemy table 敌方数据
+function BattleControllerArenaElement:OnHandleParams(rank, enemy)
+    self.lastRank = rank
+    self.curWinNum = self.arenaClass:GetWinNum()
+    self.enemy = enemy
+end
+-----检测是否可以进入战斗
+function BattleControllerArenaElement:CheckFight(callback)
+    self.onCheckCall = callback
+    local port =
+        ArenaNet:GetInstance():FightElement(
+        ArenaManager.arenaType.element,
+        self.enemy.uid,
+        self.enemy.mType,
+        _G.handler(self, self.OnFightMsgCall)
+    )
+    _G.BattleManager:GetInstance():AddLuaNetEvent(port)
+end
+---加载战斗(协程加载)
+function BattleControllerArenaElement:OnLoadFight()
+    local uiManager = _G.UIManager:GetInstance()
+    uiManager:CloseWindowsByLayer(_G.UILayers.NormalLayer, _G.UILayers.InfoLayer)
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(false, true)
+    local battleView = uiManager:OpenWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    -- 等待 战斗窗口 加载完成
+    while (_G.IsNil(battleView.View.gameObject)) do
+        _G.coroutine.waitforendofframe()
+    end
+    battleView.View:SetSettingBtnActive(false)
+    uiManager:HideWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    local battleManager = _G.BattleManager:GetInstance()
+    battleManager:initAttackSids(nil, _G.EBattleType.OneTeamArena, true)
+    -- 协程等待
+    while battleManager.Progress < 1 do
+        _G.coroutine.waitforendofframe()
+    end
+    _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, self.mgCfg.audio)
+
+    battleView.View:SetCanvasGroupTrue()
+end
+---战斗开始
+function BattleControllerArenaElement:OnStart()
+    local uiManager = _G.UIManager:GetInstance()
+    uiManager:ShowWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    local view = uiManager:GetWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    if view then
+        view.View:SetAutoBtnActive(false)
+        view.View.AtActive = false
+    end
+    _G.BattleManager:GetInstance():SetBattlePause(true)
+    _G.BattleManager:GetInstance():SetBattleStart()
+    _G.BattleManager:GetInstance():ShowBattleTeam()
+end
+---战斗结束
+--[[
+  required uint32 ack = 1;
+  optional bool winner = 2;//进攻方是否胜利
+  optional award.i_award award = 3;//战斗奖励
+  repeated uint32 info = 4;//消息，竞技场:变化积分,总积分,新排名
+]]
+---@param tab table 战斗数据
+function BattleControllerArenaElement:OnFightResult(tab, call)
+    ArenaNet:GetInstance():FightResultElement(
+        function(_data)
+            if _data.ack == 1 then
+                local result = _data.winner or false
+                self.params = {
+                    score = _data.info[1],
+                    sumscore = _data.info[2],
+                    lastRank = self.lastRank,
+                    win = result,
+                    enemy = self.enemy,
+                    re_uid = _data.re_uid,
+                    reportType = 4
+                }
+                if _data.info[4] and _data.info[5] then
+                    self.params.enemyCurScore = _data.info[4]
+                    self.params.enemyAddScore = _data.info[5] - _data.info[4]
+                end
+                self.curResultView = self.params.view
+                self:RefreshView(call)
+            else
+                self:OnSettlementEndCall(false)
+            end
+        end
+    )
+end
+---结算
+---@param callback function 结算回调(参数 结算脚本名,其他动态参数
+function BattleControllerArenaElement:OnSettlement(callback)
+    callback(_G.SettlementModel.SettlementType.arena, self.params)
+end
+---结算退出
+---@param win boolean 是否胜利
+function BattleControllerArenaElement:OnSettlementEnd(win)
+    if win == nil then --异常
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+    else
+        local ArenaController = require("ArenaController"):GetInstance()
+        if self.arenaClass:GetCurArenaState() == 1 then
+            local RedPointManagerIns = require("RedPointManager"):GetInstance()
+            local redpoint_cfg = _G.ConfigManager.redpoint_cfg
+            --获取奖励默认刷新青铜段位奖励
+            RedPointManagerIns:RefreshNodeByAllParams(redpoint_cfg.ArenaElementLeague.id)
+            --刷新宝箱红点
+            RedPointManagerIns:RefreshNodeByAllParams(redpoint_cfg.ArenaElementBoxAward.id)
+            RedPointManagerIns:RefreshNode(redpoint_cfg.ArenaElementChallenge.id)
+            self.arenaClass:RefreshReport(
+                function()
+                    self.arenaClass:GetEnemyInfo(
+                        function()
+                            _G.UIManager:GetInstance():OpenWindow(
+                                _G.ConfigManager.ui_cfg.ArenaElementMainPanelView.Name
+                            )
+                            _G.UIManager:GetInstance():OpenWindow(
+                                _G.ConfigManager.ui_cfg.ArenaElementChallengeView.Name
+                            )
+                        end,
+                        true
+                    )
+                end
+            )
+        else
+            _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+        end
+    end
+end
+
+---获取怪物组ID
+---@return number 怪物组ID
+function BattleControllerArenaElement:GetMonsterGroupID()
+    return self.mgCfg.id
+end
+---重新布阵
+function BattleControllerArenaElement:OnReEmbattle()
+    self:OnSettlementEnd(false)
+end
+--endregion
+
+--region 内部方法
+---检测回调
+---@param 变量名 变量类型 中文描述
+function BattleControllerArenaElement:OnFightMsgCall(msg)
+    if msg.ack == 1 then
+        self.mgCfg = _G.ConfigManager.monster_group_cfg[msg.fight_arg.sid]
+        if self.arenaClass:GetFreeFightTimes() <= 0 then
+            local cfg = _G.ConfigManager.arena_info_cfg[ArenaManager.arenaType.element]
+            if cfg then
+                cfg = _G.ConfigManager.exchange_cfg[cfg.ticket]
+                if cfg then
+                    _G.StorageManager:GetInstance():ConsumeItem(cfg.get_item[1][1], nil, 1)
+                end
+            end
+        end
+        self.onCheckCall(true)
+    else
+        self.onCheckCall(false, msg.ack)
+    end
+end
+function BattleControllerArenaElement:RefreshView(call)
+    if self.arenaClass:GetCurArenaState() == 1 then
+        self.arenaClass:InitInfo(
+            function()
+                self.params.curRank = self.arenaClass:GetRank()
+                self.params.winNum = self.arenaClass:GetWinNum() - self.curWinNum
+                self.params.curWinNum = self.arenaClass:GetWinNum()
+                self.params.maxWinNum = self.arenaClass:GetMaxWinNum()
+                local ArenaController = require("ArenaController"):GetInstance()
+                local RedPointManagerIns = require("RedPointManager"):GetInstance()
+                local redpoint_cfg = _G.ConfigManager.redpoint_cfg
+                --获取奖励默认刷新青铜段位奖励
+                RedPointManagerIns:RefreshNodeByAllParams(redpoint_cfg.ArenaElementLeague.id)
+                --刷新宝箱红点
+                RedPointManagerIns:RefreshNodeByAllParams(redpoint_cfg.ArenaElementBoxAward.id)
+                self.arenaClass:RefreshReport(
+                    function()
+                        self.arenaClass:GetEnemyInfo(call, true)
+                    end
+                )
+            end,
+            true
+        )
+    else
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnSureCall, self)
+        --_G.PopWindowManager:GetInstance():ShowAllTips(300301)
+    end
+end
+
+function BattleControllerArenaElement:OnSureCall()
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnSureCall, self)
+    _G.UIManager:GetInstance():CloseWindow(self.curResultView)
+    self:OnSettlementEndCall(false)
+end
+--endregion
+---加载战斗(协程加载)
+function BattleControllerArenaElement:OnLoadRecordFight(index, notInBattle)
+    local recordType = notInBattle and 2 or 1
+    _G.BattleManager:GetInstance():initAttackSids(nil, _G.EBattleType.OneTeamArena, true, recordType, 0)
+    if notInBattle then
+        while _G.BattleManager:GetInstance().Progress < 1 do
+            _G.coroutine.waitforendofframe()
+        end
+    end
+    _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, 1009)
+end
+----检测数据统计是否显示回放战斗
+function BattleControllerArenaElement:CheckShowRecordBattle()
+    return true
+end
+
+function BattleControllerArenaElement:EndFight()
+    self:OnSettlementEnd(false)
+end
+
+return BattleControllerArenaElement

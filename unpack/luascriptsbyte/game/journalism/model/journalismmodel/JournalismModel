@@ -1,0 +1,202 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Journalism.Model.JournalismModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/12/19
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local JournalismItemData = require "JournalismItemData"
+local CommonTipManager = require "CommonTipManager"
+---@class JournalismModel : GameDataModelBase
+---@field joutnalismDatas table<number,JournalismItemData[]> 所有日报数据
+---@field point number 可用点赞数
+---@field likeUis table<number,boolean> 已点赞uid
+---@field likeTypes table<number,boolean> 已点赞类型
+local JournalismModel = _G.BaseClass("JournalismModel", _G.GameDataModelBase)
+
+local Key = "JournalismModelFirst"
+---@return JournalismModel JournalismModel
+function JournalismModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function JournalismModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.Journalism
+    self.maxPoint = _G.ConfigManager.discrete_cfg[109001][1][1]
+    self.point = 0
+    ---新需求记录当前登录是否打开界面
+    self.DengLuHongDian = true
+end
+
+---销毁对象时,析构函数
+function JournalismModel:Dispose()
+end
+
+--region 子类重写
+---从服务器拉取数据
+function JournalismModel:GetDataFormServer()
+    self:GetInfo()
+    if self:CheckIsFirst() then
+        if not _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.JournalismView.Name) then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.JournalismView.Name)
+            end
+            _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.JournalismView)
+        end
+    end
+end
+
+---检测是否为当天首次打开
+function JournalismModel:CheckIsFirst()
+    if _G.PlayerPrefsManager.HasKey(Key) then
+        local time = _G.PlayerPrefsManager.GetInt(Key, 0)
+        local time2 = self:GetTime()
+        return time < time2
+    end
+    return true
+end
+---存储当日登录
+function JournalismModel:ChangeIsFirst()
+    _G.PlayerPrefsManager.SetInt(Key, self:GetTime())
+end
+---获取info数据
+function JournalismModel:GetInfo()
+    require "JournalismNet":GetInstance():GetInfo(_G.handler(self, self.GetInfoCall))
+end
+---获取当日信息
+function JournalismModel:GetTime()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local data = _G.TimeUtil.GetDateTime(time)
+    if data.hour < _G.TimeUtil.GAME_DAY_HOUR then
+        return _G.TimeUtil.GetDayBegin(time - _G.TimeUtil.GAME_DAY_TIME) + _G.TimeUtil.GAME_DAY_TIME
+    else
+        return _G.TimeUtil.GetDayBegin(time) + _G.TimeUtil.GAME_DAY_TIME
+    end
+end
+
+---获取数据回调
+---@param msg mission_news.s2c_mission_news
+function JournalismModel:GetInfoCall(msg)
+    self.point = self.maxPoint - (_G.table.isEmptyOrNil(msg.point) and 0 or #msg.point)
+    self:InitLikeType(msg.point)
+    self:InitJournalismDatas(msg)
+    self:ParseData()
+    ---刷新红点
+    _G.Events:GetInstance():Broadcast(_G.eJournalism.Refresh)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.NewsButton.id)
+end
+
+---初始化数据
+---@param msg mission_news.s2c_mission_news
+function JournalismModel:InitJournalismDatas(msg)
+    self.joutnalismDatas = {}
+    for _, v in pairs(_G.JournalismType) do
+        self.joutnalismDatas[v] = {}
+    end
+    if msg.public_news then
+        local data
+        for _, v in pairs(msg.public_news) do
+            data = JournalismItemData.New(v, _G.JournalismType.All)
+            _G.table.insert(self.joutnalismDatas[_G.JournalismType.All], data)
+        end
+    end
+
+    if msg.role_news then
+        local data
+        for _, v in pairs(msg.role_news) do
+            data = JournalismItemData.New(v, _G.JournalismType.My)
+            _G.table.insert(self.joutnalismDatas[_G.JournalismType.My], data)
+        end
+    end
+end
+
+---初始化点赞
+---@param point mission_news.i_news_point[]
+function JournalismModel:InitLikeType(point)
+    self.likeIds = {}
+    if point then
+        for _, v in pairs(point) do
+            self.likeIds[v] = true
+        end
+    end
+end
+
+---获取新闻数据
+function JournalismModel:GetJournalismDatas()
+    return self.joutnalismDatas
+end
+
+---初始化功能逻辑
+function JournalismModel:InitFunction()
+end
+---点赞
+---@param uid number 角色uid
+---@param index number 新闻号
+function JournalismModel:Like(uid, index, call)
+    ---单个角色单个类型只能点赞一次
+    if self.likeIds[index] then
+        return
+    end
+    if self:GetlikeNum() <= 0 then
+        ---TODO 提示点赞次数不足
+        return
+    end
+    require "JournalismNet":GetInstance():Like(
+        {uid = uid, index = index},
+        _G.handlerbind(self, self.LikeCall, uid, index, call)
+    )
+end
+
+---点赞回调
+---@param uid number 角色uid
+---@param index number 新闻号
+function JournalismModel:LikeCall(msg, uid, index, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    self:AddLike(uid, index)
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    self.point = self.point - 1
+    if call then
+        call(msg)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eJournalism.RefreshLike)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.NewsButton.id)
+end
+
+---增加点赞数
+---@param uid number 角色uid
+---@param index number 新闻号
+function JournalismModel:AddLike(uid, index)
+    self.likeIds[index] = true
+    for _, v in pairs(self.joutnalismDatas) do
+        for _, v2 in pairs(v) do
+            if v2.data.uid == uid then
+                v2:AddPoint()
+            end
+        end
+    end
+    _G.PlayerModel:GetInstance():AddPoint(1)
+end
+
+---获取点赞次数
+function JournalismModel:GetlikeNum()
+    return self.point or 0
+end
+
+---重连成功调用
+---@param endcall function 完成回调
+function JournalismModel:ReConnect(endcall)
+    self.isReconnect = true
+    self:InitData(endcall)
+end
+---检测是否点赞
+---@param uid number 角色uid
+---@param index number 新闻号
+function JournalismModel:CheckIsLike(index)
+    return self.likeIds[index]
+end
+
+return JournalismModel

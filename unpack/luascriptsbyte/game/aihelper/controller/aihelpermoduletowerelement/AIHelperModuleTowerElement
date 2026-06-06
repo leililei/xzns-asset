@@ -1,0 +1,290 @@
+local base = require("AIHelperModuleBaseNumberMock")
+local AIHelperModuleTower = require("AIHelperModuleTower")
+
+---种族塔类型
+local ElementTypes = {
+    _G.CardElementType.Thunder,
+    _G.CardElementType.Wind,
+    _G.CardElementType.Water,
+    _G.CardElementType.Fire,
+    --_G.CardElementType.Earth
+}
+
+---@class AIHelperModuleTowerElement : AIHelperModuleBaseNumberMock	    @AI助手-死魂塔五行塔
+---@field count number                  @剩余可挑战次数
+---@field types number[]                @可挑战的元素塔类型列表
+---@field layers table<number,tower_cfg[]>  @五行塔配置(从1开始, 至最顶层)
+local AIHelperModuleTowerElement = _G.BaseClass("AIHelperModuleTowerElement", base)
+
+---是否显示此模块(功能是否开启)
+function AIHelperModuleTowerElement:IsEnabled()
+    if not base.IsEnabled(self) then
+        return false
+    end
+    --检查是否开启五行塔
+    if not self:CheckElementEnabled(false) then
+        return false
+    end
+
+    return true
+end
+
+---是否满足模块使用条件
+function AIHelperModuleTowerElement:IsActive()
+    return self.index <= self.number and self.count > 0
+end
+
+---获取Number范围
+function AIHelperModuleTowerElement:GetCountRange()
+    local cfg = _G.ConfigManager.discrete_cfg[101801]
+    if cfg then
+        return 0, cfg[1][1] * #ElementTypes
+    end
+    return 0, 999
+end
+
+---重置状态
+function AIHelperModuleTowerElement:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.count = 1
+    self.types = nil
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleTowerElement:Check(callback)
+    self.index = 1
+    self.count = 0
+    self.types = nil
+
+    --更新死魂塔信息
+    ---@type DeadsoulTowerModel
+    local model = require("DeadsoulTowerModel"):GetInstance()
+    model:InitData(function()
+        if not model.IsOpenWx then
+            if callback then
+                callback(true)
+            end
+            return
+        end
+        _G.DeadsoulTowerManager:GetInstance():UpdateWeek()
+        --获取今日可挑战类型和总和剩余次数
+        self.types = {}
+        for _, type in ipairs(ElementTypes) do
+            if model:CheckWeek(type) then
+                table.insert(self.types, type)
+                self.count = self.count + self:GetRemainCount(type)
+            end
+        end
+        if callback then
+            callback(true)
+        end
+    end)
+end
+
+---获取当前执行状态
+function AIHelperModuleTowerElement:GetExecuteState()
+    local type, layer = nil, nil
+    if self.types and #self.types > 0 then
+        type = self.types[1]
+        layer = self:GetCurrentLayer(type)
+    end
+
+    return {
+        total = self.number,
+        index = self.index,
+        layer = layer,
+        type = type
+    }
+end
+
+---执行逻辑
+function AIHelperModuleTowerElement:Execute(callback)
+    self.index = self.index + 1
+    self.count = self.count - 1
+
+    if not self.types or #self.types == 0 then
+        if callback then
+            callback(false, nil)
+        end
+        return
+    end
+    local type = self.types[1]
+    --检查当日是否开启且未达最高层
+    if not self:CheckEnterState(type) then
+        table.remove(self.types, 1)
+        self.count = self.count - self:GetRemainCount(self.types[1]) + 1 --还原此次执行的count数量+1
+        if callback then
+            callback(false, nil)
+        end
+    end
+
+    ---检测是否正在战斗中
+    if _G.MainManager:GetInstance():IsFighting(false) then
+        if callback then
+            callback(false, self:CreateFailureResults(90028010143, _G.GetLangPackValue(self.cfg.name)))
+        end
+        return
+    end
+
+    --执行战斗逻辑
+    local towerCfg = self:GetLayerCfg(type, self:GetCurrentLayer(type) + 1)
+    AIHelperModuleTower.Fight(type, towerCfg, function(ok, results, isFight)
+        if not callback then
+            return
+        end
+        --没有战斗次数或失败时, 移除type和次数
+        local remainCount = self:GetRemainCount(self.types[1])
+        if remainCount == 0 or not ok then
+            table.remove(self.types, 1)
+            self.count = self.count - remainCount
+            if not ok then
+                --失败时, 还原此次执行的count数量+1
+                self.count = self.count + 1
+            end
+        end
+        --战斗结果
+        if not ok then
+            if not results and not isFight then
+                results = self:CreateFailureResults(self.cfg.fail_tip) --未上阵卡牌
+            else
+                results = results or {}
+            end
+            results.win = false
+
+            ok = #self.types > 0
+        end
+        callback(ok, results)
+    end)
+end
+
+---显示执行状态
+function AIHelperModuleTowerElement:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+
+    if state and state.type and state.layer then
+        local titleId =
+            state.type == _G.CardElementType.Thunder and 90000011280 or
+            state.type == _G.CardElementType.Wind and 90000011281 or
+            state.type == _G.CardElementType.Water and 90000011282 or
+            state.type == _G.CardElementType.Fire and 90000011283 or
+            state.type == _G.CardElementType.Earth and 90000011284
+        item.aortext_tip.text = _G.GetLangPackValue(titleId, state.layer + 1)
+    else
+        item.aortext_tip.text = ""
+    end
+end
+
+---显示执行结束UI状态
+function AIHelperModuleTowerElement:ShowExecuteResult(item, success, results)
+    if results and results.win == false then
+        success = false
+        if not results.tip then --显示默认tip信息, 否则显示"胜利"或"失败"图标
+            results = nil
+        end
+    end
+
+    base.ShowExecuteResult(self, item, success, results)
+    if not success then
+        return
+    end
+    self.Util.ShowAwardListOfMsg(item, results)
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleTowerElement:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+---检查目标类型能否进入战斗
+---@param type number   @目标元素塔类型
+---@return boolean
+function AIHelperModuleTowerElement:CheckEnterState(type)
+    local model = require("DeadsoulTowerModel"):GetInstance()
+    --检查是否开启五行塔
+    _G.DeadsoulTowerManager:GetInstance():UpdateWeek()
+    if not model:CheckWeek(type) then
+        return false
+    end
+    --检查是否到最大层
+    if not self:GetLayerCfg(type, self:GetCurrentLayer(type) + 1) then
+        return false
+    end
+    return true
+end
+
+---获取塔的当前层数
+---@param type number   @目标元素塔类型
+---@return number
+function AIHelperModuleTowerElement:GetCurrentLayer(type)
+    local model = require("DeadsoulTowerModel"):GetInstance()
+    if model.PracticeFloor[type] then
+        local towerId = model.PracticeFloor[type].high_floor
+        local cfg = _G.ConfigManager.tower_cfg[towerId]
+        if cfg then
+            return cfg.layer
+        end
+    end
+    return 0
+end
+
+---获取剩余挑战次数
+---@param type number       @目标元素塔类型
+---@return number
+function AIHelperModuleTowerElement:GetRemainCount(type)
+    local model = require("DeadsoulTowerModel"):GetInstance()
+    if model.PracticeFloor[type] then
+        local cfg = _G.ConfigManager.discrete_cfg[101801]
+        if not cfg then
+            return 0
+        end
+        return cfg[1][1] - model.PracticeFloor[type].pass_num
+    end
+    return 0
+end
+
+---获取塔的层数配置
+---@param type number       @目标元素塔类型
+---@param layer number      @目标层数
+---@return tower_cfg
+function AIHelperModuleTowerElement:GetLayerCfg(type, layer)
+    if not self.layers then
+        --初始化列表配置
+        self.layers = {}
+        for _, cfg in pairs(_G.ConfigManager.tower_cfg) do
+            local lst = self.layers[cfg.tower]
+            if not lst then
+                lst = {}
+                self.layers[cfg.tower] = lst
+            end
+            lst[cfg.layer] = cfg
+        end
+    end
+
+    local cfgs = self.layers[type]
+    if not cfgs then
+        return nil
+    end
+    return cfgs[layer]
+end
+
+---检查五行塔是否已开启
+---@param specific boolean  如果传入true将先检查是否存在本地缓存数据
+---@return boolean
+function AIHelperModuleTowerElement:CheckElementEnabled(specific)
+    --检查是否开启五行塔
+    local floor = require("DeadsoulTowerModel"):GetInstance().LandFloor
+    if floor then
+        local cfg = _G.ConfigManager.tower_cfg[floor] --取当前主塔层数
+        local unlockCfg = _G.ConfigManager.discrete_cfg[102301]
+        if not cfg or not unlockCfg or cfg.layer < unlockCfg[1][1] then
+            return false
+        end
+    elseif specific then
+        return false
+    end
+    return true
+end
+
+return AIHelperModuleTowerElement

@@ -1,0 +1,485 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.LimitBroken.Model.LimitBrokenModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/03/06
+-- Description: 界限突破数据类
+-----------------------------------------------------------------------
+local LimitBrokenTaskData = require("LimitBrokenTaskData")
+
+local base = _G.GameDataModelBase
+---@class LimitBrokenModel : GameDataModelBase
+---@field taskList table<number, table<number, LimitBrokenTaskData>>
+local LimitBrokenModel = _G.BaseClass("LimitBrokenModel", base)
+
+local limit_broken_cfg = _G.ConfigManager.limit_broken_cfg
+local table = _G.table
+LimitBrokenModel.FinishType = {
+    PreFinish = 0, --完成未领奖（预完成）
+    Finish = 1, --完成且领奖
+    InProgress = 2 --未完成（进行中）
+}
+
+---@return LimitBrokenModel LimitBrokenModel
+function LimitBrokenModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function LimitBrokenModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.LimitBroken
+    self.taskList = {}
+    local groupId
+    for _, v in pairs(limit_broken_cfg) do
+        groupId = v.id
+        self.taskList[groupId] = {}
+        for i, group in ipairs(v.mission) do
+            for _, id in ipairs(group) do
+                self.taskList[groupId][id] = LimitBrokenTaskData.New(id, groupId)
+            end
+        end
+    end
+    self:InitTaskDataDict()
+    _G.Events:GetInstance():AddListener(_G.ChatViewEvents.ChatViewLevel, self.UpdateAllTask, self)
+    _G.Events:GetInstance():AddListener(_G.ChatViewEvents.ChatViewTianFv, self.UpdateCardTalent, self)
+    _G.Events:GetInstance():AddListener(_G.ChatViewEvents.ChatViewHunLian, self.UpdateCardSoulLink, self)
+    _G.Events:GetInstance():AddListener(_G.ArtifactShow.ArtifactLevel, self.UpdateArtifactLevel, self)
+    _G.Events:GetInstance():AddListener(_G.ArtifactShow.ArtifactStar, self.UpdateArtifactStar, self)
+    _G.Events:GetInstance():AddListener(_G.ArtifactShow.ArtifactAwaken, self.UpdateArtifactAwaken, self)
+end
+
+---从服务器拉取数据
+function LimitBrokenModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+function LimitBrokenModel:GetInfo()
+    local count = table.count(limit_broken_cfg)
+    local GetInfo = function(gid)
+        local pbData = {group_sid = gid}
+        require("LimitBrokenNet"):GetInstance():GetInfo(
+            pbData,
+            function(msg)
+                if msg.ack == 1 then
+                    if msg.can_award then
+                        for _, tid in pairs(msg.can_award) do
+                            self.taskList[gid][tid]:ChangeState(self.FinishType.PreFinish)
+                        end
+                    end
+                    if msg.finish then
+                        for _, tid in pairs(msg.finish) do
+                            self.taskList[gid][tid]:ChangeState(self.FinishType.Finish)
+                        end
+                    end
+                end
+                count = count - 1
+                if count == 0 then
+                    self:ParseData()
+                end
+            end
+        )
+    end
+
+    for _, v in pairs(limit_broken_cfg) do
+        if _G.GlobalConditionManager.CheckConditionArrays(v.func_open) then
+            GetInfo(v.id)
+        else
+            count = count - 1
+            if count == 0 then
+                self:ParseData()
+            end
+        end
+    end
+end
+
+---@param msg guild_mysteries.s2c_info
+function LimitBrokenModel:ParseData(msg)
+    self.super.ParseData(self)
+end
+
+function LimitBrokenModel:FinishTask(groupID, taskIDLis, type, callback)
+    local pbData = {group_sid = groupID, task_sid = taskIDLis, type = type}
+    require("LimitBrokenNet"):GetInstance():Finish(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("界限突破任务完成异常！")
+                end
+                return
+            end
+            for _, taskID in pairs(taskIDLis) do
+                self.taskList[groupID][taskID]:ChangeState(type)
+            end
+            if type == self.FinishType.Finish then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.LimitBroken)
+            end
+            self:RefreshRedPoint()
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+function LimitBrokenModel:GetTaskData(groupID, taskID)
+    return self.taskList[groupID][taskID]
+end
+
+function LimitBrokenModel:GetProgress(groupID, line)
+    local taskIDLis = limit_broken_cfg[groupID].mission[line]
+    local num = 0
+    for i, v in pairs(taskIDLis) do
+        if self.taskList[groupID][v]:GetState() == self.FinishType.InProgress then
+            break
+        end
+        num = i
+    end
+    return (num - 1) / (#taskIDLis - 1)
+end
+
+function LimitBrokenModel:CheckGroupHasPreFinish(groupID)
+    for _, v in pairs(self.taskList[groupID]) do
+        if v:GetState() == self.FinishType.PreFinish then
+            return true
+        end
+    end
+    return false
+end
+
+function LimitBrokenModel:GetGroupFirstNotFinish(groupID, line)
+    local index = 1
+    local taskList = limit_broken_cfg[groupID].mission[line]
+    for k, v in pairs(taskList) do
+        if self.taskList[groupID][v]:GetState() ~= self.FinishType.Finish then
+            index = k
+            break
+        end
+    end
+    return index
+end
+
+function LimitBrokenModel:InitTaskDataDict()
+    self.cardTalents = {}
+    self.cardSoulLinks = {}
+    self.ArtifactLevels = {}
+    self.ArtifactStars = {}
+    self.ArtifactAwakens = 0
+    self.appointArtifactLevel = {}
+    self.appointArtifactStar = {}
+    self.appointArtifactAwaken = {}
+end
+
+function LimitBrokenModel:UpdateAllTask()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.LimitBroken) then
+        return
+    end
+    local preList
+    local taskID
+    for gid, group in pairs(self.taskList) do
+        preList = {}
+        for _, task in pairs(group) do
+            taskID = task:CheckTaskState()
+            if taskID then
+                table.insert(preList, taskID)
+            end
+        end
+        if #preList > 0 then
+            self:FinishTask(gid, preList, self.FinishType.PreFinish)
+        end
+    end
+    self:RefreshRedPoint()
+end
+
+function LimitBrokenModel:UpdateCardTalent()
+    self.cardTalents = {}
+    local talentNum
+    local cardList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    for _, v in pairs(cardList) do
+        talentNum = #v.open_inborn
+        if self.cardTalents[talentNum] == nil then
+            self.cardTalents[talentNum] = 1
+        else
+            self.cardTalents[talentNum] = self.cardTalents[talentNum] + 1
+        end
+    end
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.CardTalent.LevelNum},
+        1
+    )
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.LimitBroken) then
+        return
+    end
+    self:UpdateAllTask()
+end
+
+function LimitBrokenModel:UpdateCardSoulLink()
+    self.cardSoulLinks = {}
+    local cardList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    for _, v in pairs(cardList) do
+        if self.cardSoulLinks[v.soulLink_lv] == nil then
+            self.cardSoulLinks[v.soulLink_lv] = 1
+        else
+            self.cardSoulLinks[v.soulLink_lv] = self.cardSoulLinks[v.soulLink_lv] + 1
+        end
+    end
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.CardSoulLink.LevelNum},
+        1
+    )
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.LimitBroken) then
+        return
+    end
+    self:UpdateAllTask()
+end
+
+function LimitBrokenModel:UpdateArtifactLevel()
+    self.ArtifactLevels = {}
+    local lv
+    local artifactList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Artifact)
+    for _, v in pairs(artifactList) do
+        lv = v.lv
+        if self.ArtifactLevels[lv] == nil then
+            self.ArtifactLevels[lv] = 1
+        else
+            self.ArtifactLevels[lv] = self.ArtifactLevels[lv] + 1
+        end
+        if self.appointArtifactLevel[v.sid] == nil or self.appointArtifactLevel[v.sid] < lv then
+            self.appointArtifactLevel[v.sid] = lv
+        end
+    end
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.Artifact.LevelNum},
+        1
+    )
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.Artifact.SidLevel},
+        1
+    )
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.LimitBroken) then
+        return
+    end
+    self:UpdateAllTask()
+end
+
+function LimitBrokenModel:UpdateArtifactStar()
+    self.ArtifactStars = {}
+    local star
+    local artifactList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Artifact)
+    for _, v in pairs(artifactList) do
+        star = v.star
+        if self.ArtifactStars[star] == nil then
+            self.ArtifactStars[star] = 1
+        else
+            self.ArtifactStars[star] = self.ArtifactStars[star] + 1
+        end
+        if self.appointArtifactStar[v.sid] == nil or self.appointArtifactStar[v.sid] < star then
+            self.appointArtifactStar[v.sid] = star
+        end
+    end
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.Artifact.StarNum},
+        1
+    )
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.Artifact.SidStar},
+        1
+    )
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.LimitBroken) then
+        return
+    end
+    self:UpdateAllTask()
+end
+
+function LimitBrokenModel:UpdateArtifactAwaken()
+    self.ArtifactAwakens = 0
+    local awaken
+    local artifactList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Artifact)
+    for _, v in pairs(artifactList) do
+        awaken = v:GetIsAwaken()
+        if awaken then
+            self.ArtifactAwakens = self.ArtifactAwakens + 1
+            self.appointArtifactAwaken[v.sid] = true
+        end
+    end
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.Artifact.AwakenNum},
+        1
+    )
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.Artifact.SidAwaken},
+        1
+    )
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.LimitBroken) then
+        return
+    end
+    self:UpdateAllTask()
+end
+
+function LimitBrokenModel:CheckCardTalentCount(num, level)
+    for k, v in pairs(self.cardTalents) do
+        if k >= level then
+            num = num - v
+        end
+        if num <= 0 then
+            return true
+        end
+    end
+    return false
+end
+
+function LimitBrokenModel:GetCardTalentCount(level)
+    local num = 0
+    for k, v in pairs(self.cardTalents) do
+        if k >= level then
+            num = num + v
+        end
+    end
+    return num
+end
+
+function LimitBrokenModel:CheckCardSoulLinkCount(num, level)
+    for k, v in pairs(self.cardSoulLinks) do
+        if k >= level then
+            num = num - v
+        end
+        if num <= 0 then
+            return true
+        end
+    end
+    return false
+end
+
+function LimitBrokenModel:GetCardSoulLinkCount(level)
+    local num = 0
+    for k, v in pairs(self.cardSoulLinks) do
+        if k >= level then
+            num = num + v
+        end
+    end
+    return num
+end
+
+function LimitBrokenModel:CheckArtifactLevelCount(num, level)
+    for k, v in pairs(self.ArtifactLevels) do
+        if k >= level then
+            num = num - v
+        end
+        if num <= 0 then
+            return true
+        end
+    end
+    return false
+end
+
+function LimitBrokenModel:GetArtifactLevelCount(level)
+    local num = 0
+    for k, v in pairs(self.ArtifactLevels) do
+        if k >= level then
+            num = num + v
+        end
+    end
+    return num
+end
+
+function LimitBrokenModel:CheckArtifactStarCount(num, level)
+    for k, v in pairs(self.ArtifactStars) do
+        if k >= level then
+            num = num - v
+        end
+        if num <= 0 then
+            return true
+        end
+    end
+    return false
+end
+
+function LimitBrokenModel:GetArtifactStarCount(level)
+    local num = 0
+    for k, v in pairs(self.ArtifactStars) do
+        if k >= level then
+            num = num + v
+        end
+    end
+    return num
+end
+
+function LimitBrokenModel:CheckArtifactAwakenCount(num)
+    return self.ArtifactAwakens >= num
+end
+
+function LimitBrokenModel:GetArtifactAwakenCount()
+    return self.ArtifactAwakens
+end
+
+function LimitBrokenModel:CheckAppointArtifactLevel(sid, level)
+    return self.appointArtifactLevel[sid] >= level
+end
+
+function LimitBrokenModel:CheckAppointArtifactStar(sid, level)
+    return self.appointArtifactStar[sid] >= level
+end
+
+function LimitBrokenModel:CheckAppointArtifactAwaken(sid)
+    return self.appointArtifactAwaken[sid]
+end
+
+function LimitBrokenModel:CheckRedPoint(param)
+    if param == -1 then
+        for gid, group in pairs(self.taskList) do
+            if self:CheckGroupHasPreFinish(gid) then
+                return true
+            end
+        end
+    else
+        if self:CheckGroupHasPreFinish(param) then
+            return true
+        end
+    end
+    return false
+end
+
+function LimitBrokenModel:RefreshRedPoint(param)
+    if param then
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LimitBroken.id, param)
+    else
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.LimitBroken.id)
+    end
+end
+
+function LimitBrokenModel.CheckMainViewBtn()
+    return require("LimitBrokenModel"):GetInstance():CheckMainViewBtnInner()
+end
+
+function LimitBrokenModel:CheckMainViewBtnInner()
+    for _, group in pairs(self.taskList) do
+        for _, data in pairs(group) do
+            if data:GetState() ~= self.FinishType.Finish then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---销毁对象时,析构函数
+function LimitBrokenModel:Dispose()
+    self.taskList = nil
+    _G.Events:GetInstance():RemoveListener(_G.ChatViewEvents.ChatViewLevel, self.UpdateAllTask, self)
+    _G.Events:GetInstance():RemoveListener(_G.ChatViewEvents.ChatViewTianFv, self.UpdateCardTalent, self)
+    _G.Events:GetInstance():RemoveListener(_G.ChatViewEvents.ChatViewHunLian, self.UpdateCardSoulLink, self)
+    _G.Events:GetInstance():RemoveListener(_G.ArtifactShow.ArtifactLevel, self.UpdateArtifactLevel, self)
+    _G.Events:GetInstance():RemoveListener(_G.ArtifactShow.ArtifactStar, self.UpdateArtifactStar, self)
+    _G.Events:GetInstance():RemoveListener(_G.ArtifactShow.ArtifactAwaken, self.UpdateArtifactAwaken, self)
+end
+
+return LimitBrokenModel

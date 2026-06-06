@@ -1,0 +1,703 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Battle.MaidAcademyCultivate	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime:
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+---@class MaidAcademyCultivate : Component	敌方布阵情报
+local MaidAcademyCultivate = _G.BaseClass("MaidAcademyCultivate", _G.Component)
+
+local MaidAcademyModel = require("MaidAcademyModel")
+local SprintRankUtils = require("SprintRankUtils")
+
+---界面的入口函数
+function MaidAcademyCultivate:OnCreate(obj, ...)
+    self.go_table = _G.GetAutoGoTable(obj, _G.handler(self, self.OnClickBtn))
+
+    self.MaxNum = 4
+
+    self:UpdateData()
+
+    self.restStrengthCurTime = 0
+    --self.restStrengthRTime = self.cfg.physical[2]/5--x秒回复1点体力
+    ---测试一秒刷
+    self.restStrengthRTime = 1
+
+    self.maidtbList = {}
+    self.postbList = {}
+    self.qpmaidIndex = 1
+
+    self.pyTime = 0
+    self.isPying = false
+
+    ---连续培养配置【连续培养次数和时间间隔(次数#毫秒)】
+    self.pycfg = _G.ConfigManager.discrete_cfg[202001][1]
+
+    ---气泡显示配置【秒#女仆培养时的对话内容和持续时间(语言包id语言包id语言包id)】
+    self.qpcfg = _G.ConfigManager.discrete_cfg[202002]
+
+    self.qpTime = self.qpcfg[1][1] or 3
+    self.qpTexts = {}
+    if self.qpcfg[2][1] then
+        for i = 2, #self.qpcfg[2] do
+            table.insert(self.qpTexts, self.qpcfg[2][i])
+        end
+    else
+        table.insert(self.qpTexts, 20317000102)
+    end
+
+    self.go_table.toggle_auto.isOn = _G.PlayerPrefsManager.GetInt("MaidAcademyCultivateAuto") == 1
+
+    self.nextOpenTime = 0
+    self.ActiveState = SprintRankUtils.OpenState.Close
+    local data = require "ActivitySynManager":GetInstance():GetChildAcitivity(10105,100169,1)
+    local isOpen = true
+    if data == nil then
+        data = require "ActivitySynManager":GetInstance():GetNotOpenAcitivity(10105,100169,1)
+        isOpen = false
+    end
+    --local data = require "ActivitySynManager":GetInstance():GetChildAcitivity(10092,100169,1)
+    if data then
+        ---@type LegionGiftSynModel
+        self.acitivity = data.typeClass
+        local nowTime = _G.TimeUtil.GetServerUnixTime()
+        local left = 0
+        if isOpen then
+            left = data.cfg.time.start_time - nowTime
+            self.go_table.obj_redpointRank:UpdateRedPointItemIDAndParam(data:GetActivityTypeCls():GetRedpointIDByIndex(1))
+        else
+            left = data.time.start_time - nowTime
+        end
+        if left < 0 then
+            left = 0
+            self.ActiveState = SprintRankUtils.OpenState.Open
+        else
+            self.ActiveState = SprintRankUtils.OpenState.ShowTimer
+        end
+        self.nextOpenTime = left
+    end
+    self.go_table.obj_maid:SetActiveE(self.ActiveState == SprintRankUtils.OpenState.Close and 0 or 1)
+    self.go_table.aortext_timeTitle:SetActiveE(self.ActiveState == SprintRankUtils.OpenState.Open and 0 or 1)
+    self:OnThisTimer(0)
+
+    if self.ThisTimer then
+        self.ThisTimer:Stop()
+        self.ThisTimer = nil
+    end
+    self.ThisTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnThisTimer, self)
+    self.ThisTimer:Start()
+
+    if self.ThatTimer then
+        self.ThatTimer:Stop()
+        self.ThatTimer = nil
+    end
+    self.ThatTimer = _G.TimerManager:GetInstance():GetTimer(0.1, self.OnThatTimer, self)
+    self.ThatTimer:Start()
+
+    self.go_table.obj_timetips:SetActiveE(0)
+
+    _G.Events:GetInstance():AddListener(_G.eMaidAcademyEvent.AddStrengthFinish, self.OnAddStrengthFinish, self)
+    _G.Events:GetInstance():AddListener(_G.eMaidAcademyEvent.CallBackCultivate, self.OnCallBackCultivate, self)
+    _G.Events:GetInstance():AddListener(_G.eMaidAcademyEvent.UpLevel, self.OnUpLevel, self)
+    require("RedPointManager"):GetInstance():AddListener(_G.eRedPoint.RedPointRefresh, self.OnRedPointRefresh,self)
+
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.ef_MaidAcademyView_bg,
+        self.go_table.obj_eff,
+        function(trans)
+            if nil == self.go_table then
+                _G.DestroyObject(trans)
+            end
+        end
+    )
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.ef_MaidAcademyView_lizi,
+        self.go_table.obj_eff,
+        function(trans)
+            if nil == self.go_table then
+                _G.DestroyObject(trans)
+            end
+        end
+    )
+end
+
+function MaidAcademyCultivate:OnRedPointRefresh()
+    if self.redTimer then
+        return
+    end
+    self.redTimer = _G.DelayDo(1,function()
+        local data = require "ActivitySynManager":GetInstance():GetChildAcitivity(10105,100169,1)
+        if data then
+            data:GetActivityTypeCls():RefreshRedPoint()
+        end
+        self.redTimer = nil
+    end)
+end
+
+function MaidAcademyCultivate:OnUpLevel()
+    self:UpdateView()
+end
+
+function MaidAcademyCultivate:OnAddStrengthFinish()
+    self:UpdateView()
+end
+
+function MaidAcademyCultivate:OnCallBackCultivate()
+    self:CheckCanFinish()
+end
+
+function MaidAcademyCultivate:UpdateData()
+    ---@type study_cfg
+    self.cfg = _G.ConfigManager.study_cfg[MaidAcademyModel:GetInstance().level]
+    self.PosList = MaidAcademyModel:GetInstance().pos
+    _G.SortList(self.PosList, function(a)
+        return -a.index
+    end)
+end
+
+---计时，体力
+function MaidAcademyCultivate:OnThisTimer(elapsed)
+    local gotable = self.maidtbList[self.qpmaidIndex]
+    if gotable then
+        if gotable.qping then
+            self.qpTime = self.qpTime - elapsed
+            if self.qpTime <= 0 then
+                gotable.qping = false
+                gotable.obj_qipao:SetActiveE(0)
+            end
+        end
+    end
+
+    self.nextOpenTime = self.nextOpenTime - elapsed
+    if self.ActiveState == SprintRankUtils.OpenState.ShowTimer then
+        self.go_table.aortext_nexttime1.text = _G.TimeUtil.TimeToString(self.nextOpenTime, 1)
+        self.go_table.aortext_nexttime2.text = _G.TimeUtil.TimeToString(self.nextOpenTime, 1)
+    elseif self.ActiveState == SprintRankUtils.OpenState.Open then
+        self.go_table.aortext_nexttime1.text = _G.GetLangPackValue(90120200007)
+        self.go_table.aortext_nexttime2.text = _G.GetLangPackValue(90120200007)
+    else
+        self.go_table.aortext_nexttime1.text = ""
+        self.go_table.aortext_nexttime2.text = ""
+    end
+
+    self.restStrengthCurTime = self.restStrengthCurTime + elapsed
+    if self.restStrengthCurTime >= self.restStrengthRTime then
+        self:UpdateData()
+        for i = 1, #self.postbList do
+            local posgotable = self.postbList[i]
+            local posdata = self.PosList[i]
+            if posgotable and posdata then
+                posgotable.aortext_getnum.text = posdata.physical.."/"..self.cfg.physical[1]
+            end
+        end
+        self.restStrengthCurTime = 0
+    end
+end
+
+---快速培养
+function MaidAcademyCultivate:OnThatTimer(elapsed)
+    if self.isPying then
+        if self.pyTime == 0 then
+            local msg = {}
+            msg.c_info = self:GetPosCultivate(self.pycfg[1]) --当前可用位置
+            if #msg.c_info > 0 then
+                self:RecordPower()
+                self.lastProp = MaidAcademyModel:GetInstance():GetAllOtherProp()
+                MaidAcademyModel:GetInstance():Cultivate(msg, function(data)
+                    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.MaidAcademy)
+                    self:UpdateView()
+                    self:ShowQp()
+                    self:ShowPowerUp()
+                    self:CheckCanFinish()
+
+                    for i = 1, #msg.c_info do
+                        local index = msg.c_info[i].key
+                        local gotable = self.postbList[index]
+                        if gotable then
+                            if not gotable.showeffect then
+                                gotable.obj_effect:SetActiveE(0)
+                                gotable.obj_effect:SetActiveE(1)
+                                gotable.showeffect = true
+                                _G.DelayDo(
+                                    0.4,
+                                    function()
+                                        if gotable then
+                                            gotable.obj_effect:SetActiveE(0)
+                                            gotable.showeffect = false
+                                        end
+                                    end
+                                )
+                            end
+                        end
+                    end
+                end)
+            else
+                self.isPying = false
+                local hasMiad = self:CheckHasNoGrowMaid()
+                local needCheck = true
+                if hasMiad then
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidAddStrengthView.Name)
+                    _G.PopWindowManager:GetInstance():ShowAllTips(9012008)
+                    needCheck = false
+                else
+                    _G.PopWindowManager:GetInstance():ShowAllTips(9012007)
+                end
+                if needCheck then
+                    self:CheckCanFinish()
+                end
+            end
+        end
+        self.pyTime = self.pyTime + math.floor(elapsed * 1000)
+        if self.pyTime >= self.pycfg[2] then
+            self.pyTime = 0
+        end
+    end
+end
+
+---气泡显示
+function MaidAcademyCultivate:ShowQp()
+    local curindex = _G.GetRandomNum(1, #self.qpTexts)
+    local curtext = self.qpTexts[curindex]
+    local gotable = self.maidtbList[self.qpmaidIndex]
+    if gotable and not gotable.qping then
+        self.qpTime = self.qpcfg[1][1] or 3
+        gotable.qping = true
+        gotable.obj_qipao:SetActiveE(1)
+        gotable.aortext_qipaotext.text = _G.GetLangPackValue(curtext)
+    end
+end
+
+function MaidAcademyCultivate:UpdateView()
+    self.maidtbList = {}
+    self:UpdateData()
+    
+    -- self.go_table.aortext_level.text = _G.GetLangPackValue(90120200002, _G.GetLangPackValue(MaidAcademyModel:GetInstance():GetHeroicLevelDesc()), self.cfg.level)
+    -- if not MaidAcademyModel:GetInstance():IsMax() then
+    --     local nextcfg = _G.ConfigManager.study_cfg[MaidAcademyModel:GetInstance().level + 1]
+    --     self.go_table.slider_level.value = MaidAcademyModel:GetInstance().exp / (nextcfg.exp - self.cfg.exp)
+    --     self.go_table.aortext_Slider.text = MaidAcademyModel:GetInstance().exp .. "/" .. (nextcfg.exp - self.cfg.exp)
+    -- else
+    --     self.go_table.slider_level.value = MaidAcademyModel:GetInstance().exp / self.cfg.exp
+    --     self.go_table.aortext_Slider.text = MaidAcademyModel:GetInstance().exp .. "/" .. self.cfg.exp
+    -- end
+
+    self.go_table.aortext_Slidersq.text = _G.GetLangPackValue(32001170403, self.cfg.level)
+    if not MaidAcademyModel:GetInstance():IsMax() then
+        local nextcfg = _G.ConfigManager.study_cfg[MaidAcademyModel:GetInstance().level + 1]
+        self.go_table.slider_levelsq.value = MaidAcademyModel:GetInstance().exp / (nextcfg.exp - self.cfg.exp)
+        --self.go_table.aortext_Slidersq.text = MaidAcademyModel:GetInstance().exp .. "/" .. (nextcfg.exp - self.cfg.exp)
+    else
+        self.go_table.slider_levelsq.value = "Max"
+        --self.go_table.aortext_Slidersq.text = MaidAcademyModel:GetInstance().exp .. "/" .. self.cfg.exp
+    end
+
+    local model = require("HeroicIconModel"):GetInstance()
+    local curiconlevel = model:GetIconTotalLevel()
+    local curicondesc = 0
+    local nextlevel = 1
+    local cfg = _G.ConfigManager.discrete_cfg[202009]
+    for i = 1, #cfg do
+        local fav = cfg[i][1]
+        local id = cfg[i][2]
+        local rollercfg = _G.ConfigManager.study_role_roller_cfg[id]
+        if curiconlevel < fav then
+            nextlevel = fav
+        end
+        if curiconlevel >= fav then
+            curicondesc = rollercfg.describe
+        end
+    end
+    self.go_table.aortext_Slidersl.text = _G.GetLangPackValue(curicondesc)
+    if nextlevel then
+        self.go_table.slider_levelsl.value = curiconlevel / nextlevel
+        --self.go_table.aortext_Slidersl.text = curiconlevel .. "/" .. nextlevel
+
+    else
+        ---找不到下一级就是满了
+        self.go_table.slider_levelsl.value = "Max"
+        --self.go_table.aortext_Slidersl.text = curiconlevel .. "/" .. nextlevel
+    end
+
+    for i = 1, self.MaxNum do
+        local gotable = _G.GetAutoGoTable(self.go_table["obj_maidItem" .. i], _G.handlerbind(self, self.OnClickItem, i))
+        if self.cfg.position >= i then
+            ---解锁了
+            local posdata = self.PosList[i]
+            if posdata then
+                if posdata.s_role then
+                    gotable.obj_spine:SetActiveE(1)
+                    gotable.obj_info:SetActiveE(1)
+                    gotable.aorbtn_noMaid:SetActiveE(0)
+                    gotable.obj_lock:SetActiveE(0)
+
+                    local rcfg = _G.ConfigManager.study_role_level_cfg[posdata.s_role.level]
+
+                    gotable.slider_level.value = posdata.s_role.grow / rcfg.position_pay
+                    gotable.aortext_Slider.text = posdata.s_role.grow .. "/" .. rcfg.position_pay
+
+                    if nil == gotable.loadspine then
+                        _G.MaidUtil.LoadMiad(posdata.s_role.spine, gotable.obj_spine, self.go_table, 1)
+                        gotable.loadspine = true
+                    end
+                    self.maidtbList[i] = gotable
+                else
+                    gotable.obj_spine:SetActiveE(0)
+                    gotable.obj_info:SetActiveE(0)
+                    gotable.aorbtn_noMaid:SetActiveE(1)
+                    gotable.obj_lock:SetActiveE(0)
+                end
+                gotable.aortext_getnum.text = posdata.physical.."/"..self.cfg.physical[1]
+            else
+                gotable.obj_spine:SetActiveE(0)
+                gotable.obj_info:SetActiveE(0)
+                gotable.aorbtn_noMaid:SetActiveE(1)
+                gotable.obj_lock:SetActiveE(0)
+                gotable.aortext_getnum.text = self.cfg.physical[1].."/"..self.cfg.physical[1]
+            end
+            gotable.obj_py:SetActiveE(1)
+            self.postbList[i] = gotable
+        else
+            gotable.obj_lock:SetActiveE(1)
+            gotable.aorbtn_noMaid:SetActiveE(0)
+            gotable.obj_spine:SetActiveE(0)
+            gotable.obj_info:SetActiveE(0)
+            gotable.obj_py:SetActiveE(0)
+        end
+
+        if gotable.upeffect == nil then
+            --- 占位 防止重复生成
+            gotable.upeffect = 1
+            _G.UIUtils.LoadEffectByCfg(
+                _G.ConfigManager.ui_effect_cfg.ef_peiyangshengji_1,
+                gotable.obj_effect,
+                function(tran)
+                    if nil == self.go_table then
+                        tran:DestroyObject()
+                        return
+                    end
+                    gotable.upeffect = tran
+                    
+                end
+            )
+            gotable.obj_effect:SetActiveE(0)
+        end
+        
+    end
+end
+
+function MaidAcademyCultivate:OnClickItem(go, isOn, i)
+    local name = go:GetName()
+    if name == "@_aorbtn_maidclick" then
+        if self.cfg.position >= i then
+            local posdata = self.PosList[i]
+            if posdata then
+                if posdata.s_role then
+                    local rcfg = _G.ConfigManager.study_role_level_cfg[posdata.s_role.level]
+                    if posdata.s_role.grow >= rcfg.position_pay then
+                        if MaidAcademyModel:GetInstance():CheckFinishMax() then
+                            _G.PopWindowManager:GetInstance():ShowAllTips(9012009)
+                        else
+                            ---毕业
+                            local msg = {}
+                            msg.index = posdata.index --当前可用位置
+                            local roledata = _G.DeepCopy(posdata.s_role)
+                            MaidAcademyModel:GetInstance():FinishRole(msg, function(data)
+                                local gotable = self.postbList[i]
+                                if gotable then
+                                    _G.UIUtils.RemoveChildren(gotable.obj_spine)
+                                    gotable.loadspine = nil
+                                end
+                                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidFinishSuccessView.Name,
+                                    roledata)
+                                self:UpdateView()
+                            end)
+                        end
+                    else
+                        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidInfoView.Name, posdata.s_role, true,
+                            nil, i)
+                    end
+                else
+                    _G.PopWindowManager:GetInstance():ShowAllTips(9012007)
+                end
+            end
+        else
+            local unlevel = 0
+            for k = 1, #_G.ConfigManager.study_cfg do
+                if _G.ConfigManager.study_cfg[k].position == i then
+                    unlevel = _G.ConfigManager.study_cfg[k].level
+                    break
+                end
+            end
+            _G.PopWindowManager:GetInstance():ShowAllTips(1001, _G.GetLangPackValue(90120200117, unlevel))
+        end
+    end
+end
+
+function MaidAcademyCultivate:OnDestroy()
+    if self.ThisTimer then
+        self.ThisTimer:Stop()
+        self.ThisTimer = nil
+    end
+    if self.ThatTimer then
+        self.ThatTimer:Stop()
+        self.ThatTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eMaidAcademyEvent.AddStrengthFinish, self.OnAddStrengthFinish, self)
+    _G.Events:GetInstance():RemoveListener(_G.eMaidAcademyEvent.CallBackCultivate, self.OnCallBackCultivate, self)
+    _G.Events:GetInstance():RemoveListener(_G.eMaidAcademyEvent.UpLevel, self.OnUpLevel, self)
+    require("RedPointManager"):GetInstance():RemoveListener(_G.eRedPoint.RedPointRefresh, self.OnRedPointRefresh,self)
+end
+
+---判断是不是可以培养
+function MaidAcademyCultivate:CheckCanCultivate()
+    for i = 1, self.MaxNum do
+        if self.cfg.position >= i then
+            ---解锁了
+            local posdata = self.PosList[i]
+            ---女仆没满并且槽位有体力
+            if posdata and posdata.s_role and posdata.physical > 0 then
+                local rcfg = _G.ConfigManager.study_role_level_cfg[posdata.s_role.level]
+                if posdata.s_role.grow < rcfg.position_pay then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+---判断培养列表
+function MaidAcademyCultivate:GetPosCultivate(num)
+    local list = {}
+    for i = 1, self.MaxNum do
+        if self.cfg.position >= i then
+            ---解锁了
+            local posdata = self.PosList[i]
+            ---女仆没满并且槽位有体力
+            if posdata and posdata.s_role and posdata.physical > 0 then
+                local rcfg = _G.ConfigManager.study_role_level_cfg[posdata.s_role.level]
+                if posdata.s_role.grow < rcfg.position_pay then
+                    local info = {}
+                    info.key = posdata.index
+                    local pmin = _G.math.min(rcfg.position_pay - posdata.s_role.grow, num)
+                    info.value = _G.math.min(posdata.physical, pmin)
+
+                    table.insert(list, info)
+                end
+            end
+        end
+    end
+    return list
+end
+
+---获取可招募的位置
+function MaidAcademyCultivate:GetIndexCultivate()
+    for i = 1, self.MaxNum do
+        if self.cfg.position >= i then
+            ---解锁了
+            local posdata = self.PosList[i]
+            if not posdata or not posdata.s_role then
+                return i
+            end
+        end
+    end
+    return 0
+end
+
+function MaidAcademyCultivate:StopAuto()
+    self.isPying = false
+end
+
+function MaidAcademyCultivate:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_draw then
+        ---招募
+        local index = self:GetIndexCultivate()
+        if index > 0 then
+            self:RecordPower()
+            self.lastProp = MaidAcademyModel:GetInstance():GetAllOtherProp()
+            local msg = {}
+            msg.index = index --当前可用位置
+            MaidAcademyModel:GetInstance():Execute(msg, function(data)
+                _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.MaidAcademy)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidDrawSuccessView.Name, data.pos.s_role)
+                self:UpdateView()
+                self:ShowPowerUp()
+            end)
+        else
+            ---已达到招募上限
+            _G.PopWindowManager:GetInstance():ShowAllTips(9012006)
+        end
+    elseif go == self.go_table.aorbtn_addstrength then
+        ---补充体力
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidAddStrengthView.Name)
+    elseif go == self.go_table.aorbtn_cultivate then
+        if not self:CheckCanCultivate() then
+            ---培养已满或者不有体力不足
+            local hasMiad = self:CheckHasNoGrowMaid()
+            local needCheck = true
+            if hasMiad then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidAddStrengthView.Name)
+                _G.PopWindowManager:GetInstance():ShowAllTips(9012008)
+                needCheck = false
+            else
+                _G.PopWindowManager:GetInstance():ShowAllTips(9012007)
+            end
+            if needCheck then
+                self:CheckCanFinish()
+            end
+            return
+        end
+        ---培养
+        if self.go_table.toggle_auto.isOn then
+            ---自动
+            self.isPying = not self.isPying
+        else
+            --单次
+            local msg = {}
+            msg.c_info = self:GetPosCultivate(1) --当前可用位置
+            if #msg.c_info > 0 then
+                self:RecordPower()
+                self.lastProp = MaidAcademyModel:GetInstance():GetAllOtherProp()
+                MaidAcademyModel:GetInstance():Cultivate(msg, function(data)
+                    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.MaidAcademy)
+                    self:UpdateView()
+                    self:ShowQp()
+                    self:ShowPowerUp()
+                    self:CheckCanFinish()
+                end)
+
+                for i = 1, #msg.c_info do
+                    local index = msg.c_info[i].key
+                    local gotable = self.postbList[index]
+                    if gotable then
+                        if not gotable.showeffect then
+                            gotable.obj_effect:SetActiveE(0)
+                            gotable.obj_effect:SetActiveE(1)
+                            gotable.showeffect = true
+                            _G.DelayDo(
+                                0.4,
+                                function()
+                                    if gotable then
+                                        gotable.obj_effect:SetActiveE(0)
+                                        gotable.showeffect = false
+                                    end
+                                end
+                            )
+                        end
+                    end
+                end
+            else
+                local hasMiad = self:CheckHasNoGrowMaid()
+                local needCheck = true
+                if hasMiad then
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidAddStrengthView.Name)
+                    _G.PopWindowManager:GetInstance():ShowAllTips(9012008)
+                    needCheck = false
+                else
+                    _G.PopWindowManager:GetInstance():ShowAllTips(9012007)
+                end
+                if needCheck then
+                    self:CheckCanFinish()
+                end
+            end
+        end
+    elseif go == self.go_table.toggle_auto then
+        _G.PlayerPrefsManager.SetInt("MaidAcademyCultivateAuto", isOn and 1 or 0)
+    elseif go == self.go_table.aorbtn_wenhao then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidChambersView.Name, 1)
+    elseif go == self.go_table.aorbtn_activityicon then
+        self.go_table.obj_timetips:SetActiveE(0)
+        if self.ActiveState == SprintRankUtils.OpenState.Open then
+            self.acitivity:OnEnterActivity()
+        else
+            self.go_table.obj_timetips:SetActiveE(1)
+        end
+    elseif go == self.go_table.aorbtn_activitytipclose then
+        self.go_table.obj_timetips:SetActiveE(0)
+    elseif go == self.go_table.aorbtn_studyquilety then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidStudyLevelView.Name)
+    elseif go == self.go_table.aorbtn_studylevel then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidShrineLevelView.Name)
+    elseif go == self.go_table.aorbtn_AttrDetail then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.TeamHallAttrMaidPanel.Name, 2)
+    end
+end
+
+---查看是否有未完女仆
+function MaidAcademyCultivate:CheckHasNoGrowMaid()
+    local hasMiad = false
+    for i = 1, self.MaxNum do
+        if self.cfg.position >= i then
+            ---解锁了
+            local posdata = self.PosList[i]
+            ---女仆没满并且槽位有体力
+            if posdata and posdata.s_role then
+                local rcfg = _G.ConfigManager.study_role_level_cfg[posdata.s_role.level]
+                if posdata.s_role.grow < rcfg.position_pay then
+                    hasMiad = true
+                    break
+                end
+            end
+        end
+    end
+    return hasMiad
+end
+
+---判断是否可以毕业
+function MaidAcademyCultivate:CheckCanFinish()
+    local finish = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MaidFinishSuccessView.Name)
+    if nil ~= finish then
+        ---已经有完成女仆了，等后续检测
+        return
+    end
+    for i = 1, #self.PosList do
+        local posdata = self.PosList[i]
+        if posdata and posdata.s_role then
+            local rcfg = _G.ConfigManager.study_role_level_cfg[posdata.s_role.level]
+            if posdata.s_role.grow >= rcfg.position_pay then
+                if MaidAcademyModel:GetInstance():CheckFinishMax() then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(9012009)
+                else
+                    ---毕业
+                    local msg = {}
+                    msg.index = posdata.index --当前可用位置
+                    local roledata = _G.DeepCopy(posdata.s_role)
+                    MaidAcademyModel:GetInstance():FinishRole(msg, function(data)
+                        self.lastProp = MaidAcademyModel:GetInstance():GetAllOtherProp()
+                        local gotable = self.postbList[i]
+                        if gotable then
+                            _G.UIUtils.RemoveChildren(gotable.obj_spine)
+                            gotable.loadspine = nil
+                        end
+                        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MaidFinishSuccessView.Name,
+                            roledata)
+                        self:UpdateView()
+                    end)
+                end
+                break
+            end
+        end
+    end
+end
+
+function MaidAcademyCultivate:RecordPower()
+    self.power = _G.StorageManager:GetInstance():GetPlayerPower()
+end
+
+function MaidAcademyCultivate:ShowPowerUp()
+    ---临时等级提升不显示战力变化
+    local newPower = _G.StorageManager:GetInstance():GetPlayerPower()
+    local offset = newPower - self.power
+    if offset > 0 then
+        local curProp = MaidAcademyModel:GetInstance():GetAllOtherProp()
+        if _G.AppSetting.DEBUG then
+            _G.Log(self.lastProp, "当一次的属性")
+            _G.Log(curProp, "当前的属性")
+        end
+        _G.UIUtils.ShowPropUp(nil, self.lastProp, nil, { prop = curProp })
+        require "CommonTipManager".OpenPowerUpView(self.power, offset)
+    end
+    self.power = newPower
+end
+
+return MaidAcademyCultivate

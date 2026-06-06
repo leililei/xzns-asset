@@ -1,0 +1,1454 @@
+---@class MainAfkPanel : Component AFK场景
+---@field go_table _obj_afkPanel_GoTable
+---@field sectionItems _obj_afkPanel._obj_sectionItem_GoTable[] 冒险关卡节点
+---@field afkTimer Timer
+---@field checkAwakrTimer Timer
+---@field playerHead PlayerComponent
+---@field roleModels table<number,UnityEngine.Transform>        @加载的人物模型
+---@field fightTimer Timer                                      @战斗状态定时器
+---@field afkGiftTimer Timer                                    @关卡豪礼定时器
+---@field afkGiftTick number                                    @关卡豪礼定时器tick
+local MainAfkPanel = _G.BaseClass("MainAfkPanel", _G.Component)
+
+local AfkModel = require("AfkModel")
+---宝箱特效
+local boxEffect = {
+    [1] = "ef_box1",
+    [2] = "ef_box2",
+    [3] = "ef_box3"
+}
+
+---气泡初始化时间
+local TalkInitTime = 3
+
+---气泡展示时间
+local TalkShowTime = 4
+
+---气泡Cd时间
+local TalkCdTime = 2
+
+function MainAfkPanel:__init(obj)
+    self.go_table = _G.GetAutoGoTable(obj, _G.handler(self, self.OnClickBtn))
+    self.go_table.obj_sectionItem:SetActiveE(0)
+    self.boxEffect = {}
+    self.TRButton = {}
+    self.go_table.obj_bagRedpoint:UpdateRedPointItemIDAndParam(_G.ConfigManager.redpoint_cfg.MainBackpack.id, -1)
+    self.go_table.obj_taskRedpoint:UpdateRedPointItemIDAndParam(_G.ConfigManager.redpoint_cfg.MainDailyTask.id, -1)
+end
+
+function MainAfkPanel:OnCreate()
+    self:AddListener(_G.eCardShow.CardChangeSkin, self.SkinChange)
+    self:AddListener(_G.eGodHalo.GodHaloRefresh, self.UpDateGodHalo)
+
+    _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.MainAfkPanel, self.go_table)
+    local resources = _G.ConfigManager.ui_cfg.MainView.resources
+    self:AddComponent(self.go_table.obj_goldInfo, require("ResourceCompont").New(self.go_table.obj_goldInfo, resources))
+    self.playerHead = self:AddComponent(self.go_table.obj_playerInfo,
+        require("PlayerComponent").New(self.go_table.obj_playerInfo))
+    self:InitFunctionOpen()
+    self:UpdateView(true)
+    self:RefreshMineChatItem()
+    _G.MainManager:GetInstance().afkView = self
+
+    if require("MonthlyModel"):GetInstance():IsOutTimePopUp(405005) then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LimitedTimePrivilegeView.Name, 405005)
+        _G.PopWindowManager:GetInstance():ShowAllTips(240310)
+    end
+end
+
+function MainAfkPanel:OnEnable()
+    self:AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed)
+    self:AddListener(_G.GlobalEvents.PlayerPowerChange, self.UpdatePower)
+    self:AddListener(_G.GlobalEvents.DelayUpdateAllCardProp, self.UpdatePower)
+    self:AddListener(_G.eShenshiEvents.UpDataShenSHiBag, self.UpdatePower)
+    self:AddListener(_G.eUIManagerStatus.StartOpenUI, self.StartOpenUI)
+    self:AddListener(_G.ePlayerStatus.PlayerUpLevel, self.UpdateFightState)
+    self:AddListener(_G.eAfkEvents.GetAfkAward, self.UpdateFightState)
+    self:AddListener(_G.eLimitePrivilege.LimitePrivilegeChange, self.UpdateFightState)
+    self:AddListener(_G.eRedPoint.RedPointRefresh, self.OnRedPointRefresh)
+    self:AddListener(_G.eHellRoad.FinishTask, self.UpdateHell)
+    self:AddListener(_G.DungeonChallengeBattleViewShow.Open, self.UpdateNitpick)
+    self:InitFunctionOpen()
+
+    self.afkTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateAfkBox, self, false, false, true)
+    self.afkTimer:Start()
+    self:UpdateHell()
+    self:UpdateEmbattleRoles()
+
+    --主动弹出快速挂机面板
+    if AfkModel:GetInstance():GetAfkAwardBoxStatus() then
+        self.checkAwakrTimer = _G.TimerManager:GetInstance():GetTimer(0.1, self.CheckAfkAward, self, true, false, true)
+        self.checkAwakrTimer:Start()
+    else
+        if _G.AppSetting.IsDouYin then
+            local channel = require("DouyinModel"):GetInstance():GetFeedGameChannel()
+            if _G.AppSetting.DEBUG then
+               _G.LogError(tostring(channel), "抖音直流, channel=") 
+            end
+            if channel and tonumber(channel) == 2 then
+                require("DouyinModel"):GetInstance():ReportScene()
+            end
+        end
+    end
+end
+
+function MainAfkPanel:OnDisable()
+    --self:RemoveAllListener()
+    self:RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed)
+    self:RemoveListener(_G.GlobalEvents.PlayerPowerChange, self.UpdatePower)
+    self:RemoveListener(_G.GlobalEvents.DelayUpdateAllCardProp, self.UpdatePower)
+    self:RemoveListener(_G.eShenshiEvents.UpDataShenSHiBag, self.UpdatePower)
+    self:RemoveListener(_G.eUIManagerStatus.StartOpenUI, self.StartOpenUI)
+    self:RemoveListener(_G.ePlayerStatus.PlayerUpLevel, self.UpdateFightState)
+    self:RemoveListener(_G.eAfkEvents.GetAfkAward, self.UpdateFightState)
+    self:RemoveListener(_G.eLimitePrivilege.LimitePrivilegeChange, self.UpdateFightState)
+    self:RemoveListener(_G.eRedPoint.RedPointRefresh, self.OnRedPointRefresh)
+    self:RemoveListener(_G.eHellRoad.FinishTask, self.UpdateHell)
+    self:RemoveListener(_G.DungeonChallengeBattleViewShow.Open, self.UpdateNitpick)
+    if self.afkTimer then
+        self.afkTimer:Stop()
+        self.afkTimer = nil
+    end
+    if self.afkGiftTimer then
+        self.afkGiftTimer:Stop()
+        self.afkGiftTimer = nil
+    end
+    if self.checkAwakrTimer then
+        self.checkAwakrTimer:Stop()
+        self.checkAwakrTimer = nil
+    end
+
+    if self.fightTimer then
+        self.fightTimer:Stop()
+        self.fightTimer = nil
+    end
+    self:StopCondTimer()
+
+    --防止意外打开GetawardView页面
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.GetawardView.Name)
+end
+
+function MainAfkPanel:StartOpenUI(name)
+    if require("DouyinModel"):GetInstance():DouyinFeedScene() then
+       return 
+    end
+    if name ~= _G.ConfigManager.ui_cfg.MainView.Name then
+        if self.checkAwakrTimer then
+            self.checkAwakrTimer:Stop()
+            self.checkAwakrTimer = nil
+        end
+    end
+end
+
+---初始化功能开启
+function MainAfkPanel:InitFunctionOpen()
+    -- 宝箱
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(267) then
+        self.go_table.aorbtn_box:SetActiveE(1)
+        self.go_table.obj_boxTime:SetActiveE(1)
+    else
+        self.go_table.aorbtn_box:SetActiveE(0)
+        self.go_table.obj_boxTime:SetActiveE(0)
+    end
+    -- 背包
+    if _G.FunctionManager:GetInstance():CheckMainFunctionCfgUnlock(5001) then
+        self.go_table.aorbtn_bag:SetActiveE(1)
+    else
+        self.go_table.aorbtn_bag:SetActiveE(0)
+    end
+    -- 日常
+    if _G.FunctionManager:GetInstance():CheckMainFunctionCfgUnlock(5005) then
+        self.go_table.aorbtn_task:SetActiveE(1)
+    else
+        self.go_table.aorbtn_task:SetActiveE(0)
+    end
+
+    -- 左侧气泡
+    self.go_table.aorimage_pos1:SetActiveE(0)
+    self.go_table.aorimage_pos4:SetActiveE(0)
+
+    -- 右侧气泡
+    self.go_table.aorimage_pos2:SetActiveE(0)
+    self.go_table.aorimage_pos5:SetActiveE(0)
+end
+
+---更新宝箱特效
+function MainAfkPanel:UpdateAfkBoxEffect(index)
+    for i, v in pairs(self.boxEffect) do
+        v:SetActiveE(0)
+    end
+    if not self.boxEffect[index] then
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg[boxEffect[index]],
+            self.go_table["obj_box" .. index],
+            function(tran)
+                self.boxEffect[index] = tran
+            end
+        )
+    else
+        self.boxEffect[index]:SetActiveE(1)
+    end
+end
+
+---更新背景特效
+function MainAfkPanel:UpdateEffect()
+    if not self.fireEffect then
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_fire,
+            self.go_table.obj_fire,
+            function(tran)
+                self.fireEffect = tran
+            end
+        )
+    end
+    if not self.bgEffect then
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_yinghuochong_1,
+            self.go_table.obj_bgEffect,
+            function(tran)
+                self.bgEffect = tran
+            end
+        )
+    end
+    if not self.fightBtnEffect then
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_zhandoubtnliuguang,
+            self.go_table.aorbtn_fight,
+            function(trans)
+                if not self.go_table or _G.IsNil(self.go_table.gameObject) then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                self.fightBtnEffect = trans
+            end
+        )
+    end
+end
+
+---更新右上角按钮状态
+function MainAfkPanel:UpdateTRButton()
+    if require("OnlineAwardModel").CheckShowMainFunction() then
+        if not self.OnlineAward then
+            local obj = _G.InstantiateObject(self.go_table.obj_item, self.go_table.obj_TRbutton)
+            local tb = _G.GetAutoGoTable(obj, _G.handlerbind(self, self.OnRTBtn, "OnlineAward"))
+            local cfg = _G.ConfigManager.main_function_cfg[5012]
+            self.OnlineAward = obj
+            self.OnlineAward:SetActiveE(1)
+            tb.aortext_name.text = _G.GetLangPackValue(cfg.Name)
+            tb.aorimage_icon.SpriteName = cfg.Icon
+            tb.obj_redpoint:UpdateRedPointItemIDAndParam(cfg.RedPointId or 0)
+            tb.aortext_time.text = ""
+        else
+            self.OnlineAward:SetActiveE(1)
+        end
+    else
+        if self.OnlineAward then
+            self.OnlineAward:SetActiveE(0)
+        end
+    end
+end
+
+function MainAfkPanel:UpdateView(isInit)
+    self:UpdateEffect()
+    self:UpdatePlayerInfo()
+    if isInit then
+        self:InitChapters()
+    else
+        self:UpdateChapters()
+        self:UpdateAfkGift()
+        self:UpdateAfkGiftTip()
+    end
+    self:UpdateAfkBox()
+    self:UpdateTRButton()
+    local createRole = _G.PlayerModel:GetInstance():CheckCreateRole()
+    self.go_table.obj_minChatView:SetActiveE(createRole and 1 or 0)
+
+    --战斗状态
+    self:UpdateFightState()
+    self:UpdateStorePass()
+    self:UpdateSubGameBtn()
+end
+
+---更新战斗状态
+---@return void
+function MainAfkPanel:UpdateFightState()
+    if not self.go_table or _G.IsNil(self.go_table.gameObject) then
+        --停止定时器
+        if self.fightTimer then
+            self.fightTimer:Stop()
+            self.fightTimer = nil
+        end
+        return
+    end
+
+    if not self:ShowAfkCondtion() then
+        self.go_table.aorbtn_fight:SetActiveE(0)
+        self.go_table.aorbtn_fightBack:SetActiveE(0)
+        return
+    end
+    ---@type AfkBattleManager
+    local afkManager = require("AfkBattleManager"):GetInstance()
+    if not afkManager:IsFighting() then
+        --停止定时器
+        if self.fightTimer then
+            self.fightTimer:Stop()
+            self.fightTimer = nil
+        end
+        self.go_table.aorbtn_fight:SetActiveE(1)
+        self.go_table.aorbtn_fightBack:SetActiveE(0)
+    else
+        if not self.fightTimer then
+            self.fightTimer = _G.TimerManager:GetInstance():GetTimer(0.5, self.UpdateFightState, self, false, false)
+            self.fightTimer:Start()
+
+            --切换按钮状态
+            self.go_table.aorbtn_fight:SetActiveE(0)
+            self.go_table.aorbtn_fightBack:SetActiveE(1)
+            local order = self.gameObject:RequireComponentE(_G.typeof(_G.CS.UnityEngine.Canvas)).sortingOrder
+            local canvas = self.go_table.aorbtn_fightBack.gameObject:RequireComponentE(_G.typeof(_G.CS.UnityEngine
+                .Canvas))
+            canvas.sortingOrder = canvas.sortingOrder + order
+            -- if not self.fightEff then
+            --     _G.UIUtils.LoadEffectByCfg(
+            --         _G.ConfigManager.ui_effect_cfg.ef_aorbtnhuoyan,
+            --         self.go_table.aorbtn_fightBack,
+            --         function(obj)
+            --             if not self.go_table.aorbtn_fightBack then
+            --                 _G.DestroyObject(obj)
+            --                 return
+            --             end
+            --             self.fightEff = obj
+            --             obj:SetLocalPosition(0, 100, 0)
+            --         end
+            --     )
+            -- end
+        end
+        --更新文本信息
+        self.fightCount = (self.fightCount or 0) + 1
+        if self.fightCount > 3 then
+            self.fightCount = 0
+        end
+        local str = _G.GetLangPackValue(90031700069)
+        for i = 1, self.fightCount do
+            str = str .. "."
+        end
+        self.go_table.aortext_fightBack.text = str
+    end
+end
+
+function MainAfkPanel:UpdateSubGameBtn()
+    local gameType, cfg = require("MiniGameJumpManager"):GetInstance():GetGameType()
+    local isShowBtn = false
+    if gameType ~= 0 then--开启副玩法且需要放置界面的入口才显示
+        self.subGameCfg = cfg
+        if cfg.mainFunction then--不需要放置界面入口不显示
+            isShowBtn = not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(264)
+            if isShowBtn then
+                local mainFunctionCfg = _G.ConfigManager.main_function_cfg[cfg.mainFunction]--复用主界面的入口配置
+                self.go_table.aorimage_SubGameIcon.SpriteName = mainFunctionCfg.Icon
+                self.go_table.aortext_SubGameName.text = _G.GetLangPackValue(mainFunctionCfg.Name)
+                self.go_table.obj_SubGameRedpoint:UpdateRedPointItemIDAndParam(mainFunctionCfg.RedPointId)
+            end
+        end
+    end
+    self.go_table.aorbtn_SubGameBtn:SetActiveE(isShowBtn and 1 or 0)
+end
+
+function MainAfkPanel:ShowAfkCondtion()
+    local pass, content = AfkModel:GetInstance():CheckNextSectionCondition()
+    self.go_table.obj_afkCond:SetActiveE(pass and 0 or 1)
+    self.go_table.aorbtn_commendPlay:SetActiveE(pass and 0 or 1)
+    if not pass then
+        self.go_table.aortext_battleCond.text = _G.GetLangPackValue(90029400098, content)
+        local afkModel = AfkModel:GetInstance()
+        local maxAfkTime = self:GetMaxAfkTime()
+        local time = _G.TimeUtil.GetServerUnixTime() - afkModel:GetAfkTime()
+        if time > maxAfkTime then
+            time = maxAfkTime
+        end
+        if not self.condExtendText then
+            self.condExtendText = self.go_table.obj_getAfkAward:GetComponentE(_G.typeof(_G.CS.ExtendText))
+        end
+        self.afkTime = afkModel:GetCanBattleAfkTime()
+        self:StopCondTimer()
+        if time < self:GetMaxAfkTime() and time < self.afkTime then
+            self.afkCondTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateCondTimer, self, false, false, false)
+            self.afkCondTimer:Start()
+        end
+        self:UpdateCondTimer()
+        self.condExtendText.OnHrefClick:AddListener(_G.handler(self, self.OnHrefClick))
+    end
+    return pass
+end
+
+function MainAfkPanel:UpdateCondTimer()
+    local time = _G.TimeUtil.GetServerUnixTime() - AfkModel:GetInstance():GetAfkTime()
+    if time >= self:GetMaxAfkTime() or time >= self.afkTime then
+        self.condExtendText.text = _G.GetLangPackValue(90020800040)
+        self:StopCondTimer()
+    else
+        self.condExtendText.text = _G.GetLangPackValue(90020800044, self:FormateTime(self.afkTime - time))
+    end
+end
+
+function MainAfkPanel:StopCondTimer()
+    if self.afkCondTimer then
+        self.afkCondTimer:Stop()
+        self.afkCondTimer = nil
+    end
+end
+
+function MainAfkPanel:FormateTime(time)
+    local timeStr
+    local t = _G.TimeUtil.TranslateSecond(time)
+    if t.day > 0 then
+        timeStr = _G.GetLangPackValue(90022100001, t.day, t.hour)
+    else
+        timeStr = _G.string.format("%02d:%02d:%02d", t.hour, t.min, t.sec)
+    end
+    return timeStr
+end
+
+function MainAfkPanel:OnHrefClick(id)
+    if id == _G.ConfigManager.ui_cfg.GetawardView.Name then
+        AfkModel:GetInstance():CheckAfkAward(
+            function(time, data)
+                self:UpdateAfkBox()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetawardView.Name, time, data)
+            end
+        )
+    end
+end
+
+--region ------------- 玩家信息 -------------
+
+function MainAfkPanel:UpdatePlayerInfo()
+    if self.playerHead then
+        self.playerHead:UpdatePlayerInfo()
+    end
+end
+
+function MainAfkPanel:UpdatePower()
+    if self.playerHead then
+        self.playerHead:UpdatePower()
+    end
+end
+
+--endregion ----------- 玩家信息 end -----------
+
+---@param cardata CardData
+function MainAfkPanel:SkinChange(cardata)
+    local uid = cardata.uid
+    for i = 1, 5 do
+        local key = "obj_pos" .. i
+        ---@type UnityEngine.GameObject
+        local parent = self.go_table[key]
+        --如果模型未加载或sid不一致, 则重新进行加载
+        if parent:GetName() == _G.tostring(uid) then
+            parent:SetName(key)
+        end
+    end
+end
+
+---更新军衔信息
+function MainAfkPanel:UpdateHell()
+    local isShow = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Hell)
+    if isShow then
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MainNaraka.id)
+    else
+        local cfg = _G.ConfigManager.function_open_cfg[_G.FunctionID.Hell]
+        isShow = cfg and cfg.is_display
+    end
+    self.go_table.obj_hell:SetActiveE(isShow and 1 or 0)
+    if not _G.AppSetting.IsXzns then
+        self.go_table.obj_bottleRight:SetLocalPosition(-60.5, isShow and 392.5 or 268, 0)
+    end
+    if not isShow then
+        return
+    end
+
+    local model = require "HellRoadModel":GetInstance()
+    local HellData = model.hellData
+    local hellId = 1
+    local isCompleted = 0
+    if HellData ~= nil then
+        hellId = HellData.h_id
+        isCompleted = model:CheckIsFinishAll(hellId)
+    end
+    local maxCount = #_G.ConfigManager.hell_title_cfg
+    local isMax = hellId == maxCount --军衔是否已最大等级
+    isCompleted = isMax and 0 or isCompleted
+
+    self.go_table.obj_hellRoadMaxTip:SetActiveE(isMax and 1 or 0)
+    self.go_table.obj_hellRoadFinTip:SetActiveE((not isMax and isCompleted) and 1 or 0)
+    self.go_table.obj_hellRoadTip:SetActiveE((isMax or isCompleted) and 0 or 1)
+
+    if not (isMax or isCompleted) then
+        local TaskName, isCompleted = model:GetCurShowTaskName(hellId)
+        if TaskName then
+            local color = {
+                "72C946",
+                "FFFFFF",
+                "FFC800"
+            }
+            if _G.AppSetting.IsXzns then
+                color[1] = "A7EFBC"
+                color[3] = "F7EDC9"
+            end
+            self.go_table.aortext_hellRoadOrder.text = TaskName
+            self.go_table.aortext_hellRoadOrder.color = _G.ColorTools.FormatColorByString(color[3])
+            self.go_table.aortext_hellRoadOrderState.text = _G.GetLangPackValue(isCompleted and 90023900016 or
+                90023900002)
+            self.go_table.aortext_hellRoadOrderState.color = _G.ColorTools.FormatColorByString(isCompleted and color[1] or
+                color[2])
+        else
+            self.go_table.obj_hellRoadFinTip:SetActiveE(1)
+            self.go_table.obj_hellRoadTip:SetActiveE(0)
+        end
+    end
+
+    local showEff = model:CheckAwardCanGet()
+    if _G.AppSetting.IsXzns then
+        showEff = showEff or (isCompleted and not isMax)
+    end
+    if showEff and isShow then
+        self.go_table.obj_hellEff:SetActiveE(1)
+        if not self.hellEffInit then
+            self.hellEffInit = true
+            _G.UIUtils.LoadEffectByCfg(
+                _G.ConfigManager.ui_effect_cfg.ef_junxianlingqu,
+                self.go_table.obj_hellEff,
+                function(obj)
+                    if not self.go_table then
+                        self.hellEffInit = false
+                        _G.DestroyObject(obj)
+                        return
+                    end
+                end
+            )
+        end
+    else
+        self.go_table.obj_hellEff:SetActiveE(0)
+    end
+    if _G.AppSetting.IsXzns then
+        if self.go_table.obj_hellRoadFinTip:GetActiveSelf() then
+            GameUtil.ReBuildRTF(self.go_table.obj_hellRoadFinTipBg)
+        end
+        if self.go_table.obj_hellRoadTip:GetActiveSelf() then
+            GameUtil.ReBuildRTF(self.go_table.obj_hellRoadTipBg)
+        end
+    end
+end
+
+---初始化afk关卡数据
+function MainAfkPanel:InitChapters()
+    --检查是否创建角色
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return
+    end
+    --初始化afk数据
+    local afkTaskModel = require("AfkTaskModel"):GetInstance()
+    if afkTaskModel.Data then
+        self:UpdateChapters()
+        self:UpdateAfkGift()
+        self:UpdateAfkGiftTip()
+    else
+        self.go_table.obj_afkGift:SetActiveE(0)
+        self.go_table.aorbtn_afkGiftTip:SetActiveE(0)
+        afkTaskModel:GetAfkData(
+            function()
+                self:UpdateChapters()
+                self:UpdateAfkGift()
+                self:UpdateAfkGiftTip()
+            end
+        )
+    end
+end
+
+---更新afk关卡显示
+---@return void
+function MainAfkPanel:UpdateChapters()
+    --检查是否创建角色
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        self.go_table.obj_chapter:SetActiveE(0)
+        return
+    end
+    self.go_table.obj_chapter:SetActiveE(1)
+
+    --初始化节点
+    local afkModel = AfkModel:GetInstance()
+    local afkTaskModel = require("AfkTaskModel"):GetInstance()
+
+    --更新当前进度标题
+    self.curSecCfg = _G.ConfigManager.afk_cfg[afkModel:GetCurSection()]
+    self.go_table.aortext_stageNum.text = string.format("%s-%s", self.curSecCfg.chapter, self.curSecCfg.section)
+    local nameT = afkModel:GetCurChapterName()
+    if nameT then
+        self.go_table.aortext_stageName.text = LangUtil.GetLangPackValue(nameT[1])
+    end
+    self.awardDatas = afkTaskModel.AwardDatas
+    local index = self:FindJumpIndex()
+    if not self.sectionListInit then
+        self.go_table.scrollloophorizontal_section:InitItemData(
+            #self.awardDatas,
+            _G.handler(self, self.RefreshSecItem),
+            index
+        )
+        self.sectionListInit = true
+    else
+        self.go_table.scrollloophorizontal_section:UpdateAllItem()
+        self.go_table.scrollloophorizontal_section:ScrollToIndex(index)
+    end
+end
+
+function MainAfkPanel:RefreshSecItem(index, obj)
+    index = index + 1
+    ---@type _obj_afkPanel._obj_sectionItem_GoTable
+    local tb = _G.GetAutoGoTable(obj)
+    local data = self.awardDatas[index]
+    if not tb.reward then
+        tb.reward = {}
+    end
+    tb.gameObject:SetName(index)
+    tb.data = data
+    tb.aortext_name.text = _G.string.format("%d-%d", data.afkCfg.chapter, data.afkCfg.section)
+    tb.aorimage_bg1:SetActiveE((not data.CanTake or data.isGet) and 1 or 0)
+    tb.obj_eff:SetActiveE(data.CanTake and not data.isGet and 1 or 0)
+    tb.aorimage_fill:SetActiveE((data.CanTake or data.isGet) and 1 or 0)
+    --是否特殊关卡
+    local isSpecific = not _G.string.IsNullOrEmpty(data.cfg.image)
+    local itemType = _G.StorageManager:GetInstance():CheckSidType(data.realReward[1]) == _G.StorageType.Card and 1 or 2
+    tb.itemType = itemType
+    tb.obj_reward:SetLocalScaleXYZ(isSpecific and 1 or 0.7)
+    for k, v in pairs(tb.reward) do
+        if k ~= itemType then
+            v.gameObject:SetActiveE(0)
+        else
+            v.gameObject:SetActiveE(1)
+        end
+    end
+    --加载奖励图标
+    if not tb.reward[itemType] then
+        if itemType == 1 then
+            _G.ItemCardFactory:GetInstance():GetItemCard(
+                _G.ItemCardFactory.itemCardType.HeadItem_Select,
+                tb.obj_rewardRoot,
+                function(item)
+                    if tb.reward[itemType] then
+                        _G.DestroyObject(item.gameObject)
+                        return
+                    end
+                    if tb.itemType ~= itemType then
+                        item.gameObject:SetActiveE(0)
+                    elseif tb.data ~= data then
+                        data = tb.data
+                    end
+                    item.gameObject:SetLocalPositionToZero()
+                    tb.reward[itemType] = item
+                    tb.reward[itemType]:Show(
+                        data.realReward[1],
+                        _G.handlerbind(self, self.OnClickSectionBtn, tb),
+                        nil,
+                        nil,
+                        nil,
+                        nil,
+                        nil,
+                        true
+                    )
+                    tb.reward[itemType].gameObject:SetLocalScaleXYZ(0.6)
+                    -- tb.reward:SetGradeNew(data.CanTake and not data.isGet)
+                    tb.reward[itemType]:SetSelectGou(data.isGet)
+                end
+            )
+        elseif itemType == 2 then
+            _G.ItemFactory:GetInstance():GetItemCard(
+                _G.ItemFactory.itemType.ItemBaseWithCount,
+                tb.obj_rewardRoot,
+                function(item)
+                    if tb.reward[itemType] then
+                        _G.DestroyObject(item.gameObject)
+                        return
+                    end
+                    if tb.itemType ~= itemType then
+                        item.gameObject:SetActiveE(0)
+                    elseif tb.data ~= data then
+                        data = tb.data
+                    end
+                    tb.reward[itemType] = item
+                    tb.reward[itemType]:Show(
+                        data.realReward[1],
+                        _G.handlerbind(self, self.OnClickSectionBtn, tb),
+                        data.realReward[2]
+                    )
+                    tb.reward[itemType].gameObject:SetLocalScaleXYZ(0.6)
+                    -- tb.reward:SetGradeNew(data.CanTake and not data.isGet)
+                    tb.reward[itemType]:SetGou(data.isGet)
+
+                    tb.rewardEff = 1
+                    -- tb.reward[isCard]:ShowFrameEffect(data.realReward[1], data.CanTake)
+                    if data.CanTake then
+                        self:SetItemEff(tb)
+                    end
+                end
+            )
+        end
+    else
+        -- tb.reward:SetGradeNew(data.CanTake and not data.isGet)
+        if itemType == 1 then
+            tb.reward[itemType]:Show(
+                data.realReward[1],
+                _G.handlerbind(self, self.OnClickSectionBtn, tb),
+                nil,
+                nil,
+                nil,
+                nil,
+                nil,
+                true
+            )
+            tb.reward[itemType]:SetSelectGou(data.isGet)
+        elseif itemType == 2 then
+            tb.reward[itemType]:Show(
+                data.realReward[1],
+                _G.handlerbind(self, self.OnClickSectionBtn, tb),
+                data.realReward[2]
+            )
+            tb.reward[itemType]:SetGou(data.isGet)
+            if data.CanTake then
+                self:SetItemEff(tb)
+            end
+        end
+    end
+end
+
+---通关豪礼按钮状态
+---@return void
+function MainAfkPanel:UpdateAfkGift()
+    local enableCfg = _G.ConfigManager.discrete_cfg[120012]
+    if enableCfg and not _G.GlobalConditionManager.CheckConditionArrays(enableCfg) then
+        self.go_table.obj_afkGift:SetActiveE(0)
+    else
+        self.go_table.obj_afkGift:SetActiveE(1)
+    end
+end
+
+---更新通关豪礼tip窗口
+---@return void
+function MainAfkPanel:UpdateAfkGiftTip()
+    if self.go_table.obj_afkGift:GetActiveSelf() ~= 1 then
+        return
+    end
+    local model = require("AfkTaskModel"):GetInstance()
+    --是否有可领取的豪礼
+    local hasAward = model:CheckSectionAward2()
+    if hasAward then
+        self.go_table.aorbtn_afkGiftTip:SetActiveE(1)
+        self.go_table.aortext_afkGiftTip.text = _G.GetLangPackValue(90000001250) --当前可领奖
+        self.afkGiftTick = nil
+        if self.afkGiftTimer then
+            self.afkGiftTimer:Stop()
+            self.afkGiftTimer = nil
+        end
+        return
+    end
+
+    local intervalCfg = _G.ConfigManager.discrete_cfg[120011]
+    local interval = intervalCfg[1][1] or 5 --默认间隔5秒, 0常驻显示, -1不显示
+    local isShowTip = false
+    if interval > 0 then
+        --创建定时器
+        if not self.afkGiftTimer then
+            self.afkGiftTimer = _G.TimerManager:GetInstance():GetTimer(interval, self.UpdateAfkGiftTip, self, false,
+                false, true)
+            self.afkGiftTimer:Start()
+        end
+        self.afkGiftTick = (self.afkGiftTick or 0) + 1
+        isShowTip = self.afkGiftTick % 2 == 0
+    else
+        --销毁定时器
+        if self.afkGiftTimer then
+            self.afkGiftTimer:Stop()
+            self.afkGiftTimer = nil
+        end
+        isShowTip = interval ~= -1
+    end
+
+    --是否需要显示tip
+    self.go_table.aorbtn_afkGiftTip:SetActiveE(isShowTip and 1 or 0)
+    if not isShowTip then
+        return
+    end
+    --获取下一个可领取的关卡
+    local nextAfk = model:GetNextSectionAward2()
+    if not nextAfk then
+        --奖励已全部领取完成
+        self.go_table.aorbtn_afkGiftTip:SetActiveE(0)
+        if self.afkGiftTimer then
+            self.afkGiftTimer:Stop()
+            self.afkGiftTimer = nil
+        end
+        return
+    end
+    local curAfkId = AfkModel:GetInstance():GetCurSection()
+    local afk = _G.ConfigManager.afk_cfg[curAfkId]
+    self.go_table.aortext_afkGiftTip.text = _G.GetLangPackValue(90000001249,
+        afk and (nextAfk.number - afk.number + 1) or nextAfk.number)
+end
+
+---监听红点刷新
+---@param id number
+function MainAfkPanel:OnRedPointRefresh(id)
+    if id == _G.ConfigManager.redpoint_cfg.MainNaraka.id then
+        self:UpdateHell()
+    elseif id == _G.ConfigManager.redpoint_cfg.RedPointAfkStage2.id then
+        self:UpdateAfkGift()
+        self:UpdateAfkGiftTip()
+    end
+end
+
+---设置奖励item特效
+function MainAfkPanel:SetItemEff(go)
+    local eff = _G.ConfigManager.ui_effect_cfg.ef_kelingqukuang
+    _G.UIUtils.RemoveChildren(go.obj_eff)
+    _G.UIUtils.LoadEffectByCfg(
+        eff,
+        go.obj_eff,
+        function(trans)
+            if _G.IsNil(go) then
+                _G.DestroyObject(trans)
+                return
+            end
+            go.frameEffect = trans
+            go.eff = eff
+        end
+    )
+end
+
+function MainAfkPanel:FindJumpIndex()
+    local index, index1, target
+    for i, data in pairs(self.awardDatas) do
+        if data.isGet then
+            index1 = i
+        elseif data.CanTake then
+            index = i
+            break
+        end
+    end
+    target = index or (index1 and index1 + 1 or 0)
+    if target > 0 then
+        local sum = #self.awardDatas - 4
+        if target > sum then
+            target = sum
+        else
+            target = target - 1
+        end
+        target = target - 1
+        target = target < 0 and 0 or target
+        return target --C#从0开始
+    end
+    target = target < 0 and 0 or target
+    return target
+end
+
+---最大挂机时间
+function MainAfkPanel:GetMaxAfkTime()
+    local vipTime = require "PrivilegeManager":GetInstance():GetPrivilegeDataNew({ 1 })
+    local Time = 0
+    if not _G.table.isEmptyOrNil(vipTime) then
+        Time = vipTime[1][2]
+    end
+    return _G.ConfigManager.discrete_cfg[101103][1][1] + Time
+end
+
+---更新afk宝箱状态
+---@return void
+function MainAfkPanel:UpdateAfkBox()
+    local show, index = false, 1
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        local afkModel = AfkModel:GetInstance()
+        local cfg = _G.ConfigManager.afk_cfg[afkModel:GetCurSection()]
+        local time = _G.TimeUtil.GetServerUnixTime() - afkModel:GetAfkTime()
+        if cfg and cfg.pre_section > 0 then
+            show = true
+            local discreteID = {
+                HalfAfkTime = 101110,
+                ResultIntervalTime = 101109
+            }
+            local halfAfkTime = _G.ConfigManager.discrete_cfg[discreteID.HalfAfkTime][1][1]
+            local interval = _G.ConfigManager.discrete_cfg[discreteID.ResultIntervalTime][1][1]
+            if time < interval then
+                index = 1
+            elseif time < halfAfkTime then
+                index = 2
+            else
+                index = 3
+            end
+        end
+
+        local maxAfkTime = self:GetMaxAfkTime()
+        if time < self:GetMaxAfkTime() then
+            self.go_table.aortext_Slider.text = _G.TimeUtil.TransDayHourMineMiao(time)
+            self.go_table.slider_bossProgress.value = time / maxAfkTime
+        else
+            self.go_table.aortext_Slider.text = _G.TimeUtil.TransDayHourMineMiao(maxAfkTime)
+            self.go_table.slider_bossProgress.value = 1
+        end
+    end
+    for i = 1, 3 do
+        if i == index then
+            self.go_table["obj_box" .. i]:SetActiveE(1)
+        else
+            self.go_table["obj_box" .. i]:SetActiveE(0)
+        end
+    end
+    self:UpdateAfkBoxEffect(index)
+end
+
+---更新afk编队人员显示
+---@return void
+function MainAfkPanel:UpdateEmbattleRoles()
+    --检查是否创建角色
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return
+    end
+    --获取布阵数据
+    ---@type number[]
+    local emData
+    local embattleIds = require("AfkBattleManager"):GetInstance():GetCurEmbattleID()
+    for _, embattleId in pairs(embattleIds) do
+        emData = require("EmbattleModel"):GetInstance():GetEmbattleData(embattleId)
+        if emData then
+            for i = #emData, 1, -1 do
+                if not emData[i] or emData[i] <= 0 then
+                    table.remove(emData, i)
+                end
+            end
+        end
+        if not _G.table.isEmptyOrNil(emData) then
+            break
+        end
+    end
+
+    if not self.roleModels then
+        self.roleModels = {}
+    end
+    --没有任何数据, 清空模型
+    if _G.table.isEmptyOrNil(emData) then
+        for i = 1, 5 do
+            local model = self.roleModels[i]
+            if model then
+                self.roleModels[i] = nil
+                _G.PoolsManager:GetInstance():Despawn(model, _G.ePoolType.Temporary)
+            end
+            ---@type UnityEngine.GameObject
+            local parent = self.go_table["obj_pos" .. i]
+            parent:SetActiveE(0)
+            parent:SetName("0")
+        end
+        return
+    end
+
+    --开始加载模型
+    local loadingId = "loadid_" .. math.random()
+    self.roleLoadingId = loadingId --异步加载限制
+    -- 是否展示对话气泡（需要五个角色上满）
+    local IsShowPop = true
+    for i = 1, 5 do
+        ---@type UnityEngine.GameObject
+        local parent = self.go_table["obj_pos" .. i]
+        local uid = emData[i] or 0
+        if uid == 0 then
+            IsShowPop = false
+        end
+        ---@type CardData
+        local cardData = uid > 0 and _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid) or nil
+        local loadSid = "0" --加载的模型的sid(card_cfg或skin_cfg)
+        if cardData then
+            local isWearSkin, skinId = require("CardCommentManager"):GetInstance():CardWearSkin(cardData.cfg.id)
+            if isWearSkin and skinId and skinId > 0 then
+                loadSid = tostring(skinId)
+            else
+                loadSid = tostring(cardData.cfg.id)
+            end
+        end
+
+        --如果模型未加载或sid不一致, 则重新进行加载
+        if parent:GetName() ~= loadSid or _G.AppSetting.IsXzns then
+            local model = self.roleModels[i]
+            if model then
+                self.roleModels[i] = nil
+                _G.PoolsManager:GetInstance():Despawn(model, _G.ePoolType.Temporary)
+            end
+            parent:SetActiveE(0)
+
+            if cardData then
+                parent:SetActiveE(1)
+                local isWearSkin, skinId = require("CardCommentManager"):GetInstance():CardWearSkin(cardData.cfg.id)
+                local path = isWearSkin and _G.ConfigManager.skin_cfg[skinId].ModelPathHi or cardData.cfg.ModelPathHi
+                if _G.UIUtils.IsUseBattleSpine(_G.UseBattleSpine.MainAfkView) then
+                    path = _G.UIUtils.GetBattleSpine(cardData.cfg)
+                end
+                local filpX = (i == 2 or i == 5) and -1 or 1 --是否需要翻转x轴
+                local scale = cardData.cfg.size4
+                _G.PoolsManager:GetInstance():Spawn(
+                    path,
+                    _G.ePoolType.Temporary,
+                    parent,
+                    function(trans)
+                        if trans == nil then
+                            if _G.AppSetting.DEBUG then
+                                _G.LogError("角色模型加载失败, 角色sid=" .. uid .. ", 路径=" .. cardData.cfg.ModelPathHi)
+                            end
+                            return
+                        end
+                        if _G.IsNil(self.gameObject) or self.roleLoadingId ~= loadingId then
+                            _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.Temporary)
+                            return
+                        end
+                        trans:SetLocalScale(filpX * scale, scale, scale)
+                        trans:SetLocalPositionToZero()
+                        parent:SetName(loadSid)
+                        parent:SetActiveE(1)
+                        self.roleModels[i] = trans
+
+                        --- 只有星座女神有神环
+                        if _G.AppSetting.IsXzns then
+                            local godHaloID = _G.PlayerModel:GetInstance():IsCardWearGodHalo(cardData.cfg.id)
+                            if godHaloID ~= 0 then
+                                local effCfg = _G.ConfigManager.god_halo_cfg[godHaloID].ui_effect_cfg
+                                --- 神环路径，父级路径(加载角色的下面)
+                                _G.UIUtils.LoadGodHalo(effCfg, trans, godHaloID)
+                            end
+                            _G.UIUtils.LoadArtifacteffect(trans,cardData.cfg.id ,nil,nil)
+                        end
+                    end
+                )
+            else
+                IsShowPop = false
+                parent:SetName("0")
+            end
+        end
+    end
+    self.emData = emData
+
+    if IsShowPop then
+        -- 左右
+        self.randomLeftRight = math.random(1, 2)
+        _G.DelayDo(
+            TalkInitTime,
+            function()
+                if _G.IsNil(self.go_table.gameObject) then
+                    return
+                end
+                if self.roleLoadingId ~= loadingId then
+                    return
+                end
+                self:ShowTalkPop(self.roleLoadingId)
+            end
+        )
+    end
+end
+
+function MainAfkPanel:UpDateGodHalo()
+    --检查是否创建角色
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return
+    end
+    --获取布阵数据
+    ---@type number[]
+    local emData
+    local embattleIds = require("AfkBattleManager"):GetInstance():GetCurEmbattleID()
+    for _, embattleId in pairs(embattleIds) do
+        emData = require("EmbattleModel"):GetInstance():GetEmbattleData(embattleId)
+        if emData then
+            for i = #emData, 1, -1 do
+                if not emData[i] or emData[i] <= 0 then
+                    table.remove(emData, i)
+                end
+            end
+        end
+        if not _G.table.isEmptyOrNil(emData) then
+            break
+        end
+    end
+
+    if not self.roleModels then
+        self.roleModels = {}
+    end
+    --没有任何数据, 清空模型
+    if _G.table.isEmptyOrNil(emData) then
+        return
+    end
+    for i = 1, 5 do
+        ---@type UnityEngine.GameObject
+        local uid = emData[i] or 0
+        if uid == 0 then
+            IsShowPop = false
+        end
+        ---@type CardData
+        local cardData = uid > 0 and _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid) or nil
+ 
+        if cardData and self.roleModels[i] then
+            --- 只有星座女神有神环
+            if _G.AppSetting.IsXzns then
+                local godHaloID = _G.PlayerModel:GetInstance():IsCardWearGodHalo(cardData.cfg.id)
+                if godHaloID ~= 0 then
+                    local effCfg = _G.ConfigManager.god_halo_cfg[godHaloID].ui_effect_cfg
+                    --- 神环路径，父级路径(加载角色的下面)
+                    _G.UIUtils.LoadGodHalo(effCfg, self.roleModels[i], godHaloID)
+                end
+                _G.UIUtils.LoadArtifacteffect(self.roleModels[i],cardData.cfg.id ,nil,nil)
+            end
+        end
+    end
+end
+
+function MainAfkPanel:ShowTalkPop(loadingId)
+    local uid
+    local emData = self.emData
+
+    -- 左侧气泡
+    self.go_table.aorimage_pos1:SetActiveE(0)
+    self.go_table.aorimage_pos4:SetActiveE(0)
+
+    -- 右侧气泡
+    self.go_table.aorimage_pos2:SetActiveE(0)
+    self.go_table.aorimage_pos5:SetActiveE(0)
+
+    -- 左右气泡交叉出现
+    if self.randomLeftRight == 1 then
+        self.randomLeftRight = 2
+    else
+        self.randomLeftRight = 1
+    end
+
+    local randomLeftRight = self.randomLeftRight
+    -- 上下
+    local randomDeepTop = math.random(1, 2)
+
+    local txt
+    local image
+    if randomLeftRight == 1 then
+        if randomDeepTop == 1 then
+            txt = self.go_table.aortext_pos1
+            image = self.go_table.aorimage_pos1
+            uid = emData[1]
+        else
+            txt = self.go_table.aortext_pos4
+            image = self.go_table.aorimage_pos4
+            uid = emData[4]
+        end
+    else
+        if randomDeepTop == 1 then
+            txt = self.go_table.aortext_pos2
+            image = self.go_table.aorimage_pos2
+            uid = emData[2]
+        else
+            self.go_table.aorimage_pos5:SetActiveE(1)
+            txt = self.go_table.aortext_pos5
+            image = self.go_table.aorimage_pos5
+            uid = emData[5]
+        end
+    end
+    local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+    local afktalk
+    local randomTalk12 = math.random(1, 2)
+    if (not cardData) or (not cardData.cfg) then
+        return
+    end
+    -- 最后的参数是容错处理 按理说不要有空的
+    local afktalk1 = #cardData.cfg.afktalk > 0 and cardData.cfg.afktalk[math.random(1, #cardData.cfg.afktalk)] or
+        91307420805
+    if #_G.ConfigManager.discrete_cfg[120018] > 0 and #_G.ConfigManager.discrete_cfg[120018][1] > 0 then
+        local afktalk2 = _G.ConfigManager.discrete_cfg[120018][1]
+            [math.random(1, #_G.ConfigManager.discrete_cfg[120018][1])]
+
+        if randomTalk12 == 1 then
+            afktalk = afktalk1
+        else
+            afktalk = afktalk2
+        end
+    else
+        afktalk = afktalk1
+    end
+
+    txt.text = _G.GetLangPackValue(afktalk)
+    image:SetActiveE(1)
+    -- 展示对话完4s后 关闭对话 间隔2s后再次执行此逻辑
+    _G.DelayDo(
+        TalkShowTime,
+        function()
+            if _G.IsNil(self.go_table.gameObject) then
+                return
+            end
+            image:SetActiveE(0)
+            _G.DelayDo(
+                TalkCdTime,
+                function()
+                    if _G.IsNil(self.go_table.gameObject) then
+                        return
+                    end
+                    if self.roleLoadingId ~= loadingId then
+                        return
+                    end
+                    self:ShowTalkPop(loadingId)
+                end
+            )
+        end
+    )
+end
+
+function MainAfkPanel:OnUIClosed(uiName)
+    if uiName == _G.ConfigManager.ui_cfg.ChatView.Name then
+        self.go_table.obj_minChatView:SetActiveE(1)
+    elseif uiName == _G.ConfigManager.ui_cfg.GetawardView.Name then
+        self:UpdateAfkBox()
+    elseif uiName == _G.ConfigManager.ui_cfg.OnlineAwardView.Name then
+        self:UpdateTRButton()
+    end
+end
+
+---@param item _obj_afkPanel._obj_sectionItem_GoTable|{data:ChapterRewardData}
+function MainAfkPanel:OnClickSectionBtn(item)
+    if not item.data then
+        return
+    end
+    if not item.data.CanTake or item.data.isGet then
+        -- _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AfkGiftView.Name)
+        --展示奖励tip
+        require("CommonTipManager"):GetInstance():OpenTip(item.gameObject, item.data.realReward[1])
+    else
+        -- require "AfkTaskModel":GetInstance():ReceiveAward(
+        --     item.data.sid,
+        --     function(msg, sids)
+        --         _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        --         self:UpdateChapters()
+        --         require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RedPointAfk.id)
+        --     end
+        -- )
+        require "AfkTaskModel":GetInstance():GetAllAward(
+            function(msg, sids)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                self:UpdateChapters()
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RedPointAfk.id)
+            end
+        )
+    end
+end
+
+function MainAfkPanel:OnRTBtn(go, isOn, name)
+    if name == "OnlineAward" then
+        require("OnlineAwardModel"):GetInstance():OpenWindowSetTime()
+    end
+end
+
+---检查挂机奖励
+function MainAfkPanel:CheckAfkAward()
+    local function checkOpenQuickAward()
+        if not self.go_table or _G.IsNil(self.go_table.gameObject) then
+            return false
+        end
+        --如果afk界面已经隐藏
+        if self.go_table.gameObject:GetctiveInHierarchy() ~= 1 then
+            return false
+        end
+        if require("DouyinModel"):GetInstance():DouyinFeedScene() then
+           return true 
+        end
+        --如果mainview不是在最顶层(打开了其他页面)
+        local existWindow = _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.TopLayer.Name) or
+            _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.NormalLayer.Name) or
+            _G.UIManager:GetInstance():GetTopWindowByLayer(_G.UILayers.SceneLayer.Name)
+        if existWindow and existWindow.Name ~= _G.ConfigManager.ui_cfg.MainView.Name then
+            return false
+        end
+
+        return true
+    end
+    if not checkOpenQuickAward() then
+        return
+    end
+    AfkModel:GetInstance():CheckAfkAward(
+        function(time, data)
+            if not checkOpenQuickAward() then
+                return
+            end
+            self:UpdateAfkBox()
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetawardView.Name, time, data)
+            require("DouyinModel"):GetInstance():ReportAndStoreFeed()
+        end
+    )
+end
+
+function MainAfkPanel:UpdateStorePass()
+    local unlock = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.StorePass)
+    self.go_table.aorbtn_storePass:SetActiveE(unlock and 1 or 0)
+end
+
+---检查对象是否为空
+---@return boolean true有空
+function MainAfkPanel:ChecksIsNil(...)
+    for i = 1, select("#", ...) do
+        local arg = select(i, ...) --得到第i个参数
+        if _G.IsNil(arg) then
+            --("对象为空 ")
+            return true
+        end
+    end
+
+    return false
+end
+
+function MainAfkPanel:AddMinChatItem(pindao, content)
+    self.initLoadCompleted = true
+    if self:ChecksIsNil(self.go_table.obj_minChatItem, self.go_table.obj_minChat) then
+        return
+    end
+    local item, tb
+
+    ---当前主界面小聊天消息队列
+    if self.nowMinChatAll == nil then
+        self.nowMinChatAll = {}
+    end
+    if #self.nowMinChatAll >= 3 then
+        self.nowMinChatAll[1]:SetActiveE(0)
+        self.nowMinChatAll[1]:DestroyObject()
+        _G.table.remove(self.nowMinChatAll, 1)
+    end
+    item = _G.InstantiateObject(self.go_table.obj_minChatItem, self.go_table.obj_minChat)
+    tb = _G.GetAutoGoTable(item)
+
+    if pindao == _G.ChatType.world then
+        tb.aortext_pindao.text = "<color=#36C959>[" .. _G.GetLangPackValue(9002060002) .. "]</color>"
+    elseif pindao == _G.ChatType.system then
+        tb.aortext_pindao.text = "<color=#F7972F>[" .. _G.GetLangPackValue(9002060001) .. "]</color>"
+    elseif pindao == _G.ChatType.selfWorld then
+        tb.aortext_pindao.text = "<color=#c27ef6>{" .. _G.GetLangPackValue(9002060003) .. "}</color>"
+    elseif pindao == _G.ChatType.union then
+        tb.aortext_pindao.text = "<color=#c73c34>{" .. _G.GetLangPackValue(90010050081) .. "}</color>"
+    elseif pindao == _G.ChatType.team then
+        tb.aortext_pindao.text = "<color=#68a0f4>{" .. _G.GetLangPackValue(9002060005) .. "}</color>"
+    elseif pindao == _G.ChatType.privateChat then
+        tb.aortext_pindao.text = "<color=#68a0f4>{" .. _G.GetLangPackValue(90020600025) .. "}</color>"
+    elseif pindao == _G.ChatType.unionbattle then
+        tb.aortext_pindao.text = "<color=#68a0f4>{" .. _G.GetLangPackValue(90010050081) .. "}</color>"
+    end
+    tb.aortext_info.text = content
+
+    _G.table.insert(self.nowMinChatAll, item)
+    item:SetActiveE(1)
+end
+
+function MainAfkPanel:RefreshMineChatItem()
+    if not self.initLoadCompleted then
+        local channel, content = _G.MainManager:GetInstance():GetLastChat()
+        if channel and content then
+            self:AddMinChatItem(channel, content)
+        end
+    end
+end
+
+function MainAfkPanel:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_fight then
+        if AfkModel:GetInstance():CheckPassAll() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(210108)
+            return
+        end
+        if _G.DeadsoulTowerManager:GetInstance():IsFighting() or
+            require("SecretRealmModel"):GetInstance():IsFighting() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(46)
+            return
+        end
+        if require "ActivityDispatchModel":GetInstance():GetBattleIng() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(46)
+            return
+        end
+        --如果正在战斗中, 直接返回战斗
+        local afkManager = require("AfkBattleManager"):GetInstance()
+        if afkManager:IsFighting() then
+            afkManager:SetFightView(true)
+            self.gameObject:SetActiveE(false)
+            return
+        end
+
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Afk) then
+            _G.FunctionManager:GetInstance():ShowFuncitonOpenTips(_G.FunctionID.Afk)
+            return
+        end
+        if not AfkModel:GetInstance():CheckNextSectionCondition() then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LevelUpGuideView.Name)
+            return
+        end
+        require "EmbattleModel":GetInstance():ClearLastAssist()
+        --第一关特殊处理直接进战斗
+        if self.curSecCfg.chapter == 1 and self.curSecCfg.section == 1 then
+            require("AfkBattleManager"):GetInstance():FirstFight()
+        else
+            require("AfkBattleManager"):GetInstance():EnterEmbattle()
+        end
+    elseif go == self.go_table.aorbtn_fightBack then
+        ---@type AfkBattleManager
+        local afkManager = require("AfkBattleManager"):GetInstance()
+        if not afkManager:IsFighting() then
+            self:UpdateFightState()
+            return
+        end
+        --切换bgm
+        local mId = AfkModel:GetInstance():GetCurMonsterID()
+        local mcfg = _G.ConfigManager.monster_group_cfg[mId]
+        _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, mcfg.audio)
+        afkManager:SetFightView(true)
+        self.gameObject:SetActiveE(false)
+    elseif go == self.go_table.aorbtn_playerInfo then
+        _G.SystemSettingManager:GetInstance():OpenView(_G.PlayerModel:GetInstance():GetPlayerUid())
+    elseif go == self.go_table.aorbtn_bag then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.BagNewView.Name)
+    elseif go == self.go_table.aorbtn_task then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ActiveTaskView.Name)
+    elseif go == self.go_table.aorbtn_hell or go == self.go_table.aorbtn_hell2 then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.MilitaryRankView.Name,
+            _G.handler(self, self.UpdateHell)
+        )
+    elseif go == self.go_table.aorbtn_box then
+        require "RequestSubscribeModel":GetInstance():DoRS(1)
+        AfkModel:GetInstance():CheckAfkAward(
+            function(time, data)
+                self:UpdateAfkBox()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetawardView.Name, time, data)
+            end
+        )
+    elseif go == self.go_table.aorbtn_chatView then
+        self.go_table.obj_minChatView:SetActiveE(0)
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.ChatView.Name,
+            _G.MainManager:GetInstance().mainType or _G.ChatType.world
+        )
+    elseif go == self.go_table.aorbtn_commendPlay then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LevelUpGuideView.Name)
+    elseif go == self.go_table.aorbtn_afkGiftBtn or go == self.go_table.aorbtn_afkGiftTip then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AfkGiftView.Name)
+    elseif go == self.go_table.aorbtn_storePass then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.StorePassView.Name)
+    elseif go == self.go_table.aorbtn_SubGameBtn then
+        if self.subGameCfg and self.subGameCfg.enterFun then
+            self.subGameCfg.enterFun(false)
+        end
+    end
+end
+
+function MainAfkPanel:OnDestroy()
+    self:RemoveListener(_G.eCardShow.CardChangeSkin, self.SkinChange)
+    self:RemoveListener(_G.eGodHalo.GodHaloRefresh, self.UpDateGodHalo)
+    _G.MainManager:GetInstance().afkView = nil
+    if self.fireEffect then
+        _G.DestroyObject(self.fireEffect)
+    end
+    if self.bgEffect then
+        _G.DestroyObject(self.bgEffect)
+    end
+    for i, v in pairs(self.boxEffect) do
+        _G.DestroyObject(v)
+    end
+end
+
+return MainAfkPanel

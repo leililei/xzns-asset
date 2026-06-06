@@ -1,0 +1,361 @@
+-- 包路径:        Game.Story.Module.IStoryPlay
+-- File Name:    IStoryPlay.lua
+-- Description:    剧情播放控制器抽象
+-- Author:       TangHuan
+-- Create Date:    2020/02/26
+
+require "TimerManager"
+require "EStoryPlayEvent"
+require "EntityData"
+
+--- Note:
+--- 当前类只是为了抽象剧情播放器，方便剧情可以由多个不同的播放器控制播放
+--- 抽象剧情播放的核心流程和相关抽象接口
+--- 最终目的是为了适配StoryPlayController.lua和AutomaticPlayStory.lua播放器
+
+---@class IStoryPlay : BaseEvent @剧情播放控制器抽象
+---@field CurrentAutoStory AutoStory @当前的剧情数据
+---@field DefaultPoolType ePoolType @默认对象池(子类重定义来修改)
+---@field StoryParentNode UnityEngine.GameObject @剧情挂载节点(播放会删除，同时作为资源加载绑定对象，销毁后方便资源被释放)
+---@field CurrentPlayStep StoryStep @当前播放的剧情步骤
+---@field TempCameraV3  UnityEngine.Vector3[] @缓存摄象机位置 旋转
+---@field StoryPlayCompleteCB function<number, boolean> @剧情播放完成回调(函数参数为剧情ID和是否播放成功)
+---@field IsStoryPlaying boolean @剧情是否正在播放
+---@field StoryUpdateTimer Timer @剧情Update定时器
+---@field StoryItemMap table<number, WorldBaseItem> @剧情实体对象映射Map(Key为UID，Value为实体对象)
+---@field StoryEffectMap table<number, GameObject> @剧情特效映射Map(Key为特效UID，Value为特效实例对象)
+local IStoryPlay = _G.BaseClass("IStoryPlay", _G.BaseEvent)
+IStoryPlay.CurrentAutoStory = nil
+IStoryPlay.DefaultPoolType = _G.ePoolType.Temporary
+IStoryPlay.StoryParentNode = nil
+IStoryPlay.TempCameraV3 = nil
+IStoryPlay.CurrentPlayStep = nil
+IStoryPlay.StoryPlayCompleteCB = nil
+IStoryPlay.IsStoryPlaying = nil
+IStoryPlay.StoryUpdateTimer = nil
+IStoryPlay.StoryItemMap = nil
+IStoryPlay.StoryEffectMap = nil
+
+---IStoryPlay构造函数
+function IStoryPlay:__init()
+    self.CurrentAutoStory = nil
+    self.StoryParentNode = nil
+    self.CurrentPlayStep = nil
+    self.TempCameraV3 = nil
+    self.StoryPlayCompleteCB = nil
+    self.IsStoryPlaying = false
+    self.StoryUpdateTimer = nil
+    self.StoryItemMap = {}
+    self.StoryEffectMap = {}
+
+    --- 之前是否已打开遮罩  true本次剧情打开的遮罩本次剧情结束关闭
+    self.isShowShadowView = nil
+    -- --- 之前的镜头跟随缓动值 >0本次剧情之前的缓动值 本次剧情结束还原
+    -- self.Interpolation = nil
+    --- 需要使用遮罩的行为
+    self.ShadowActionDic = {
+        [_G.EStoryActionType.WorldItemPlayAnimation] = true
+    }
+end
+
+---触发播放剧情
+---@param storyid number @剧情ID
+---@param storycompletecb function<number, boolean> @剧情播放完全回调(函数参数为剧情ID和是否播放成功)
+function IStoryPlay:Play(storyid, storycompletecb)
+    local cfg = _G.ConfigManager.story_cfg[storyid]
+    assert(cfg, "未找到 剧情ID storyid: " .. storyid)
+    -- assert(storycompletecb, "剧情播放不允许传递空的完成回调函数!")
+    if not self.IsStoryPlaying then
+        if self.CurrentAutoStory == nil then
+            _G.Events:GetInstance():Broadcast(_G.GuideStoryStart.StoryStart, storyid)
+
+            self.isShowShadowView = false
+            if
+                cfg.HidemainUI ~= true and
+                    _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name) == true
+             then
+                self.isShowShadowView = true
+                _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+            end
+            ---关闭副本设置界面 防止重叠
+            if _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.SectionStopView.Name) == true then
+                _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SectionStopView.Name)
+            end
+
+            -- self.Interpolation = _G.StoryManager:GetInstance():CameraLerpTimeZero(true)
+
+            self.StoryUpdateTimer = _G.TimerManager:GetInstance():GetTimer(1, self.Update, self, false, true, true)
+            self.StoryUpdateTimer:Start()
+            self.CurrentAutoStory = _G.ObjectPool:GetInstance():Pop(_G.AutoStory, self, storyid, self.DefaultPoolType)
+            self.StoryPlayCompleteCB = storycompletecb
+            self.IsStoryPlaying = true
+
+            _G.StoryUtilities.SaveStoryIDToLocal(storyid)
+            self:PlayStoryPreparation()
+
+            _G.StoryManager:GetInstance():SetNowStory(self)
+            -- 测试用  剧情跳过
+            if _G.StoryManager:GetInstance():GetIsSkipStory() and storyid ~= nil and storyid ~= 7001 and storyid ~= 7002 then
+                self:Skip()
+                return
+            end
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError("当前没有设置有效剧情，播放剧情失败!")
+            end
+            if storycompletecb ~= nil then
+                storycompletecb(0, false)
+            end
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("剧情ID:%d正在播放，播放失败!", self.CurrentAutoStory.CurrentStory.StoryID))
+        end
+    end
+end
+
+---剧情播放准备[abstract]
+function IStoryPlay:PlayStoryPreparation()
+    if _G.AppSetting.DEBUG then
+        _G.LogError("子类请实现此方法:IStoryPlay:PlayStoryPreparation()!")
+    end
+    -- 子类记得触发OnPlayStoryPreparationCompleted回调
+end
+
+---剧情播放准备完成回调
+---@param result boolean @资源预加载结果
+function IStoryPlay:OnPlayStoryPreparationCompleted(result)
+    self:DispatchEvent(
+        _G.EStoryPlayEvent,
+        _G.EStoryPlayEvent.EnumValue.StartPlayStory,
+        self.CurrentAutoStory.CurrentStory.StoryID
+    )
+    ---销毁 所有气泡
+    _G.Events:GetInstance():Broadcast(_G.HUDEvent.EnumValue.HUDDestroy, true)
+    self:PlayNextStep()
+end
+
+---剧情Update(触发Play后会负责更新)
+function IStoryPlay:Update()
+    for itemuid, item in ipairs(self.StoryItemMap) do
+        -- item:Update()
+    end
+end
+
+---播放下一个剧情步骤
+function IStoryPlay:PlayNextStep()
+    if _G.AppSetting.DEBUG then
+        _G.LogUtilities.LogError(
+            _G.EModuleName.StoryModule,
+            string.format(
+                "剧情ID:%d 当前播放步骤:%d",
+                self.CurrentAutoStory.CurrentStory.StoryID,
+                self.CurrentAutoStory.NextStepIndex
+            )
+        )
+    end
+    self.CurrentPlayStep = self.CurrentAutoStory:GetNextStep()
+    self:DispatchEvent(_G.EStoryPlayEvent, _G.EStoryPlayEvent.EnumValue.PlayNextStoryStep, self.CurrentPlayStep)
+    -- 采用先抛后播的形式，先播后抛事件可能导致剧情只有一步直接播放完成触发结束，导致相关数据被清除问题
+    self.CurrentPlayStep:Play(_G.handler(self, self.StepCompleteCB))
+end
+
+---跳过剧情
+function IStoryPlay:Skip()
+    if self.IsStoryPlaying == true then
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.DialogueView.Name)
+        self:DispatchEvent(_G.EStoryPlayEvent, _G.EStoryPlayEvent.EnumValue.SkipStoryPlay)
+        _G.LogUtilities.Log(
+            _G.EModuleName.StoryModule,
+            string.format("跳过剧情Story ID:%d", self.CurrentAutoStory.CurrentStory.StoryID)
+        )
+        self:SkipAllLeftSteps()
+        self:PlayOver()
+    else
+        --("当前没有播放有效剧情，打断剧情失败!")
+    end
+end
+
+---跳过剩下的所有步骤
+function IStoryPlay:SkipAllLeftSteps()
+    if self.CurrentPlayStep ~= nil then
+        self.CurrentPlayStep:Skip()
+    end
+    local nextstep = self.CurrentAutoStory:GetNextStep()
+    while nextstep ~= nil do
+        nextstep:Skip()
+        nextstep = self.CurrentAutoStory:GetNextStep()
+    end
+end
+
+---单步剧情完成回到
+---@param storystep StoryStep @完成的剧情步骤
+function IStoryPlay:StepCompleteCB(storystep)
+    if self.CurrentAutoStory == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("剧情已结束")
+        end
+        return
+    end
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("完成剧情Story ID:%d的剧情步骤ID:%d", self.CurrentAutoStory.CurrentStory.StoryID, storystep.StepID)
+    )
+    self.CurrentPlayStep = nil
+    self.CurrentAutoStory:CompleteOneStep()
+    if self.CurrentAutoStory:IsStoryOver() then
+        self:PlayOver()
+    else
+        self:PlayNextStep()
+    end
+end
+
+---剧情播放完成
+function IStoryPlay:PlayOver()
+    ---TODO：做成服务器端存储剧情播放数据(这里是为了动态显示条件里支持剧情播放过特定剧情ID的判定)
+    if _G.IsNil(self.CurrentAutoStory) then
+        return
+    end
+    _G.StoryManager:GetInstance():CloseAutoCustomLightInfo()
+    -- if self.Interpolation ~= nil and self.Interpolation > 0 then
+    --     _G.StoryManager:GetInstance():CameraLerpTimeZero(false)
+    --     self.Interpolation = nil
+    -- end
+
+    _G.StoryManager:GetInstance():GetCamera(true)
+
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("剧情Story ID:%d播放完成", self.CurrentAutoStory.CurrentStory.StoryID)
+    )
+
+    local storyid = self.CurrentAutoStory.CurrentStory.StoryID
+    self.StoryUpdateTimer:Stop()
+    self:RestoreGame()
+    self:Clear()
+    self.CurrentAutoStory:Clear()
+    self:DispatchEvent(_G.EStoryPlayEvent, _G.EStoryPlayEvent.EnumValue.StoryPlayComplete, storyid)
+    _G.Events:GetInstance():Broadcast(
+        _G.eIllustrationsToUnlockEvent.Unlock,
+        {
+            storyid
+        }
+    )
+    _G.ObjectPool:GetInstance():Push(self.CurrentAutoStory)
+    _G.Events:GetInstance():Broadcast(_G.GuideStoryStart.StoryEnd, storyid)
+    self.CurrentAutoStory = nil
+    _G.StoryManager:GetInstance():SetNowStory(nil)
+
+    if self.isShowShadowView == true then
+        ---需要等待加载时不显示主界面
+        if not require("AfkBattleManager"):GetInstance():GetFrontEmbattleStoryIsWaitLoad() then
+            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        end
+        self.isShowShadowView = false
+    end
+    if self.StoryPlayCompleteCB ~= nil then
+        self.StoryPlayCompleteCB(storyid, true)
+    end
+    -- ---剧情结束 有引导就显示引导 防止玩家点击穿透
+    -- _G.GuideManager:GetInstance():DisPlayGuide()
+
+    _G.MainManager:GetInstance():ShowFightStopIcon(true)
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(string.format("剧情ID:%s 播放完成 >>", storyid))
+    end
+end
+
+---恢复游戏状态[abstract]
+function IStoryPlay:RestoreGame()
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("剧情Story ID:%d的播放结束，恢复游戏状态", self.CurrentAutoStory.CurrentStory.StoryID)
+    )
+end
+
+---数据清空
+function IStoryPlay:Clear()
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("清除剧情Story ID:%d播放相关数据", self.CurrentAutoStory.CurrentStory.StoryID)
+    )
+    self.StoryParentNode = nil
+    -- self.StoryPlayCompleteCB = nil
+    self.IsStoryPlaying = false
+    self.StoryEffectMap = {}
+end
+---数据接口结束
+
+---剧情效果接口结束
+
+---剧情辅助管理接口开始
+---添加实体对象[virtual]
+---@param storyitem WorldBaseItem @实体对象
+---@return boolean @是否添加成功
+function IStoryPlay:AddStoryItem(storyitem)
+    assert(storyitem, "不允许添加空剧情实体对象!")
+    if self:IsStoryItemExit(storyitem.Uid) == false then
+        self.StoryItemMap[storyitem.Uid] = storyitem
+
+        return true
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("剧情实体对象类型：%s UID:%s已存在，添加剧情实体对象失败!", storyitem.ItemType, storyitem.Uid)
+        end
+        return false
+    end
+end
+
+---销毁指定UID实体对象[abstract]
+---@param uid number @实体对象UID
+---@return boolean @是否销毁剧情实体成功
+function IStoryPlay:DestroySpecificStoryItem(uid)
+    local storyitem = self:GetStoryItem(uid)
+    if storyitem ~= nil then
+        if table.removebyvalue(self.StoryItemMap, storyitem) ~= 0 then
+            _G.WorldManager:GetInstance():GetCurWorld():RemoveWorldItems(storyitem.Uid)
+            return true
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError("剧情实体对象类型：%s UID:%s不存在，销毁剧情实体对象失败!", storyitem.ItemType, storyitem.Uid)
+            end
+            _G.WorldManager:GetInstance():GetCurWorld():RemoveWorldItems(storyitem.Uid)
+            return false
+        end
+    else
+        return false
+    end
+end
+
+---销毁所有实体对象[virtual]
+function IStoryPlay:DestroyAllStoryItem()
+    for uid, item in pairs(self.StoryItemMap) do
+        _G.WorldManager:GetInstance():GetCurWorld():RemoveWorldItems(uid)
+        self.StoryItemMap[uid] = nil
+    end
+end
+
+---获取指定实体对象[virtual]
+---@param uid number @实体对象UID
+---@return WorldBaseItem @符合条件的实体对象
+function IStoryPlay:GetStoryItem(uid)
+    if self.StoryItemMap[uid] ~= nil then
+        return self.StoryItemMap[uid]
+    else
+        return nil
+    end
+end
+
+---指定实体对象是否存在[virtual]
+---@param uid number @实体对象UID
+---@return boolean @是否存在指定实体对象
+function IStoryPlay:IsStoryItemExit(uid)
+    return self:GetStoryItem(uid) ~= nil
+end
+---剧情辅助管理接口结束
+
+---@type IStoryPlay @剧情播放控制器抽象
+_G.IStoryPlay = IStoryPlay
+---@type IStoryPlay @剧情播放控制器抽象
+return IStoryPlay

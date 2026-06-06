@@ -1,0 +1,247 @@
+-----------------------------------------------------------------------
+-- C:.workspace.alpha_FT.Client.Assets.Resources.LuaScripts.Game.TreasureHunt.Model.TreasureHuntModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/04/11
+-- Description: 寻宝奇缘数据管理
+-----------------------------------------------------------------------
+local TreasureHuntNet = require("TreasureHuntNet"):GetInstance()
+local TreasureHuntMissionData = require("TreasureHuntMissionData")
+
+---@class TreasureHuntBoxData
+---@field received number
+---@field award prop.i_item
+---@field taskList number[]
+---@field taskIndexList number[]
+
+---@class TreasureHuntJigsawFragmentData
+---@field task task.i_task
+---@field cfg mission_extra_cfg
+---@field data TreasureHuntMissionData
+---@field received boolean
+
+local base = require("ThemeActivityBaseModel")
+---@class TreasureHuntModel    中文描述
+---@field MissionList table<number, TreasureHuntJigsawFragmentData> 任务列表（拼图index，任务数据
+---@field BoxesInfo table<number, TreasureHuntBoxData> 宝箱列表（宝箱id，宝箱数据
+---@field MissionSidIdx table<number, number> 任务与拼图位置映射（任务sid，拼图index
+---@field TempMissionList table<number, TreasureHuntJigsawFragmentData> 临时任务列表（任务sid，任务数据
+---@field Info activity_theme.i_treasure 服务器活动数据
+---@field ReceivedList number[] 已领取宝箱列表
+---@field FinishedList number[] 已完成任务列表
+---@field BackgroundPath string 背景图资源路径
+---@field JigsawPath string 拼图资源路径
+---@field JigsawProgress number 终极大奖进度
+local TreasureHuntModel = _G.BaseClass("TreasureHuntModel", base)
+_G.TreasureHuntModel = TreasureHuntModel
+
+local CS = _G.CS
+local typeof = _G.typeof
+
+---类的构造函数
+function TreasureHuntModel:__init()
+end
+
+---初始化数据
+function TreasureHuntModel:InitData(msg)
+    self.Info = msg
+    self.ReceivedList = msg.award_list or {}
+    self.FinishedList = msg.finish_task or {}
+    self.BackgroundPath = msg.background
+    self.JigsawPath = msg.puzzle
+    self.BoxesInfo = {}
+    for i, v in pairs(msg.award_cfg_list) do
+        if v.id == 1 then
+            self.UltimatePrize = v.award
+            self.JigsawPosition = v.position
+        end
+        self.BoxesInfo[v.id] = { award = v.award, received = _G.table.ContainsValue(self.ReceivedList, v.id) }
+    end
+    for k, v in pairs(self.BoxesInfo) do
+        v.taskList = {}
+        v.taskIndexList = {}
+        local index = k % 100
+        if k == 1 then
+            ---终极大奖
+            ---下面处理
+        elseif k < 200 then
+            ---行宝箱
+            v.taskList = self.JigsawPosition[index].task_ids
+            v.taskIndexList = { index * 5 - 4, index * 5 - 3, index * 5 - 2, index * 5 - 1, index * 5 }
+        else
+            ---列宝箱
+            for i = 1, 4 do
+                _G.table.insert(v.taskList, self.JigsawPosition[i].task_ids[index])
+                _G.table.insert(v.taskIndexList, i * 5 + index - 5)
+            end
+        end
+    end
+
+    self.MissionList = {}
+    self.MissionSidIdx = {}
+
+    self.TempMissionList = {}
+    if msg.task_curr then
+        for i, v in pairs(msg.task_curr) do
+            self.TempMissionList[v.sid] = { task = v,
+                                            cfg = _G.ConfigManager.mission_extra_cfg[v.sid],
+                                            data = TreasureHuntMissionData.New(v),
+                                            received = _G.table.ContainsValue(self.FinishedList, v.sid)
+            }
+        end
+    end
+
+    for i, row in pairs(self.JigsawPosition) do
+        for v, taskSid in pairs(row.task_ids) do
+            local index = i * 5 + v - 5
+            if _G.table.ContainsValue(self.FinishedList, taskSid) then
+                local i_task = { sid = taskSid,
+                                 state = 3,
+                                 target = { 0 },
+                                 time = 0 }
+                self.MissionList[index] = {
+                    task = i_task,
+                    cfg = _G.ConfigManager.mission_extra_cfg[taskSid],
+                    data = TreasureHuntMissionData.New(i_task),
+                    received = _G.table.ContainsValue(self.FinishedList, taskSid)
+                }
+            else
+                self.MissionList[index] = self.TempMissionList[taskSid]
+            end
+            self.MissionSidIdx[taskSid] = index
+            _G.table.insert(self.BoxesInfo[1].taskList, taskSid)
+            _G.table.insert(self.BoxesInfo[1].taskIndexList, index)
+        end
+    end
+    self.JigsawProgress = #self.FinishedList
+end
+
+---进入活动
+function TreasureHuntModel:EnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.TreasureHuntView.Name)
+end
+
+---领取宝箱or终极大奖
+function TreasureHuntModel:GetAward(activityId, id, callback)
+    local pbData = { activity_id = activityId, id = id }
+    TreasureHuntNet:GetAward(pbData, function(data)
+        local awardData = {award = {item = {}}}
+        awardData.award.item = {{type = {self.BoxesInfo[id].award[1].sid,self.BoxesInfo[id].award[1].num}}}
+        self.BoxesInfo[id].received = true
+        _G.StorageManager:GetInstance():ReceiveAwardData(awardData)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, awardData)
+        self:RefreshRedPoint()
+        if callback then
+            callback(data)
+        end
+    end)
+end
+
+---领取拼图奖励
+function TreasureHuntModel:GetJigsawAward(activityId, taskIndex, callback)
+    local task_sid = self.MissionList[taskIndex].task.sid
+    local pbData = { activity_id = activityId, task_sid = task_sid, finish_type = 2 }
+    TreasureHuntNet:TaskFinish(pbData, function(data)
+        self.MissionList[taskIndex].received = true
+        self.JigsawProgress = self.JigsawProgress + 1
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+        self:RefreshRedPoint()
+        if callback then
+            callback(data)
+        end
+    end)
+end
+
+---更新任务进度（TaskModule调用）
+function TreasureHuntModel:UpdataTask(task)
+    local isUpdate = false
+    if task == nil or task.sid == nil then
+        return isUpdate
+    end
+    local mTask = self:GetTaskByTaskId(task.sid)
+    if mTask == nil then
+        return isUpdate
+    end
+    mTask:UpdataData(task)
+    self:RefreshRedPoint()
+    return true
+end
+
+---根据任务sid获取任务Data
+function TreasureHuntModel:GetTaskByTaskId(taskId)
+    if self.MissionList[self.MissionSidIdx[taskId]] ~= nil then
+        return self.MissionList[self.MissionSidIdx[taskId]].data
+    end
+    return nil
+end
+
+---检查宝箱进度
+function TreasureHuntModel:CheckBoxProgress(id)
+    local count = 0
+    for i, v in pairs(self.BoxesInfo[id].taskIndexList) do
+        --if self.MissionList[v].data:GetProgress() == 1 then
+        if self.MissionList[v].received then
+            count = count + 1
+        end
+    end
+    return count / #self.BoxesInfo[id].taskIndexList
+end
+
+---检查终极大奖进度
+function TreasureHuntModel:CheckUltimatePrizeProgress()
+    local count = 0
+    for _, mission in pairs(self.MissionList) do
+        --if mission.received or mission.data:GetProgress() == 1 then
+        if mission.received then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+---初始化红点树{{id,lua,child}} id 红点id ,lua 红点脚本需继承RedPointBaseThemeActivity,child 子功能红点id,第一个红点必须id为1
+function TreasureHuntModel:InitRedTree()
+    self.redTree = { { 1, "RedPointTreasureHunt", {} } }
+end
+
+---检查红点
+function TreasureHuntModel:CheckRedPoint()
+    if not require "ThemeActivityManager":GetInstance():CheckThemeActivityIsOpen() then
+        return false
+    end
+    local received = {}
+    for i = 1, 20 do
+        if self.MissionList[i].data:GetProgress() == 1 then
+            if not self.MissionList[i].received then
+                return true
+            end
+            received[i] = true
+        end
+    end
+    for _, v in pairs(self.BoxesInfo) do
+        if not v.received then
+            local count = 0
+            for _, idx in pairs(v.taskIndexList) do
+                if received[idx] then
+                    count = count + 1
+                else
+                    break
+                end
+            end
+            if count == #v.taskIndexList then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function TreasureHuntModel:RefreshRedPoint()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(self:GetRedPointId())
+end
+
+---类的析构函数
+function TreasureHuntModel:Dispose()
+end
+
+return TreasureHuntModel

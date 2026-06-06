@@ -1,0 +1,1107 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.DecorationBoss.Model.DecorationBossBattleView	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/09/09
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local DecorationBossModel = require("DecorationBossModel")
+---@class DecorationBossBattleView : UIBaseView	中文描述
+---@field public go_table DecorationBossBattleView_GoTable GoTable
+local DecorationBossBattleView = _G.BaseClass("DecorationBossBattleView", _G.UIBaseView)
+
+---@type string[] 前三排名图标
+local RANK_ICON_IMAGES = {
+    "tz_qjhs_phb_mingci_01",
+    "tz_qjhs_phb_mingci_02",
+    "tz_qjhs_phb_mingci_03"
+}
+local AnimName = "victory_1"
+
+function DecorationBossBattleView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+---界面的入口函数
+function DecorationBossBattleView:OnCreate(config)
+    self.config = config
+    self.bossStateEnum = DecorationBossModel:GetInstance().bossStateEnum
+    ---自己的排名
+    self.myRank = 0
+    ---计算缩放比例
+    self.scale = 1
+    self.titleScale = _G.ConfigManager.discrete_cfg[103902][1][1] * 0.0035
+    if _G.CS.Launcher.Inst.UIScaler.matchWidthOrHeight < 0.5 then --适配宽 分辨率比例小于 16：9
+        local screenSize = _G.CS.Launcher.Inst.ScreenSize
+        self.scale = _G.AppSetting.CONFIG_SCREEN_HEIGHT / screenSize.y
+    end
+    self.titleScale = _G.ConfigManager.discrete_cfg[103902][1][1] * 0.0035
+    self.roleTrans = {}
+    self.roleComponent = {}
+    self.halo = {}
+    self.title = {}
+    self.titleCor = {}
+    ---初始化模型位置
+    self:InitModelPos()
+    ---加载场景
+    self:LoadScene()
+    self:AddListener(_G.eDecorationBoss.RefreshBossInfo, _G.handler(self, self.RefreshBossInfo))
+    self:AddListener(_G.eDecorationBoss.BossDeath, _G.handler(self, self.RefreshBossDeath))
+    self:AddListener(_G.eDecorationBoss.BossAwardChange, _G.handler(self, self.BossAwardChange))
+    self:AddListener(_G.eDecorationBoss.BattleTimeEnd, _G.handler(self, self.BattleTimeEnd))
+    self:AddListener(_G.eDecorationBoss.BossRevive, self.OnBossRevive)
+end
+
+function DecorationBossBattleView:LoadEffect()
+    if self.isLoadYunEffect then
+        return
+    end
+    self.isLoadYunEffect = true
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.ef_DecorationBossBattleView_yun,
+        self.go_table.obj_effect,
+        function(trans)
+            if self:IsNil() then
+                _G.DestroyObject(trans)
+            end
+        end
+    )
+end
+
+function DecorationBossBattleView:InitModelPos()
+    self.modelPosList = {}
+    for index, v in ipairs(self.config.model) do
+        self.modelPosList[index] = v
+    end
+end
+
+---加载场景
+function DecorationBossBattleView:LoadScene()
+    local mConfig = _G.ConfigManager.monster_group_cfg[self.config.monster]
+    self.sceneRoot = _G.GameObject("DecorationBossBattleRoot")
+    self.sceneRoot:SetPosition(mConfig.FightAreaPos[1], mConfig.FightAreaPos[2], mConfig.FightAreaPos[3])
+    if not _G.string.IsNullOrEmpty(mConfig.ScenePath) then
+        _G.PoolsManager:GetInstance():Spawn(
+            mConfig.ScenePath,
+            _G.ePoolType.Static,
+            self.sceneRoot,
+            function(trans)
+                if _G.IsNil(self.sceneRoot) then
+                    _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.Static)
+                    return
+                end
+                self.curSceneTrans = trans
+                _G.UIManager:GetInstance():SetWorldSceneHideTimes(1)
+                trans:ChangeCameraAdaption()
+                _G.WorldManager:GetInstance():SetCurrentWorldVisible(false)
+                trans:SetLocalPositionToZero()
+                local battleCameraPath =
+                    _G.string.IsNullOrEmpty(mConfig.EmbattleCamera) and mConfig.BattleCamera or mConfig.EmbattleCamera
+                if not _G.string.IsNullOrEmpty(battleCameraPath) then
+                    local cameraNum = string.match(battleCameraPath, "%d+")
+                    trans:GetComponentE(_G.typeof(_G.CS.WorldSetting)):ChangeCameraParams(battleCameraPath, cameraNum)
+                end
+                _G.GraphicsManager.Instance:UpdateMainCameraPosImmediate()
+                self:LoadBossModel()
+                self:InitRank()
+            end
+        )
+    end
+    self:RefreshView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DecorationBossMainView.Name)
+    if view then
+        view:Hide()
+    end
+    local bossData = DecorationBossModel:GetInstance():GetBossData(self.config.id)
+    if bossData.fight_card then
+        require("DecorationBossModel"):GetInstance():GetBossInfo({ self.config.id }, function()
+            self:InitBossState()
+        end)
+    end
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+end
+
+function DecorationBossBattleView:OnEnable()
+    self:GetBossInfoTimer()
+end
+
+function DecorationBossBattleView:OnDisable()
+    if self.bossInfoTimer then
+        self.bossInfoTimer:Stop()
+        self.bossInfoTimer = nil
+    end
+end
+
+---每5秒拉取一次boss信息
+function DecorationBossBattleView:GetBossInfoTimer()
+    if self.bossInfoTimer then
+        self.bossInfoTimer:Stop()
+        self.bossInfoTimer = nil
+    end
+    self.bossInfoTimer = _G.TimerManager:GetInstance():GetTimer(5, self.UpdateBossInfo, self, false, false, true)
+    self.bossInfoTimer:Start()
+end
+
+---拉取boss信息和排行榜信息
+function DecorationBossBattleView:UpdateBossInfo()
+    local bossData = DecorationBossModel:GetInstance():GetBossData(self.config.id)
+    if bossData.fight_card then
+        require("DecorationBossModel"):GetInstance():GetBossInfo({ self.config.id }, function()
+            self:InitBossState()
+        end)
+
+        ---排行榜
+        self:InitRank()
+    end
+end
+
+---加载boss
+function DecorationBossBattleView:LoadBossModel()
+    local cfg = require "CardCommentManager":GetInstance():CardData(self.config.preview_monster, false)
+    _G.PoolsManager:GetInstance():Spawn(
+        cfg.ModelPathHi,
+        _G.ePoolType.Temporary,
+        self.sceneRoot,
+        function(trans)
+            if trans == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("DecorationBossBattleView-boss模型无法加载path:" .. cfg.ModelPathHi)
+                end
+                return
+            end
+            if self:IsNil() or not self.curSceneTrans then
+                _G.DestroyObject(trans)
+                return
+            end
+            local bosspos = self.config.bosspos
+            trans:SetLocalPosition(bosspos[1], bosspos[2], bosspos[3])
+            local monster = _G.ConfigManager.monster_group_cfg[self.config.monster]
+            for _, v in pairs(monster.DefaultDefenserSids[1]) do
+                if v > 0 then
+                    local mcfg = _G.ConfigManager.monster_cfg[v]
+                    if mcfg.MonsterType == 5 then
+                        trans:SetLocalScaleXYZ(mcfg.GlobalScale * 0.0001)
+                        break
+                    end
+                end
+            end
+            if bosspos[5] == 1 then
+                trans:SetLocalEulerAngles(0, 0, 0)
+            elseif bosspos[5] == -1 then
+                trans:SetLocalEulerAngles(0, 180, 0)
+            elseif bosspos[4] == 1 then
+                trans:SetLocalEulerAngles(0, 90, 0)
+            else
+                trans:SetLocalEulerAngles(0, 270, 0)
+            end
+            self.bossTrans = trans
+        end
+    )
+end
+
+---模型动作
+function DecorationBossBattleView:PlayModelAction()
+    if self.actionTimer then
+        self.actionTimer:Stop()
+        self.actionTimer = nil
+    end
+    self.actionTimer = _G.TimerManager:GetInstance():GetTimer(10, self.OnPlayModelAction, self, false, false)
+    self.actionTimer:Start()
+end
+
+function DecorationBossBattleView:OnPlayModelAction()
+    -- for _, v in pairs(self.roleComponent) do
+    --     if v:isHaveAni(AnimName) then
+    --         v:Play(AnimName, true)
+    --         _G.AnimatorPlayEndCallback.AddCallback(
+    --             v:GetInstanceIDE(),
+    --             _G.handlerbind(self, self.PlayAniCallBack, v)
+    --         )
+    --     end
+    -- end
+
+    local config = _G.ConfigManager.ui_effect_cfg.ef_DecorationBossBattleView_shandian
+    _G.UIUtils.LoadEffectByPath(
+        config.Path,
+        self.go_table.obj_effect,
+        function(trans)
+            if self:IsNil() then
+                _G.DestroyObject(trans)
+            end
+            ---受击特效
+            local hintConfig = _G.ConfigManager.ui_effect_cfg.ef_DecorationBossBattleView_hit
+            _G.UIUtils.LoadEffectByPath(
+                hintConfig.Path,
+                self.go_table.obj_effect,
+                function(hintTrans)
+                    if self:IsNil() then
+                        _G.DestroyObject(hintTrans)
+                    end
+                end,
+                nil,
+                hintConfig.LifeTime,
+                self.config.special,
+                hintConfig.Scale,
+                hintConfig.DispoeType,
+                hintConfig.AddUIParticleOrderChange,
+                hintConfig.AddUIParticleScale,
+                hintConfig.AddCanvas
+            )
+        end,
+        nil,
+        config.LifeTime,
+        self.config.special,
+        config.Scale,
+        config.DispoeType,
+        config.AddUIParticleOrderChange,
+        config.AddUIParticleScale,
+        config.AddCanvas
+    )
+end
+
+function DecorationBossBattleView:PlayAniCallBack(_, animComponent)
+    --如果之前对象有 则销毁之前的回调
+    if animComponent ~= nil then
+        _G.AnimatorPlayEndCallback.RemoveCallback(animComponent:GetInstanceIDE())
+    end
+    animComponent:Play("idle_1")
+end
+
+---加载单个角色
+---@param rolepath string 模型路径
+---@param posIndex number 模型位置
+function DecorationBossBattleView:InitRoleModel(rolepath, posIndex, roleInfo)
+    if self.roleTrans[posIndex] then
+        _G.PoolsManager:GetInstance():Despawn(self.roleTrans[posIndex], _G.ePoolType.Temporary)
+        self.roleTrans[posIndex] = nil
+    end
+    _G.PoolsManager:GetInstance():Spawn(
+        rolepath,
+        _G.ePoolType.Temporary,
+        nil,
+        function(trans)
+            if trans == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("DecorationBossBattleView角色无法加载path:" .. rolepath)
+                end
+                return
+            end
+            if self:IsNil() or not self.curSceneTrans then
+                _G.DestroyObject(trans)
+                return
+            end
+            trans:SetParentE(self.sceneRoot)
+            local pos = self.modelPosList[posIndex]
+            trans:SetLocalPosition(pos[1], pos[2], pos[3])
+            trans:SetLocalScaleXYZ(pos[4])
+            local orientation = self.config.orientation[posIndex]
+            trans:SetEulerAngles(orientation[1], orientation[2], orientation[3])
+            local animComponent = _G.RoleAnimatorController.GetOrCreateAnimatorController(trans)
+            self.roleComponent[posIndex] = animComponent
+            self.roleTrans[posIndex] = trans
+            local rolePoint = trans:GetComponentE(_G.typeof(_G.CS.RolePoint))
+            if rolePoint == nil then
+                rolePoint = trans:AddComponentE(_G.typeof(_G.CS.RolePoint))
+            end
+            -- self:UpdateTitle(posIndex, rolePoint, roleInfo)
+            -- self:UpdateHalo(posIndex, rolePoint, roleInfo)
+        end
+    )
+end
+
+---称号
+function DecorationBossBattleView:UpdateTitle(pos, rolePoint, roleInfo)
+    local parent = self.roleTrans[pos]
+    if not self.title[pos] or _G.IsNil(self.title[pos].gameObject) then
+        if not roleInfo.title then
+            return
+        end
+        _G.PoolsManager:GetInstance():Spawn(
+            "CommonPrefab/World/Common_TitleWithDesignation",
+            _G.ePoolType.Temporary,
+            parent,
+            function(trans)
+                if _G.IsNil(parent) then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                local go_table = _G.GetAutoGoTable(trans)
+                trans:AddComponentE(_G.typeof(_G.CS.UnityEngine.Canvas))
+                self.title[pos] = go_table
+                self:SetTitlePos(pos, rolePoint)
+                go_table.aortext_TextName.text = roleInfo.name
+
+                if roleInfo.title.sid == 0 then
+                    if self.title[pos].item then
+                        _G.DestroyObject(self.title[pos].item)
+                        self.title[pos].item = nil
+                    end
+                    return
+                end
+                ---@type player_title_effect_cfg
+                local cfg = _G.ConfigManager.player_title_effect_cfg[roleInfo.title.sid]
+                if cfg then
+                    if cfg.type_title == 1 then
+                        go_table.aorrawimage_Title:LoadImage(
+                            cfg.icon,
+                            function()
+                                go_table.aorrawimage_Title:SetNativeSize()
+                                go_table.aorrawimage_Title:SetLocalScaleXYZ(
+                                    self.titleScale * self.scale
+                                )
+                            end
+                        )
+                        if self.title[pos].item then
+                            _G.DestroyObject(self.title[pos].item)
+                            self.title[pos].item = nil
+                        end
+                        self.title[pos].aorrawimage_Title:SetActiveE(1)
+                    else
+                        self.title[pos].aorrawimage_Title:SetActiveE(0)
+                        if self.title[pos].item then
+                            _G.DestroyObject(self.title[pos].item)
+                            self.title[pos].item = nil
+                        end
+                        _G.UIUtils.LoadEffectTitleOrFrame(
+                            cfg.title,
+                            self.title[pos].gameObject,
+                            function(titleTrans)
+                                if self:IsNil() then
+                                    _G.DestroyObject(titleTrans)
+                                    return
+                                end
+                                titleTrans:SetLayerAndChild(30)
+                                self.title[pos].item = titleTrans
+                                local x, y, z = self.title[pos].aorrawimage_Title:GetPosition()
+                                titleTrans:SetPosition(x, y + 0.4, z)
+                                self.title[pos].item:SetLocalScaleXYZ(
+                                    self.titleScale * self.scale
+                                )
+                                titleTrans:SetActiveE(1)
+                            end
+                        )
+                    end
+                end
+            end
+        )
+    elseif self.title[pos] then
+        if self.title[pos].item then
+            _G.DestroyObject(self.title[pos].item)
+            self.title[pos].item = nil
+        end
+        self.title[pos].aortext_TextName.text = roleInfo.name
+        if not roleInfo.title or roleInfo.title.sid <= 0 then
+            self.title[pos].aorrawimage_Title:SetActiveE(0)
+            return
+        end
+        ---@type player_title_effect_cfg
+        local cfg = _G.ConfigManager.player_title_effect_cfg[roleInfo.title.sid]
+        if cfg.type_title == 1 then
+            self.title[pos].aorrawimage_Title:LoadImage(
+                cfg.icon,
+                function()
+                    self.title[pos].aorrawimage_Title:SetNativeSize()
+                    self.title[pos].aorrawimage_Title:SetLocalScaleXYZ(
+                        self.titleScale * self.scale
+                    )
+                end
+            )
+            self.title[pos].aorrawimage_Title:SetActiveE(1)
+        else
+            _G.UIUtils.LoadEffectTitleOrFrame(
+                cfg.title,
+                self.title[pos].gameObject,
+                function(trans)
+                    if self:IsNil() then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    trans:SetLayerAndChild(30)
+                    self.title[pos].item = trans
+                    local x, y, z = self.title[pos].aorrawimage_Title:GetPosition()
+                    trans:SetPosition(x, y + 0.2, z)
+                    self.title[pos].item:SetLocalScaleXYZ(
+                        self.titleScale * self.scale
+                    )
+                    trans:SetActiveE(1)
+                end
+            )
+            self.title[pos].aorrawimage_Title:SetActiveE(0)
+        end
+    end
+end
+
+---初始化头顶名称位置
+---@param deltaY number Y轴便宜值
+function DecorationBossBattleView:SetTitlePos(pos, rolePoint)
+    if self.titleCor[pos] then
+        _G.coroutine.stopwaiting(self.titleCor[pos])
+        self.titleCor[pos] = nil
+    end
+    self.titleCor[pos] = _G.DelayFrameDo(
+        function()
+            if self:IsNil() then
+                return
+            end
+            if self.title[pos] and not _G.IsNil(self.title[pos].gameObject) then
+                local x, y, z = rolePoint.Point_Head:GetPosition()
+                if x then
+                    local parent = self.roleTrans[pos]
+                    if parent == nil then
+                        return
+                    end
+                    local position = { x = x, y = y + 0.2, z = z }
+                    local scale = parent:GetLocalScale()
+                    self.title[pos].gameObject:SetLocalScaleXYZ(scale)
+                    self.title[pos].transform:SetLocalPositionToZero()
+                    self.title[pos].transform:SetPosition(position.x, position.y, position.z)
+                    local lookAt = self.title[pos].transform:GetComponentE(_G.typeof(_G.CS.LookAtTarget))
+                    if _G.IsNil(lookAt) then
+                        lookAt = self.title[pos].transform:AddComponentE(_G.typeof(_G.CS.LookAtTarget))
+                    end
+                    lookAt:SetData(_G.Camera.main.transform, parent)
+                end
+            end
+        end
+    )
+end
+
+function DecorationBossBattleView:UpdateHalo(pos, rolePoint, roleInfo)
+    if self.halo[pos] then
+        _G.PoolsManager:GetInstance():Despawn(self.halo[pos], _G.ePoolType.Temporary)
+        self.halo[pos] = nil
+    end
+    if not roleInfo.halo or roleInfo.halo.sid == 0 then
+        return
+    end
+    local parent = self.roleTrans[pos]
+    ---@type player_halo_effect_cfg
+    local cfg = _G.ConfigManager.player_halo_effect_cfg[roleInfo.halo.sid]
+    _G.PoolsManager:GetInstance():Spawn(
+        cfg.halo,
+        _G.ePoolType.Temporary,
+        parent,
+        function(trans)
+            if _G.IsNil(parent) then
+                _G.DestroyObject(trans)
+                return
+            end
+            self.halo[pos] = trans
+            if cfg.type_halo == 2 then
+                self.halo[pos]:SetParentE(rolePoint.Point_Chest)
+            else
+                local scale = self.halo[pos]:GetParent():GetLocalScale()
+                local rate = self.scale
+                self.halo[pos]:SetLocalScaleXYZ(rate * _G.ConfigManager.discrete_cfg[103901][1][1] / scale)
+            end
+            self.halo[pos]:GetChildE(0):SetActiveE(1)
+            self.halo[pos]:SetEulerAngles(0, 0, 0)
+            self.halo[pos]:SetLocalPositionToZero()
+        end
+    )
+end
+
+---刷新界面
+function DecorationBossBattleView:RefreshView()
+    self:InitRecommandCard()
+    self:InitSkill()
+    self:InitMechanics()
+    self:InitBossState()
+    self:BossAwardChange()
+    self:InitProtectTime()
+end
+
+---初始化保护时间
+function DecorationBossBattleView:InitProtectTime()
+    if self.protectTimer then
+        self.protectTimer:Stop()
+        self.protectTimer = nil
+    end
+    local bossData = DecorationBossModel:GetInstance():GetBossData(self.config.id)
+    local reviveCd = _G.ConfigManager.discrete_cfg[115302][1][1]
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if bossData and bossData.last_end_time and bossData.last_end_time + reviveCd <= serverTime then
+        local protectTime = _G.ConfigManager.discrete_cfg[115305][1][1]
+        local leftTime = bossData.last_end_time + reviveCd + protectTime - serverTime
+        if leftTime > 0 then
+            self.go_table.aortext_protect.text = _G.GetLangPackValue(90031900038, leftTime)
+            self.protectTimer = _G.TimerManager:GetInstance():GetTimer(1,
+                _G.handlerbind(self, self.UpdateProtectTime, bossData, reviveCd, protectTime), self, false, true, true)
+            self.protectTimer:Start()
+        else
+            self.go_table.aortext_protect.text = ""
+        end
+    else
+        self.go_table.aortext_protect.text = ""
+    end
+end
+
+function DecorationBossBattleView:UpdateProtectTime(_, _, bossData, reviveCd, protectTime)
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local leftTime = bossData.last_end_time + reviveCd + protectTime - serverTime
+    if leftTime > 0 then
+        self.go_table.aortext_protect.text = _G.GetLangPackValue(90031900038, leftTime)
+    else
+        self.go_table.aortext_protect.text = ""
+        if self.protectTimer then
+            self.protectTimer:Stop()
+            self.protectTimer = nil
+        end
+    end
+end
+
+---初始化排行榜
+function DecorationBossBattleView:InitRank()
+    DecorationBossModel:GetInstance():GetRankInfo(self.config.id, 2, 1, function(rankInfo)
+        if self:IsNil() then
+            ---服务器返回数据后界面已关闭界面
+            return
+        end
+        self:RefreshRank(rankInfo)
+    end)
+end
+
+---刷新排行榜
+function DecorationBossBattleView:RefreshRank(rankInfo)
+    self.rankInfo = rankInfo or {}
+    if not self.rankListView then
+        self.go_table.scrollloopvectical_rank:InitItemData(
+            _G.Mathf.Max(#self.rankInfo, 3),
+            _G.handler(self, self.RefreshRankItem)
+        )
+        self.rankListView = self.go_table.scrollloopvectical_rank
+    else
+        self.rankListView:UpdateCount(_G.Mathf.Max(#self.rankInfo, 3))
+    end
+    ---前5名
+    local bossData = DecorationBossModel:GetInstance():GetBossData(self.config.id)
+    if bossData.fight_card then
+        for i = 1, 5 do
+            if self.rankInfo[i] then
+                local data = self.rankInfo[i].role_info
+                if not self.lastRankInfo or not self.lastRankInfo[i] or self.lastRankInfo[i].role_info.uid ~= data.uid then
+                    local modelPath = require "CardInfoManager".GetBattleModelPath(data.city_style_id, false)
+                    self:InitRoleModel(modelPath, i, data)
+                end
+            else
+                if self.roleTrans[i] then
+                    _G.PoolsManager:GetInstance():Despawn(self.roleTrans[i], _G.ePoolType.Temporary)
+                    self.roleTrans[i] = nil
+                end
+            end
+        end
+    end
+    self.lastRankInfo = self.rankInfo
+    if #self.rankInfo > 0 then
+        self:LoadEffect()
+        if not self.actionTimer then
+            self:PlayModelAction()
+        end
+    else
+        if self.actionTimer then
+            self.actionTimer:Stop()
+            self.actionTimer = nil
+        end
+    end
+
+    ---查找自己的排名
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    for i, v in ipairs(self.rankInfo) do
+        if v.role_info.uid == uid then
+            self.myRank = i
+            break
+        end
+    end
+    if self.myRank > 0 then
+        self.go_table.aortext_mineRank.text = _G.GetLangPackValue(90029300023, self.myRank)
+    else
+        self.go_table.aortext_mineRank.text = _G.GetLangPackValue(90029300023, _G.GetLangPackValue(90022900040))
+    end
+end
+
+---放弃boss后客户端手动删除数据,因为服务器有延迟
+function DecorationBossBattleView:RefreshGiveUpRank()
+    _G.table.remove(self.rankInfo, self.myRank)
+    self.myRank = 0
+    self.go_table.aortext_mineRank.text = _G.GetLangPackValue(90029300023, _G.GetLangPackValue(90022900040))
+    self.rankListView:UpdateCount(_G.Mathf.Max(#self.rankInfo, 3))
+    ---前5名
+    self:ClearAllRoleModel()
+    for i = 1, 5 do
+        if self.rankInfo[i] then
+            local data = self.rankInfo[i].role_info
+            local modelPath = require "CardInfoManager".GetBattleModelPath(data.city_style_id, false)
+            self:InitRoleModel(modelPath, i, data)
+        else
+            if self.roleTrans[i] then
+                _G.PoolsManager:GetInstance():Despawn(self.roleTrans[i], _G.ePoolType.Temporary)
+                self.roleTrans[i] = nil
+            end
+        end
+    end
+    self:PlayModelAction()
+end
+
+function DecorationBossBattleView:RefreshRankItem(index, obj)
+    local tb = _G.GetAutoGoTable(obj, _G.handlerbind(self, self.OnClickRankItem, false))
+    local rank = index + 1
+    local data = self.rankInfo[rank]
+    if data then
+        tb.aortext_name.text = data.role_info.name
+        tb.aortext_value.text = _G.GameUtil.NumberToUnitStrFight(data.dps)
+    else
+        tb.aortext_name.text = _G.GetLangPackValue(90021800103)
+        tb.aortext_value.text = ""
+    end
+    tb.aorimage_rank:SetActiveE(rank <= 3 and 1 or 0)
+    tb.aortext_rank:SetActiveE(rank > 3 and 1 or 0)
+    if rank <= 3 then
+        tb.aorimage_rank.SpriteName = RANK_ICON_IMAGES[rank]
+    else
+        tb.aortext_rank.text = rank
+    end
+end
+
+function DecorationBossBattleView:OnClickRankItem(_, _, switchPanel)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.CommonRankView.Name,
+        _G.CommonRankType.DecorationBoss,
+        { id = self.config.id, type = 2, OnCloseCall = _G.handler(self, self.ChangeWindow), switchPanel = switchPanel }
+    )
+    self:ChangeWindow(false)
+end
+
+---推荐角色
+function DecorationBossBattleView:InitRecommandCard()
+    self.recommend = self.config.recommend
+    if not self.cardListView then
+        self.go_table.scrollloophorizontal_card:InitItemData(#self.recommend, _G.handler(self, self.RefreshCardItem))
+        self.cardListView = self.go_table.scrollloophorizontal_card
+    end
+end
+
+function DecorationBossBattleView:RefreshCardItem(index, obj)
+    local sid = self.recommend[index + 1]
+    local tb = _G.GetAutoGoTable(obj)
+    _G.StorageManager:GetInstance():GetItemBaseViewNew(
+        { sid },
+        tb.obj_root,
+        function(luaItem)
+            if _G.IsNil(tb.obj_root) then
+                luaItem.Spawn(luaItem)
+                return
+            end
+            luaItem:ShowLv(false)
+        end,
+        function()
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonIllustrationsH5View.Name,
+                sid,
+                function()
+                    _G.GraphicsManager.Instance:UpdateMainCameraPosImmediate()
+                end,
+                true,
+                nil,
+                nil,
+                nil,
+                nil,
+                nil,
+                nil,
+                1
+            )
+        end
+    )
+end
+
+---技能预览
+function DecorationBossBattleView:InitSkill()
+    self.skill = self.config.preview_skill
+    if not self.skillListView then
+        self.go_table.scrollloophorizontal_skill:InitItemData(#self.skill, _G.handler(self, self.RefreshSkillItem))
+        self.skillListView = self.go_table.scrollloophorizontal_skill
+    end
+end
+
+function DecorationBossBattleView:RefreshSkillItem(index, obj)
+    local skillId = self.skill[index + 1]
+    local skillCfg = _G.ConfigManager.card_skills_cfg[skillId]
+    local tb = _G.GetAutoGoTable(obj, _G.handlerbind(self, self.OnClickSkill, skillId))
+    require("CardInfoManager").LoadRawImage(tb.aorrawimage_skill, skillCfg.icon)
+end
+
+function DecorationBossBattleView:OnClickSkill(_, _, skillId)
+    require("CommonTipManager"):GetInstance():OpenSkillTip(skillId)
+end
+
+---初始化机制
+function DecorationBossBattleView:InitMechanics()
+    local skillCfg = _G.ConfigManager.card_skills_cfg[self.config.card_skills]
+    if skillCfg.describe1 > 0 then
+        self.go_table.aortext_mechanics.text = _G.GetLangPackValue(skillCfg.describe1)
+    else
+        self.go_table.aortext_mechanics.text = _G.GetLangPackValue(90022500400)
+    end
+    local cardCfg = _G.ConfigManager.card_cfg[self.config.preview_monster]
+    self.go_table.aortext_bossName.text = _G.GetLangPackValue(cardCfg.Name) .. " " ..
+        _G.GetLangPackValue(90025500012, self.config.boss_lv)
+    self.isAttention = DecorationBossModel:GetInstance():CheckAttentionBoss(self.config.id)
+    if self.isAttention then
+        self.go_table.aorimage_followIcon.SpriteName = "ui_zyzm_zd_guanzhu_btn"
+        self.go_table.aortext_follow.text = _G.GetLangPackValue(90031900010)
+    else
+        self.go_table.aorimage_followIcon.SpriteName = "ui_zyzm_zd_quxiaoguanzhu_btn"
+        self.go_table.aortext_follow.text = _G.GetLangPackValue(90031900031)
+    end
+end
+
+---初始化boss状态
+function DecorationBossBattleView:InitBossState()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self:RefreshBossInfo()
+    self.state, self.endTime = DecorationBossModel:GetInstance():GetBossState(self.config.id)
+    self.go_table.obj_showTime:SetActiveE(
+        self.state ~= self.bossStateEnum.Fighting and 1 or 0
+    )
+    self.go_table.aorbtn_battle:SetGray(self.state ~= self.bossStateEnum.Fighting)
+    self.go_table.aorimage_battle:SetGray(self.state ~= self.bossStateEnum.Fighting)
+    self.isNotArrived = self.state == self.bossStateEnum.NotArrived
+    ---boss死亡后结算倒计时
+    local monsterSid = DecorationBossModel:GetInstance():GetMonsterSid() or 0
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if monsterSid > 0 then
+        local settleTime = _G.ConfigManager.discrete_cfg[115308][1][1]
+        local bossData = DecorationBossModel:GetInstance():GetBossData(self.config.id)
+        local lastEndTime = bossData.last_end_time or 0
+        if bossData.fight_card or (lastEndTime > 0 and lastEndTime + settleTime - serverTime > 0) then
+            self.settleTime = bossData.last_end_time + settleTime
+            self.go_table.aorbtn_giveUp:SetActiveE(1)
+        else
+            self.go_table.aorbtn_giveUp:SetActiveE(0)
+        end
+    else
+        self.go_table.aorbtn_giveUp:SetActiveE(0)
+    end
+    if self.endTime > 0 then
+        self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, true, true)
+        self.timer:Start()
+        self:UpdateTime()
+    end
+
+    if self.cdTimer then
+        self.cdTimer:Stop()
+        self.cdTimer = nil
+    end
+    local lastFightTime = DecorationBossModel:GetInstance():GetLastFightTime()
+    local cd = _G.ConfigManager.discrete_cfg[115303][1][1]
+    if lastFightTime and serverTime < lastFightTime + cd then
+        ---挑战冷却中
+        self.go_table.aorbtn_battle:SetGray(true)
+        self.go_table.aorimage_battle:SetGray(true)
+        self.cdTimer = _G.TimerManager:GetInstance():GetTimer(
+            1,
+            _G.handlerbind(self, self.RefreshCdTimer, lastFightTime, cd),
+            self,
+            false,
+            false
+        )
+        self.cdTimer:Start()
+        self:RefreshCdTimer(nil, nil, lastFightTime, cd)
+    else
+        self.go_table.aortext_cdTimer.text = ""
+    end
+end
+
+function DecorationBossBattleView:RefreshCdTimer(_, _, lastFightTime, cd)
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local leftTime = lastFightTime + cd - serverTime
+    if leftTime > 0 then
+        self.go_table.aortext_cdTimer.text = _G.GetLangPackValue(90031900042, leftTime)
+    else
+        local bossData = DecorationBossModel:GetInstance():GetBossData(self.config.id)
+        if bossData.fight_card then
+            self.go_table.aorbtn_battle:SetGray(false)
+            self.go_table.aorimage_battle:SetGray(false)
+        end
+        self.go_table.aortext_cdTimer.text = ""
+        if self.cdTimer then
+            self.cdTimer:Stop()
+            self.cdTimer = nil
+        end
+    end
+end
+
+---刷新boss信息
+function DecorationBossBattleView:RefreshBossInfo()
+    local bossData = DecorationBossModel:GetInstance():GetBossData(self.config.id)
+    if bossData.fight_card then
+        for _, v in pairs(bossData.fight_card) do
+            local sid = _G.GameUtil.GetDivisionNumber(v.uid, 100)
+            if _G.ConfigManager.monster_cfg[sid].MonsterType == 5 then
+                local hp = v.hp or 0
+                self.go_table.aortext_Slider.text = _G.GameUtil.FormatNum(hp / 100) .. "%"
+                self.go_table.slider_hp.value = hp / 10000
+                break
+            end
+        end
+    else
+        self.go_table.aortext_Slider.text = "0%"
+        self.go_table.slider_hp.value = 0
+        self.go_table.aorbtn_giveUp:SetActiveE(0)
+    end
+    local cardCfg = _G.ConfigManager.card_cfg[self.config.preview_monster]
+    self.go_table.aorimage_head.SpriteName = cardCfg.Icon
+end
+
+---清除排行榜和排行榜的模型
+function DecorationBossBattleView:ClearRank(isClearRank)
+    if isClearRank then
+        self.rankInfo = {}
+        if self.rankListView then
+            self.rankListView:UpdateCount(_G.Mathf.Max(#self.rankInfo, 3))
+        end
+    end
+    self:ClearAllRoleModel()
+    self.go_table.obj_effect:ClearChildren()
+end
+
+---boss死亡刷新
+function DecorationBossBattleView:RefreshBossDeath()
+    self:InitBossState()
+    if self.rankInfo and #self.rankInfo > 0 then
+        self:ClearRank()
+    end
+    ---boss死亡后再拉取一次排行榜数据
+    self:UpdateBossInfo()
+end
+
+---boss死亡结算完成
+function DecorationBossBattleView:BossAwardChange()
+    local checkAward = DecorationBossModel:GetInstance():CheckCanGetAward()
+    self.go_table.aorbtn_box:SetActiveE(checkAward and 1 or 0)
+end
+
+---挑战时间结束，刷新界面
+function DecorationBossBattleView:BattleTimeEnd()
+    self.go_table.aorbtn_giveUp:SetActiveE(0)
+    self.go_table.aorbtn_battle:SetGray(true)
+    self.go_table.aorimage_battle:SetGray(true)
+    self:InitBossState()
+end
+
+---boss复活后清除排行榜
+function DecorationBossBattleView:OnBossRevive(monsterId)
+    if monsterId and monsterId == self.config.id then
+        self:InitProtectTime()
+        self:ClearRank(true)
+        self.go_table.aorbtn_box:SetActiveE(0)
+    end
+end
+
+function DecorationBossBattleView:UpdateTime()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if self.endTime - serverTime >= 0 then
+        if self.isNotArrived then
+            ---降临倒计时
+            self.go_table.aortext_showTime.text = _G.GetLangPackValue(
+                90031900008,
+                _G.TimeUtil.TimeToString(self.endTime - serverTime, 1)
+            )
+        else
+            if self.settleTime and self.settleTime - serverTime >= 0 then
+                ---结算倒计时
+                self.go_table.aortext_showTime.text = _G.GetLangPackValue(
+                    90031900032,
+                    _G.TimeUtil.TimeToString(self.settleTime - serverTime, 1)
+                )
+                self.go_table.aorbtn_giveUp:SetActiveE(self.settleTime - serverTime == 0 and 0 or 1)
+            else
+                ---复活倒计时
+                self.go_table.aortext_showTime.text = _G.GetLangPackValue(
+                    90031900007,
+                    _G.TimeUtil.TimeToString(self.endTime - serverTime, 1)
+                )
+            end
+        end
+    else
+        if self.isNotArrived then
+            self:InitBossState()
+        else
+            if self.state == self.bossStateEnum.Reviving then
+                ---boss已复活奖励邮件发放，不手动领取
+                self.needRefreshMainView = true
+                self:CloseView()
+            end
+        end
+    end
+end
+
+---界面和场景的显隐
+function DecorationBossBattleView:ChangeWindow(isShow)
+    self.sceneRoot:SetActiveE(isShow and 1 or 0)
+    if isShow then
+        self:Show()
+        _G.GraphicsManager.Instance:UpdateMainCameraPosImmediate()
+    else
+        self:Hide()
+    end
+end
+
+---界面的销毁函数
+function DecorationBossBattleView:Dispose()
+    self:RemoveAllListener()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.cdTimer then
+        self.cdTimer:Stop()
+        self.cdTimer = nil
+    end
+    if self.protectTimer then
+        self.protectTimer:Stop()
+        self.protectTimer = nil
+    end
+    if self.bossInfoTimer then
+        self.bossInfoTimer:Stop()
+        self.bossInfoTimer = nil
+    end
+    _G.UIManager:GetInstance():SetWorldSceneHideTimes(-1)
+    if self.curSceneTrans then
+        if not self.clickBattleButton then
+            _G.WorldManager:GetInstance():SetCurrentWorldVisible(true)
+            self.clickBattleButton = false
+        end
+        _G.PoolsManager:GetInstance():Despawn(self.curSceneTrans, _G.ePoolType.Static)
+    end
+    if self.bossTrans then
+        _G.PoolsManager:GetInstance():Despawn(self.bossTrans, _G.ePoolType.Temporary)
+    end
+    self.bossTrans = nil
+    self:ClearAllRoleModel()
+    self.curSceneTrans = nil
+    self.sceneRoot:Dispose()
+end
+
+function DecorationBossBattleView:ClearAllRoleModel()
+    if self.actionTimer then
+        self.actionTimer:Stop()
+        self.actionTimer = nil
+    end
+    if not self.curSceneTrans then
+        return
+    end
+    for i = 1, 5 do
+        if self.halo[i] then
+            _G.PoolsManager:GetInstance():Despawn(self.halo[i], _G.ePoolType.Temporary)
+        end
+        if self.title[i] then
+            _G.PoolsManager:GetInstance():Despawn(self.title[i].gameObject, _G.ePoolType.Temporary)
+        end
+    end
+    for _, v in pairs(self.roleTrans) do
+        _G.PoolsManager:GetInstance():Despawn(v, _G.ePoolType.Temporary)
+    end
+    for _, v in pairs(self.titleCor) do
+        _G.coroutine.stopwaiting(v)
+    end
+    self.roleTrans = {}
+    self.halo = {}
+    self.title = {}
+    self.titleCor = {}
+end
+
+function DecorationBossBattleView:CloseView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DecorationBossMainView.Name)
+    if view then
+        local sid = DecorationBossModel:GetInstance():GetMonsterSid()
+        if sid and sid == self.config.id then
+            view:Close()
+        else
+            view:Show()
+            view:RefreshBoss()
+        end
+    else
+        if self.needRefreshMainView then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecorationBossMainView.Name)
+        end
+    end
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+    self:Close()
+end
+
+---按钮点击事件在这里派发
+function DecorationBossBattleView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_close then
+        self:CloseView()
+    elseif go == self.go_table.aorbtn_battle then
+        local state, _, isBefore = DecorationBossModel:GetInstance():GetBossState(self.config.id)
+        if state == self.bossStateEnum.NotArrived then
+            if isBefore then
+                _G.PopWindowManager:GetInstance():ShowAllTips(960102)
+            else
+                _G.PopWindowManager:GetInstance():ShowAllTips(960103)
+            end
+            return
+        end
+
+        ---战斗
+        if DecorationBossModel:GetInstance():GetLeftAwardTimes() == 0 then
+            _G.PopWindowManager:GetInstance():ShowAllTips(960111)
+            return
+        end
+
+        local bossData = DecorationBossModel:GetInstance():GetBossData(self.config.id)
+        if not bossData.fight_card then
+            ---首领已死亡
+            _G.PopWindowManager:GetInstance():ShowAllTips(960109)
+            return
+        end
+
+        local lastFightTime = DecorationBossModel:GetInstance():GetLastFightTime()
+        local cd = _G.ConfigManager.discrete_cfg[115303][1][1]
+        if lastFightTime and _G.TimeUtil.GetServerUnixTime() < lastFightTime + cd then
+            ---挑战冷却中
+            _G.PopWindowManager:GetInstance():ShowAllTips(960108)
+            return
+        end
+        self.clickBattleButton = true
+        require("DecorationBossController"):GetInstance():OpenEmbattle(self.config, false)
+    elseif go == self.go_table.aorbtn_giveUp then
+        ---放弃
+        _G.PopWindowManager:GetInstance():ShowAllTips(960112, nil, function()
+            self.settleTime = nil
+            self.go_table.aorbtn_giveUp:SetActiveE(0)
+            DecorationBossModel:GetInstance():GiveUpBoss(function()
+                self.needRefreshMainView = true
+                self:RefreshGiveUpRank()
+            end)
+        end)
+    elseif go == self.go_table.aorbtn_award then
+        self:OnClickRankItem(nil, nil, true)
+    elseif go == self.go_table.aorbtn_box then
+        if not DecorationBossModel:GetInstance():CheckCanGetAward() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(960114)
+            return
+        end
+        DecorationBossModel:GetInstance():GetRankAward(function()
+            self.needRefreshMainView = true
+        end)
+    elseif go == self.go_table.aorbtn_follow then
+        local type = self.isAttention and 2 or 1
+        DecorationBossModel:GetInstance():AttentionBoss(self.config.id, type, function()
+            self:InitMechanics()
+            if self.isAttention then
+                _G.PopWindowManager:GetInstance():ShowAllTips(960104)
+            else
+                _G.PopWindowManager:GetInstance():ShowAllTips(960105)
+            end
+        end)
+    elseif go == self.go_table.aorbtn_help then
+        ---帮助信息
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 139)
+    end
+end
+
+return DecorationBossBattleView

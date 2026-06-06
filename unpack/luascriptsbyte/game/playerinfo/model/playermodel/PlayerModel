@@ -1,0 +1,1980 @@
+-----------------------------------------------------------------------
+-- D:.OnePiece.Patch.Client.Assets.Resources.LuaScripts.UI.Login.Model.PlayerModel	(修改路径必须修正此项!)
+-- Created by szs
+-- DateTime: 2020/01/04
+-- Description 玩家的数据
+-----------------------------------------------------------------------
+local CardCommentManager = require("CardCommentManager")
+
+local SDKDef = require("SDKDef")
+-- local SDKManager = require("SDKManager")
+local UserNet = require "UserNet"
+
+---@class PlayerModel : Singleton 主角的数据
+---@field public server_time number 服务器时间
+---@field public open_time  number 开服时间
+---@field public login_days  number 登录天数
+---@field public role_uid  number uid
+---@field public role_name  string name
+---@field public exp  number UpdateExp
+---@field public vip_exp number vip经验
+---@field public create_time number 创建时间
+---@field public room_id number 房间id
+---@field public role_style number  角色形象
+---@field public update_name_times number  改名次数
+---@field public role_lv number  玩家等级
+---@field public frame number  头像框
+---@field public city_style number 模型id
+---@field public title role.i_effect 称号
+---@field public halo role.i_effect 光环
+---@field public day_count  number 累计登录天数
+---@field public point number 累计点赞数量
+---@field public main_open_time number 战区主服开服时间
+---@field public seq_login_day number 连续登录天数
+---@field public function_preview_award table 功能预告领奖已领取奖励
+---@field public desktop_award table 抖音侧边栏/添加桌面已领取奖励
+---@field public core_power number 共鸣核心卡牌战斗力
+---@field public last_up_award_lv number 上次玩家领取奖励等级
+local PlayerModel = _G.BaseClass("PlayerModel", _G.Singleton)
+_G.PlayerModel = PlayerModel
+
+local DefaultFrameSid = 100
+local DefaultChatFrameSid = 10100
+local DefaultRoleFrameSid = _G.ConfigManager.discrete_cfg[150000][1][1]
+
+---@class PlayerModel.InfoChangeEvent  玩家数据改变事件枚举
+---@field public line string 当分线改变
+PlayerModel.InfoChangeEventEnum = {
+    line = "OnPlayerServerLineChanged"
+}
+---@return PlayerModel PlayerModel
+function PlayerModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---获取累计点赞数
+function PlayerModel:GetPoint()
+    return self.point
+end
+
+---增加点赞数
+function PlayerModel:AddPoint(num)
+    self.point = self.point + num
+end
+
+--region 本地方法
+--通过当前经验得到当前等级
+local ChangeLvByExp = function(self, exp, call)
+    if not IsNumber(exp) then
+        return
+    end
+    local nowLv = self.role_lv
+    local nowExp = self.exp
+    local sumExp = nowExp + exp
+    local isUp = false
+    local upLv = nowLv
+    local expList = _G.ConfigManager.player_level_cfg
+    for i = nowLv, #expList do
+        local lvCfg = expList[i]
+        if _G.IsNil(lvCfg) then
+            break
+        end
+        if sumExp < lvCfg.exp or lvCfg.exp == 0 then
+            break
+        end
+        if sumExp >= lvCfg.exp then
+            isUp = true
+        end
+        sumExp = sumExp - lvCfg.exp
+        upLv = i + 1
+    end
+    self.role_lv = upLv
+    self:RuTrackEvent(nowLv, upLv)
+    self.exp = sumExp
+    if isUp then
+        _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerUpLevel, nowLv, upLv)
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            { _G.ActiveTaskEnum.ConditionEnum.CharacterLevel.Level },
+            self.role_lv
+        )
+        if _G.CS.Launcher.Inst.IsSDK then
+            _G.SDKManager:GetInstance():SendLevelUp(tostring(self.role_lv))
+            require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_Level, self.role_lv)
+        end
+        --营地检测
+        require("CampsiteModel"):GetInstance():UnLockCaowei(self.role_lv)
+        --红点 等级礼包
+        require "LevelActivityModel":GetInstance():RefreshRedPoint()
+        --require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.LevelActivity.id)
+
+        require "PopUpGiftBagModel":GetInstance():IsPlayerLevel(nowLv, upLv)
+
+        _G.SDKManager:GetInstance():GameAction(SDKDef.GameAction.EveryLevelUp, upLv)
+    else
+        _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeExp, sumExp)
+        if call ~= nil then
+            call()
+        end
+    end
+end
+--通过当前经验得到当前VIP等级
+local ChangeVipLvByExp = function(self)
+    local lv = 0
+    local expList = _G.ConfigManager.player_vip_cfg
+    for l = 1, #expList do
+        if self.vip_exp >= expList[l].exp then
+            lv = l
+        end
+    end
+    local isUp = false
+    if self.isInit then
+        if self.vipLv < lv then
+            if _G.AppSetting.DEBUG then
+                _G.Log("玩家VIP等级提升了")
+            end
+            isUp = true
+        end
+    end
+    self.vipLv = lv
+    -- if isUp then
+    --     _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerUpVipLevel, lv)
+    -- else
+    --     _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeVipExp)
+    -- end
+end
+
+---下一级还差的经验
+function PlayerModel:GetNextLevelNeedExp(level)
+    if level and self.role_lv >= level then
+        return 0
+    end
+
+    local expList = _G.ConfigManager.player_level_cfg
+    local curLevelExp = expList[self.role_lv] and expList[self.role_lv].exp or 0
+    if curLevelExp == 0 then
+        ---已达到最大等级
+        return 0
+    end
+
+    if not level then
+        return expList[self.role_lv].exp - (self.exp or 0)
+    end
+
+    local totalExp = 0
+    for i = self.role_lv, level - 1 do
+        totalExp = totalExp + (expList[i].exp or 0)
+    end
+    return totalExp - (self.exp or 0)
+end
+
+--endregion
+
+---创建对象时,入口构造函数
+function PlayerModel:__init()
+    ---清档时 清除该角色key 本地缓存
+    self.PrefsKeyDic = {}
+    self.main_open_time = 0
+    self.isInit = false
+    self.SDK_AgeState = -1
+    self:DefaultData()
+    self:SetCurCitySid(300)
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.role_level_award.Cmd, self.P2C_RoleUp, self)
+    _G.Events:GetInstance():AddListener(
+        _G.ConfigManager.net_map.game_player_effect_unlock.Cmd,
+        self.P2C_EffectUnlock,
+        self
+    )
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.core_power_update.Cmd, self.SetCorePower, self)
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClock, self)
+end
+
+--region ---------------------------------角色key缓存-------------
+
+---记录缓存key 方便清档时清除该角色缓存
+---@return boolean true新增key
+function PlayerModel:AddPrefsKey(key)
+    if self.isInit and self.PrefsKeyDic and not self.PrefsKeyDic[key] then
+        self.PrefsKeyDic[key] = true
+        self:SavePrefsKey()
+        return true
+    end
+
+    return false
+end
+
+---记录缓存key 方便清档时清除该角色缓存
+---@return boolean true新增key
+function PlayerModel:GetPrefsKey()
+    return self.PrefsKeyDic
+end
+
+---记录缓存key 方便清档时清除该角色缓存
+---@return boolean true新增key
+function PlayerModel:SavePrefsKey()
+    if self.isInit then
+        _G.PlayerPrefsManager.SetTable("Prefs" .. self.role_uid, _G.PlayerModel:GetInstance():GetPrefsKey(), true)
+    end
+end
+
+function PlayerModel:GetPrefsTable()
+    if self.isInit then
+        return _G.PlayerPrefsManager.GetTable("Prefs" .. self.role_uid, true) or {}
+    end
+    return {}
+end
+
+--endregion--------------------------------------------
+
+---销毁对象时,析构函数
+function PlayerModel:Dispose()
+    self.isInit = false
+    self.SDK_AgeState = nil
+    self.role_style = nil
+    self.role_name = nil
+    self.role_uid = nil
+    self.role_lv = nil
+    self.exp = nil
+    self.isFirst = nil
+    self.power = nil
+    self.PosRecord = nil
+    self.SociatyId = nil
+    self.city_style = nil
+    if self.titleAndHaloTimer then
+        self.titleAndHaloTimer:Stop()
+        self.titleAndHaloTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.role_level_award.Cmd, self.P2C_RoleUp, self)
+    _G.Events:GetInstance():RemoveListener(
+        _G.ConfigManager.net_map.game_player_effect_unlock.Cmd,
+        self.P2C_EffectUnlock,
+        self
+    )
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.core_power_update.Cmd, self.SetCorePower, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClock, self)
+end
+
+function PlayerModel:DefaultData()
+    self.role_style = 128
+    self.role_name = _G.GetLangPackValue(90022500420)
+    self.role_uid = 114200000
+    self.role_lv = 1
+    self.exp = 0
+    self.isFirst = true
+    self.power = 0
+    self.corePower = 0
+    self.PosRecord = {}
+    self.SociatyId = 0
+    self.city_style = 114200000
+    self.halo = 0
+    self.title = { sid = 0, end_time = 0 }
+    self.chat_frame = { sid = 0, end_time = 0 }
+    self.role_frame = { sid = 0, end_time = 0 }
+
+    --region --------------------------------------解锁的--------
+    ---头像框
+    self.frameDic = {}
+    ---称号
+    self.titleDic = {}
+    ---光环
+    self.haloDic = {}
+    ---聊天框
+    self.chatFrameDic = {}
+    ---角色框
+    self.roleFrameDic = {}
+    ---玩家拥有的头像sid
+    self.un_style = {}
+    --endregion------------------------------------解锁的--------
+end
+
+--切换地图重置位置
+function PlayerModel:ResetPos()
+    if self.isSetServerPos then
+        self.isSetServerPos = false
+        return
+    end
+    self.start_point = 0
+    self.start_time = 0
+    self.end_point = 0
+end
+
+--region 角色创建相关
+---创建角色
+---@param callback function 创建完成回调
+function PlayerModel:CreateRole(callback)
+    local initialCreateRole = not _G.ServerManager:GetInstance():CheckHasPlayer()
+    if initialCreateRole then
+        --第一次创角的新用户
+        _G.SDKManager:GetInstance():ReportAuthorized()
+    end
+    self.getRoleInfoCallback = callback
+    local msg = {}
+    msg.style = 128
+    UserNet:GetInstance():CreateRole(msg, _G.handlerbind(self, self.CreateRoleSucceed, initialCreateRole))
+end
+
+---创建角色协议数据处理
+---@param message role_pb.ReplyCreateRole 中文描述
+---@param initialCreateRole boolean 是否创建的第一个角色
+function PlayerModel:CreateRoleSucceed(message, initialCreateRole)
+    if message.ack == 1 then
+        _G.SDKManager:GetInstance():GameStepInfo(-70001)
+        _G.SDKManager:GetInstance():MiniGameTrack(SDKDef.DotMsg.ShuShu.create_role)
+        _G.SDKManager:GetInstance():ReportCreateRole(initialCreateRole)
+        _G.SDKManager:GetInstance():TrackEvent(SDKDef.DotMsg.Ru.upgradeRole_l1)
+        --创建成功
+        self:GetUserInfo(
+            nil,
+            function()
+                if _G.CS.Launcher.Inst.IsSDK then
+                    self:SDKSendCreateRole()
+                end
+            end
+        )
+    elseif message.ack == 49 then
+        if _G.AppSetting.DEBUG then
+            _G.Log("[LoginView]角色已经创建", "<color=red>" .. ">>>" .. "</color>")
+        end
+        self:GetUserInfo()
+    elseif message.ack == 65 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            1003,
+            nil,
+            function()
+                _G.DelayFrameDo(
+                    function()
+                        _G.GameMain:ResetGame()
+                    end
+                )
+            end
+        )
+
+        -- body
+        -- elseif message.ack == "role_name_exist" then
+        --     --该名字已经存在
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(200101)
+        -- elseif message.ack == "has_mask_words" then
+        --     --名字包含违禁字
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(200115)
+        --else
+        --"role_trust_no_create" 托管用户不创建
+        --_G.PopWindowManager:GetInstance():ShowAllTips(1001, message.ack)
+    end
+end
+
+function PlayerModel:SDKSendCreateRole()
+    local roleId = tostring(self:GetPlayerUid())
+    local roleName = tostring(self.role_name)
+    local roleLevel = tostring(self.role_lv)
+    local zoneId = tostring(_G.ServerManager:GetInstance().CurServer.Sid)
+    local zoneName = tostring(_G.ServerManager:GetInstance().CurServer.ServerName)
+    local createRoletime = tostring(self.create_time)
+    local power = _G.tostring(self:GetPower())
+    local vipLevel = _G.tostring(self.vipLv)
+    local extra = _G.string.format("style=%d&frmae=%d", self:GetRoleStyle(), self:GetCurFrame())
+    _G.SDKManager:GetInstance():SendCreateRole(roleId, roleName, roleLevel, zoneId, zoneName, createRoletime, power,
+        vipLevel, extra)
+end
+
+---获取用户信息
+function PlayerModel:GetUserInfo(callback, createandget)
+    self.getRoleInfoCallback = callback and callback or self.getRoleInfoCallback
+    self.CreateAndGetCallBack = createandget
+    UserNet:GetInstance():GetUserInfo(_G.handler(self, self.GetUserInfoCall))
+end
+
+---获取用户信息数据处理
+---@param message role.s2c_get_user 中文描述
+function PlayerModel:GetUserInfoCall(message)
+    --初始化服务器时区
+    if message.utc_time then
+        local serverTimeZone = tonumber(message.utc_time)
+        _G.TimeUtil.InitTimeZone(serverTimeZone)
+    end
+
+    self:ResolvPlayerData(message)
+    if self.getRoleInfoCallback then
+        self.getRoleInfoCallback()
+        self.getRoleInfoCallback = nil
+    end
+    if self.CreateAndGetCallBack then
+        self.CreateAndGetCallBack()
+        self.CreateAndGetCallBack = nil
+    end
+end
+
+------解析服务器的玩家数据
+---@param message role.s2c_get_user 数据table
+function PlayerModel:ResolvPlayerData(message)
+    if not self.isInit then
+        self.isSetServerPos = true
+    end
+    if type(message) == "table" then
+        for key, value in pairs(message) do
+            ---断线重连服务器经验等级不在解析进玩家信息 前端计算
+            if key == "exp" or key == "role_lv" then
+                if not _G.LoginManager:GetInstance().isReLogin then
+                    self[key] = value
+                end
+            else
+                self[key] = value
+            end
+        end
+    end
+
+    local curEndTime = self.frame and self.frame[2] or 0
+    self.frame = self.frame and self.frame[1] or DefaultFrameSid
+
+    self.day_countTime = _G.TimeUtil.GetServerUnixTime()
+    if _G.table.isEmptyOrNil(self.title) then
+        self.title = { sid = 0, end_time = 0 }
+    end
+    if _G.table.isEmptyOrNil(self.halo) then
+        self.halo = { sid = 0, end_time = 0 }
+    end
+    if _G.table.isEmptyOrNil(self.chat_frame) then
+        self.chat_frame = { sid = 0, end_time = 0 }
+    end
+    if self.chat_frame.sid == 0 then
+        self.chat_frame.sid = DefaultChatFrameSid
+    end
+
+    if _G.table.isEmptyOrNil(self.role_frame) then
+        self.role_frame = { sid = 0, end_time = 0 }
+    end
+    if self.role_frame.sid == 0 then
+        self.role_frame.sid = DefaultRoleFrameSid
+    end
+
+    if AppSetting.IsXzns then
+        self.isNewGodHaloList = {}
+        if _G.table.isEmptyOrNil(self.un_god_halo) then
+            self.un_god_halo = {}
+        end
+        if _G.table.isEmptyOrNil(self.card_god_halo) then
+            self.card_god_halo = {}
+        end
+        self:SetRedPointGodHalo()
+        self:SetGodHaloPrivilege()
+    end
+    self:SetCurCitySid(message.scene_sid or 300)
+    self.city_style = message.city_style or 114200000
+    ---防止断线重连后战力变成0
+    if not self.power then
+        self.power = 0
+    end
+    self.corePower = message.core_power or 0
+    _G.Events:GetInstance():Broadcast(_G.GlobalEvents.PlayerCorePowerSyn, self.corePower)
+    if self.last_up_award_lv < self:GetLevel() then
+        self:GetLevelAward()
+    end
+
+    self.vipLv = 0
+    self:UpdateVipExp(self.vip_exp or 0)
+
+    --region --------------------------------------解锁的--------
+    ---光环/称号穿戴角色
+    self:InitEffectState()
+
+    if self.frame_db == nil or not _G.table.ContainsValue(self.frame_db, self.frame) then
+        self:SetUnlockFrame({ sid = self.frame, end_time = curEndTime })
+    end
+    if self.frame_db then
+        --永久头像框
+        for i = 1, #self.frame_db do
+            self:SetUnlockFrame({ sid = self.frame_db[i], end_time = 0 })
+        end
+        self.frame_db = nil
+    end
+    if self.frame_time then
+        --限时头像框
+        for k, v in pairs(self.frame_time) do
+            self:SetUnlockFrame({ sid = v.key, end_time = v.value })
+        end
+        self.frame_time = nil
+    end
+    if self.title_db then
+        for i = 1, #self.title_db do
+            self:SetUnlockTitle(self.title_db[i])
+        end
+        self.title_db = nil
+    end
+    if self.halo_db then
+        for i = 1, #self.halo_db do
+            self:SetUnlockHalo(self.halo_db[i])
+        end
+        self.halo_db = nil
+    end
+    ---主题背景
+    if self.backgrounds then
+        for i = 1, #self.backgrounds do
+            self:UnLockSettingTheme(self.backgrounds[i])
+        end
+        self.backgrounds = nil
+    end
+    if self.chat_frame_db then
+        for i = 1, #self.chat_frame_db do
+            self:SetUnlockChatFrame(self.chat_frame_db[i])
+        end
+        self.chat_frame_db = nil
+    end
+
+    if self.role_frame_db then
+        for i = 1, #self.role_frame_db do
+            self:SetUnlockRoleFrame(self.role_frame_db[i])
+        end
+        self.role_frame_db = nil
+    end
+    --endregion------------------------------------解锁的--------
+
+    --- {皮肤id=true}  拥有的皮肤
+    self.skin = {}
+    if message.skin ~= nil then
+        for _, skinId in pairs(message.skin) do
+            self.skin[skinId] = true
+        end
+    end
+
+    if self.is_first_login then
+        require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_LoginSign, message.day_count)
+        self.is_first_login = false
+    end
+    self.isInit = true
+    if _G.AppSetting.IS_EDITOR then
+        --region --------------------------------------若服务器 清档 清除账号缓存--------
+        self.PrefsKeyDic = self:GetPrefsTable()
+        local uid = message.role_uid
+        local createTime = message.create_time
+        local saveTime = _G.PlayerPrefsManager.GetInt("create_time", 999)
+        ---如果上次该角色创建时间 与本次登录不同
+        if saveTime ~= 999 and saveTime ~= message.create_time then
+            for key, value in pairs(self.PrefsKeyDic) do
+                _G.PlayerPrefsManager.DeleteKey(key, true)
+            end
+            _G.PlayerPrefsManager.SetInt("create_time", message.create_time)
+        elseif saveTime == 999 then
+            ---如果该账号没记录创建时间
+            _G.PlayerPrefsManager.SetInt("create_time", message.create_time)
+        end
+
+        --endregion------------------------------------若服务器 清档 清除账号缓存--------
+    end
+    -- self:CheckGongDan()
+    --region --------------------------------------镇魂街ZHJ-9972--------
+    if _G.PlayerPrefsManager.GetInt("IsAutoBattle", 999) == 999 then
+        _G.PlayerPrefsManager.SetInt("IsAutoBattle", 1)
+    end
+    --endregion------------------------------------【客户端】自动战斗开启后默认勾选为自动--------
+
+    ---  头像 ---
+    self.un_style = {}
+    if AppSetting.IsXzns then
+        if message.un_style then
+            local count = #message.un_style
+            self.un_style = {}
+            for i = 1, count do
+                self.un_style[message.un_style[i]] = true
+            end
+        end
+    end
+
+    ---绑定奖励
+    require("BindAccountModel"):GetInstance():GetAwardInLogin()
+
+    if _G.AppSetting.DEBUG then
+        if self.main_open_time == 0 then
+            _G.LogError("当前服务器还未分配赛区(本条日志为打印)")
+        end
+    end
+end
+
+function PlayerModel:AddHaveSkin(skinID)
+    self.skin[skinID] = true
+end
+
+function PlayerModel:IsHaveSkin(skinID)
+    return self.skin[skinID] == true
+end
+
+---更新角色累计登录天数
+---
+function PlayerModel:CumulativeLogin()
+    if self.day_countTime == nil then
+        self.day_countTime = _G.TimeUtil.GetServerUnixTime()
+    else
+        local day = _G.TimeUtil.GetIntervalDayBySix1(self.day_countTime, _G.TimeUtil.GetServerUnixTime())
+        if day > 0 then
+            self.day_countTime = _G.TimeUtil.GetServerUnixTime()
+            self.day_count = self.day_count + day
+            require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_LoginSign, self.day_count)
+        end
+    end
+
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        { _G.ActiveTaskEnum.ConditionEnum.CumulativeLogin.day },
+        self.day_count
+    )
+end
+
+---保存角色场景切换位置信息
+function PlayerModel:WritePosRecord(curSceneSid, x, y, z)
+    if self.PosRecord[curSceneSid] == nil then
+        self.PosRecord[curSceneSid] = {}
+    end
+    self.PosRecord[curSceneSid] = { x = x, y = y, z = z }
+end
+
+--返回角色场景切换位置信息
+function PlayerModel:GetPosRecord(targetSceneSid)
+    if _G.table.isEmptyOrNil(self.PosRecord) or targetSceneSid == nil then
+        return nil
+    end
+    if self.PosRecord[targetSceneSid] ~= nil then
+        return self.PosRecord[targetSceneSid]
+    end
+end
+
+--endregion
+
+--region 数据 对外接口
+---获取是否创建角色
+---@return boolean 是否创建角色
+function PlayerModel:CheckCreateRole()
+    return self.isInit
+end
+
+---获取玩家角色形象sid
+---@return number card_cfg的sid
+function PlayerModel:GetRoleSid()
+    if self.city_style then
+        return self.city_style
+    end
+    return 114200000
+end
+
+function PlayerModel:GetTitle()
+    return self.title
+end
+
+function PlayerModel:SetTitle(id)
+    self.title = id
+end
+
+---更换角色sid
+---@param sid number card_cfg的sid
+function PlayerModel:UpdateRoleSid(sid)
+    self.city_style = sid
+end
+
+---更新角色称号
+---@param data role.i_effect
+function PlayerModel:UpdateTitle(data, sid)
+    self.title = data or { sid = 0 }
+    _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeTitle, self.title)
+end
+
+---更新角色光环
+---@param data role.i_effect
+function PlayerModel:UpdateHalo(data, sid)
+    if self.roleEffect[sid] == nil then
+        self.roleEffect[sid] = { sid = sid, title_sid = 0, halo_sid = 0 }
+    end
+    if data then
+        local preHalo = self.roleEffect[sid].halo_sid
+        if self.haloUse[data.sid] then
+            self.roleEffect[self.haloUse[data.sid]].halo_sid = 0
+        end
+        if data.sid == 0 or preHalo ~= 0 then
+            --卸下/替换
+            self.haloUse[preHalo] = nil
+        end
+        if data.sid > 0 then
+            --穿上
+            self.haloUse[data.sid] = sid
+        end
+        self.roleEffect[sid].halo_sid = data.sid
+    end
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    if player and sid == CardCommentManager:GetInstance():GetBaseSidBySkin(player.Sid) then
+        self.halo = data or 0
+        player:ChangeEffect(data)
+    elseif sid == CardCommentManager:GetInstance():GetBaseSidBySkin(self.city_style) then
+        self.halo = data or 0
+    end
+    _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeHalo, self.halo)
+end
+
+function PlayerModel:UpdateChatFrame(data)
+    self.chat_frame = data
+end
+
+function PlayerModel:UpdateRoleFrame(data)
+    self.role_frame = data
+end
+
+---更新玩家经验值
+---@param exp number 玩家经验值
+---@param call function 设置完的回调
+function PlayerModel:UpdateExp(exp, call)
+    ChangeLvByExp(self, exp, call)
+end
+
+---更新角色累计登录天数
+function PlayerModel:Accumulative(day)
+    self.day_count = day or 0
+end
+
+---设置玩家的战力
+function PlayerModel:SetPower(power)
+    self.power = power or 0
+end
+
+---获取玩家的战力
+function PlayerModel:GetPower()
+    if _G.AppSetting.IsXzns then
+        return self:GetCorePower()
+    end
+    return self.power
+end
+
+---设置玩家槽位卡的战力
+function PlayerModel:SetCorePower(msg)
+    self.corePower = 0
+    for _, v in pairs(msg.power or {}) do
+        self.corePower = self.corePower + v.value
+    end
+    _G.Events:GetInstance():Broadcast(_G.GlobalEvents.PlayerCorePowerSyn, self.corePower)
+    if _G.AppSetting.DEBUG then
+        _G.Log(msg, "接收到服务器战力同步：")
+        _G.Log(self.corePower, "当前槽位总战力：")
+    end
+end
+
+---获取玩家槽位卡的战力
+function PlayerModel:GetCorePower(power)
+    return self.corePower
+end
+
+---获取玩家等级
+---@return number 玩家等级
+function PlayerModel:GetLevel()
+    return self.role_lv
+end
+
+---获取玩家累计登录天数
+---@return number 累计登录天数
+function PlayerModel:DayCount()
+    return self.day_count
+end
+
+---获取玩家vip等级
+---@return number vip等级
+function PlayerModel:GetVipLevel()
+    return self.vipLv
+end
+
+---更新Vip经验值
+function PlayerModel:UpdateVipExp(exp)
+    self.vip_exp = exp
+    ChangeVipLvByExp(self)
+end
+
+------设置服务器分线
+---@param line number 分线
+function PlayerModel:SetServerLine(line)
+    local lashLine = self.room_id
+    self.room_id = line
+    if self.room_id and self.room_id ~= lashLine then
+        _G.Events:GetInstance():Broadcast(PlayerModel.InfoChangeEventEnum.line, line)
+    end
+end
+
+------获取当前所在服务器分线
+---@return number 服务器分线
+function PlayerModel:GetServerLine()
+    return self.room_id and self.room_id > 0 and self.room_id or 0
+end
+
+---设置当前所在的主城sid
+---@param sid number 场景sid
+function PlayerModel:SetCurCitySid(sid)
+    self.curSceneSid = sid
+end
+
+---获取当前场景的sid
+---@return number scene_cfg的sid
+function PlayerModel:GetCurCitySid()
+    return self.curSceneSid
+end
+
+---获取玩家头像框
+---@return number scene_cfg的sid
+function PlayerModel:GetCurFrame()
+    return (self.frame and self.frame > 0) and self.frame or DefaultFrameSid
+end
+
+---获取玩家角色形象sid
+---@return number 玩家角色形象sid
+function PlayerModel:GetRoleStyle()
+    return (self.role_style and self.role_style > 0) and self.role_style or 128
+end
+
+---设置玩家头像
+function PlayerModel:SetRoleStyle(id)
+    self.role_style = id
+    _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeIcon)
+end
+
+---更新玩家头像框
+---@param v number 头像框id
+function PlayerModel:UpdateCurFrame(v)
+    if IsNumber(v) then
+        self.frame = v
+        _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeFrame)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("PlayerModel:UpdateCurFrame() 参数不合法")
+        end
+    end
+end
+
+---获取玩家uid
+---@return number 玩家uid
+function PlayerModel:GetPlayerUid()
+    if self.isInit then
+        return self.role_uid
+    else
+        return self:GetRoleSid()
+    end
+end
+
+---获取玩家名称
+---@return number 玩家名称
+function PlayerModel:GetName()
+    return self.role_name
+end
+
+---获取角色创建时间戳
+---@return number 时间戳
+function PlayerModel:GetCreateRoleTime()
+    return self.create_time
+end
+
+---获取服务器开服时间
+---@return 变量类型 中文描述
+function PlayerModel:GetServerOpenTime()
+    return self.open_time
+end
+
+---获取服务器已开服时长(单位:秒, 以开服时间当天06:00开始计算)
+---@param ceil boolean  @向上取整, 默认true
+---@return number
+function PlayerModel:GetServerOpenDuration(ceil)
+    local result = _G.TimeUtil.GetServerUnixTime() - _G.TimeUtil.GetDayBySix(self:GetServerOpenTime())
+    if ceil or ceil == nil then
+        result = math.ceil(result)
+    end
+    return result
+end
+
+---获取赛区主服开启时间
+---@return number 时间戳
+function PlayerModel:GetBattleOpenTime()
+    return self.main_open_time == 0 and self:GetServerOpenTime() or self.main_open_time
+end
+
+---获取连续登录天数
+function PlayerModel:GetLoginDay()
+    return self.seq_login_day
+end
+
+---是否领取预览奖励
+function PlayerModel:IsGetFuncPreview(id)
+    if not self.function_preview_award then
+        return false
+    end
+
+    return _G.table.indexof(self.function_preview_award, id)
+end
+
+function PlayerModel:AddFuncPreview(list)
+    if not self.function_preview_award then
+        self.function_preview_award = {}
+    end
+    for _, v in pairs(list) do
+        _G.table.insert(self.function_preview_award, v)
+    end
+end
+
+--endregion
+
+function PlayerModel:SetFirstIsFalse()
+    self.isFirst = false
+end
+
+--- 服务器推送 角色升级奖励
+---@param Data role.p2c_up_level_award
+function PlayerModel:P2C_RoleUp(Data)
+    self.Show_nowlv = Data.now_lv
+    --- 防止多次升级推送
+    if self.Show_OldLv == nil then
+        self.Show_OldLv = Data.old_lv
+
+        --ZHJ-35679【AI助手】【adhoc】使用ai一次性执行多次付费挂机次数，挂机后魂玉数量前后台不一致
+        --在收到消息时立即获取奖励, 而不是等待展示升级页面时再获取奖励, 因为在等待期间可能刷新此资源数量
+        --此时缓存的升级奖励信息已失效
+        --ZHJH-4235 延时获取奖励，防止挂机奖励触发升级奖励，两者协议顺序出错导致物品数量显示问题
+        -- _G.DelayDo(
+        --     1,
+        --     function()
+        --         _G.StorageManager:GetInstance():ReceiveAwardData(self.Show_awardData)
+        --     end
+        -- )
+        self:GetLevelAward(false)
+    else
+        self:GetLevelAward(true)
+    end
+end
+
+---俄罗斯等级变化上报
+function PlayerModel:RuTrackEvent(oldLv, nowLv)
+    if oldLv < 5 and nowLv >= 5 then
+        _G.SDKManager:GetInstance():TrackEvent(SDKDef.DotMsg.Ru.upgradeRole_l5)
+    end
+    if oldLv < 10 and nowLv >= 10 then
+        _G.SDKManager:GetInstance():TrackEvent(SDKDef.DotMsg.Ru.upgradeRole_l10)
+    end
+end
+
+function PlayerModel:GetLevelAward(mergeAward)
+    require("PlayerInfoNet"):GetInstance():GetLevelAward(_G.handlerbind(self, self.GetLevelAwardSuc, mergeAward))
+end
+
+---获取等级奖励成功回调
+function PlayerModel:GetLevelAwardSuc(msg, mergeAward)
+    if msg.ack == 1 and msg.award then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+        if not mergeAward then
+            self.Show_awardData = msg
+            ---@type  MainOpenViewFunItem
+            local FunItem = {}
+            FunItem.checkFun = function()
+                return self.Show_OldLv ~= nil
+            end
+            FunItem.OpenViewFun = function(callback)
+                ---@type  params_RoleLevelUpView
+                local Roledata = {}
+                Roledata.awardDic = self.Show_awardData.award
+                Roledata.nowlv = self.Show_nowlv or self:GetLevel()
+                Roledata.oldlv = self.Show_OldLv or self.last_up_award_lv
+                self.Show_OldLv = nil
+                self.last_up_award_lv = self:GetLevel()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RoleLevelUpView.Name, Roledata, callback)
+            end
+            _G.PopWindowManager:GetInstance():AddPopWindowQuene(FunItem, _G.PopViewShowOrder.PlayerLevelUp)
+        else
+            _G.table.insertto(self.Show_awardData.award.item, msg.award.item)
+        end
+    end
+end
+
+---称号或光环获取推送
+---@param msg player_effect.2c_player_effect_unlock
+function PlayerModel:P2C_EffectUnlock(msg)
+    if msg.effect_list == nil then
+        return
+    end
+    for _, v in pairs(msg.effect_list) do
+        if v.type == 13 then
+            self:SetUnlockTitle({ sid = v.sid, end_time = v.end_time })
+        elseif v.type == 14 then
+            self:SetUnlockHalo({ sid = v.sid, end_time = v.end_time })
+        end
+    end
+    _G.SystemSettingManager:GetInstance():RefreshTitleAndHaloAttribute()
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.TitleAndHalo)
+end
+
+--- 如果有接受到玩家升级奖励 立马显示界面
+---@param call function (false未显示界面)
+function PlayerModel:ShowRoleLvUpAward(call)
+    if self.Show_OldLv == nil then
+        if call ~= nil then
+            call(false)
+        end
+        return
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(self.Show_awardData)
+
+    local FunItem = {}
+    FunItem.OpenViewFun = function(callback)
+        ---@type  params_RoleLevelUpView
+        local Roledata = {}
+        Roledata.awardDic = self.Show_awardData.award
+        Roledata.nowlv = self.Show_nowlv
+        Roledata.oldlv = self.Show_OldLv
+        Roledata.call = call
+        self.Show_OldLv = nil
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RoleLevelUpView.Name, Roledata, callback)
+    end
+    _G.PopWindowManager:GetInstance():AddPopWindowQuene(FunItem, _G.PopViewShowOrder.PlayerLevelUp)
+end
+
+--- 检测 玩家 本次是否升级  (结算显示逻辑判断)
+function PlayerModel:IsRoleLvUp()
+    local roleMode = _G.PlayerModel:GetInstance()
+    if roleMode == nil or roleMode.Show_OldLv == nil then
+        return false
+    end
+    return true
+end
+
+---更新玩家名字
+function PlayerModel:UpdateName(name)
+    self.role_name = name
+    _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeName, name)
+end
+
+--region全局方法
+function _G.GetIsCreateRole()
+    local model = _G.PlayerModel:GetInstance()
+    local isPlayer = model:CheckCreateRole()
+    if model.isFirst then
+        if not isPlayer then
+            model:SetFirstIsFalse()
+            return true
+        end
+    end
+    return false
+end
+
+---获取玩家名称
+---@return string 玩家名字
+function _G.GetPlayerName()
+    return PlayerModel:GetInstance():GetName()
+end
+
+---获取玩家uid
+---@return string 玩家uid
+function _G.GetPlayerUid()
+    return PlayerModel:GetInstance():GetPlayerUid()
+end
+
+--region --------------------------------------解锁的--------
+
+---头像框
+function PlayerModel:SetUnlockFrame(data)
+    local id = tonumber(data.sid)
+    if self.frameDic == nil then
+        self.frameDic = {}
+    end
+    ---@type player_frame_cfg
+    local cfg = _G.ConfigManager.player_frame_cfg[id]
+    if cfg.time_duration > 0 then
+        if data.end_time <= _G.TimeUtil.GetServerUnixTime() then
+            --称号已过期
+            if id == self.frame then
+                _G.SystemSettingManager:GetInstance():UpdateFrame(
+                    DefaultFrameSid,
+                    function(msg)
+                        self:UpdateCurFrame(DefaultFrameSid)
+                    end
+                )
+            end
+            return
+        end
+    end
+    self.frameDic[id] = data
+    --设置刷新头像框红点
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "frame" .. id
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+    else
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, 1)
+    end
+    if cfg.time_duration > 0 then
+        self:InitTitleAndHaloTimer()
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Frame.id)
+end
+
+---神环
+function PlayerModel:SetGodHaloToRole(sid)
+    _G.SystemSettingManager:GetInstance():UpdateHaloAndTitle(
+        sid,
+        4,
+        function()
+            self.god_halo = sid
+        end
+    )
+end
+
+---称号
+---@param data role.i_effect
+function PlayerModel:SetUnlockTitle(data)
+    local id = tonumber(data.sid)
+    if self.titleDic == nil then
+        self.titleDic = {}
+    end
+    --设置刷新光环红点
+    ---@type player_title_effect_cfg
+    local cfg = _G.ConfigManager.player_title_effect_cfg[id]
+    if not self.titleDic[id] then
+        if cfg.time_duration > 0 then
+            if data.end_time <= _G.TimeUtil.GetServerUnixTime() then
+                if id == self.title.sid then
+                    _G.SystemSettingManager:GetInstance():UpdateHaloAndTitle(
+                        0,
+                        2,
+                        function()
+                            self:UpdateTitle({ sid = 0 })
+                        end
+                    )
+                end
+                return
+            end
+        end
+    end
+    self.titleDic[id] = data
+    --设置刷新称号
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "title" .. id
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+    else
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, 1)
+    end
+
+    if cfg.time_duration > 0 then
+        self:InitTitleAndHaloTimer()
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerTitle.id)
+end
+
+---光环
+---@param data table<number,number>
+function PlayerModel:SetUnlockHalo(data)
+    if self.haloDic == nil then
+        self.haloDic = {}
+    end
+    local id = data.sid
+    --设置刷新光环红点
+    ---@type player_halo_effect_cfg
+    local cfg = _G.ConfigManager.player_halo_effect_cfg[id]
+    if not self.haloDic[id] then
+        if cfg.time_duration > 0 then
+            if data.end_time <= _G.TimeUtil.GetServerUnixTime() then
+                if id == self.halo.sid then
+                    self.halo = { sid = 0 }
+                end
+                return
+            end
+        end
+    end
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "halo" .. id
+
+    self.haloDic[id] = data
+
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+    else
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, 1)
+    end
+
+    if cfg.time_duration > 0 then
+        self:InitTitleAndHaloTimer()
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerHalo.id)
+end
+
+--- 神环装备卡牌 替换卡牌
+function PlayerModel:SetUnlockGodHalo(cardID, GodHaloID, SkillID)
+    local isHave = false
+    for i = 1, #self.card_god_halo do
+        -- 传入的神环ID已经被装备了
+        if self.card_god_halo[i].halo_id == GodHaloID then
+            --- 替换为当前卡牌
+            self.card_god_halo[i].card_sid = cardID
+            self.card_god_halo[i].halo_id_skill = SkillID
+            isHave = true
+        end
+    end
+
+    local list = {}
+    for i = 1, #self.card_god_halo do
+        -- 传入的卡牌ID已经存在 但神环不等于传入ID 说明是被替换的
+        if self.card_god_halo[i].card_sid == cardID and self.card_god_halo[i].halo_id ~= GodHaloID then
+
+        else
+            table.insert(list, self.card_god_halo[i])
+        end
+    end
+    self.card_god_halo = list
+
+    if not isHave then
+        local args = { card_sid = cardID, halo_id = GodHaloID, halo_id_skill = SkillID }
+        table.insert(self.card_god_halo, args)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eGodHalo.GodHaloRefresh)
+end
+
+--- 神环装备技能
+function PlayerModel:SetUnGodHaloList(GodHaloID, SkillID)
+    --  把原神环取出
+    local list = {}
+    for i = 1, #self.un_god_halo do
+        if self.un_god_halo[i].k == GodHaloID then
+        elseif self.un_god_halo[i].v == SkillID then
+            table.insert(list, { k = self.un_god_halo[i].k, v = 0 })
+        else
+            table.insert(list, self.un_god_halo[i])
+        end
+    end
+
+    local godhalo = { k = GodHaloID, v = SkillID }
+    table.insert(list, godhalo)
+
+    self.un_god_halo = list
+end
+
+--- 初始化时候调用 把未装备卡牌的神环加入红点判断里（self.isNewGodHaloList）
+function PlayerModel:SetRedPointGodHalo()
+    local card_god_halo = self.card_god_halo
+    local un_god_halo = self.un_god_halo
+
+    --- 去循环判断每个神环 在不在卡牌神环里
+    for i = 1, #un_god_halo do
+        local isHaveCard = false
+        for j = 1, #card_god_halo do
+            if card_god_halo[j].halo_id == un_god_halo[i].k then
+                isHaveCard = true
+            end
+        end
+
+        if not isHaveCard then
+            table.insert(self.isNewGodHaloList, un_god_halo[i].k)
+        end
+    end
+end
+
+--- 神环特权
+function PlayerModel:SetGodHaloPrivilege()
+    --- 清理全部神环特权
+    for i = 1, #_G.ConfigManager.god_halo_cfg do
+        local halo_effect = _G.ConfigManager.god_halo_cfg[i].halo_effect
+        for j = 1, #halo_effect do
+            local effectCfg = _G.ConfigManager.god_halo_effect_cfg[halo_effect[j]]
+            if #effectCfg.privilege_id > 0 then
+                for index = 1, #effectCfg.privilege_id do
+                    require "PrivilegeManager":GetInstance():RemovePrivilege(effectCfg.privilege_id[index])
+                end
+            end
+        end
+    end
+
+    local un_god_halo = self.un_god_halo
+
+    for i = 1, #un_god_halo do
+        local halo_effect = _G.ConfigManager.god_halo_cfg[un_god_halo[i].k].halo_effect
+        for j = 1, #halo_effect do
+            local effectCfg = _G.ConfigManager.god_halo_effect_cfg[halo_effect[j]]
+            if #effectCfg.privilege_id > 0 then
+                for index = 1, #effectCfg.privilege_id do
+                    require "PrivilegeManager":GetInstance():AddPrivilege(effectCfg.privilege_id[index], false, true)
+                end
+            end
+        end
+    end
+end
+
+--- 神环解锁
+function PlayerModel:AddUnlockGodHalo(GodHaloID)
+    table.insert(self.isNewGodHaloList, GodHaloID)
+    local SkillID = 0
+    local halo_effect = _G.ConfigManager.god_halo_cfg[GodHaloID].halo_effect
+
+    if #halo_effect > 0 then
+        local effectCfg = _G.ConfigManager.god_halo_effect_cfg[halo_effect[1]]
+        if effectCfg.effect_type ~= 1 then
+            SkillID = effectCfg.id
+        end
+    end
+
+
+    table.insert(self.un_god_halo, { k = GodHaloID, v = SkillID })
+    self:SetGodHaloPrivilege()
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PointGodHaloFirstOne.id)
+end
+
+--- 获取所有解锁神环
+function PlayerModel:GetAllUnlockGodHalo()
+    return self.un_god_halo
+end
+
+--- 判断是否解锁神环
+function PlayerModel:IsUnlockGodHalo(id)
+    local un_god_halo = self.un_god_halo
+    for i = 1, #un_god_halo do
+        if un_god_halo[i].k == id then
+            return true
+        end
+    end
+    return false
+end
+
+--- 判断神环是否装备卡牌 等于1为没有
+---@param id number 神环ID
+---@param isSkin boolean 是否要获得皮肤Id
+function PlayerModel:IsGodHaloWear(id, isSkin)
+    local card_god_halo = self.card_god_halo
+    for i = 1, #card_god_halo do
+        if card_god_halo[i].halo_id == id then
+            local cardId = card_god_halo[i].card_sid ~= 0 and card_god_halo[i].card_sid or 1
+            if cardId ~= 1 and isSkin then
+                local iswear, skinID = require "CardCommentManager":GetInstance():CardWearSkin(cardId)
+                if iswear then
+                    cardId = skinID
+                end
+            end
+            return cardId
+        end
+    end
+    return 1
+end
+
+--- 通过技能ID取神环ID
+function PlayerModel:GetGodHaloIDBySkillID(skill)
+    local un_god_halo = self.un_god_halo
+    for i = 1, #un_god_halo do
+        if un_god_halo[i].v == skill then
+            return un_god_halo[i].k
+        end
+    end
+    return 0
+end
+
+--- 通过技能ID取配置表中原始神环ID
+function PlayerModel:GetGodHaloIDBySkillCfgID(skill)
+    local un_god_halo = self.un_god_halo
+    local god_halo_cfg = _G.ConfigManager.god_halo_cfg
+    for k, v in pairs(god_halo_cfg) do
+        for i = 1, #v.halo_effect do
+            if v.halo_effect[i] == skill then
+                return v.id
+            end
+        end
+    end
+    return 0
+end
+
+--- 判断卡牌是否装备神环 等于0为没有
+function PlayerModel:IsCardWearGodHalo(id)
+    local card_god_halo = self.card_god_halo
+    for i = 1, #card_god_halo do
+        if card_god_halo[i].card_sid == id then
+            return card_god_halo[i].halo_id
+        end
+    end
+    return 0
+end
+
+--- 判断神环是否有技能
+function PlayerModel:IsGodHaloHaveSkill(id)
+    local un_god_halo = self.un_god_halo
+    for i = 1, #un_god_halo do
+        if un_god_halo[i].k == id then
+            return un_god_halo[i].v ~= 0 and un_god_halo[i].v or 1
+        end
+    end
+    return 1
+end
+
+--- 返回未装备技能的神环数量
+function PlayerModel:GetNotWearSkillGodHaloNumber()
+    local un_god_halo = self.un_god_halo
+    local num = 0
+    for i = 1, #un_god_halo do
+        if un_god_halo[i].v == 0 then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+--- 神环属性加成
+function PlayerModel:GetGodHaloAttribute()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+
+    local un_god_halo = self.un_god_halo
+    for i = 1, #un_god_halo do
+        local cfg = _G.ConfigManager.god_halo_cfg[un_god_halo[i].k]
+
+        attribute = self:UpdateAttribute(AttributeClassManager, attribute, cfg.base_att)
+    end
+
+    local changeAttrTypes = AttributeClassManager:GetChangeAttrTypes(attribute)
+
+    return attribute, changeAttrTypes
+end
+
+function PlayerModel:UpdateAttribute(attributeManager, attribute, attData)
+    for _, v in pairs(attData) do
+        local type = v[2] == "2" and _G.AttCountType.basePercent or _G.AttCountType.other
+        attribute:AddValueByName(
+            v[1],
+            attributeManager:GetValueWithName(v[1], v[3], v[2]),
+            false,
+            type
+        )
+    end
+    return attribute
+end
+
+---获取神环属性
+---@return table 属性
+function PlayerModel:GetGodHaloAttributeDict()
+    local atk   = 0
+    local bre   = 0
+    local def   = 0
+    local maxHp = 0
+    for i = 1, #self.un_god_halo do
+        local cfg = _G.ConfigManager.god_halo_cfg[self.un_god_halo[i].k]
+        for key, value in pairs(cfg.base_att) do
+            if value[1] == "atk" then
+                atk = atk + value[3]
+            elseif value[1] == "bre" then
+                bre = bre + value[3]
+            elseif value[1] == "def" then
+                def = def + value[3]
+            elseif value[1] == "max_hp" then
+                maxHp = maxHp + value[3]
+            end
+        end
+    end
+
+    return { atk, maxHp, bre, def }
+end
+
+function PlayerModel:SetUnlockChatFrame(data)
+    local id = _G.tonumber(data.sid)
+    if self.chatFrameDic == nil then
+        self.chatFrameDic = {}
+    end
+    ---@type player_bubble_cfg
+    local cfg = _G.ConfigManager.player_bubble_cfg[id]
+    if not self.chatFrameDic[id] then
+        if cfg.time_duration > 0 then
+            if data.end_time <= _G.TimeUtil.GetServerUnixTime() then
+                return
+            end
+        end
+    end
+    self.chatFrameDic[id] = data
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerChatFrame.id)
+end
+
+function PlayerModel:SetUnlockRoleFrame(data)
+    local id = _G.tonumber(data.sid)
+    if self.roleFrameDic == nil then
+        self.roleFrameDic = {}
+    end
+    ---@type player_rolebox_cfg
+    local cfg = _G.ConfigManager.player_rolebox_cfg[id]
+    if not self.roleFrameDic[id] then
+        if cfg.time_duration > 0 then
+            if data.end_time <= _G.TimeUtil.GetServerUnixTime() then
+                return
+            end
+        end
+    end
+    self.roleFrameDic[id] = data
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerRoleBox.id)
+end
+
+function PlayerModel:IsUnlockFrame(id)
+    return self.frameDic and not _G.table.isEmptyOrNil(self.frameDic[id])
+end
+
+function PlayerModel:IsUnlockTitle(id)
+    return self.titleDic and not _G.table.isEmptyOrNil(self.titleDic[id])
+end
+
+function PlayerModel:IsUnlockHalo(id)
+    return self.haloDic and not _G.table.isEmptyOrNil(self.haloDic[id])
+end
+
+function PlayerModel:IsUnlockChatFrame(id)
+    if id == DefaultChatFrameSid then
+        return true
+    end
+    return self.chatFrameDic and not _G.table.isEmptyOrNil(self.chatFrameDic[id])
+end
+
+function PlayerModel:IsUnlockRoleFrame(id)
+    if id == DefaultRoleFrameSid then
+        return true
+    end
+    return self.roleFrameDic and not _G.table.isEmptyOrNil(self.roleFrameDic[id])
+end
+
+---获取头像框数据
+---@return role.i_effect
+function PlayerModel:GetFrameData(id)
+    if self.frameDic then
+        return self.frameDic[id]
+    end
+    return nil
+end
+
+---获取头像框剩余时长
+---@param id number
+---@return number 时长(秒)
+function PlayerModel:GetFrameRemainDuration(id)
+    if not self.frameDic or not self.frameDic[id] then
+        return 0
+    end
+    local remain = self.frameDic[id].end_time - _G.TimeUtil.GetServerUnixTime()
+    if remain < 0 then
+        return 0
+    end
+    return remain
+end
+
+---获取称号数据
+---@return role.i_effect
+function PlayerModel:GetTitleData(id)
+    if self.titleDic then
+        return self.titleDic[id]
+    end
+    return nil
+end
+
+---获取称号剩余时长
+---@param id number
+---@return number 时长(秒)
+function PlayerModel:GetTitleRemainDuration(id)
+    if not self.titleDic or not self.titleDic[id] then
+        return 0
+    end
+    local remain = self.titleDic[id].end_time - _G.TimeUtil.GetServerUnixTime()
+    if remain < 0 then
+        return 0
+    end
+    return remain
+end
+
+---获取光环数据
+---@return role.i_effect
+function PlayerModel:GetHaloData(id)
+    if self.haloDic then
+        return self.haloDic[id]
+    end
+    return nil
+end
+
+---获取光环剩余时长
+---@param id number
+---@return number 时长(秒)
+function PlayerModel:GetHaloRemainDuration(id)
+    if not self.haloDic or not self.haloDic[id] then
+        return 0
+    end
+    local remain = self.haloDic[id].end_time - _G.TimeUtil.GetServerUnixTime()
+    if remain < 0 then
+        return 0
+    end
+    return remain
+end
+
+function PlayerModel:GetDefaultChatFrameSid()
+    return DefaultChatFrameSid
+end
+
+function PlayerModel:GetDefaultRoleFrameSid()
+    return DefaultRoleFrameSid
+end
+
+function PlayerModel:GetChatFrame()
+    return self.chat_frame
+end
+
+function PlayerModel:GetRoleFrame()
+    return self.role_frame
+end
+
+function PlayerModel:GetChatFrameData(id)
+    if self.chatFrameDic then
+        return self.chatFrameDic[id]
+    end
+    return nil
+end
+
+function PlayerModel:GetRoleFrameData(id)
+    if self.roleFrameDic then
+        return self.roleFrameDic[id]
+    end
+    return nil
+end
+
+---获取聊天框剩余时长
+---@param id number
+---@return number 时长(秒)
+function PlayerModel:GetChatFrameRemainDuration(id)
+    if not self.chatFrameDic or not self.chatFrameDic[id] then
+        return 0
+    end
+    local remain = self.chatFrameDic[id].end_time - _G.TimeUtil.GetServerUnixTime()
+    if remain < 0 then
+        return 0
+    end
+    return remain
+end
+
+---获取聊天框剩余时长
+---@param id number
+---@return number 时长(秒)
+function PlayerModel:GetRoleFrameRemainDuration(id)
+    if not self.roleFrameDic or not self.roleFrameDic[id] then
+        return 0
+    end
+    local remain = self.roleFrameDic[id].end_time - _G.TimeUtil.GetServerUnixTime()
+    if remain < 0 then
+        return 0
+    end
+    return remain
+end
+
+---初始化光环倒计时
+function PlayerModel:InitTitleAndHaloTimer()
+    local endTime = -1
+    local time = _G.TimeUtil.GetServerUnixTime()
+    ---@type player_frame_cfg|player_halo_effect_cfg|player_title_effect_cfg
+    local cfg
+    for _, v in pairs(self.frameDic) do
+        cfg = _G.ConfigManager.player_frame_cfg[v.sid]
+        if cfg and cfg.time_duration > 0 then
+            if v.end_time > time then
+                if endTime > 0 then
+                    if endTime > v.end_time - time then
+                        endTime = v.end_time - time
+                    end
+                else
+                    endTime = v.end_time - time
+                end
+            end
+        end
+    end
+    for _, v in pairs(self.haloDic) do
+        cfg = _G.ConfigManager.player_halo_effect_cfg[v.sid]
+        if cfg and cfg.time_duration > 0 then
+            if v.end_time > time then
+                if endTime > 0 then
+                    if endTime > v.end_time - time then
+                        endTime = v.end_time - time
+                    end
+                else
+                    endTime = v.end_time - time
+                end
+            end
+        end
+    end
+    for _, v in pairs(self.titleDic) do
+        cfg = _G.ConfigManager.player_title_effect_cfg[v.sid]
+        if cfg and cfg.time_duration > 0 then
+            if v.end_time > time then
+                if endTime > 0 then
+                    if endTime > v.end_time - time then
+                        endTime = v.end_time - time
+                    end
+                else
+                    endTime = v.end_time - time
+                end
+            end
+        end
+    end
+    for _, v in pairs(self.chatFrameDic) do
+        cfg = _G.ConfigManager.player_bubble_cfg[v.sid]
+        if cfg and cfg.time_duration > 0 then
+            if v.end_time > time then
+                if endTime > 0 then
+                    if endTime > v.end_time - time then
+                        endTime = v.end_time - time
+                    end
+                else
+                    endTime = v.end_time - time
+                end
+            end
+        end
+    end
+    if self.titleAndHaloTimer then
+        self.titleAndHaloTimer:Stop()
+        self.titleAndHaloTimer = nil
+    end
+    if endTime > 0 then
+        self.titleAndHaloTimer = _G.TimerManager:GetInstance():GetTimer(endTime, self.TitleAndHaloTimerOver, self, true,
+            false, true)
+        self.titleAndHaloTimer:Start()
+    end
+end
+
+function PlayerModel:TitleAndHaloTimerOver()
+    self.titleAndHaloTimer = nil
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local changeTitle = false
+    local changeHalo = false
+    ---@type player_frame_cfg|player_halo_effect_cfg|player_title_effect_cfg
+    local cfg
+    local cardSid
+    for k, v in pairs(self.frameDic) do
+        cfg = _G.ConfigManager.player_frame_cfg[v.sid]
+        if cfg and cfg.time_duration > 0 then
+            if v.end_time <= time then
+                self.frameDic[k] = nil
+                if v.sid == self.frame then
+                    _G.SystemSettingManager:GetInstance():UpdateFrame(
+                        DefaultFrameSid,
+                        function(msg)
+                            self:UpdateCurFrame(DefaultFrameSid)
+                        end
+                    )
+                end
+            end
+        end
+    end
+    for k, v in pairs(self.haloDic) do
+        cfg = _G.ConfigManager.player_halo_effect_cfg[v.sid]
+        if cfg and cfg.time_duration > 0 then
+            if v.end_time <= time then
+                self.haloDic[k] = nil
+                if v.sid == self.halo.sid then
+                    changeHalo = true
+                    cardSid = self:GetEffectUser(1, v.sid)
+                    _G.SystemSettingManager:GetInstance():UpdateHaloAndTitle(
+                        0,
+                        1,
+                        function()
+                            self:UpdateHalo({ sid = 0, end_time = 0 }, cardSid)
+                        end,
+                        cardSid
+                    )
+                end
+            end
+        end
+    end
+
+    for k, v in pairs(self.titleDic) do
+        cfg = _G.ConfigManager.player_title_effect_cfg[v.sid]
+        if cfg and cfg.time_duration > 0 then
+            if v.end_time <= time then
+                self.titleDic[k] = nil
+                -- if v.sid == self.title.sid then
+                changeTitle = true
+                --cardSid = self:GetEffectUser(2, v.sid)
+                _G.SystemSettingManager:GetInstance():UpdateHaloAndTitle(
+                    0,
+                    2,
+                    function()
+                        self:UpdateTitle({ sid = 0, end_time = 0 })
+                    end
+                )
+                -- end
+            end
+        end
+    end
+    for k, v in pairs(self.chatFrameDic) do
+        cfg = _G.ConfigManager.player_bubble_cfg[v.sid]
+        if cfg and cfg.time_duration > 0 then
+            if v.end_time <= time then
+                self.chatFrameDic[k] = nil
+                _G.SystemSettingManager:GetInstance():UpdateHaloAndTitle(
+                    DefaultChatFrameSid,
+                    3,
+                    function()
+                        self:UpdateChatFrame({ sid = DefaultChatFrameSid, end_time = 0 })
+                    end
+                )
+            end
+        end
+    end
+    if changeHalo then
+        _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeHalo, self.halo)
+    end
+    if changeTitle then
+        _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerChangeTitle, self.title)
+    end
+    _G.SystemSettingManager:GetInstance().Attribute = nil
+    _G.SystemSettingManager:GetInstance():GetTitleAndHaloAttribute()
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.TitleAndHalo)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Frame.id)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerTitle.id)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerHalo.id)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerChatFrame.id)
+    self:InitTitleAndHaloTimer()
+end
+
+--endregion------------------------------------解锁的--------
+
+---获取构造的 i_role消息体
+---@return 变量类型 中文描述
+function PlayerModel:GetIRroleTable(
+    deep,
+    unName,
+    unStyle,
+    unLevel,
+    unPower,
+    unFrame,
+    unCityStyle,
+    unTitle,
+    unAfk,
+    unHell,
+    unGuild)
+    if deep then
+        return {
+            uid = self:GetPlayerUid(),
+            name = not unName and self:GetName() or nil,
+            style = not unStyle and self:GetRoleStyle() or nil,
+            level = not unLevel and self:GetLevel() or nil,
+            power = not unPower and self:GetPower() or nil,
+            frame = not unFrame and self:GetCurFrame() or nil,
+            city_style_id = not unCityStyle and self:GetCurCitySid() or nil,
+            title = not unTitle and
+                {
+                    sid = self.title.sid,
+                    end_time = self.title.end_time,
+                    type = 2
+                } or
+                nil,
+            afk = not unAfk and require("AfkModel"):GetInstance():GetLastSection() or nil,
+            hell_id = not unHell and require("HellRoadModel"):GetInstance():GetLastHell() or nil,
+            guild_name = not unGuild and require("SociatyManager"):GetInstance():GetGuildName() or nil
+        }
+    else
+        if not self.iRoleTable then
+            self.iRoleTable = {
+                uid = self:GetPlayerUid(),
+                name = not unName and self:GetName() or nil,
+                style = not unStyle and self:GetRoleStyle() or nil,
+                level = not unLevel and self:GetLevel() or nil,
+                power = not unPower and self:GetPower() or nil,
+                frame = not unFrame and self:GetCurFrame() or nil,
+                city_style_id = not unCityStyle and self:GetCurCitySid() or nil,
+                title = not unTitle and
+                    {
+                        sid = self.title.sid,
+                        end_time = self.title.end_time,
+                        type = 2
+                    } or
+                    nil,
+                afk = not unAfk and require("AfkModel"):GetInstance():GetLastSection() or nil,
+                hell_id = not unHell and 1,
+                guild_name = not unGuild and require("SociatyManager"):GetInstance():GetGuildName() or nil
+            }
+        else
+            self.iRoleTable.name = not unName and self:GetName() or nil
+            self.iRoleTable.style = not unStyle and self:GetRoleStyle() or nil
+            self.iRoleTable.level = not unLevel and self:GetLevel() or nil
+            self.iRoleTable.power = not unPower and self:GetPower() or nil
+            self.iRoleTable.frame = not unFrame and self:GetCurFrame() or nil
+            self.iRoleTable.city_style_id = not unCityStyle and self:GetCurCitySid() or nil
+            self.iRoleTable.title = not unTitle and
+                {
+                    sid = self.title.sid,
+                    end_time = self.title.end_time,
+                    type = 2
+                } or
+                nil
+            self.iRoleTable.afk = not unAfk and require("AfkModel"):GetInstance():GetLastSection() or nil
+            self.iRoleTable.hell_id = not unHell and 1
+            self.iRoleTable.guild_name = not unGuild and require("SociatyManager"):GetInstance():GetGuildName() or nil
+        end
+        return self.iRoleTable
+    end
+end
+
+---解锁主题
+function PlayerModel:UnLockSettingTheme(id)
+    if not self.settingThemeList then
+        self.settingThemeList = {}
+    end
+    if self.settingThemeList[id] then
+        return
+    end
+    self.settingThemeList[id] = true
+    if not _G.PlayerPrefsManager.HasKey("SettingTheme" .. id) then
+        _G.PlayerPrefsManager.SetInt("SettingTheme" .. id, 1)
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PlaySence.id, id)
+end
+
+---检测主题是否解锁
+function PlayerModel:CheckSettingThemeIsUnLock(id)
+    if not self.settingThemeList then
+        return false
+    end
+    return self.settingThemeList[id]
+end
+
+--endregion
+
+function PlayerModel:CheckGongDan()
+    if self.gdTimer then
+        self.gdTimer:Stop()
+        self.gdTimer = nil
+    end
+    _G.SystemSettingManager:GetInstance():Get()
+    self.gdTimer = _G.TimerManager:GetInstance():GetTimer(3600, self.CheckGongDan, self, true, false, true)
+    self.gdTimer:Start()
+end
+
+---初始化光环/称号角色绑定关系
+function PlayerModel:InitEffectState(effectPut)
+    effectPut = effectPut or {}
+    self.titleUse = {}
+    self.haloUse = {}
+    self.roleEffect = {}
+    for _, v in pairs(effectPut) do
+        if v.title_sid and v.title_sid > 0 then
+            self.titleUse[v.title_sid] = v.sid
+        end
+        if v.halo_sid and v.halo_sid > 0 then
+            self.haloUse[v.halo_sid] = v.sid
+        end
+        self.roleEffect[v.sid] = v
+    end
+end
+
+---获取光环/称号的使用角色sid
+---@param type number 1 光环  2 称号
+function PlayerModel:GetEffectUser(type, sid)
+    if type == 1 then
+        return self.haloUse[sid] or 0
+    else
+        return self.titleUse[sid] or 0
+    end
+end
+
+---获取角色使用的光环/称号
+---@param type number 1 光环  2 称号
+function PlayerModel:GetRoleEffect(type, sid)
+    local role = self.roleEffect[sid]
+    if role == nil then
+        return 0
+    elseif type == 1 then
+        return role.halo_sid or 0
+    else
+        return role.title_sid or 0
+    end
+end
+
+---是否拥有头像
+function PlayerModel:GetIsHasHeadShot(sid)
+    return self.un_style[sid]
+end
+
+---添加头像
+function PlayerModel:AddHeadShot(sid)
+    self.un_style[sid] = true
+end
+
+function PlayerModel:OnSixClock()
+    self.seq_login_day = self.seq_login_day and self.seq_login_day + 1 or 1
+end

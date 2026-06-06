@@ -1,0 +1,710 @@
+--------------------------------------------------------------------------
+-- E:.Game.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Campsite.CampsiteModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/11/09
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+---@class CampsiteModel : Singleton    中文描述
+---@field GetInstance fun() : CampsiteModel
+local CampsiteModel = _G.BaseClass("CampsiteModel", _G.GameDataModelBase)
+_G.CampsiteModel = CampsiteModel
+local CampData = require("CampData")
+
+local pos_num = 6
+function CampsiteModel:__init()
+    self.endCallback = nil
+    self.curFunctionOpenID = 44
+    self.camp = {}
+    self.currentCampId = 0
+    self.camppower = 0
+end
+function CampsiteModel:GetDataFormServer()
+    require("CampsiteNet"):GetInstance():AccessCampInfos(_G.handler(self, self.ParseData))
+end
+---@param data table i_camp
+--- cid  营地的id unlock 解锁槽位 cards 当前营地中的卡牌
+function CampsiteModel:ParseData(CampAlldata)
+    self.camp = {}
+    self:InitCamp(CampAlldata.camp_info)
+    self:RefredPointAllCamp()
+    self.super.ParseData(self)
+end
+function CampsiteModel:InitFunction()
+end
+---销毁对象时,析构函数
+function CampsiteModel:Dispose()
+end
+
+---对外接口
+function CampsiteModel:GetCampOneAttribute(campid, grade, star)
+    local attrib = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    if campid == 0 then
+        return attrib
+    end
+    --品質
+    if grade <= 1 then
+        return attrib
+    end
+    local cfg = _G.ConfigManager.camp_cfg[campid]
+    if star < cfg.star_condition then
+        return attrib
+    end
+    --檢測 星級 品值
+    if not self:CheckFunction() then
+        return attrib
+    end
+    if _G.table.isEmptyOrNil(self.camp) then
+        return attrib
+    end
+    local allatt = self.camp[campid]:CalCampAttribute()
+    attrib = self.camp[campid]:AddUpAttribute(allatt)
+    return attrib
+end
+---6个阵营的平均效用星级，即取∑（上阵卡牌星级-配置放入条件星级+1）/6（四舍五入）
+function CampsiteModel:GetCampAverageStar(campid)
+    local star = 0
+    local cfg = _G.ConfigManager.camp_cfg[campid]
+    local data = self.camp[campid]
+    if data then
+        ---@type CardData[]
+        local cards = data:GetAllCampCards()
+        if not _G.table.isEmptyOrNil(cards) then
+            for _, v in pairs(cards) do
+                star = star + v.star - cfg.star_condition + 1
+            end
+        end
+    end
+    return _G.Mathf.RoundToInt(star / 6)
+end
+
+---初始化 营地
+function CampsiteModel:InitCamp(CampAlldata)
+    for i = 1, #CampAlldata do
+        local data = CampData.New()
+        data:Parse(CampAlldata[i])
+        self.camp[CampAlldata[i].cid] = data
+    end
+    _G.table.sort(
+        self.camp,
+        function(a, b)
+            return a.campid < b.campid
+        end
+    )
+end
+--region 检测功能
+function CampsiteModel:CheckFunction()
+    local flag = false
+    flag = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID)
+    return flag
+end
+--endregion
+--region 对外获取数据接kou
+---计算卡牌属性
+-- function CampsiteModel:GetCampAttribute(campid, card)
+--     if self:CheckFunction() then
+--         return
+--     end
+--     if campid ~= 0 then
+--         self.camp[campid]:GetCampOneAttribute(card)
+--     end
+-- end
+---界面中获得卡牌增加的属性值
+function CampsiteModel:GetCardCampAttribute(card)
+end
+---升级解锁 槽位
+---@param limit_condition number 条件检测
+function CampsiteModel:UnLockCaowei()
+    if not self:CheckFunction() then
+        return
+    end
+    for key, value in pairs(self.camp) do
+        value:UpCaoWei()
+    end
+end
+---获得卡牌，删除卡牌，改变卡牌数据
+---@param add table 增加的卡牌
+---@field uid number add的 key
+---@field sid number add的 value
+function CampsiteModel:AddorRemoveOrChange(add, rem, chang)
+    if not self:CheckFunction() then
+        return
+    end
+    if not _G.table.isEmptyOrNil(add) then
+        self:AddCard(add)
+    end
+    if not _G.table.isEmptyOrNil(rem) then
+        self:RemoveCard(rem)
+    end
+    if not _G.table.isEmptyOrNil(chang) then
+        self:ChangeCard(chang)
+    end
+end
+--获得卡牌 (默认检测 营地配置表，第一营地数据)
+function CampsiteModel:AddCard(add)
+    local flag = false
+    local addCardElements = {}
+    local campCfg = _G.ConfigManager.camp_cfg[101]
+    for key, value in pairs(add) do
+        local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, key)
+        card:SetCampId(card.cfg.Elements + 100)
+        if card.star >= campCfg.star_condition then
+            flag = true
+            table.insert(addCardElements, card.cfg.Elements)
+        end
+    end
+    if flag then
+        require("CampsiteNet"):GetInstance():AccessCampInfos(
+            function(data)
+                if data.ack ~= 1 then
+                    return
+                end
+                self.camp = {}
+                self:InitCamp(data.camp_info)
+                for i = 1, #addCardElements do
+                    self:RefredPointCampByElements(addCardElements[i])
+                end
+            end
+        )
+    else
+        for _, value in pairs(self.camp) do
+            value:AllCalCamp()
+        end
+    end
+end
+---删除卡牌
+function CampsiteModel:RemoveCard(rem)
+    local flag = false
+    local addCardElements = {}
+    for key, value in pairs(rem) do
+        for k, v in pairs(self.camp) do
+            local campData = v
+            if not _G.table.isEmptyOrNil(campData.card_info) then
+                for kc, vc in pairs(campData.card_info) do
+                    if key == vc.uid then
+                        flag = true
+                        table.insert(addCardElements, vc.cfg.elements)
+                        break
+                    end
+                end
+            end
+        end
+    end
+    if flag then
+        require("CampsiteNet"):GetInstance():AccessCampInfos(
+            function(data)
+                if data.ack ~= 1 then
+                    return
+                end
+                self.camp = {}
+                self:InitCamp(data.camp_info)
+                for i = 1, #addCardElements do
+                    self:RefredPointCampByElements(addCardElements[i])
+                end
+            end
+        )
+    end
+end
+--卡牌数据改变
+---@param change table 卡牌数据(暂时)
+function CampsiteModel:ChangeCard(change)
+    local flag = false
+    local addCardElements = {}
+    local campCfg = _G.ConfigManager.camp_cfg[101]
+    for key, value in pairs(change) do
+        local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, key)
+        if card.star >= campCfg.star_condition then
+            flag = true
+            table.insert(addCardElements, card.cfg.Elements)
+            break
+        end
+    end
+    if flag then
+        require("CampsiteNet"):GetInstance():AccessCampInfos(
+            function(data)
+                if data.ack ~= 1 then
+                    return
+                end
+                self.camp = {}
+                self:InitCamp(data.camp_info)
+                for i = 1, #addCardElements do
+                    self:RefredPointCampByElements(addCardElements[i])
+                end
+            end
+        )
+    end
+end
+--endregion
+--region 获得
+---多少个营地
+function CampsiteModel:CampCount()
+    return #self.camp or ""
+end
+---获取所有营地
+function CampsiteModel:GetAllCamp()
+    return self.camp or {}
+end
+---获得 营地槽位信息
+function CampsiteModel:GetCampInfo(cid)
+    return self.camp[cid]
+end
+--endregion
+--region 自动上阵功能
+function CampsiteModel:CheckAuotReplace(c_id)
+    local replaceTable = {}
+    local campinfo = self:GetCampInfo(c_id)
+    --查找 空的位置 和 不是空的位置
+    local space_tb = {}
+    local no_space_tb = {}
+    for i = 1, pos_num do
+        -- local temp = {
+        --     cid = 0
+        -- }
+        if campinfo.kacaoinfo[i] ~= _G.CampPosEnum.unlock then
+            -- temp.cid = c_id
+            -- local te = {}
+            if _G.table.isEmptyOrNil(campinfo.card_info[i]) then
+                -- temp.location = i
+                -- te = campinfo:CheckposnilAuto(temp.location)
+                _G.table.insert(space_tb, i)
+            else
+                -- temp.location = campinfo.card_info[i].location
+                -- te = campinfo:CheckSidAndUid(campinfo.card_info[i].uid, temp.location)
+                local data = {
+                    uid = campinfo.card_info[i].uid,
+                    location = campinfo.card_info[i].location
+                }
+                _G.table.insert(no_space_tb, data)
+            end
+        -- if not _G.table.isEmptyOrNil(te) then
+        --     temp.uid = te.uid
+        --     te:SetCampPos(temp.location)
+        --     _G.table.insert(replaceTable, temp)
+        -- end
+        end
+    end
+    if not _G.table.isEmptyOrNil(space_tb) then
+        for si = 1, #space_tb do
+            local temp = {
+                cid = 0
+            }
+            temp.cid = c_id
+            local te = {}
+            temp.location = space_tb[si]
+            te = campinfo:CheckposnilAuto(temp.location)
+            if not _G.table.isEmptyOrNil(te) then
+                temp.uid = te.uid
+                te:SetCampPos(temp.location)
+                _G.table.insert(replaceTable, temp)
+            end
+        end
+    end
+    if not _G.table.isEmptyOrNil(no_space_tb) then
+        for si = 1, #no_space_tb do
+            local temp1 = {
+                cid = 0
+            }
+            temp1.cid = c_id
+            local te = {}
+            temp1.location = no_space_tb[si].location
+            te = campinfo:CheckSidAndUid(no_space_tb[si].uid, no_space_tb[si].location)
+            if not _G.table.isEmptyOrNil(te) then
+                temp1.uid = te.uid
+                te:SetCampPos(temp1.location)
+                _G.table.insert(replaceTable, temp1)
+            end
+        end
+    end
+
+    return replaceTable
+end
+function CampsiteModel:AutoUp(campinfo, callCamp)
+    local pbData = {
+        type = 1,
+        cards = {}
+    }
+    pbData.cards = self:CheckAuotReplace(campinfo.campid)
+    if _G.table.isEmptyOrNil(pbData.cards) then
+        local flag = true
+        for i = 1, pos_num do
+            if campinfo.kacaoinfo[i] == _G.CampPosEnum.add then
+                flag = false
+                break
+            end
+        end
+        if flag then
+            _G.PopWindowManager:GetInstance():ShowAllTips(480102) --已经是最大的
+        else
+            _G.PopWindowManager:GetInstance():ShowAllTips(480101) --没有卡牌了
+        end
+        return
+    end
+    require("CampsiteNet"):GetInstance():AccessCampAutoUp(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            local cinfo = campinfo
+            local indexs = {}
+            for i = 1, #pbData.cards do
+                cinfo:SetKaCaoInfo(pbData.cards[i].location, _G.CampPosEnum.cardsid)
+                if not _G.table.isEmptyOrNil(cinfo.card_info[pbData.cards[i].location]) then
+                    local card =
+                        _G.StorageManager:GetInstance():GetItemDataByID(
+                        _G.StorageID.Card,
+                        cinfo.card_info[pbData.cards[i].location].uid
+                    )
+                    card:SetCampPos(0)
+                end
+                cinfo.card_info[pbData.cards[i].location] = pbData.cards[i]
+                local nowCard = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, pbData.cards[i].uid)
+                nowCard:SetCampPos(pbData.cards[i].location)
+                --刷新红点
+                --self:RefRedPoinCamp(campinfo.campid, pbData.cards[i].location)
+                --刷新红点
+                for i = 1, pos_num do
+                    self:RefRedPoinCamp(campinfo.campid, i)
+                end
+                _G.table.insert(indexs, pbData.cards[i].location)
+            end
+            cinfo:AllCalCamp()
+            self:CountUpdata(campinfo.campid)
+            ---刷新主界面的 战力
+            local windows = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+            if windows then
+                windows.View:UpdatePower()
+            end
+            if callCamp then
+                callCamp(cinfo)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eCamp.PalyEffect, indexs)
+        end
+    )
+end
+
+--region --------------------------------------任务广播 上阵角色数量--------
+
+function CampsiteModel:GetCount(cid)
+    local count = 0
+    ---@type CampData
+    local data = self:GetCampInfo(cid)
+    if data and data.card_info then
+        count = table.count(data.card_info)
+    end
+    return count
+end
+
+function CampsiteModel:GetSumCount()
+    local sumCount = 0
+
+    if self.camp then
+        ---@param  data CampData
+        for key, data in pairs(self.camp) do
+            if data and data.card_info then
+                local count = table.count(data.card_info) or 0
+                sumCount = sumCount + count
+            end
+        end
+    end
+    return sumCount
+end
+
+---单池更改
+function CampsiteModel:CountUpdata(cid)
+    local upCount = nil
+    ---@type CampData
+    local data = self:GetCampInfo(cid)
+    if data and data.card_info then
+        local count = table.count(data.card_info)
+
+        if count > 0 then
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.Campsite.upCardCount,
+                    cid
+                },
+                count,
+                false,
+                true
+            )
+
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.Campsite.upCardCount,
+                    ---全部
+                    0
+                },
+                self:GetSumCount(),
+                false,
+                true
+            )
+        end
+    end
+end
+
+--endregion------------------------------------任务广播 上阵角色--------
+
+function CampsiteModel:AutoDown(campinfo, callBack)
+    if _G.table.isEmptyOrNil(campinfo.card_info) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(480103)
+        return
+    end
+    local pbData = {
+        type = 2,
+        camp_id = 0
+    }
+    pbData.camp_id = campinfo.campid
+    require("CampsiteNet"):GetInstance():AccessCampAutoUp(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            local count = _G.LangUtil.GetLangPackValue(90012300054)
+            _G.FloatTipsModel:GetInstance():Show(count)
+            ---清空
+            local tem = {}
+            local indexs = {}
+            for key, value in pairs(campinfo.card_info) do
+                if not _G.table.isEmptyOrNil(value) then
+                    local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, value.uid)
+                    card:SetCampPos(0)
+                    _G.table.insert(indexs, value.location)
+                end
+            end
+            campinfo.card_info = {}
+            for i = 1, pos_num do
+                if campinfo.kacaoinfo[i] == _G.CampPosEnum.unlock then
+                else
+                    campinfo.kacaoinfo[i] = _G.CampPosEnum.add
+                end
+            end
+            --刷新红点
+            for i = 1, pos_num do
+                self:RefRedPoinCamp(campinfo.campid, i)
+            end
+            campinfo:AllCalCamp()
+            _G.Events:GetInstance():Broadcast(_G.eCamp.PalyEffect, indexs)
+            ---刷新主界面的 战力
+            local windows = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+            if windows then
+                windows.View:UpdatePower()
+            end
+            if callBack then
+                callBack(campinfo)
+            end
+        end
+    )
+end
+--endregion
+
+--region 红点
+function CampsiteModel:RefredPointAllCamp()
+    local cfg = _G.ConfigManager.camp_cfg
+    for _, value in pairs(cfg) do
+        for i = 1, pos_num do
+            self:RefRedPoinCamp(value.id, i)
+        end
+    end
+end
+
+function CampsiteModel:RefredPointCampByElements(elements)
+    local cfg = _G.ConfigManager.camp_cfg
+    for _, value in pairs(cfg) do
+        if value.elements == elements then
+            for i = 1, pos_num do
+                self:RefRedPoinCamp(value.id, i)
+            end
+            break
+        end
+    end
+end
+
+function CampsiteModel:RefRedPoinCamp(campid, pos_index)
+    require("RedPointManager"):GetInstance():RefreshNode(
+        _G.ConfigManager.redpoint_cfg.Caedcamproom.id,
+        campid * 10 + pos_index
+    )
+    --require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Cardcampelements.id)
+end
+---获取营地红点数量
+---@param param number 营地id + 营地得槽位(6)
+function CampsiteModel:GerRedpointCampNum(param)
+    local campid = _G.GameUtil.GetDivisionNumber(param,10)
+    local index = math.fmod(param, 10)
+    ---@type CampData
+    local camp = self:GetCampInfo(campid)
+    if _G.table.isEmptyOrNil(camp) then
+        return 0
+    end
+    local card = camp:GetAllCampCardsToRed()
+    if _G.table.isEmptyOrNil(card) then
+        return 0
+    end
+    if camp:GetCaoweiState(index) == _G.CampPosEnum.unlock then
+        return 0
+    elseif camp:GetCaoweiState(index) == _G.CampPosEnum.cardsid then
+        local temp = 0
+        local card_info = camp:GetCardCampTOUid(index)
+        temp = camp:CheckRedPointCamp(card_info.uid)
+        return temp
+    elseif camp:GetCaoweiState(index) == _G.CampPosEnum.add then
+        local allcards1 = camp:GetCampRenCardsToRed() or {}
+        if _G.table.isEmptyOrNil(allcards1) then
+            return 0
+        end
+        local allcards = {}
+        for k, va in pairs(allcards1) do
+            allcards[k] = va[1]
+        end
+        local card_lists = {}
+        for key, value in pairs(allcards) do
+            if value:GetCampPos() == 0 then
+                _G.table.insert(card_lists, value)
+            end
+        end
+        if _G.table.isEmptyOrNil(card_lists) then
+            return 0
+        end
+        if _G.table.isEmptyOrNil(camp.card_info) then
+            return 1
+        end
+        local card = card_lists[1]
+        for key, value in pairs(camp.card_info) do
+            if not _G.table.isEmptyOrNil(value) then
+                local tempcard = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, value.uid)
+                if tempcard.sid == card.sid then
+                    return 0
+                end
+            end
+        end
+    end
+    return 1
+end
+--endregin
+--region 对外接口 角色回退
+---角色回退 下阵卡牌
+---@param  i_card table
+---@field  cid number 营地id
+---@field  uid number 卡牌uid
+---@field  location number 位置
+function CampsiteModel:CardBakeCamp(card, call)
+    if not self:CheckFunction() then
+        return
+    end
+    local uid = card.uid
+    --local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+    local campid = card:GetCampId()
+    self.currentCampId = campid
+    if campid == 0 then
+        return
+    end
+    local star = card:GetStar()
+    local cfg = _G.ConfigManager.camp_cfg
+
+    if star < cfg[campid].star_condition then
+        return
+    end
+    local camp = self:GetCampInfo(campid)
+    local card_info = camp.card_info
+    if _G.table.isEmptyOrNil(card_info) then
+        return
+    end
+    local i_card = {}
+
+    for key, value in pairs(card_info) do
+        if not _G.table.isEmptyOrNil(value) then
+            if value.uid == uid then
+                i_card.uid = uid
+                i_card.location = value.location
+                i_card.cid = campid
+                break
+            end
+        end
+    end
+    if _G.table.isEmptyOrNil(i_card) then
+        return
+    end
+    local pbData = {
+        type = _G.CampBehaviorEnum.popCard,
+        be_info = {}
+    }
+    pbData.be_info = i_card
+    require("CampsiteNet"):GetInstance():AccessCampBehavior(
+        pbData,
+        _G.handlerbind(self, self.PopCardCampidSuc, camp, card, i_card.location, call)
+    )
+end
+function CampsiteModel:PopCardCampidSuc(data, campinfo, card, location, call)
+    if data.ack ~= 1 then
+        return
+    end
+    campinfo.kacaoinfo[location] = _G.CampPosEnum.add
+    campinfo.card_info[location] = {}
+    card:SetCampPos(0)
+    --计算属性
+    campinfo:AllCalCamp()
+    --刷新红点
+    --for i = 1, pos_num do
+    --    self:RefRedPoinCamp(campinfo.campid, i)
+    --end
+    if call then
+        call()
+    end
+end
+
+---卡牌回退红点刷新
+function CampsiteModel:RefRedPointForReset(card)
+    local camp = self:GetCampInfo(card:GetCampId())
+    for i = 1, pos_num do
+        self:RefRedPoinCamp(camp.campid, i)
+    end
+end
+
+---检测是否在营地
+---@param card CardData
+function CampsiteModel:CheckInCamp(card)
+    if not self:CheckFunction() then
+        return false
+    end
+    local uid = card.uid
+    --local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+    local campid = card:GetCampId()
+    if campid == 0 then
+        return false
+    end
+    local star = card:GetStar()
+    local cfg = _G.ConfigManager.camp_cfg
+
+    if star < cfg[campid].star_condition then
+        return false
+    end
+    local camp = self:GetCampInfo(campid)
+    local card_info = camp.card_info
+    if _G.table.isEmptyOrNil(card_info) then
+        return
+    end
+    for key, value in pairs(card_info) do
+        if not _G.table.isEmptyOrNil(value) then
+            if value.uid == uid then
+                return true
+            end
+        end
+    end
+    return false
+end
+---获取不同营地的星级
+---@field table<number,number>  k=五行，v=星级
+function CampsiteModel:GetAllStar()
+    local tb = {}
+    ---@type CampData[]
+    local camp = self:GetAllCamp()
+    for _, v in pairs(camp) do
+        tb[v.cfg.elements] = v:GetAllCardStar()
+    end
+    return tb
+end
+return CampsiteModel

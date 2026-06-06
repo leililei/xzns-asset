@@ -1,0 +1,194 @@
+-- 包路径:        Game.Story.Module.BaseStoryAction
+-- File Name:    BaseStoryAction.lua
+-- Description:    剧情行为基类
+-- Author:       TangHuan
+-- Create Date:    2020/02/26
+
+---Note:
+---子类所有加载的实体资源都要挂载StoryPlayController:GetInstance().StoryParentNode上
+---以免跳过剧情时无法正确删除剧情资源
+
+---@class BaseStoryAction @剧情行为基类
+---@field StoryStepOwner StoryStep @所属剧情步骤
+---@field public ActionID number @剧情步骤ID
+---@field public ActionType number @剧情步骤类型
+---@field public ActionData BaseActionData @对应行为类型的数据抽象(数据类型子类重定义方便Emmylua提示)
+---@field public PreloadResources string[] @预加载的资源名列表
+---@field public OnActionEnterCompleteCB function<BaseStoryAction> @行为进入完成回调
+---@field public OnActionExecuteCompleteCB function<BaseStoryAction> @行为执行完成回调(自定义Action需要在Excute完成后手动调用此方法)
+---@field protected DurationTimer Timer @行为持续时间Timer
+---@field protected IsExecuteComplete boolean @是否执行完成
+---@field protected No_Skip_Action number @ 1(跳过也必须执行)
+local BaseStoryAction = _G.BaseClass("BaseStoryAction")
+BaseStoryAction.StoryStepOwner = nil
+BaseStoryAction.ActionID = nil
+BaseStoryAction.ActionType = nil
+BaseStoryAction.ActionData = nil
+BaseStoryAction.PreloadResources = nil
+BaseStoryAction.OnActionEnterCompleteCB = nil
+BaseStoryAction.OnActionExecuteCompleteCB = nil
+BaseStoryAction.DurationTimer = nil
+BaseStoryAction.IsExecuteComplete = nil
+
+---BaseStoryAction的构造函数
+---@param storystepowner StoryStep @所属剧情步骤
+---@param storyactionid number @剧情行为ID
+function BaseStoryAction:__init(storystepowner, storyactionid)
+    self.StoryStepOwner = storystepowner
+    self.ActionID = storyactionid
+    ---@type story_action_cfg_Item
+    local storyactioncfg = _G.ConfigManager.story_action_cfg[storyactionid]
+    self.ActionType = storyactioncfg.ActionType
+    self.PreloadResources = storyactioncfg.PreloadResources
+    self.No_Skip_Action = storyactioncfg.No_Skip_Action or 0
+    self.OnActionEnterCompleteCB = nil
+    self.OnActionExitCompleteCB = nil
+    ---@type EStoryActionTypeSource
+    self.IsExecuteComplete = false
+
+    --- 需要使用遮罩的行为
+    self.ShadowActionDic = {
+        [_G.EStoryActionType.WorldItemPlayAnimation] = true
+    }
+    self:ParseData()
+end
+
+---解析数据
+function BaseStoryAction:ParseData()
+    self.ActionData = _G.StoryUtilities.CreateStoryActionData(self.ActionID)
+end
+
+---剧情动作进入[virtual](子类重写执行行为进入准备工作)
+---Note:
+---子类Enter执行完成后再调用BaseStoryAction.Enter(self)，预示着Enter状态结束
+function BaseStoryAction:Enter()
+    assert(self.OnActionEnterCompleteCB, "动作执行进入完成回调不能为空!")
+    self.OnActionEnterCompleteCB(self)
+end
+
+---剧情动作执行[virtual](子类重写执行具体行为)
+---Note:
+---子类执行后再再调用BaseStoryAction.Excute(self)，预示着行为结束判定执行结束
+---self.ActionData.WaitExecuteComplete的情况子类自行决定是否判定
+function BaseStoryAction:Excute()
+    --- 需要使用遮罩的行为
+
+    self.isShowShadowView = false
+    if self.ShadowActionDic[self.ActionType] == true then
+        self.isShowShadowView = true
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+    end
+
+    --是否需要采用持续时间去判定行为结束时机
+    if self.ActionData.WaitExecuteComplete == false then
+        if self.ActionData.DurationTime > 0 then
+            self.DurationTimer =
+                _G.TimerManager:GetInstance():GetTimer(
+                self.ActionData.DurationTime,
+                self.OnDurationTimeEnd,
+                self,
+                true,
+                false
+            )
+            self.DurationTimer:Start()
+        else
+            self:ActionExecuteCompleteCB()
+        end
+    else
+        -- 执行等待完成相关代码
+        self:DoWaitExecuteAction()
+    end
+end
+
+---执行等待完成行为的相关代码[virtual](子类执行等待执行完成的相关行为代码)
+---Note:
+---子类要支持WaitExecuteComplete == true的表现必须重写这个方法
+---请勿调用此父方法，此方法用于验证配置了WaitExecuteComplete == true
+---子类却没有重写支持时的打印提醒
+function BaseStoryAction:DoWaitExecuteAction()
+    if _G.AppSetting.DEBUG then
+        _G.LogError(string.format("剧情Action ID:%d ActionType:%d没有支持执行等待完成!", self.ActionID, self.ActionType))
+    end
+end
+
+---剧情动作退出[virtual](子类重写执行行为退出后的清理工作)
+---Note:
+---子类清理结束后再调用BaseStoryAction.Exit(self)，预示着行为结束清除数据
+function BaseStoryAction:Exit()
+    if self.DurationTimer ~= nil and self.DurationTimer:IsOver() then
+        self.DurationTimer:Stop()
+    end
+    if self.isShowShadowView == true then
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+    end
+    self:ResetData()
+end
+
+---跳过剧情行为播放
+function BaseStoryAction:Skip()
+    ---如果当前StoryAction未执行完成(self.IsExecuteComplete = false),支持子类按需重写DoMustDoForSkip重走部分流程
+    if self.IsExecuteComplete == false and self.No_Skip_Action == 1 then
+        self:DoMustDoForSkip()
+    end
+    --暂时默认跳过就是直接退出
+    self:Exit()
+end
+
+---跳过剧情行为必须做的部分[virtual](子类按需重写支持跳过按钮--e.g. 快速移动NPC到指定位置)
+---跳过不会走正常的执行流程(Enter() -> Execute() => Exit())
+---跳过直接走DoMustDoForSkip() -> Exit() || Exit()
+function BaseStoryAction:DoMustDoForSkip()
+end
+
+---响应剧情行为持续时间达到
+function BaseStoryAction:OnDurationTimeEnd()
+    _G.LogUtilities.Log(
+        _G.EModuleName.StoryModule,
+        string.format("剧情Action ID:%d的持续时间已到，强制停止行为!", self.ActionID, self.ActionData.DurationTime)
+    )
+    --持续时间抵达就强制标记为执行结束
+    self:ActionExecuteCompleteCB()
+end
+
+---剧情动作完成回调触发(子类动作执行完成后手动调用此方法)
+function BaseStoryAction:ActionExecuteCompleteCB()
+    assert(self.OnActionExecuteCompleteCB, "动作执行完成回调不能为空!")
+    _G.LogUtilities.LogError(_G.EModuleName.StoryModule, string.format("完成执行剧情Action ID:%d", self.ActionID))
+    if self.IsExecuteComplete == false then
+        self.IsExecuteComplete = true
+        self.OnActionExecuteCompleteCB(self)
+    else
+        --(string.format("剧情Action ID:%d已完成，无法重复完成!", self.ActionID))
+    end
+end
+
+function BaseStoryAction:Log(str, isLogErr)
+    if _G.AppSetting.DEBUG then
+        local str =
+            string.format(
+            tostring(str) .. " \nActionID:%s StepID:%s StoryID:%s",
+            self.ActionID,
+            self.StoryStepOwner.StepID,
+            self.StoryStepOwner.StoryOwner.StoryID
+        )
+        if isLogErr == true then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(str)
+            end
+        else
+            _G.LogUtilities.Log(_G.EModuleName.StoryModule, str)
+        end
+    end
+end
+---重置剧情行为播放数据[virtual](子类重写去重置行为播放数据)
+function BaseStoryAction:ResetData()
+    self.OnActionEnterCompleteCB = nil
+    self.OnActionExitCompleteCB = nil
+    self.DurationTimer = nil
+    self.IsExecuteComplete = false
+end
+
+---@type BaseStoryAction @剧情行为基类
+_G.BaseStoryAction = BaseStoryAction
+---@type BaseStoryAction @剧情行为基类
+return BaseStoryAction

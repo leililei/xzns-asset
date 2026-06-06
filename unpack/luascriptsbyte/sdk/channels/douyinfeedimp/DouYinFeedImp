@@ -1,0 +1,218 @@
+--local base = require("ChannelFuncBase")
+
+local json = _G.json
+---@type FastSpace.FastSDK
+local FastSDK = _G.CS.FastSpace.FastSDK
+
+---@class DouYinFeedImp    抖音小游戏推荐流直出 https://doc.youkia.net/docs/fast-sdk-ext-doc/fast-sdk-ext-doc-1grmmc2julote#8hzbzl
+---@field sdkManager SDKManager
+---@field info DouYinFeedInfo
+local DouYinFeedImp = {} --_G.BaseClass("ChannelImpDouYin", base)
+--local DouYinFeedImp =  require("DouYinFeedImp")
+
+--DouYinFeedImp:Invoke(function(info)
+--    _G.Log("Lua DouYinFeedImp:Invoke ok")
+--end)
+
+
+---@class DouYinFeedInfo
+---@field feed boolean 是否是推荐流直出场景
+---@field active boolean 是否激活了订阅
+
+---执行
+---@param callback fun(obj:DouYinFeedInfo) 执行完成回调
+function DouYinFeedImp:Invoke(callback)
+    self.sdkManager = _G.SDKManager:GetInstance()
+    --_G.LogError("Lua DouYinFeedImp:Invoke")
+    ---@type DouYinFeedInfo
+    self:GetLaunchFeedInfo(function(b, query)
+        --是否是推荐流直出场景
+        self.info = { feed = b }
+        self.info.query = query
+        if b then
+            self.info.active = true
+            callback(self.info)
+            --上报，这样抖音才知道游戏加载完成，才会刷游戏出来。
+            -- self:ReportScene(math.floor(_G.CS.UnityEngine.Time.realtimeSinceStartup * 1000))
+            --self:OffFeedStatusChange()
+            self:OnFeedStatusChange(function(b)
+                -- 补打点
+            end)
+        else
+            self:CheckFeedSubscribeStatus(function(ret, data)
+                --是否激活了订阅
+                if ret then
+                    self.info.active = data.status ~= nil and data.status or false
+                else
+                    self.info.active = false
+                end
+                callback(self.info)
+                -- --测试
+                --if not active then
+                --    self:RequestFeedSubscribe(function(b)
+                --        --测试
+                --        self:StoreFeedData(_G.CS.YoukiaCore.TimeKit.CurrentTimeMillis()+10000)
+                --    end)
+                --else
+                --    --测试
+                --    self:StoreFeedData(_G.CS.YoukiaCore.TimeKit.CurrentTimeMillis()+10000)
+                --end
+            end)
+        end
+    end)
+end
+
+---获取启动场景值是否为推荐流直出场景
+---@param callback fun(b:boolean, query:table)
+---@private
+function DouYinFeedImp:GetLaunchFeedInfo(callback)
+    local ok, result = pcall(function()
+       return FastSDK.ExtendFunc("getLaunchOptionsSync", nil)
+    end)
+
+    if ok and not _G.string.IsNullOrEmpty(result) then
+        local obj = json.decode(result)
+        self:OnGetLaunchFeedInfo(true, obj, callback)
+    else
+        if _G.AppSetting.DEBUG and not ok then
+            _G.LogError(result) 
+        end 
+    end
+end
+
+---@class DouYinLaunchOptions
+---@field scene string 启动场景值, 所有 scene 值可以在 场景值 中查看。以及 抖音开发工具IDE 中：普通编译-> 增加编译模式->进入场景，查看所有场景值
+
+---监听获取启动场景值是否为推荐流直出场景
+---@param b boolean
+---@param query table
+---@param info string|DouYinLaunchOptions
+---@param callback fun(b:boolean, query:table)
+---@private
+function DouYinFeedImp:OnGetLaunchFeedInfo(b, info, callback)
+    --_G.LogError("Lua DouYinFeedImp:OnGetLaunchFeedInfo", tostring(b) .. "," .. tostring(info))
+    if b then
+        local scene = info.scene
+        local query = info.query
+        if scene and string.sub(scene, -4) == "3041" then
+            callback(true, query)
+            return
+        end
+    end
+    callback(false)
+end
+
+---上报场景加载完成的耗时 https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/develop/api/javascript-api/data-analysis/tt-report-scene
+---@param costTime number 毫秒数 math.floor(_G.CS.UnityEngine.Time.realtimeSinceStartup * 1000)
+function DouYinFeedImp:ReportScene(costTime)
+    self.sdkManager:SendExtend("reportScene", nil, {
+        sceneId = 7001,
+        costTime = costTime
+    })
+end
+
+---请求推荐流直出订阅授权 https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/develop/api/javascript-api/open-capacity/feed-subscribe/request-feed-subscribe
+---@param callback fun(b:boolean)
+function DouYinFeedImp:RequestFeedSubscribe(callback)
+    local cData = _G.GameUtil.GetFunctionData(_G.FunctionBlock.content)
+    if _G.table.isEmptyOrNil(cData) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("DouYinFeedImp.RequestFeedSubscribe： function_block_cfg对应的content配置为空！")
+        end
+        return
+    end
+    self.sdkManager:SendExtend("requestFeedSubscribe", function(b, info)
+        --_G.LogError("Lua DouYinFeedImp:requestFeedSubscribe", tostring(b) .. "," .. tostring(info))
+        if b then
+            if not self.info then
+               self.info = { active = false } 
+            end
+            self.info.active = info.success or false
+        end
+        callback(b, info)
+    end, {
+        scene = _G.tonumber(cData[1]),
+        contentIDs = cData[2],
+        allScene = false,
+        type = "play"
+    })
+end
+
+---检查推荐流直出订阅授权 https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/develop/api/open-capacity/feed-subscribe/check-feed-subscribe-status
+---@param callback fun(b:boolean, info:table)
+---@private
+function DouYinFeedImp:CheckFeedSubscribeStatus(callback)
+    local cData = _G.GameUtil.GetFunctionData(_G.FunctionBlock.content)
+    if _G.table.isEmptyOrNil(cData) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("DouYinFeedImp.CheckFeedSubscribeStatus function_block_cfg对应的content配置为空！")
+        end
+        return
+    end
+    self.sdkManager:SendExtend("checkFeedSubscribeStatus", function(b, info)
+        --_G.LogError("Lua DouYinFeedImp:checkFeedSubscribeStatus", tostring(b) .. "," .. tostring(info))
+        callback(b, info)
+    end, {
+        scene = cData[1],
+        allScene = false,
+        type = "play"
+    })
+end
+
+---监听 Feed 流进入/退出小游戏事件。https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/develop/api/open-capacity/feed-subscribe/tt-feed-status-change
+---@param callback fun(b:boolean) b - true 进入；b - false 退出
+function DouYinFeedImp:OnFeedStatusChange(callback)
+    self.sdkManager:SendExtend("onFeedStatusChange", function(b, info)
+        --_G.LogError("Lua DouYinFeedImp:onFeedStatusChange", tostring(b) .. "," .. tostring(info))
+        if b then
+            local type = info.type
+            if type then
+                _G.Log("Lua DouYinFeedImp:onFeedStatusChange", type)
+                if type == "feedEnter" then
+                    --从 Feed 流进入小游戏
+                    callback(true)
+                elseif type == "feedExit" then
+                    --退出小游戏回到 Feed 流
+                    callback(false)
+                end
+            else
+                _G.LogError("Lua DouYinFeedImp:onFeedStatusChange error1", tostring(info))
+            end
+        else
+            _G.LogError("Lua DouYinFeedImp:onFeedStatusChange error2", tostring(info))
+        end
+    end)
+end
+
+---取消监听内外流切换事件
+function DouYinFeedImp:OffFeedStatusChange()
+    self.sdkManager:SendExtend("offFeedStatusChange")
+end
+
+---存储游戏是否直玩就绪状态 https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/develop/api/javascript-api/open-capacity/feed-subscribe/tt-store-feed-data
+---@param time number 离线奖励刷新时间点(ms)
+function DouYinFeedImp:StoreFeedData(time)
+    local cData = _G.GameUtil.GetFunctionData(_G.FunctionBlock.content)
+    if _G.table.isEmptyOrNil(cData) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("DouYinFeedImp.StoreFeedData： function_block_cfg对应的content配置为空！")
+        end
+        return
+    end
+    self.sdkManager:SendExtend("storeFeedData", function(b, info)
+        --_G.LogError("Lua DouYinFeedImp:storeFeedData", tostring(b) .. "," .. tostring(info))
+    end, {
+        scene = _G.tonumber(cData[1]),
+        contentID = cData[2],
+        leftValue = "timeStampMs",
+        operator = ">=",
+        rightValue = time,
+        status = 1
+    })
+end
+
+function DouYinFeedImp:Dispose()
+    self.info = nil
+end
+
+return DouYinFeedImp

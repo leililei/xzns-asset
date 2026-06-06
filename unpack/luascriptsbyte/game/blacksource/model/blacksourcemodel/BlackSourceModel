@@ -1,0 +1,594 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.BlackSource.Model.BlackSourceModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/08/26
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local BlackSourceNet = require "BlackSourceNet"
+---@class BlackSourceModel : GameDataModelBase
+local BlackSourceModel = _G.BaseClass("BlackSourceModel", _G.GameDataModelBase)
+---@return BlackSourceModel BlackSourceModel
+local settlementAllTime = _G.ConfigManager.discrete_cfg[108005][1][1]
+---@return BlackSourceModel
+function BlackSourceModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function BlackSourceModel:__init()
+    self.systemId = 209
+    self.curFunctionOpenID = 80
+    self.bossOrderArray = _G.ConfigManager.discrete_cfg[108002][1]
+    self.maxOrder = #self.bossOrderArray
+    self.curOrder = 0
+    self.RTS = 0
+end
+
+---销毁对象时,析构函数
+function BlackSourceModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+    end
+end
+
+--region 子类重写
+---从服务器拉取数据
+function BlackSourceModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---初始化功能逻辑
+function BlackSourceModel:InitFunction()
+end
+
+function BlackSourceModel:GetInfo()
+    BlackSourceNet:GetInstance():GetInfo(_G.handler(self, self.GetInfoCall))
+end
+
+---@param msg dark_boss.s2c_dark_boss_info
+function BlackSourceModel:GetInfoCall(msg)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.bossId = msg.dark_info.boss_id
+    self.maxFightNum = _G.ConfigManager.system_cfg[self.systemId].count_reset
+    self.fightNum = msg.dark_info.fight_num
+    self.dps = msg.dark_info.high_dps
+    self.bossCfg = _G.ConfigManager.guild_boss_cfg[self.bossId]
+    self.buy_times = msg.dark_info.buy_times
+    self.startTime = msg.boss_start_time
+    self:InitOrder()
+    self:InitTime()
+    self:ParseData()
+    --TODO 刷新红点
+    _G.Events:GetInstance():Broadcast(_G.eBlackSource.RefreshPanel)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Bossbattle.id)
+end
+
+---初始化时间
+function BlackSourceModel:InitTime()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.endTime = self.startTime + 48 * 3600
+    self.settlementTime = self.endTime - _G.ConfigManager.discrete_cfg[108005][1][1]
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    self.RTS = self.settlementTime - curTime
+    if self.RTS <= 0 then
+        self.RTS = self.endTime - curTime
+    end
+    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.ChangeRTS, self, false, false, true)
+    self.timer:Start()
+end
+---更改剩余时间
+function BlackSourceModel:ChangeRTS(elapsed)
+    self.RTS = self.RTS - elapsed
+    _G.Events:GetInstance():Broadcast(_G.eBlackSource.RefreshTime, self:TranslateSecond())
+    if self.RTS <= 0 then
+        if self.timer then
+            self.timer:Stop()
+            self.timer = nil
+        end
+        if _G.TimeUtil.GetServerUnixTime() < self.endTime then
+            local isHave = false
+            if _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.EmbattleView.Name) then
+                local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+                ctrl:QuitEmbattle()
+                isHave = true
+            end
+            if _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.EmbattleGrounpRecommendView.Name) then
+                _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.EmbattleGrounpRecommendView.Name)
+                isHave = true
+            end
+            if isHave then
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                    310402,
+                    _G.LangUtil.GetLangPackValue(90000010312, self:TranslateSecond())
+                )
+            end
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Bossbattle.id)
+            self:InitTime()
+        end
+    end
+end
+
+function BlackSourceModel:InitOrder()
+    for i = 1, #self.bossOrderArray do
+        if self.bossOrderArray[i] == self.bossId then
+            self.curOrder = i
+            break
+        end
+    end
+end
+
+---获取boss配置表
+function BlackSourceModel:GetBossCfg(id)
+    if not id then
+        return self.bossCfg
+    end
+    return _G.ConfigManager.guild_boss_cfg[id]
+end
+
+---挑战Boss
+---@param skipBattle boolean  @ 是否显示跳过战斗按钮
+function BlackSourceModel:OnFightBoss(id, index, skipBattle)
+    if self.bossId ~= id then
+        if id then
+            if id == _G.ConfigManager.discrete_cfg[108006][1][1] then
+                _G.PopWindowManager:GetInstance():ShowAllTips(310404)
+            else
+                local str = ""
+                if id < self.bossId then
+                    str =
+                        _G.LangUtil.GetLangPackValue(
+                        90000010314,
+                        self:TranslateSecond(
+                            self.RTS + _G.math.max(self.maxOrder - self.curOrder - 1 + index, 0) * 2 * 86400
+                        )
+                    )
+                else
+                    str =
+                        _G.LangUtil.GetLangPackValue(
+                        90000010314,
+                        self:TranslateSecond(self.RTS + _G.math.max(index - self.curOrder - 1, 0) * 2 * 86400)
+                    )
+                end
+                _G.PopWindowManager:GetInstance():ShowAllTips(310403, str)
+            end
+        end
+        return
+    end
+    if self:IsSettlement() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            310402,
+            _G.LangUtil.GetLangPackValue(90000010312, self:TranslateSecond())
+        )
+        return
+    end
+    local fight = function()
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        require "EmbattleController":GetInstance():OpenEmbattle(
+            _G.EmbattleType.BlackSource,
+            _G.EmbattleSaveType.server,
+            false,
+            _G.EmbattleControllerItemType.blackSource,
+            _G.handler(self, self.ExitEmbattle),
+            function(_, _, _skipBattle)
+                if _skipBattle then
+                    self:SkipFight()
+                else
+                    self:EnterFight()
+                end
+            end,
+            self.bossCfg.monster_group,
+            skipBattle
+        )
+    end
+
+    if self:GetFightNum() <= 0 then
+        local param = _G.ConfigManager.discrete_cfg[108001][1]
+        if _G.StorageManager:GetInstance():CheckItem(_G.ResPropID.Diamond, param[2]) then
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                310401,
+                _G.LangUtil.GetLangPackValue(90000010313, param[2]),
+                function()
+                    self:BuyTimes(fight)
+                end
+            )
+        else
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, _G.ResPropID.Diamond)
+        end
+
+        return
+    end
+    fight()
+end
+
+function BlackSourceModel:TranslateSecond(time1)
+    if not time1 then
+        time1 = self.RTS
+    end
+    time1 = math.ceil(time1)
+    local time = _G.TimeUtil.TranslateSecond(time1)
+    local str = ""
+    if time.day > 0 then
+        str = _G.LangUtil.GetLangPackValue(90028010120, time.day, time.hour, time.min)
+    elseif time.hour > 0 then
+        str = _G.LangUtil.GetLangPackValue(90028010121, time.hour, time.min)
+    else
+        str = _G.LangUtil.GetLangPackValue(90028010122, time.min, time.sec)
+    end
+    return str, time1
+end
+---进入战斗
+function BlackSourceModel:EnterFight()
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.BlackSource)
+end
+
+function BlackSourceModel:ExitEmbattle()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.BlackSourceView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+end
+
+---跳过战斗直接显示结算页面
+---@return void
+function BlackSourceModel:SkipFight()
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    --发起战斗结算
+    require("BlackSourceNet"):GetInstance():FightBoss(
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+            --计算战斗结果
+            _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+            local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+            if not record or not record.result then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+
+            ---@type BattleControllerFirstTestBoss
+            local controller = _G.require(_G.BattleControllerType.BlackSource).New()
+            controller.curFightState = 4 --设置战斗结束
+
+            _G.BattleManager:GetInstance():SetArgData(msg.fight_arg)
+            _G.BattleManager:GetInstance():SetStatisticsCached(record)
+            _G.BattleManager:GetInstance():SetBattleController(controller)
+            --显示结算界面
+            controller:FightResultFunc(record.result)
+        end
+    )
+end
+
+---监听界面打开
+---@param name string 界面名称
+function BlackSourceModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.BlackSourceView.Name)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+        if view then
+            view.go_table.aorbtn_clear:SetLocalPosition(50, 80, 0)
+        end
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    end
+end
+
+---获取排行榜奖励数据
+function BlackSourceModel:GetRankRewardData()
+    if not self.rewardDatas then
+        self.rewardDatas = {}
+        local array = _G.ConfigManager.discrete_cfg[108003][1]
+        local cfg
+        for _, v in pairs(array) do
+            cfg = _G.ConfigManager.system_rank_cfg[v]
+            if not self.rewardDatas[cfg.league] then
+                self.rewardDatas[cfg.league] = {}
+            end
+            _G.table.insert(self.rewardDatas[cfg.league], cfg)
+        end
+        for _, v in pairs(self.rewardDatas) do
+            _G.SortList(
+                v,
+                function(a)
+                    return -a.id
+                end
+            )
+        end
+    end
+    return self.rewardDatas
+end
+
+function BlackSourceModel:GetRank(call)
+    -- BlackSourceNet:GetInstance():GetRank(
+    --     function(msg)
+    --         if call then
+    --             call(msg)
+    --         end
+    --     end
+    -- )
+    require "LingRankNet":GetInstance():GetRankAllInfos({type = 60}, _G.handlerbind(self, self.GetRankCall1, call))
+end
+
+---获取排行榜回调
+---@param msg rank.s2c_rank_record_rank
+function BlackSourceModel:GetRankCall1(msg, callback)
+    self.rankList = msg.rankers or {}
+    require "DungonesModel":GetInstance().rank_all_player = {}
+    require "DungonesModel":GetInstance():SetRankAllPlayer(msg.rank, 60)
+    if callback then
+        callback(msg)
+    end
+end
+---获取玩家排行榜数据
+function BlackSourceModel:GetPlayerRank(call)
+    BlackSourceNet:GetInstance():GetPlayerRank(
+        function(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+function BlackSourceModel:PlayRecord(uid, call)
+    BlackSourceNet:GetInstance():PlayRecord(
+        {uid = uid},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:ParseRecordData(_G.BattleManager:GetInstance():GetStatisticsRecord(msg.data), msg.data)
+        end
+    )
+end
+
+---解析回放数据
+function BlackSourceModel:ParseRecordData(data, arg)
+    if not data then
+        _G.PopWindowManager:GetInstance():ShowAllTips(540302)
+        return
+    end
+    local battleData = self:ParseBattleData(data)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name,
+        battleData,
+        {0},
+        function()
+        end,
+        nil,
+        nil,
+        1,
+        true,
+        arg
+    )
+end
+---解析战斗数据
+function BlackSourceModel:ParseBattleData(data)
+    local statisticsData = {}
+    local statisticsMax = {}
+    local CombMax = {}
+    if data.FighterInfo ~= nil then
+        statisticsData = data.FighterInfo[1]
+        for i, v in ipairs(data.FighterInfo) do
+            if i > 1 then
+                _G.table.insertto(statisticsData.Attacker, v.Attacker)
+                _G.table.insertto(statisticsData.Defender, v.Defender)
+                _G.table.insertto(statisticsData.AtkCombineSkills[1], v.AtkCombineSkills[1])
+                _G.table.insertto(statisticsData.DefCombineSkills[1], v.DefCombineSkills[1])
+            end
+        end
+    end
+    statisticsMax = {DmgOut = 1, DmgIn = 1, HpRecover = 1, CreateGuard = 1}
+    for i = 1, #statisticsData.Attacker do
+        if statisticsMax.DmgOut < statisticsData.Attacker[i].DmgOut then
+            statisticsMax.DmgOut = statisticsData.Attacker[i].DmgOut
+        end
+
+        if statisticsMax.DmgIn < statisticsData.Attacker[i].DmgIn then
+            statisticsMax.DmgIn = statisticsData.Attacker[i].DmgIn
+        end
+
+        if statisticsMax.HpRecover < statisticsData.Attacker[i].HpRecover then
+            statisticsMax.HpRecover = statisticsData.Attacker[i].HpRecover
+        end
+        if statisticsMax.CreateGuard < statisticsData.Attacker[i].CreateGuard then
+            statisticsMax.CreateGuard = statisticsData.Attacker[i].CreateGuard
+        end
+    end
+    for i = 1, #statisticsData.Defender do
+        if statisticsMax.DmgOut < statisticsData.Defender[i].DmgOut then
+            statisticsMax.DmgOut = statisticsData.Defender[i].DmgOut
+        end
+
+        if statisticsMax.DmgIn < statisticsData.Defender[i].DmgIn then
+            statisticsMax.DmgIn = statisticsData.Defender[i].DmgIn
+        end
+
+        if statisticsMax.HpRecover < statisticsData.Defender[i].HpRecover then
+            statisticsMax.HpRecover = statisticsData.Defender[i].HpRecover
+        end
+        if statisticsMax.CreateGuard < statisticsData.Defender[i].CreateGuard then
+            statisticsMax.CreateGuard = statisticsData.Defender[i].CreateGuard
+        end
+    end
+    CombMax = {DmgOut = 1, CreateGuard = 1, HpRecover = 1}
+    for i = 1, #statisticsData.AtkCombineSkills[1] do
+        if CombMax.DmgOut < statisticsData.AtkCombineSkills[1][i].DmgOut then
+            CombMax.DmgOut = statisticsData.AtkCombineSkills[1][i].DmgOut
+        end
+
+        if CombMax.CreateGuard < statisticsData.AtkCombineSkills[1][i].CreateGuard then
+            CombMax.CreateGuard = statisticsData.AtkCombineSkills[1][i].CreateGuard
+        end
+
+        if CombMax.HpRecover < statisticsData.AtkCombineSkills[1][i].HpRecover then
+            CombMax.HpRecover = statisticsData.AtkCombineSkills[1][i].HpRecover
+        end
+    end
+    for i = 1, #statisticsData.DefCombineSkills[1] do
+        if CombMax.DmgOut < statisticsData.DefCombineSkills[1][i].DmgOut then
+            CombMax.DmgOut = statisticsData.DefCombineSkills[1][i].DmgOut
+        end
+
+        if CombMax.CreateGuard < statisticsData.DefCombineSkills[1][i].CreateGuard then
+            CombMax.CreateGuard = statisticsData.DefCombineSkills[1][i].CreateGuard
+        end
+
+        if CombMax.HpRecover < statisticsData.DefCombineSkills[1][i].HpRecover then
+            CombMax.HpRecover = statisticsData.DefCombineSkills[1][i].HpRecover
+        end
+    end
+    local PetMax = {DmgOut = 1, CreateGuard = 1, HpRecover = 1}
+    for j = 1, #statisticsData.AtkPetSkills[1] do
+        if PetMax.DmgOut < statisticsData.AtkPetSkills[1][j].DmgOut then
+            PetMax.DmgOut = statisticsData.AtkPetSkills[1][j].DmgOut
+        end
+
+        if PetMax.CreateGuard < statisticsData.AtkPetSkills[1][j].CreateGuard then
+            PetMax.CreateGuard = statisticsData.AtkPetSkills[1][j].CreateGuard
+        end
+
+        if PetMax.HpRecover < statisticsData.AtkPetSkills[1][j].HpRecover then
+            PetMax.HpRecover = statisticsData.AtkPetSkills[1][j].HpRecover
+        end
+    end
+    for j = 1, #statisticsData.DefPetSkills[1] do
+        if PetMax.DmgOut < statisticsData.DefPetSkills[1][j].DmgOut then
+            PetMax.DmgOut = statisticsData.DefPetSkills[1][j].DmgOut
+        end
+
+        if PetMax.CreateGuard < statisticsData.DefPetSkills[1][j].CreateGuard then
+            PetMax.CreateGuard = statisticsData.DefPetSkills[1][j].CreateGuard
+        end
+
+        if PetMax.HpRecover < statisticsData.DefPetSkills[1][j].HpRecover then
+            PetMax.HpRecover = statisticsData.DefPetSkills[1][j].HpRecover
+        end
+    end
+    local tb = {}
+    _G.table.insert(
+        tb,
+        {statisticsData = statisticsData, statisticsMax = statisticsMax, CombMax = CombMax, PetMax = PetMax}
+    )
+    return tb
+end
+
+--region 获取info信息
+---获取最高伤害
+function BlackSourceModel:GetDamage()
+    return self.dps or 0
+end
+---获取挑战次数
+function BlackSourceModel:GetFightNum()
+    return self.maxFightNum + self.buy_times - self.fightNum
+end
+---获取当前boss id
+function BlackSourceModel:GetCurBossId()
+    return self.bossId
+end
+---获取下轮bossId
+function BlackSourceModel:GetNextBossId()
+    return self.curOrder + 1 > #self.bossOrderArray and self.bossOrderArray[1] or self.bossOrderArray[self.curOrder + 1]
+end
+---获取bossId
+function BlackSourceModel:GetBossId(index)
+    return self.bossOrderArray[index] and self.bossOrderArray[index] or _G.ConfigManager.discrete_cfg[108006][1][1]
+end
+---获取剩余时间
+function BlackSourceModel:GetRTS()
+    return self.RTS
+end
+
+--endregion
+---打开战报界面
+function BlackSourceModel:OpenBlackSourceReportPanel()
+    BlackSourceNet:GetInstance():GetReport(
+        function(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.BlackSourceReportPanel.Name, msg)
+        end
+    )
+end
+---更新界面
+function BlackSourceModel:ReturnPanel(isWin)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.BlackSourceView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+    if isWin then
+        local monsterCfg = _G.ConfigManager.monster_cfg[self.bossCfg.monster]
+        local type = _G.FightBossWinType.BlackSource_Feng + self.bossCfg.id - 11
+        _G.GlobalInterface.OpenFightBossWinView(
+            type,
+            nil,
+            nil,
+            _G.ConfigManager.card_cfg[monsterCfg.CardID].Portrait,
+            _G.GetLangPackValue(monsterCfg.Name),
+            _G.ZoneRankType.BlackSource,
+                nil,
+            monsterCfg.CardID
+        )
+    end
+end
+
+function BlackSourceModel:ReEnterFight()
+    self:OnFightBoss(self.bossId)
+end
+
+function BlackSourceModel:FightEnd()
+    self:SaveFist()
+    require "BlackSourceModel":GetInstance():InitData()
+end
+---书否在结算中
+function BlackSourceModel:IsSettlement()
+    return self.RTS <= settlementAllTime
+end
+
+function BlackSourceModel:CheckRedPoint()
+    if not self.bossId then
+        return false
+    end
+    if self:GetFightNum() >= self.maxFightNum then
+        return true
+    --else
+    --    if _G.PlayerPrefsManager.HasKey("BlackSourceFirst") then
+    --        return _G.PlayerPrefsManager.GetInt("BlackSourceFirst") ~= self:GetTime()
+    --    else
+    --        return true
+    --    end
+    end
+    return false
+end
+
+function BlackSourceModel:GetTime()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local data = _G.TimeUtil.GetDateTime(time)
+    if data.hour < _G.TimeUtil.GAME_DAY_HOUR then
+        return _G.TimeUtil.GetDayBegin(time - _G.TimeUtil.GAME_DAY_TIME) + _G.TimeUtil.GAME_DAY_TIME
+    else
+        return _G.TimeUtil.GetDayBegin(time) + _G.TimeUtil.GAME_DAY_TIME
+    end
+end
+---保存当天首次进入界面记录
+function BlackSourceModel:SaveFist()
+    _G.PlayerPrefsManager.SetInt("BlackSourceFirst", self:GetTime())
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Bossbattle.id)
+end
+---购买次数
+function BlackSourceModel:BuyTimes(call)
+    BlackSourceNet:GetInstance():BuyTimes(
+        function()
+            local param = _G.ConfigManager.discrete_cfg[108001][1]
+            self.buy_times = param[1]
+            _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, nil, param[2])
+            _G.Events:GetInstance():Broadcast(_G.eBlackSource.RefreshFightTimes)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Bossbattle.id)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+return BlackSourceModel

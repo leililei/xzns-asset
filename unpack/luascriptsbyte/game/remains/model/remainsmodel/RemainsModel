@@ -1,0 +1,785 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Spoils.Model.RemainsModel	(修改路径必须修正此项!)
+-- Created by
+-- DateTime:
+-- Description: 遗物模块
+-----------------------------------------------------------------------
+local RemainsNet = require("RemainsNet")
+local RemainsData = require("RemainsData")
+
+local base = _G.GameDataModelBase
+---@class RemainsModel : GameDataModelBase
+---@field RemainsDatas RemainsData[]
+local RemainsModel = _G.BaseClass("RemainsModel", base)
+
+---@return RemainsModel RemainsModel
+function RemainsModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function RemainsModel:__init()
+    local EventsIns = _G.Events:GetInstance()
+    local net_map = _G.ConfigManager.net_map
+    self.curFunctionOpenID = _G.FunctionID.Remains
+    self.cfg = _G.ConfigManager.remains_cfg
+    self.suitCfg = _G.ConfigManager.remains_fetter_cfg
+    self.fetters = {}
+    self.RemainsDatas = {}
+    for sid, v in pairs(self.cfg) do
+        if v.id > 0 and v.isdisplay == 1 then
+            local sp = RemainsData.New()
+            sp:InitCfg(v.id)
+            self.RemainsDatas[v.id] = sp
+        end
+    end
+    EventsIns:AddListener(net_map.game_remains_task_curr.Cmd, self.OnTaskCurCall, self)
+
+    self.DebrisList = {}
+    for _, v in pairs(_G.ConfigManager.item_cfg) do
+        if v.Type1 == _G.ItemCfgType.Remains then
+            self.DebrisList[v.ID] = v
+        end
+    end
+end
+
+---从服务器拉取数据
+function RemainsModel:GetDataFormServer()
+    RemainsNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+--- 接收推送
+function RemainsModel:OnTaskCurCall(msg)
+    for k, v in pairs(msg.task_curr) do
+        local sid = v.key
+        local taskcur = v.value
+        local data = self:GetData(sid)
+        data:SetTaskCurStr(taskcur)
+        if k == table.count(msg.task_curr) then
+            self.attribute = nil
+            self.attribute2 = nil
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Remains)
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.RemainsLevel)
+            _G.Events:GetInstance():Broadcast(_G.eRemainsUpdate.RemainsUpdate)
+        end
+    end
+end
+
+function RemainsModel:ParseData(msg)
+    local list = msg.remains_list or {}
+    for i = 1, #list do
+        ---@type RemainsData
+        local sp = self.RemainsDatas[list[i].sid]
+        if sp then
+            sp:Parse(list[i])
+        end
+    end
+    local suitList = msg.suit_list or {}
+    -- for i = 1, #suitList do
+    --     local spsuit = self.RemainsSuitDatas[suitList[i].suit_sid]
+    --     if spsuit then
+    --         spsuit.cards = suitList[i].cards or {}
+    --     end
+    -- end
+
+    local fetters = msg.suit_list or {}
+    self.fetters = {}
+    for _, v in pairs(fetters) do
+        self.fetters[v.suit_sid] = v.index
+    end
+
+    self.attribute = nil
+    self.attribute2 = nil
+    self.attribute3 = nil
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Remains)
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.RemainsLevel)
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.RemainsFetter)
+
+    _G.Events:GetInstance():Broadcast(_G.eRemainsUpdate.RemainsInit)
+
+    self.super.ParseData(self)
+end
+
+---获取所有的碎片配置
+function RemainsModel:GetDebrisCfgs()
+    return self.DebrisList
+end
+
+---获取羁绊阶段
+---@param sid number 羁绊sid
+function RemainsModel:GetFetterIndex(sid)
+    return self.fetters[sid] or 0
+end
+
+---@param sidNumLis table 碎片数组{{sid = 1, num = 1},..}
+function RemainsModel:DebrisDecompose(sidNumLis, call)
+    local pbData = {
+        fragment_list = sidNumLis
+    }
+    RemainsNet:GetInstance():Decompose(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        for _, v in pairs(sidNumLis) do
+            _G.StorageManager:GetInstance():ConsumeItem(v.key, nil, v.value)
+        end
+        _G.Events:GetInstance():Broadcast(_G.eBuildDecompose.BuildDecomposeRefresh)
+        if call then
+            call(msg)
+        end
+    end)
+end
+
+---调用立即自动分解
+function RemainsModel:AutoDecompose(callback, msg)
+    -- --只处理紫丶橙丶红三种品质
+    -- local gradeList = _G.ConfigManager.discrete_cfg[126610]
+    -- if not gradeList then
+    --         callback(msg)
+    --     end
+    --     return
+    -- end
+
+    local DebrisList = {}
+    for _, remainData in pairs(self:GetAllDatas()) do
+        -- 已合成且满星的灵兽, 才进行分解
+        if remainData:IsMaxStar() then
+            local data = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Prop,
+                remainData.cfg.materials_item)
+            if not table.isEmptyOrNil(data) then
+                table.insert(DebrisList, {
+                    sid = remainData.cfg.materials_item,
+                    num = data.count
+                })
+            end
+        end
+    end
+
+    if #DebrisList > 0 then
+        self:DebrisDecompose(DebrisList, function(msg)
+            if not msg or msg.ack ~= 1 then
+                if callback then
+                    callback(msg)
+                end
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            -- 对应材料id
+            local gradeCfg = _G.ConfigManager.discrete_cfg[306005]
+            if gradeCfg and gradeCfg[1] then
+                local firstGradeCfg = _G.ConfigManager.discrete_cfg[gradeCfg[1][2]]
+                local itemId = firstGradeCfg[1][1]
+                local itemNum = 0
+                if msg.award and msg.award.item then
+                    for _, v in ipairs(msg.award.item) do
+                        if v.type[1] == itemId then
+                            itemNum = itemNum + v.type[2]
+                        end
+                    end
+                end
+                if itemNum > 0 then
+                    -- 显示分解tip
+                    _G.PopWindowManager:GetInstance():ShowAllTips(1110201, nil, nil, nil, nil, nil, itemNum)
+                end
+            end
+        end)
+    else
+        if callback then
+            callback(msg)
+        end
+    end
+end
+
+---是否展示分解按钮
+---@return number
+function RemainsModel:IsDecomposeBtn()
+    for _, v in pairs(self.RemainsDatas) do
+        local chipID = v.cfg.reward[1][1]
+        -- local number = _G.StorageManager:GetInstance():GetItemCountBySid(chipID)
+        if v:GetStar() >= v.cfg.degrade_star then
+            return 1
+        end
+    end
+    return 0
+end
+
+---是否自动分解
+---@return boolean
+function RemainsModel:IsAutoDecompose()
+    return _G.PlayerPrefsManager.GetInt("AutoRemainsDecompose", 0) == 1
+end
+
+---设置自动分解
+---@param isOn boolean
+function RemainsModel:SetAutoDecompose(isOn)
+    _G.PlayerPrefsManager.SetInt("AutoRemainsDecompose", isOn and 1 or 0)
+end
+
+---获取羁绊所有属性的描述
+function RemainsModel:GetFettersDic()
+    local dic = {}
+    for k, v in pairs(self.fetters) do
+        local cfg = self.suitCfg[k].att[v]
+        local isNotHave = true
+        for i = 1, #dic do
+            if dic[i].name == _G.AttrType[cfg[2]].des and dic[i].percentage == cfg[3] then
+                dic[i].value = dic[i].value + cfg[4]
+                isNotHave = false
+                break
+            end
+
+        end
+        if isNotHave then
+            _G.table.insert(dic, {
+                ID = _G.AttrType[cfg[2]].ID,
+                name = _G.AttrType[cfg[2]].des,
+                value = cfg[4],
+                icon = _G.AttrTypeIcon[cfg[2]],
+                percentage = cfg[3],
+                proptype = _G.AttrType[cfg[2]].proptype
+            })
+        end
+    end
+    return dic
+end
+
+---获取当前羁绊内可激活的最高阶段
+function RemainsModel:GetActiveMaxIndex(sid)
+    local curIndex = self:GetFetterIndex(sid)
+    if curIndex >= 5 then
+        return
+    end
+
+    local fetterCfg = _G.ConfigManager.remains_fetter_cfg[sid]
+    local maxIndex = nil
+    for i = curIndex ~= 0 and curIndex or 1, 5 do
+        if self:CanActiveFetter(fetterCfg.remains, tonumber(fetterCfg.att[i][1])) then
+            maxIndex = i
+        end
+    end
+
+    return maxIndex
+end
+
+--- 有没有可激活图鉴
+function RemainsModel:CheckCanActiveFetter()
+    self.fetterConfigs = {}
+    local fetterCfg = _G.ConfigManager.remains_fetter_cfg
+    for _, v in pairs(fetterCfg) do
+        if v.isdisplay == 1 then
+            table.insert(self.fetterConfigs, v)
+        end
+    end
+    for _, v in pairs(self.fetterConfigs) do
+        local nowIndex = self:GetFetterIndex(v.id)
+        if nowIndex < 5 then
+            if self:CanActiveFetter(v.remains, tonumber(v.att[nowIndex + 1][1])) then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---当前羁绊是否可升级
+function RemainsModel:CanActiveFetter(remains, star)
+    for _, id in pairs(remains) do
+        local data = self:GetData(id)
+        if not data:GetIsActive() then
+            return false
+        end
+
+        if data:GetStar() < star then
+            return false
+        end
+    end
+    return true
+end
+
+---当前羁绊激活数量
+function RemainsModel:ActiveFetterNum(remains)
+    local num = 0
+    for _, id in pairs(remains) do
+        local data = self:GetData(id)
+        if data:GetIsActive() then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+---激活羁绊
+---@param sid number 羁绊sid
+---@param index number 羁绊阶段
+function RemainsModel:FetterActive(sid, index, call)
+    local pbData = {
+        suit_sid = sid,
+        index = index
+    }
+    RemainsNet:GetInstance():FetterActive(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.attribute3 = nil
+        self.fetters[sid] = index
+        -- _G.Events:GetInstance():Broadcast(_G.eBuildUpFetter.BuildUpFetterRefresh)
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.RemainsFetter)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryRelicSetUp.id)
+        if call then
+            call()
+        end
+    end)
+end
+
+--- 升星
+function RemainsModel:UpStar(sid, star, call)
+    local pbData = {
+        sid = sid,
+        new_star = star
+    }
+    RemainsNet:GetInstance():UpStar(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.attribute = nil
+        self.attribute2 = nil
+        self.RemainsDatas[sid]:UpStar(star)
+
+        local cfg = _G.ConfigManager.remains_cfg[sid]
+
+        _G.StorageManager:GetInstance():ConsumeItem(cfg.materials[star + 1][1], 0, cfg.materials[star + 1][2] or 0)
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Remains)
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.RemainsLevel)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryRelicLevelUp.id)
+        _G.Events:GetInstance():Broadcast(_G.eRemainsUpdate.RemainsUpdate)
+        if call then
+            call()
+        end
+    end)
+end
+
+--- 升级
+function RemainsModel:UpLevel(sid, level, call)
+    local pbData = {
+        sid = sid,
+        new_level = level
+    }
+    RemainsNet:GetInstance():UpLevel(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.attribute2 = nil
+        local cfg1, cfg2 = self.RemainsDatas[sid]:LevelUpMaterial(nil, level)
+        for k, v in pairs(cfg1) do
+            _G.StorageManager:GetInstance():ConsumeItem(v[1], 0, v[2] - cfg2[k][2] or 0)
+        end
+        self.RemainsDatas[sid]:UpLevel(level)
+        self.attribute2 = nil
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryRelicStarUp.id)
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.RemainsLevel)
+        _G.Events:GetInstance():Broadcast(_G.eRemainsUpdate.RemainsUpdate)
+
+        if call then
+            call()
+        end
+    end)
+end
+
+--- 激活
+function RemainsModel:ActiveSelf(sid, call)
+    local cfg = _G.ConfigManager.remains_cfg[sid]
+    local pbData = {
+        sid = sid,
+        consume_num = cfg.materials[1][2]
+    }
+    RemainsNet:GetInstance():ActiveSelf(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.attribute = nil
+        self.attribute2 = nil
+        self.RemainsDatas[sid]:DoActive()
+        _G.StorageManager:GetInstance():ConsumeItem(cfg.materials[1][1], 0, cfg.materials[1][2] or 0)
+        _G.Events:GetInstance():Broadcast(_G.eRemainsUpdate.RemainsUpdate)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryRelicLevelUp.id, sid)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryRelicStarUp.id)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryRelicSetUp.id)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryTenPull.id)
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Remains)
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.RemainsLevel)
+        if call then
+            call()
+        end
+    end)
+end
+
+---获取数据
+---@return RemainsData
+function RemainsModel:GetData(sid)
+    local sp = self.RemainsDatas[sid]
+    if nil == sp then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(sid, "不存在对应的遗物")
+        end
+        for sid, _ in pairs(_G.ConfigManager.remains_cfg) do
+            sp = RemainsData.New()
+            sp:InitCfg(sid)
+            break
+        end
+    end
+    return sp
+end
+
+---获取所有数据
+---@return RemainsData[]
+function RemainsModel:GetAllDatas()
+    return self.RemainsDatas
+end
+
+--- 获取品质总数量
+function RemainsModel:GetAllDatasByGrade(grade, isActive)
+    local index = 0
+    for k, v in pairs(self.RemainsDatas) do
+        if v.cfg.grade == grade then
+            if isActive then
+                if v:GetIsActive() then
+                    index = index + 1
+                end
+            else
+                index = index + 1
+            end
+        end
+    end
+
+    return index
+end
+
+---主界面列表所有展示数据【包含占位符】
+---type == 2 可升星 type == 3 可升级
+---@return RemainsData[]
+function RemainsModel:GetAllDatasShowList(type)
+    local data = self.RemainsDatas
+    local SuitDatas = {}
+    --- 先把标题栏都设为false 如果对应品质有数据再打开
+    local titleArgs = {
+        [4] = false,
+        [5] = false,
+        [6] = false,
+        [8] = false
+    }
+
+    ---这里存的是该品质道具是否有数据，如果为false，后续要移除标题栏
+    local ItemHave = {
+        [4] = false,
+        [5] = false,
+        [6] = false,
+        [8] = false
+    }
+
+    --- 可升星
+    local isNeedCanStarUp = false
+    --- 可升级
+    local isNeedCanLevelUp = false
+
+    if type == 2 then
+        isNeedCanStarUp = true
+    elseif type == 3 then
+        isNeedCanLevelUp = true
+    end
+
+    local list = {}
+
+    for k, v in pairs(data) do
+        table.insert(list, v)
+    end
+
+    table.sort(list, function(a, b)
+        if a.cfg.grade == b.cfg.grade then
+            return a.cfg.order > b.cfg.order
+        else
+            return a.cfg.grade > b.cfg.grade
+
+        end
+    end)
+    --- 每四个为一组 用来存储的临时数组
+    local linshi = {}
+    --- 总长度
+    local index = 0
+    local maxIndex = table.count(list)
+    for _, v in pairs(list) do
+        index = index + 1
+        --- 当titleArgs为false时 说明此标题没有被放入数组
+        if titleArgs[v.cfg.grade] == false then
+            titleArgs[v.cfg.grade] = true
+            --- 此时先判断linshi里面有没有东西 有就放进去
+            if table.count(linshi) > 3 then
+                table.insert(SuitDatas, linshi)
+                linshi = {}
+            end
+            linshi.order = v.cfg.order
+            linshi.type = 1
+            linshi.grade = v.cfg.grade
+            --- 把标题栏放进去占位
+            table.insert(SuitDatas, linshi)
+            linshi = {}
+
+        end
+
+        --- 如果临时里面有4个格子了，先放进去，再清空
+        if table.count(linshi) >= 7 then
+            table.insert(SuitDatas, linshi)
+            linshi = {}
+            linshi.order = v.cfg.order
+            linshi.type = 2
+            linshi.grade = v.cfg.grade
+            if type == 1 or (isNeedCanStarUp and (v:IsCanStarUp() or v:IsCanActive())) or
+                (isNeedCanLevelUp and v:IsCanLevelUp()) then
+                table.insert(linshi, {
+                    type = 2,
+                    sid = v.cfg.id,
+                    order = v.cfg.order,
+                    grade = v.cfg.grade
+                })
+            end
+            if index == maxIndex and table.count(linshi) >= 4 then
+                table.insert(SuitDatas, linshi)
+            end
+        else
+            linshi.order = v.cfg.order
+            linshi.type = 2
+            linshi.grade = v.cfg.grade
+            if type == 1 or (isNeedCanStarUp and (v:IsCanStarUp() or v:IsCanActive())) or
+                (isNeedCanLevelUp and v:IsCanLevelUp()) then
+                table.insert(linshi, {
+                    type = 2,
+                    sid = v.cfg.id,
+                    order = v.cfg.order,
+                    grade = v.cfg.grade
+                })
+            end
+            if index == maxIndex and table.count(linshi) >= 4 then
+                table.insert(SuitDatas, linshi)
+            end
+        end
+    end
+
+    local endData = {}
+    for i = 1, #SuitDatas do
+        if SuitDatas[i].type == 2 then
+            ItemHave[SuitDatas[i].grade] = true
+        end
+    end
+
+    for i = 1, #SuitDatas do
+        if SuitDatas[i].type == 1 and ItemHave[SuitDatas[i].grade] then
+            table.insert(endData, SuitDatas[i])
+        elseif SuitDatas[i].type == 2 then
+            table.insert(endData, SuitDatas[i])
+        end
+    end
+
+    return endData
+end
+
+--- 有没有可激活或者可升星的
+function RemainsModel:CheckCanActiveOrStarUp()
+    if _G.table.isEmptyOrNil(self.RemainsDatas) then
+        return 0
+    end
+    for _, v in pairs(self.RemainsDatas) do
+        if v:IsCanStarUp() or v:IsCanActive() then
+            return 1
+        end
+    end
+    return 0
+end
+
+--- 有没有可升级的
+function RemainsModel:CheckCanLevelUp()
+    if _G.table.isEmptyOrNil(self.RemainsDatas) then
+        return 0
+    end
+    for _, v in pairs(self.RemainsDatas) do
+        if v:IsCanLevelUp() then
+            return 1
+        end
+    end
+    return 0
+end
+
+--- 获取可升级的数量
+function RemainsModel:GetCanLevelUpAll(grade)
+    if _G.table.isEmptyOrNil(self.RemainsDatas) then
+        return 0
+    end
+    local num = 0
+    for _, v in pairs(self.RemainsDatas) do
+        if v:IsCanLevelUp() and v:GetOrder() == grade then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+--- 获取可升星的数量
+function RemainsModel:GetCanStarUpAll(grade)
+    if _G.table.isEmptyOrNil(self.RemainsDatas) then
+        return 0
+    end
+    local num = 0
+    for _, v in pairs(self.RemainsDatas) do
+        if (v:IsCanStarUp() or v:IsCanActive()) and v:GetOrder() == grade then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+---获取所有固定值加成
+function RemainsModel:GetAllOtherProp()
+    local allProp = {
+        atk = 0,
+        bre = 0,
+        def = 0,
+        max_hp = 0
+    }
+    local prop
+    for _, spData in pairs(self.RemainsDatas) do
+        prop = spData:GetAttributeDict()
+        for k, v in pairs(allProp) do
+            allProp[k] = allProp[k] + prop[k]
+        end
+    end
+    return allProp
+end
+
+---基础属性(不计算被动)
+function RemainsModel:GetAllAttribute()
+    if self.attribute ~= nil then
+        return self.attribute, self.changeAttrTypes
+    end
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    for _, v in pairs(self.cfg) do
+        if v.isdisplay == 1 then
+            local attr = v.att1
+            local data = self.RemainsDatas[v.id]
+            local rateNum = v.rate[data:GetStar() ~= 0 and data:GetStar() + 1 or 1] or 10000
+            local rate = rateNum / 10000
+            if data:GetIsActive() then
+                attribute = self:UpdateAttribute(AttributeClassManager, attribute, attr, rate)
+            end
+        end
+    end
+    local changeAttrTypes = AttributeClassManager:GetChangeAttrTypes(attribute)
+    self.attribute = attribute
+    self.changeAttrTypes = changeAttrTypes
+    return attribute, changeAttrTypes
+end
+
+---被动属性(不计算基础属性)
+function RemainsModel:GetAllAttribute2()
+    if self.attribute2 ~= nil then
+        return self.attribute2, self.changeAttrTypes2
+    end
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    for _, v in pairs(self.cfg) do
+        if v.isdisplay == 1 then
+            local attr = v.att2
+            local data = self.RemainsDatas[v.id]
+            local rateNum = v.rate[data:GetStar() ~= 0 and data:GetStar() + 1 or 1] or 10000
+            local rate = rateNum / 10000
+            local rate2 = data:GetLevelCfg().rate / 10000
+            local rate3 = data:GetTaskCur()
+            if data:GetIsActive() then
+                attribute = self:UpdateAttribute(AttributeClassManager, attribute, attr, rate * rate2 * rate3)
+            end
+        end
+    end
+    local changeAttrTypes = AttributeClassManager:GetChangeAttrTypes(attribute)
+    self.attribute2 = attribute
+    self.changeAttrTypes2 = changeAttrTypes
+    return attribute, changeAttrTypes
+end
+
+---图鉴的属性
+function RemainsModel:GeFetterAttribute()
+    if self.attribute3 ~= nil then
+        return self.attribute3, self.changeAttrTypes3
+    end
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    for _, v in pairs(_G.ConfigManager.remains_fetter_cfg) do
+        if v.isdisplay == 1 then
+            local index = self.fetters[v.id]
+            if index and index > 0 then
+                local args = {{v.att[index][2], v.att[index][3], v.att[index][4]}}
+                attribute = self:UpdateAttributeFetter(AttributeClassManager, attribute, args)
+            end
+        end
+    end
+
+    local changeAttrTypes = AttributeClassManager:GetChangeAttrTypes(attribute)
+    self.attribute3 = attribute
+    self.changeAttrTypes3 = changeAttrTypes
+    return attribute, changeAttrTypes
+end
+
+--- 基础和被动属性参与星级和等级的万分比计算
+function RemainsModel:UpdateAttribute(attributeManager, attribute, attData, rate)
+    for _, v in pairs(attData) do
+        local type = v[2] == "2" and _G.AttCountType.basePercent or _G.AttCountType.other
+        attribute:AddValueByName(v[1], attributeManager:GetValueWithName(v[1], tonumber(v[3]) * rate, v[2]), false, type)
+    end
+    return attribute
+end
+
+--- 羁绊属性不参与星级和等级的万分比计算
+function RemainsModel:UpdateAttributeFetter(attributeManager, attribute, attData, rate)
+    for _, v in pairs(attData) do
+        local type = v[2] == "2" and _G.AttCountType.basePercent or _G.AttCountType.other
+        attribute:AddValueByName(v[1], attributeManager:GetValueWithName(v[1], tonumber(v[3]), v[2]), false, type)
+    end
+    return attribute
+end
+
+---销毁对象时,析构函数
+function RemainsModel:Dispose()
+    local EventsIns = _G.Events:GetInstance()
+    local net_map = _G.ConfigManager.net_map
+    EventsIns:RemoveListener(net_map.game_remains_task_curr.Cmd, self.OnTaskCurCall, self)
+
+end
+
+---通过碎片id获取当前id
+function RemainsModel:GetIdByPropId(propId)
+    return self.RelationShipList[propId]
+end
+
+---获取升星进度
+function RemainsModel:GetUpStarByPropId(propId)
+    local sid = self:GetIdByPropId(propId)
+    local spData = self.RemainsDatas[sid]
+    if spData:IsMaxStar() then
+        return true, 0
+    end
+
+    return false, spData:GetUpCostNum()
+end
+
+--- 获取大于x品质y数量
+function RemainsModel:GetNumByGrade(grade)
+    local index = 0
+    for k, v in pairs(self.RemainsDatas) do
+        if v.cfg.grade >= grade then
+            if v:GetIsActive() then
+                index = index + 1
+            end
+        end
+    end
+
+    return index
+end
+
+return RemainsModel

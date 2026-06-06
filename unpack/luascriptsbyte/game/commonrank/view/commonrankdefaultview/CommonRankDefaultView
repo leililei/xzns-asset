@@ -1,0 +1,363 @@
+---@class CommonRankDefaultView : UIBaseView    默认伤害/积分排行榜
+---@field go_table CommonRankDefaultView_GoTable GoTable
+---@field listItems table<number,CommonRankDefaultView._obj_listItem_GoTable>   @排行榜列表节点
+---@field ranks CommonRankData[]                        @排行榜数据
+---@field selfRank CommonRankData                       @自己的数据
+---@field topRanks {data:CommonRankData,role:any}[]     @前三玩家的数据
+---@field topItems CommonRankDefaultView._obj_info1_GoTable[]       @前三玩家的节点
+---@field playbackCallback function                     @战斗回放回调
+local CommonRankDefaultView = _G.BaseClass("CommonRankDefaultView", _G.UIBaseView)
+
+local TOP_PLAYER_COUNT = 3
+
+local RankIcon = {
+    [1] = "0ui_icon_diyi",
+    [2] = "0ui_icon_dier",
+    [3] = "0ui_icon_disan"
+}
+local RankBg = {
+    [1] = "ui_diban1",
+    [2] = "ui_diban2",
+    [3] = "ui_diban3",
+    [4] = "TY_img_kuang"
+}
+
+function CommonRankDefaultView:Awake()
+    self.go_table.obj_listItem:SetActiveE(0)
+
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+function CommonRankDefaultView:OnDestroy()
+    self.topRanks = nil
+    self:ClearAllRoleModel()
+end
+
+function CommonRankDefaultView:OnCreate(data)
+    self.go_table.aortext_title.text = _G.GetLangPackValue(data.title)
+    self.go_table.aorimage_tipBg:SetActiveE(data.tip and 1 or 0)
+    if data.tip then
+        self.go_table.aortext_tip.text = _G.GetLangPackValue(data.tip)
+    end
+
+    self.ranks = data.ranks or {}
+    self.selfRank = data.selfRank
+    self.playbackCallback = data.playback
+
+    self:UpdateSelfRank()
+    self:InitTopRanks()
+
+    local count = #self.ranks
+    if count < TOP_PLAYER_COUNT then
+        count = TOP_PLAYER_COUNT
+    end
+    self.go_table.scrollloopvectical_list:InitItemData(count, _G.handler(self, self.RefreshItem))
+end
+
+---更新自己的排名信息
+---@return void
+function CommonRankDefaultView:UpdateSelfRank()
+    self.go_table.obj_selfRank:SetActiveE(self.selfRank and 1 or 0)
+    self.go_table.scrollloopvectical_list:UpdateScrollRectHeight(true) --更新滑动列表大小
+
+    if self.selfRank then
+        self:UpdateItem(
+            self.selfRank:GetRank(),
+            _G.GetAutoGoTable(self.go_table.obj_selfRank),
+            self.selfRank
+        )
+    end
+end
+
+--region =============================前三玩家加载逻辑=============================
+
+
+---初始化前三玩家数据
+---@return void
+function CommonRankDefaultView:InitTopRanks()
+    self.topRanks = {}
+    for i = 1, TOP_PLAYER_COUNT do
+        if self.ranks[i] then
+            table.insert(self.topRanks, { data = self.ranks[i] })
+            _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.CommonRankDefaultItem .. i,
+                _G.GetAutoGoTable(self.go_table["obj_info" .. i]))
+        else
+            break
+        end
+    end
+    self:GetTopRankInfos()
+end
+
+---获取前三玩家角色形象信息(全部完成后执行模型加载逻辑)
+---@return void
+function CommonRankDefaultView:GetTopRankInfos()
+    if not self.topRanks or self:IsNil() then
+        return
+    end
+
+    local topRanks = self.topRanks
+    for i = 1, TOP_PLAYER_COUNT do
+        local topRank = topRanks[i]
+        if topRank and topRank.data and not topRank.role then
+            require("SystemSettingNet"):GetInstance():GetPlayerInfo(
+                { uid = topRank.data.role.uid },
+                function(msg)
+                    if topRanks ~= self.topRanks then
+                        --加载逻辑已被中断
+                        return
+                    end
+                    if not msg.info then
+                        return
+                    end
+                    topRank.role = msg.info
+                    self:GetTopRankInfos() --拉取下一个玩家的信息
+                end
+            )
+            return
+        end
+    end
+
+    --所有角色数据已加载完毕
+    self:ClearAllRoleModel()
+    self:UpdateAllRoleModel()
+    self:UpdateTopRankInfos()
+end
+
+function CommonRankDefaultView:ClearAllRoleModel()
+    for i = 1, TOP_PLAYER_COUNT do
+        --回收角色模型
+        ---@type CommonRankDefaultView._obj_info1_GoTable
+        local temp = _G.GetAutoGoTable(self.go_table["obj_info" .. i])
+        local tempCount = temp.trans_role:GetChildCountE()
+        if tempCount > 0 then
+            _G.PoolsManager:GetInstance():Despawn(temp.trans_role:GetChildE(0), _G.ePoolType.Temporary)
+        end
+    end
+end
+
+---刷新所有角色
+function CommonRankDefaultView:UpdateAllRoleModel()
+    if not self.roleTrans then
+        self.roleTrans = {}
+    end
+    for i = 1, TOP_PLAYER_COUNT do
+        local data = self.topRanks[i]
+        if data and data.role then
+            local cfg = require "CardCommentManager":GetInstance():CardData(data.role.city_style_id, false)
+            local path = _G.UIUtils.GetBattleSpine(cfg, _G.UseBattleSpine.RankView)
+            self:LoadRoleModel(path, i, cfg.size4,cfg,data)
+            self:UpdateTop3Title(i, data.role.title)
+        end
+    end
+end
+
+---加载单个角色
+---@param view table 视图
+---@param rolepath string 模型路径
+---@param posType number 摆放的位置
+function CommonRankDefaultView:LoadRoleModel(rolepath, posIndex, scale,cfg,data)
+    ---@type CommonRankDefaultView._obj_info1_GoTable
+    local info = _G.GetAutoGoTable(self.go_table["obj_info" .. posIndex])
+
+    _G.PoolsManager:GetInstance():Spawn(
+        rolepath,
+        _G.ePoolType.Temporary,
+        nil,
+        function(trans)
+            if trans == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("角色无法加载 path:" .. rolepath)
+                end
+                return
+            end
+            if self:IsNil() then
+                _G.DestroyObject(trans)
+                return
+            end
+            trans:SetParentE(info.trans_role)
+            trans:SetLocalPosition(0, 0, 0)
+            trans:SetLocalScaleXYZ(scale)
+            self.roleTrans[posIndex] = trans
+
+            --- 只有星座女神有神环
+            if _G.AppSetting.IsXzns then
+                local godHaloID = data.role.god_halo
+                if godHaloID ~= 0 then
+                    local effCfg = _G.ConfigManager.god_halo_cfg[godHaloID].ui_effect_cfg
+                    --- 神环路径，父级路径(加载角色的下面)
+                    _G.UIUtils.LoadGodHalo(effCfg, trans,godHaloID)
+                end
+                if not table.isEmptyOrNil(data.role.artifact_skin) then
+                    _G.UIUtils.LoadArtifacteffect(trans,nil,data.role.artifact_skin[1],data.role.artifact_skin[2])
+                end
+            end
+        end
+    )
+end
+
+---生成称号
+---@param item table
+function CommonRankDefaultView:UpdateTop3Title(index, data)
+    if data.sid == 0 then
+        return
+    end
+    local tb = _G.GetAutoGoTable(self.go_table["obj_info" .. index])
+    if self.curShowEffTitle == nil then
+        self.curShowEffTitle = {}
+    end
+    local titleScale = _G.ConfigManager.discrete_cfg[100111] and _G.ConfigManager.discrete_cfg[100111][1][1] or 1
+    local player_title = _G.ConfigManager.player_title_effect_cfg[data.sid]
+    if player_title.type_title == 1 then
+        tb.aorrawimage_title:LoadImage(player_title.title)
+        tb.aorrawimage_title:SetActiveE(1)
+        tb.aorrawimage_title:SetLocalScaleXYZ(0.29 * titleScale)
+        tb.obj_titleEffect:RemoveAllChildren()
+        self.curShowEffTitle[index] = nil
+    elseif player_title.type_title == 2 then
+        if self.curShowEffTitle[index] == nil or (self.curShowEffTitle[index] ~= nil and self.curShowEffTitle[index] ~= player_title.title) then
+            tb.obj_titleEffect:RemoveAllChildren()
+            self.curShowEffTitle[index] = player_title.title
+            _G.UIUtils.LoadEffectTitleOrFrame(
+                player_title.title,
+                tb.obj_titleEffect,
+                function(trans)
+                    if self.curShowEffTitle[index] ~= player_title.title then
+                        trans:DestroyObject()
+                        return
+                    end
+                    local parClip = trans:AddComponentE(_G.typeof(_G.CS.ParticleClipRect))
+                    parClip.NeedCheck = true
+                    parClip.CheckCount = 10
+                    parClip.CheckOne = 3
+                    trans:SetLocalScaleXYZ(titleScale)
+                end
+            )
+        end
+        tb.aorrawimage_title:SetActiveE(0)
+    end
+end
+
+---更新前三玩家UI信息
+---@return void
+function CommonRankDefaultView:UpdateTopRankInfos()
+    if not self.topItems then
+        self.topItems = {}
+        for i = 1, TOP_PLAYER_COUNT do
+            self.topItems[i] = _G.GetAutoGoTable(self.go_table["obj_info" .. i])
+            self.topItems[i].rank = i
+        end
+    end
+
+    for i = 1, TOP_PLAYER_COUNT do
+        local tb = self.topItems[i]
+        local topRank = self.topRanks[i]
+        if topRank and topRank.data then
+            tb.data = topRank.data
+            tb.aorrawimage_noRole:SetActiveE(0)
+            tb.aortext_name.text = topRank.data.role.name
+            tb.aortext_score.text = topRank.data:GetTopDataDescript()
+        else
+            tb.data = nil
+            tb.aortext_name.text = _G.GetLangPackValue(90000010159)
+            tb.aortext_score.text = ""
+            tb.aorrawimage_noRole:SetActiveE(1)
+        end
+    end
+end
+
+--endregion
+
+
+---刷新item
+---@param index number
+---@param go UnityEngine.GameObject
+function CommonRankDefaultView:RefreshItem(index, go)
+    if not self.listItems then
+        self.listItems = {}
+    end
+    ---@type CommonRankDefaultView._obj_listItem_GoTable|{data:CommonRankData}
+    local item = self.listItems[go:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(go)
+        _G.AddViewBtnClick(go, _G.handlerbind(self, self.OnItemClickBtn, item))
+        self.listItems[go:GetInstanceIDE()] = item
+    end
+
+    local rank = index + 1
+    local data = self.ranks[rank]
+    item.data = data
+    self:UpdateItem(rank, item, data)
+end
+
+---设定item显示状态
+---@param rank number   排名
+---@param item CommonRankDefaultView._obj_listItem_GoTable|CommonRankDefaultView._obj_selfRank_GoTable
+---@param data CommonRankData
+function CommonRankDefaultView:UpdateItem(rank, item, data)
+    item.aorimage_Bg.SpriteName = RankBg[rank] or RankBg[#RankBg]
+
+    if item.obj_rank then
+        --自己的排名信息
+        item.obj_rank:SetActiveE(rank >= 1 and 1 or 0)
+        item.aortext_noRank:SetActiveE(rank < 1 and 1 or 0)
+        if rank >= 1 then
+            item.aortext_rank.text = tostring(rank)
+        end
+    else
+        --列表排名信息
+        local rankIcon = RankIcon[rank]
+        item.aorimage_rank:SetActiveE(rankIcon and 1 or 0)
+        item.aortext_rank2:SetActiveE(rankIcon and 0 or 1)
+        if rankIcon then
+            item.aorimage_rank.SpriteName = rankIcon
+            item.aortext_rank.text = tostring(rank)
+        else
+            item.aortext_rank2.text = tostring(rank)
+        end
+    end
+    if item.aortext_no then
+        item.aortext_no:SetActiveE(data and 0 or 1)
+    end
+
+    --头像丶名称信息
+    item.aortext_name.text = data and data.role.name or ""
+    if data then
+        _G.UIUtils.SetPlayerHeadItemNew(item.obj_HeadItemBase, data.role, 0.7, true, true, true)
+    else
+        ---@type _obj_listItem._obj_HeadItemBase_GoTable
+        local headGoTable = item.headGoTable
+        if not headGoTable then
+            headGoTable = _G.GetAutoGoTable(item.obj_HeadItemBase)
+            item.headGoTable = headGoTable
+        end
+        --headGoTable.aorimage_iconBg.SpriteName = "ui_zjm_touxiang_frame"
+        headGoTable.aorimage_portrait.SpriteName = "0ui_jsxt_sx_icon5"
+        headGoTable.aorrawimage_frame:SetActiveE(0)
+        headGoTable.aorimage_levelBg:SetActiveE(0)
+        headGoTable.obj_lvNode:SetActiveE(0)
+        headGoTable.obj_frameEffect:RemoveAllChildren()
+    end
+    --分数丶伤害数据信息
+    item.aortext_score.text = data and data:GetDataDescript() or ""
+
+    --菜单按钮
+    if item.aorbtn_playback then
+        item.aorbtn_playback:SetActiveE(data and self.playbackCallback and 1 or 0)
+    end
+end
+
+---监听item点击事件
+---@param item CommonRankDefaultView._obj_listItem_GoTable|{data:CommonRankData}
+function CommonRankDefaultView:OnItemClickBtn(go, isOn, item)
+    if go == item.aorbtn_playback and self.playbackCallback then
+        self.playbackCallback(item.data)
+    end
+end
+
+function CommonRankDefaultView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_CloseView then
+        self:Close()
+    end
+end
+
+return CommonRankDefaultView

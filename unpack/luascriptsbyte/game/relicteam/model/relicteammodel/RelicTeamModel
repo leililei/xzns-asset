@@ -1,0 +1,2317 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.RelicTeam.Model.RelicTeamModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/04/23
+-- Description: 数据类
+-----------------------------------------------------------------------
+local RelicTeamNet = require("RelicTeamNet")
+
+local base = _G.GameDataModelBase
+---@class RelicTeamModel : GameDataModelBase
+local RelicTeamModel = _G.BaseClass("RelicTeamModel", base)
+local relic_cfg = _G.ConfigManager.relic_cfg
+local relic_events_cfg = _G.ConfigManager.relic_events_cfg
+local relic_effect_cfg = _G.ConfigManager.relic_effect_cfg
+local FSE = {
+    win = 1,           --战斗胜利
+    sec = 2,           --x秒内胜利
+    dieNum = 3,        --阵亡数不超过x
+    leastEle = 4,      --至少x个y种族
+    mulEle = 5,        --同时上阵x个ABCD种族
+    diffEle = 6,       --使用x种不同种族
+    noPro = 7,         --不使用x,y职业获得胜利
+    allPro = 8,        --全是x职业
+    appoint2 = 100901, --包含x卡和y卡
+    killNum = 10,      --同一角色击杀x人
+    mostEle = 11,      --至多x个y种族
+    mostPro = 12,      --至多x个y职业
+    highHP = 13,       --队伍血量高于x%
+    leastStar = 14,    --至少上阵x个y星级
+    leastOrder = 15,   --至少上阵x个y品质
+    leastPro = 16      --至少x个y职业
+}
+
+---@return RelicTeamModel RelicTeamModel
+function RelicTeamModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function RelicTeamModel:__init()
+    self.relicStatus = {
+        close = 0,
+        team = 1,
+        explore = 2,
+        idle = 3,
+        settle = 4
+    }
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+    local multipleData = _G.ConfigManager.discrete_cfg[125110]
+    self.multipleList = {}
+    self.multipleEventNumList = {}
+    for k, v in ipairs(multipleData) do 
+        self.multipleList[k] = v[1]
+        self.multipleEventNumList[k] = v[2]
+    end
+    
+    self.team_info = nil
+end
+
+---从服务器拉取数据
+function RelicTeamModel:GetDataFormServer()
+    RelicTeamNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+function RelicTeamModel:GetInfo(callBack)
+    RelicTeamNet:GetInstance():GetInfo(function(msg)
+        self:ParseData(msg)
+        if msg.ack == 1 then
+            if callBack then
+                callBack()
+            end
+        end
+    end)
+end
+
+---@param msg relic.s2c_relic_info
+function RelicTeamModel:ParseData(msg)
+    if msg.ack == 1 then
+        self.status = msg.relic_info.status
+        self.camp = msg.relic_info.camp
+        self.jewel = msg.relic_info.jewel or 0
+        self.team_info = msg.relic_info.team_info
+        self.role_event = msg.relic_info.role_event or {}
+        self.role_event.event = self.role_event.event or {}
+        self.role_event.all_e_num = self.role_event.all_e_num or 0
+        self.multiple = msg.relic_info.role_event.multiple or 1
+        self.energy = msg.relic_info.energy or 0
+        self.energy_time = msg.relic_info.energy_time
+        self.buff_count = msg.relic_info.buff_count or {}
+        self:SortBuff()
+        self:CalBuffAttNum()
+        self.array = msg.relic_info.array
+        self.allJewel = 0
+        if msg.relic_info.invite then
+            self.newInviteBol = true
+        end
+        if self.team_info then
+            if self.team_info.request then
+                self.newRequestBol = true
+            end
+            for k, v in pairs(self.team_info.member_list or {}) do
+                v.jewel = v.jewel or 0
+                self.allJewel = self.allJewel + v.jewel
+            end
+            self:FreshAssistInfo()
+            self:FreshReceiveAssistInfo()
+        end
+        self:CalMyPowerByArray()
+        -- self.campHeadInfo = {}
+        -- self.campHeadInfo[1] = msg.relic_info.camp_role1
+        -- self.campHeadInfo[2] = msg.relic_info.camp_role2
+        self.curActivityClass = require "ActivitySynManager":GetInstance():GetActivityWithTypeId(10058)
+        local eggTime = 0 
+        if self.curActivityClass then 
+            eggTime = _G.ConfigManager.discrete_cfg[125111][1][1]
+        end
+        self.EggAwardFlag = msg.relic_info.easter_egg
+        self.campNum = msg.relic_info.camp_count
+        self.id = msg.pub.season_id or 1
+        self.start_time = msg.pub.start_timer
+        self.end_time = msg.pub.end_time - eggTime
+        self.EggEndTime = msg.pub.end_time
+        self.team_time = self.start_time + msg.pub.team_time
+        self.fight_time = self.start_time + msg.pub.team_time + msg.pub.fight_time
+        self.fallFlag = msg.relic_info.role_event.drop_out
+        self.score = msg.relic_info.score or 0
+        relic_cfg = _G.ConfigManager.relic_cfg[self.id]
+        self:ChangeStatusAndNextTimeLine()
+
+        if self.status and self.status ~= 0 then
+            self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTimer, self, false, false, true)
+            self.timer:Start()
+            --todo 改到一个计时器里面
+            self:UpdateTimer()
+
+            self.activityTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateActivityTimer, self, false, false,
+                true)
+            self.activityTimer:Start()
+            self:UpdateActivityTimer()
+            --require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamFullEnergy.id)
+        end
+        self.activity = require "ActivitySynManager":GetInstance():GetChildAcitivity(10058, 100081)
+        if self.activity then
+            self.activity:GetActivityTypeCls():RefreshRedPoint()
+        end
+        _G.Events:GetInstance():Broadcast(_G.eRelicTeam.RelicTeamRefresh)
+    elseif msg.ack == 5220 then
+        self:SetLaterGetDataBol(true)
+        self.status = self.relicStatus.close
+    elseif msg.ack == 5 then
+        self.status = self.relicStatus.close
+        self.activity = require "ActivitySynManager":GetInstance():GetChildAcitivity(10058, 100081)
+        require("ActivitySynEnterManager"):GetInstance():RemoveActivityBtn(self.activity)
+    end
+
+    self.super.ParseData(self)
+end
+
+function RelicTeamModel:CheckInEggAwrdStatus()
+    local nowTime = _G.TimeUtil.GetServerUnixTime()
+    if self.EggEndTime and self.end_time < nowTime and self.EggEndTime > nowTime then 
+        return true
+    end
+    return false 
+end
+
+function RelicTeamModel:GetLaterGetDataBol()
+    return self.laterGetDataBol
+end
+
+function RelicTeamModel:SetLaterGetDataBol(bol)
+    self.laterGetDataBol = bol
+end
+
+function RelicTeamModel:GetMultiple()
+    return self.multiple or 1
+end
+
+function RelicTeamModel:SetMultipleNum(num)
+    self.multiple = num
+end
+
+function RelicTeamModel:GetMultipleIndex()
+    for k, v in pairs(self.multipleList) do 
+        if v == self.multiple then 
+            return k
+        end
+    end
+    return 1
+end
+
+function RelicTeamModel:GetMultipleList()
+    return self.multipleList
+end
+
+function RelicTeamModel:GetMultipleEventNumList()
+    return self.multipleEventNumList
+end
+
+function RelicTeamModel:CalMyPowerByArray()
+    local power = 0
+    local uid = 0
+    local card = nil
+    local ratio = self:GetBuffPowerRatio()
+    local myInfo = self:GetTeamRoleInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    if myInfo and myInfo.team then
+        for i = 1, #myInfo.team do
+            uid = myInfo.team[i].uid
+            if uid and uid > 0 then
+                card = self:GetCardData(uid)
+                power = power + card:GetPower()
+            end
+        end
+    elseif self.array then
+        for i = 1, #self.array.sits do
+            uid = self.array.sits[i]
+            if uid > 0 then
+                card = self:GetCardData(uid)
+                power = power + card:GetPower()
+            end
+        end
+    end
+    uid = nil
+    card = nil
+    self:SetMyTeamPower(power * ratio, power)
+end
+
+---获取卡牌对象
+---@param uid number 卡牌uid
+---@return CardData
+function RelicTeamModel:GetCardData(uid)
+    local info = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+    local card
+    if not info then
+        local assistCards = self:GetMyAssistCards()
+        for k, v in ipairs(assistCards) do
+            if v.c_info.uid == uid then
+                info = v.card or v.c_info
+                card = _G.CardData.New()
+                card:Parse(info)
+                card.assist = 1
+                card:SetLevel(300)
+                card:SaveEquipmentData(info, true)
+                card:SaveDecorationData(info, true)
+                if not _G.AppSetting.IsOverseas then
+                    card:SaveArtifactData(info, true)
+                    card:SaveSpiritualData(info, true)
+                end
+                card:CalcNowSumProp()
+            end
+        end
+    else
+        card = _G.DeepCopy(info)
+        card:SetLevel(300)
+        card.shenshiPosType = _G.StonePosType.PosZero
+        card:CalcNowSumProp()
+    end
+    return card
+end
+
+--region 获取数据
+--获取阵营
+function RelicTeamModel:GetCamp()
+    return self.camp
+end
+
+--获取宝石
+function RelicTeamModel:GetJewel()
+    local info = self:GetTeamRoleInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    return info.jewel or 0
+end
+
+--获取队伍信息
+function RelicTeamModel:GetTeamInfo()
+    return self.team_info
+end
+
+--获取当前事件
+function RelicTeamModel:GetRoleEvent()
+    return self.role_event
+end
+
+--获取所有事件文本
+function RelicTeamModel:GetEventShowTxtTable()
+    local T = {}
+    local str1, str2
+    if self.role_event.event_show then
+        for k, v in ipairs(self.role_event.event_show) do
+            if k <= 3 then
+                local cfg = relic_events_cfg[v.event_sid]
+                if cfg.event_type == 3 or cfg.event_type == 2 then
+                    str1 = _G.GetLangPackValue(tonumber(v.args[1]) == 1 and cfg.desc[2][1] or cfg.desc_defeat)
+                    -- if v.jewel and v.jewel > 0 then
+                    --     str1 = string.format("%s%s", str1, _G.GetLangPackValue(90033500123, v.jewel))
+                    -- end
+                    table.insert(T, str1)
+                    str2 = _G.GetLangPackValue(cfg.desc[1][1])
+                    table.insert(T, str2)
+                elseif cfg.event_type == 6 then
+                    str1 = _G.GetLangPackValue(tonumber(v.args[1]) == 1 and cfg.desc[2][1] or cfg.desc[2][2])
+                    -- if v.jewel and v.jewel > 0 then
+                    --     str1 = string.format("%s%s", str1, _G.GetLangPackValue(90033500123, v.jewel))
+                    -- end
+                    table.insert(T, str1)
+                    str2 = _G.GetLangPackValue(cfg.desc[1][1])
+                    table.insert(T, str2)
+                elseif cfg.desc[1] then
+                    str1 = _G.GetLangPackValue(cfg.desc[2][1])
+                    -- if v.jewel and v.jewel > 0 then
+                    --     str1 = string.format("%s%s", str1, _G.GetLangPackValue(90033500123, v.jewel))
+                    -- end
+                    table.insert(T, str1)
+                    str2 = _G.GetLangPackValue(cfg.desc[1][1])
+                    table.insert(T, str2)
+                end
+            end
+        end
+        T = table.reverseTable(T)
+    end
+    if self:CheckHaveEventNow() then
+        local cfg = relic_events_cfg[self.role_event.event.event_sid]
+        str1 = _G.GetLangPackValue(cfg.desc[1][1])
+        table.insert(T, str1)
+    end
+    return T
+end
+
+--检查是不是非小怪战斗
+function RelicTeamModel:CheckNowIsBossEvent()
+    if self:CheckHaveEventNow() then
+        local cfg = relic_events_cfg[self.role_event.event.event_sid]
+        return cfg.event_type == 2 or cfg.event_type == 3
+    end
+end
+
+--检查现在有没有正在进行的事件
+function RelicTeamModel:CheckHaveEventNow()
+    if self.role_event and not table.isEmptyOrNil(self.role_event.event) and self.role_event.event.event_sid ~= 0 then
+        return true
+    end
+    return false
+end
+
+--获取最新体力
+function RelicTeamModel:GetEnergy()
+    return self.energy
+end
+
+--获取上次体力恢复时间
+function RelicTeamModel:GetEnergyTime()
+    return self.energy_time
+end
+
+--获取队员当前宝石数量
+function RelicTeamModel:GetRoleJewel()
+    return self.role_jewel
+end
+
+--获取布阵
+function RelicTeamModel:GetArray()
+    return self.array
+end
+
+--获取完成事件信息
+function RelicTeamModel:GetEventArgs()
+    return self.eventArgs
+end
+
+--获取当前层数
+function RelicTeamModel:GetNowLayer()
+    return self.role_event.layer or 1
+end
+
+--获取已完成事件数
+function RelicTeamModel:GetNowEventNum()
+    return self.role_event.event_num or 0
+end
+
+--获取当前血量
+function RelicTeamModel:GetNowHP()
+    return self.role_event.hp or 100
+end
+
+--获取最大血量
+function RelicTeamModel:GetMaxHP()
+    return 100
+end
+
+--获取当期配置
+function RelicTeamModel:GetRelicCfgNow()
+    return relic_cfg
+end
+
+--获取当前期数
+function RelicTeamModel:GetIDNow()
+    return self.id
+end
+
+--获取体力上限
+function RelicTeamModel:GetMaxEnergy()
+    return relic_cfg.physical[1][1]
+end
+
+--获取每次事件体力消耗
+function RelicTeamModel:GetEventEnergy()
+    local layer = self:GetNowLayer()
+    return relic_cfg.physical[3][layer]
+end
+
+--获取参与服务器列表
+function RelicTeamModel:GetServerList()
+    return self.server_list
+end
+
+--获取队伍内某队员信息（如果没有队伍的时候获取自己，创建新信息）
+function RelicTeamModel:GetTeamRoleInfo(uid)
+    if self.team_info and self.team_info.member_list then
+        for k, v in pairs(self.team_info.member_list) do
+            if uid == v.role_info.uid then
+                return v
+            end
+        end
+    end
+    return {}
+end
+
+--获取我的援助信息
+function RelicTeamModel:GetMyAssistCards()
+    local info = self:GetTeamRoleInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    return info.assist_info or {}
+end
+
+--获取当期副本名字
+function RelicTeamModel:GetRelicName()
+    return _G.GetLangPackValue(tonumber(relic_cfg.name))
+end
+
+--获取当期英雄模型sid
+function RelicTeamModel:GetRoleModelSid()
+    return self.camp == 1 and relic_cfg.actor[1] or relic_cfg.actor[2]
+end
+
+--获取某一天的阵容条件
+function RelicTeamModel:GetGarrayCondition(day)
+    day = day or self:GetNowExploreDay()
+    return relic_cfg.condition[day]
+end
+
+--获取某一天的阵容条件不满足debuff
+function RelicTeamModel:GetGarrayEffects(day)
+    day = day or self:GetNowExploreDay()
+    return relic_cfg.skills[day]
+end
+
+--获取某一天的阵容条件不满足debuff文字
+function RelicTeamModel:GetNowEffectsStr(day)
+    local str = {}
+    local effects = self:GetGarrayEffects(day)
+    for k, v in ipairs(effects) do
+        table.insert(str, _G.GetLangPackValue(_G.ConfigManager.card_skills_cfg[v].describe1))
+    end
+    return str
+end
+
+--获取某一天的Boss数据
+function RelicTeamModel:GetBossCfg(day)
+    day = day or self:GetNowExploreDay()
+    return _G.ConfigManager.guild_boss_cfg[relic_cfg.relic_boss[day]]
+end
+
+--能否进入下一层
+function RelicTeamModel:CheckCanNextLayer()
+    local nowLayer = self:GetNowLayer()
+    if relic_cfg["condition" .. nowLayer] then
+        return self:GetNowEventNum() >= relic_cfg["condition" .. nowLayer][2][1]
+    else
+        return false
+    end
+end
+
+--获取升层条件
+function RelicTeamModel:GetLayerEventCondition(layer)
+    local nowLayer = layer or self:GetNowLayer()
+    if relic_cfg["condition" .. nowLayer] then
+        return relic_cfg["condition" .. nowLayer][2][1]
+    end
+end
+
+--获取升层描述
+function RelicTeamModel:GetUpTxt(layer)
+    local nowLayer = layer or self:GetNowLayer()
+    if relic_cfg["condition" .. nowLayer] then
+        local eventSid = relic_cfg["condition" .. nowLayer][1][1]
+        return relic_events_cfg[eventSid].mission_desc
+    end
+end
+
+--获取升层事件list
+function RelicTeamModel:GetUpLayerEventIdList(layer)
+    local nowLayer = layer or self:GetNowLayer()
+    if relic_cfg["condition" .. nowLayer] then
+        return relic_cfg["condition" .. nowLayer][1]
+    end
+end
+
+--获取升层弹窗标记
+function RelicTeamModel:GetUpLayerTipsBol()
+    return self.upLayerTipsBol
+end
+
+function RelicTeamModel:SetUpLayerTipsBol(bol)
+    self.upLayerTipsBol = bol
+end
+
+--获取队伍查询列表
+function RelicTeamModel:GetTeamList()
+    return self.teamList, self.noFullTeamList
+end
+
+---收到的队伍邀请
+function RelicTeamModel:GetTeamInviteList()
+    return self.teamInviteList
+end
+
+--增加体力
+function RelicTeamModel:AddEnergy(num)
+    self.energy = self.energy + num
+    _G.Events:GetInstance():Broadcast(_G.eRelicTeam.RelicTeamUpdateEnergy)
+    if self.energy >= relic_cfg.physical[1][1] and self.status == self.relicStatus.explore then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamFullEnergy.id)
+    end
+    return self.energy
+end
+
+---从服务器拉取数据
+function RelicTeamModel:GetDataFormServer()
+    RelicTeamNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+--region 协议接口
+---获取自身队伍信息
+function RelicTeamModel:GetTeam(call)
+    RelicTeamNet:GetInstance():GetTeam(function(msg)
+        if msg.ack == 1 then
+            self.team_info = msg.team or self.team_info
+            self.allJewel = 0
+            if self.team_info then
+                local InvitedUidList = self:GetInvitedUidList()
+                for k, v in pairs(self.team_info.member_list or {}) do
+                    v.jewel = v.jewel or 0
+                    self.allJewel = self.allJewel + v.jewel
+                    table.removebyvalue(InvitedUidList, v.role_info.uid)
+                    if v.role_info.uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                        if v.team then
+                            self.array = self.array or {}
+                            self.array.sits = self.array.sits or { 0, 0, 0, 0, 0 }
+                            for i = 1, #v.team do
+                                self.array.sits[i] = v.team[i].uid or 0
+                            end
+                        end
+                    end
+                end
+                self.RequestedTeamUidList = {}
+                self:FreshAssistInfo()
+                self:FreshReceiveAssistInfo()
+            end
+            self:CalMyPowerByArray()
+            self:SetTeamUpdateBol(false)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamInvite.id)
+        elseif msg.ack == 5204 then
+            self.team_info = nil
+            self:SetTeamUpdateBol(false)
+        end
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamAssist.id)
+        if call then
+            call()
+        end
+    end)
+end
+
+---创建队伍
+function RelicTeamModel:CreateTeam(pbData, callback)
+    RelicTeamNet:GetInstance():CreateTeam(pbData, function(msg)
+        if msg.ack == 1 then
+            self.team_info = {}
+            self.team_info.name = pbData.name
+            self.team_info.is_check = pbData.type
+            self.team_info.join_power = pbData.power
+            self.team_info.uid = msg.uid
+            self.team_info.leader_uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+            self.team_info.member_list = { {} }
+            self.team_info.member_list[1].role_info = _G.PlayerModel:GetInstance():GetIRroleTable()
+            self.team_info.member_list[1].jewel = 0
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamInvite.id)
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---选择阵营
+function RelicTeamModel:ChooseCamp(pbData, callback)
+    RelicTeamNet:GetInstance():ChooseCamp(pbData, function(msg)
+        if msg.ack == 1 then
+            self.camp = pbData.camp
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---更新阵容
+function RelicTeamModel:UpdateGarray(pbData, callback)
+    RelicTeamNet:GetInstance():UpdateGarray(pbData, function(msg)
+        if msg.ack == 1 then
+            self.array = pbData.garray
+            if callback then
+                callback(0)
+            end
+        else
+            callback(-1)
+        end
+    end)
+end
+
+---设置倍率
+function RelicTeamModel:SetMultiple(pbData, callback)
+    RelicTeamNet:GetInstance():SetMultiple(pbData, function(msg)
+        if msg.ack == 1 then
+            self.multiple = pbData.multiple
+        end
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---获取队伍申请信息、可邀请列表
+function RelicTeamModel:GetRequestAndCanInviteList(callback)
+    RelicTeamNet:GetInstance():GetRequestAndCanInviteList(function(msg)
+        if msg.ack == 1 then
+            self.requestsList = msg.apply or {}
+            self.canInviteList = {}
+            if msg.role then
+                for k, v in ipairs(msg.role) do
+                    for k1, v1 in ipairs(v.role) do
+                        v1.type = v.type
+                        table.insert(self.canInviteList, v1)
+                    end
+                end
+            end
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+--获取申请列表
+function RelicTeamModel:GetRequestsList()
+    return self.requestsList
+end
+
+--获取可以邀请的列表
+function RelicTeamModel:GetCanInviteList()
+    return self.canInviteList
+end
+
+---获取收到的队伍邀请
+function RelicTeamModel:GetInviteMeListFromServer(callback)
+    RelicTeamNet:GetInstance():GetInviteMeList(function(msg)
+        if msg.ack == 1 then
+            self.inviteMeList = msg.list or {}
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+--获取邀请自己的队伍列表
+function RelicTeamModel:GetInviteMeList()
+    return self.inviteMeList
+end
+
+---获取队伍列表
+function RelicTeamModel:GetTeamListFromServer(callback)
+    RelicTeamNet:GetInstance():GetTeamList(function(msg)
+        if msg.ack == 1 then
+            self.teamList = msg.list or {}
+            self.noFullTeamList = {}
+            for k, v in ipairs(self.teamList) do
+                if #v.role_info < 3 then
+                    table.insert(self.noFullTeamList, v)
+                end
+                v.power = 0
+                for k1, v1 in ipairs(v.role_info) do
+                    v.power = v.power + v1.power
+                end
+            end
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---查询队伍
+function RelicTeamModel:SelectTeam(pbData, callback)
+    RelicTeamNet:GetInstance():SelectTeam(pbData, function(msg)
+        if msg.ack == 1 then
+            if msg.list then
+                msg.noFullTeamList = {}
+                for k, v in ipairs(msg.list) do
+                    if #v.role_info < 3 then
+                        table.insert(msg.noFullTeamList, v)
+                    end
+                    v.power = 0
+                    for k1, v1 in ipairs(v.role_info) do
+                        v.power = v.power + v1.power
+                    end
+                end
+            end
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---申请加入队伍
+function RelicTeamModel:RequestTeam(pbData, callback)
+    RelicTeamNet:GetInstance():RequestTeam(pbData, function(msg)
+        if msg.ack == 1 then
+            if msg.team then
+                self.team_info = msg.team or {}
+                self:FreshAssistInfo()
+                self:FreshReceiveAssistInfo()
+                _G.Events:GetInstance():Broadcast(_G.eRelicTeam.RelicTeamRefresh)
+                self.RequestedTeamUidList = {}
+            else
+                self.RequestedTeamUidList = self.RequestedTeamUidList or {}
+                for k, v in ipairs(pbData.uid) do
+                    table.insert(self.RequestedTeamUidList, v)
+                end
+                if #msg.reply == 1 and msg.reply[1].ack ~= 1 then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(msg.reply[1].ack)
+                end
+            end
+        end
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---获取已申请队伍uid列表
+function RelicTeamModel:GetRequestedTeamUidList()
+    return self.RequestedTeamUidList or {}
+end
+
+---处理申请
+function RelicTeamModel:CheckRequest(pbData, callback)
+    RelicTeamNet:GetInstance():CheckRequest(pbData, function(msg)
+        if msg.ack == 1 then
+            self.requestsUidList = self.requestsUidList or {}
+            local bol
+            for k, v in pairs(msg.reply) do
+                if v.ack == 1 then
+                    table.insert(self.requestsUidList, pbData.uid[k])
+                    bol = true
+                    if pbData.type == 0 then
+                        for k2, v2 in ipairs(self.requestsList) do
+                            if v2.uid == pbData.uid[k] then
+                                _G.table.remove(self.requestsList, k2)
+                                break
+                            end
+                        end
+                    end
+                else
+                    _G.PopWindowManager:GetInstance():ShowAllTips(v.ack)
+                end
+            end
+            if bol and callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---获取已处理过的申请uid列表
+function RelicTeamModel:GetRequestsUidList()
+    return self.requestsUidList or {}
+end
+
+---清除已处理过的申请uid列表
+function RelicTeamModel:RemoveRequestsUidList()
+    self.requestsUidList = {}
+end
+
+---获取收到的队伍邀请
+function RelicTeamModel:GetTeamInviteListFromServer(callback)
+    RelicTeamNet:GetInstance():GetTeamInviteList(function(msg)
+        if msg.ack == 1 then
+            self.teamInviteList = msg.list or {}
+            for k, v in ipairs(self.teamInviteList) do
+                v.power = 0
+                for k1, v1 in ipairs(v.role_info) do
+                    v.power = v.power + v1.power
+                end
+            end
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---邀请好友、公会成员
+function RelicTeamModel:Invite(pbData, callback)
+    RelicTeamNet:GetInstance():Invite(pbData, function(msg)
+        if msg.ack == 1 then
+            local bol = false
+            self.InvitedUidList = self.InvitedUidList or {}
+            for k, v in ipairs(msg.reply) do
+                if v.ack == 1 then
+                    bol = true
+                    table.insert(self.InvitedUidList, v.uid)
+                end
+            end
+            if bol and callback then
+                callback()
+            end
+        end
+    end)
+end
+
+--获取已邀请过的uid列表
+function RelicTeamModel:GetInvitedUidList()
+    return self.InvitedUidList or {}
+end
+
+---处理邀请
+function RelicTeamModel:CheckInvite(pbData, callback)
+    RelicTeamNet:GetInstance():CheckInvite(pbData, function(msg)
+        if msg.ack == 1 then
+            if pbData.type == 0 then
+                self.teamInviteList = {}
+            end
+            if msg.team then
+                self.team_info = msg.team
+            end
+            RelicTeamModel:ClearNewInviteBol()
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamInvite.id)
+            if callback then
+                callback(msg.team)
+            end
+        end
+    end)
+end
+
+---设置加入队伍的条件
+function RelicTeamModel:SetCondition(pbData, callback)
+    RelicTeamNet:GetInstance():SetCondition(pbData, function(msg)
+        if msg.ack == 1 then
+            self.team_info.name = pbData.name or self.team_info.name
+            self.team_info.is_check = pbData.type or self.team_info.is_check
+            self.team_info.join_power = pbData.power or self.team_info.join_power
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---踢出队伍
+function RelicTeamModel:TeamKickOut(pbData, callback)
+    RelicTeamNet:GetInstance():TeamKickOut(pbData, function(msg)
+        if msg.ack == 1 then
+            local index
+            for i = 1, #self.team_info.member_list do
+                if self.team_info.member_list[i].role_info.uid == pbData.uid then
+                    index = i
+                end
+            end
+            table.remove(self.team_info.member_list, index)
+            -- self:FreshAssistInfo()
+            -- self:FreshReceiveAssistInfo()
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---主动退出队伍
+function RelicTeamModel:QuitTeam(callback)
+    RelicTeamNet:GetInstance():QuitTeam(function(msg)
+        if msg.ack == 1 then
+            self.team_info = nil
+            self.RequestedTeamUidList = {}
+            self:ClearNewRequestBol()
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamRequest.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamAssist.id)
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---使用体力道具
+function RelicTeamModel:EnergyUse(pbData, callback)
+    RelicTeamNet:GetInstance():EnergyUse(pbData, function(msg)
+        if msg.ack == 1 then
+            _G.StorageManager:GetInstance():ConsumeItem(pbData.item_id, nil, 1)
+            self.energy = msg.energy
+            self.energy_time = msg.time
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---获取情报
+function RelicTeamModel:BattleInfoRequest(callback)
+    RelicTeamNet:GetInstance():BattleInfoRequest(function(msg)
+        self.layer_num = msg.layer_num or {}
+        self.battleInfoMine = msg.role_info or {}
+        self.battleInfoAll = msg.info or {}
+        _G.table.insertto(self.battleInfoAll, self.battleInfoMine)
+        table.sort(self.battleInfoMine, function(a, b)
+            return a.time < b.time
+        end)
+        table.sort(self.battleInfoAll, function(a, b)
+            return a.time < b.time
+        end)
+        if callback then
+            callback()
+        end
+    end)
+end
+
+---取消掉层标记
+function RelicTeamModel:ChangeDrop(callback)
+    RelicTeamNet:GetInstance():ChangeDrop(function(msg)
+        if msg.ack == 1 then
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+function RelicTeamModel:GetBattleInfo()
+    return self.battleInfoMine, self.battleInfoAll, self.layer_num
+end
+
+---进入下一层
+function RelicTeamModel:NextLayer(callback)
+    RelicTeamNet:GetInstance():NextLayer(function(msg)
+        if msg.ack == 1 then
+            self.role_event.layer = self.role_event.layer + 1
+            self.role_event.event_num = 0
+            self.role_event.all_e_num = 0
+            self.multiple = 1
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---完成事件
+function RelicTeamModel:FinishEvent(pb, callback)
+    local T = { args = self.role_event.event.event_sid }
+    self:GetRankData()
+    RelicTeamNet:GetInstance():FinishEvent(pb, function(msg)
+        if msg.ack == 1 then
+            self.eventArgs = msg
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            local cfg = relic_events_cfg[self.role_event.event.event_sid]
+            -- if cfg.event_type == 3 or cfg.event_type == 2 then
+            --     local addScore = msg.winner and cfg.points[1][1] or cfg.points[2][1]
+            --     self.score = self.score + addScore
+            -- elseif cfg.event_type == 6 then
+            --     local addScore = pb.args[1] == 1 and cfg.points[1][1] or cfg.points[2][1]
+            --     self.score = self.score + addScore
+            -- else
+            --     self.score = self.score + cfg.points[1][1]
+            -- end
+            if cfg.fold ~= 1 then 
+                self.role_event.all_e_num = self.role_event.all_e_num + self.multiple
+            else 
+                self.role_event.all_e_num = self.role_event.all_e_num + 1
+            end
+            if msg.add_score then 
+                self.score = self.score + msg.add_score
+            end
+            local upLayerList = self:GetUpLayerEventIdList()
+            if table.ContainsValue(upLayerList, self.role_event.event.event_sid) then
+                local num = self:GetLayerEventCondition()
+                if num - self.role_event.event_num == 1 then
+                    self.upLayerTipsBol = true
+                end
+                self.role_event.event_num = self.role_event.event_num + 1
+            end
+            self.role_event.event = {}
+            self.role_event.event_show = self.role_event.event_show or {}
+            local jewelNum = 0
+            for k, v in ipairs(msg.add_event_show) do
+                table.insert(self.role_event.event_show, 1, v)
+                jewelNum = jewelNum + v.jewel
+            end
+            if jewelNum > 0 then
+                msg.award = msg.award or {}
+                msg.award.item = msg.award.item or {}
+                table.insert(msg.award.item, { type = { 76, jewelNum } })
+            end
+            if msg.n_energy then
+                self.energy = msg.n_energy[1]
+                self.energy_time = msg.n_energy[2]
+            end
+            if msg.n_hp then
+                self.role_event.hp = msg.n_hp
+            end
+            if msg.role_event then
+                self.role_event = msg.role_event
+            end
+            if msg.is_fall then
+                self.fallFlag = msg.is_fall
+                self.fallFlag = true
+                _G.Events:GetInstance():Broadcast(_G.eRelicTeam.RelicTeamFall)
+            end
+            if msg.add_jewel then
+                local info = self:GetTeamRoleInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+                ---如果不存在字段或者字段是增加宝石那就加宝石
+                if nil == msg.add_jewel_bool or msg.add_jewel_bool == true then
+                    info.jewel = info.jewel + msg.add_jewel
+                else
+                    info.jewel = info.jewel - msg.add_jewel
+                end
+            end
+        elseif msg.ack == 5213 then
+            self.fallFlag = true
+            if msg.n_energy then
+                self.energy = msg.n_energy[1]
+                self.energy_time = msg.n_energy[2]
+            end
+            if msg.n_hp then
+                self.role_event.hp = msg.n_hp
+            end
+            if msg.role_event then
+                self.role_event = msg.role_event
+            end
+            _G.Events:GetInstance():Broadcast(_G.eRelicTeam.RelicTeamFall)
+        else
+            if msg.n_energy then
+                self.energy = msg.n_energy[1]
+                self.energy_time = msg.n_energy[2]
+            end
+            if msg.n_hp then
+                self.role_event.hp = msg.n_hp
+            end
+            if msg.role_event then
+                self.role_event = msg.role_event
+            end
+        end
+        if callback then
+            callback(msg)
+        end
+        local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicView.Name)
+        if ctrl then
+            ctrl:SetLockFinishEventBtnBol(false)
+        end
+    end)
+end
+
+function RelicTeamModel:CheckEventEnergyEnough()
+    if self:GetNowLayer() == 3 then 
+        return self.energy >= relic_cfg.physical[3][self:GetNowLayer()] * self.multiple
+    end
+    return self.energy >= relic_cfg.physical[3][self:GetNowLayer()]
+end
+
+---下一个事件
+function RelicTeamModel:NextEvent(callback)
+    self:GetRankData()
+    local T = { c_layer = self:GetNowLayer()}
+    RelicTeamNet:GetInstance():NextEvent(T, function(msg)
+        if msg.ack == 1 then
+            self.role_event.event = msg.event
+            if msg.energy then
+                self.energy = msg.energy
+                require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamFullEnergy
+                    .id)
+            else
+                if self:GetNowLayer() == 3 then 
+                    self:AddEnergy(-relic_cfg.physical[3][self:GetNowLayer()] * self.multiple)
+                else 
+                    self:AddEnergy(-relic_cfg.physical[3][self:GetNowLayer()])
+                end
+            end
+            if self.multiple ~= 1 and relic_events_cfg[msg.event.event_sid].fold == 1 then 
+                _G.PopWindowManager:GetInstance():ShowAllTips(1070032)
+            end
+            --self.energy = self.energy - relic_cfg.physical[3][self:GetNowLayer()]
+            if msg.energy_time then
+                self.energy_time = msg.energy_time
+            end
+            if callback then
+                callback()
+            end
+        elseif msg.ack == 5213 then
+            _G.Events:GetInstance():Broadcast(_G.eRelicTeam.RelicTeamFall)
+        end
+    end)
+end
+
+---援助英雄
+function RelicTeamModel:TeamAssist(pbData, callback)
+    RelicTeamNet:GetInstance():TeamAssist(pbData, function(msg)
+        if msg.ack == 1 then
+            for i = 1, #self.team_info.member_list do
+                if self.team_info.member_list[i].role_info.uid == pbData.uid then
+                    self.team_info.member_list[i].assist_info = self.team_info.member_list[i].assist_info or {}
+                    local T = {
+                        uid = _G.PlayerModel:GetInstance():GetPlayerUid(),
+                        c_info = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, pbData.card_uid)
+                    }
+                    table.insert(self.team_info.member_list[i].assist_info, T)
+                end
+            end
+            self:FreshAssistInfo()
+            self:FreshReceiveAssistInfo()
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---获取参与服务器列表
+function RelicTeamModel:GetServerList(callback)
+    RelicTeamNet:GetInstance():GetServerList(function(msg)
+        if msg.ack == 1 then
+            self.server_list = msg.server_list
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+
+---获取结算后全服奖励
+function RelicTeamModel:GetEggAward(callback)
+    require "ActivitySynNet":GetInstance():GetAward(
+        self.curActivityClass:GetActivityID(),
+        {},
+        function(msg)
+            if msg.ack == 1 then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                self.EggAwardFlag = true
+                self.curActivityClass.typeClass:RefreshActRedPoint()
+                if callback then
+                    callback()
+                end
+            end 
+        end
+    )
+end
+
+---查询队友卡牌详情
+function RelicTeamModel:GetCardInfo(pbData, callback)
+    RelicTeamNet:GetInstance():GetCardInfo(pbData, function(msg)
+        if msg.ack == 1 then
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+--被攻击推送
+function RelicTeamModel:AttackedPushCall(msg)
+    self.role_event.hp = msg.hp
+    self.jewel = msg.jewel
+    local info = self:GetTeamRoleInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    info.jewel = msg.jewel
+    self.fallFlag = msg.fall
+    self.attackedBol = true
+    if msg.energy then
+        self.energy = msg.energy[1]
+        self.energy_time = msg.energy[2]
+    end
+    if msg.fall then
+        self.role_event.event = {}
+        self.role_event.layer = self.role_event.layer - 1
+        self.role_event.event_num = 0
+        self.role_event.all_e_num = 0
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamAttacked.id)
+end
+
+--队友水晶推送
+function RelicTeamModel:GemChangePushCall(msg)
+    if msg.uid ~= _G.PlayerModel:GetInstance():GetPlayerUid() then
+        local info = self:GetTeamRoleInfo(msg.uid)
+        if info then
+            info.jewel = msg.jewel or info.jewel
+            info.power = msg.power or info.power
+        end
+    end
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicView.Name)
+    if ctrl then
+        self:CheckSelfRank(require("RankUtils").RankType.AncientGodAllianceTeam)
+    end
+end
+
+--队伍信息更新推送
+function RelicTeamModel:TeamUpdatePushCall(msg)
+    local uid = msg.uid or _G.PlayerModel:GetInstance():GetPlayerUid()
+    local info = self:GetTeamRoleInfo(uid)
+    if msg.g then
+        if msg.uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+            self.array = msg.g
+        else
+            for i = 1, #msg.g.sits do
+                if msg.g.sits[i] == 0 then
+                    info.team[i] = { sid = 0 }
+                end
+            end
+        end
+    end
+    if msg.ass then
+        info.assist_info = msg.ass
+        self:FreshAssistInfo()
+        self:FreshReceiveAssistInfo()
+    end
+    if msg.state == 4 then
+        self.newRequestBol = true
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamRequest.id)
+    elseif msg.state == 6 then
+        self.newInviteBol = true
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamInvite.id)
+    elseif msg.state == 3 then
+        self.team_info = nil
+        self.RequestedTeamUidList = {}
+    end
+end
+
+--region 战斗相关
+---PVP挑战
+function RelicTeamModel:OnChallenge(embattleBol)
+    local embattleId = _G.EmbattleType.RelicTeam
+    self.embattleBol = embattleBol
+    local pvpInfo
+    if not embattleBol then
+        pvpInfo = self:GetPVPInfo()
+    end
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.RelicTeamEmbattleView.Name,
+        embattleId,
+        _G.handlerbind(self, self.OnExitFight, pvpInfo),
+        _G.handlerbind(self, self.OnFight, pvpInfo),
+        nil,
+        pvpInfo,
+        relic_cfg,
+        embattleBol
+    )
+end
+
+---退出布阵
+function RelicTeamModel:OnExitFight(pvpInfo)
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicView.Name)
+    if ctrl then
+        ctrl:SetLockFinishEventBtnBol(false)
+    end
+    self:ReturnPanel()
+end
+
+function RelicTeamModel:SetFightName(name)
+    self.fightName = name
+end
+
+function RelicTeamModel:GetFightName(name)
+    return self.fightName
+end
+
+---进入战斗
+function RelicTeamModel:OnFight(pvpInfo)
+    if self.embattleBol then
+        self:OnExitFight()
+        --self.embattleBol = nil
+    else
+        self:Fight(pvpInfo)
+    end
+end
+
+function RelicTeamModel:SetNowFightType(type)
+    self.nowFightType = type or 1
+end
+
+---进入战斗
+function RelicTeamModel:Fight(pvpInfo)
+    local T = { args = {}, c_layer = self:GetNowLayer() }
+    self:FinishEvent(T, function(msg)
+        if msg.ack == 5218 then
+            self.role_event.event = {}
+            _G.WorldManager:GetInstance():DespawnRoleParent()
+            self:ReturnPanel(true)
+            return
+        elseif msg.ack ~= 1 then
+            _G.WorldManager:GetInstance():DespawnRoleParent()
+            self:ReturnPanel(true)
+            return
+        end
+        local bol = self.nowFightType == 2 or self.nowFightType == 3
+        if _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.RelicTeamSkipFight, 1) == 1 and not bol then
+            self:TiaoGuo(msg)
+        else
+            if self.nowFightType == 2 then
+                self:SetFightName(_G.GetLangPackValue(self:GetBossCfg().name))
+            end
+            _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.RelicTeam)
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.RelicTeamToggleView.Name)
+            local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicView.Name)
+            if ctrl then
+                ctrl:ShowScene(false)
+            end
+        end
+    end)
+end
+
+--跳过战斗
+function RelicTeamModel:TiaoGuo(_data)
+    _G.WorldManager:GetInstance():DespawnRoleParent()
+    --_G.StorageManager:GetInstance():ReceiveAwardData(_data)
+    local result = _data.winner or false
+
+    --双方对战名称
+    -- local leftName = _G.PlayerModel:GetInstance():GetName()
+    -- local rightName = self.curChallengePlayer and self.curChallengePlayer.name or ""
+
+    self.curBattleController = _G.require(_G.BattleControllerType.RelicTeam).New()
+    -- self.curBattleController.leftName = leftName
+    -- self.curBattleController.rightName = rightName
+    self.curBattleController:StartSettlement(
+        _G.SettlementModel.SettlementType.RelicTeam
+    -- _data,
+    -- true,
+    -- function()
+    --     self:UpdateInitData(_G.handlerbind(self, self.OnChallengeCall, true))
+    -- end,
+    -- nil,
+    -- _G.BattleManager:GetInstance():GetStatisticsRecord(_data.fight_arg),
+    -- _data.fight_arg
+    -- self.report_uid,
+    -- self.curChallengePlayer
+    )
+    -- _G.BattleManager:GetInstance():DestroyBattle()
+    -- _G.BattleManager:GetInstance():SetArgData(_data.fight_arg)
+    -- _G.BattleManager:GetInstance():SetBattleController( self.curBattleController)
+    -- _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.AllHeroesBattle_Fight}, 1)
+end
+
+function RelicTeamModel:ReEnterFight()
+    --local embattleId = _G.EmbattleType["SystemFairyland" .. self.curChanllengeBoss]
+    local embattleId = _G.EmbattleType.RelicTeam
+
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.RelicTeamEmbattleView.Name,
+        embattleId,
+        _G.handlerbind(self, self.OnExitFight),
+        _G.handlerbind(self, self.OnFight)
+    )
+end
+
+--现在是不是boss战
+function RelicTeamModel:NowIsBoss()
+
+end
+
+--获取pvp信息
+function RelicTeamModel:GetPVPInfo()
+    local roleEvent = self:GetRoleEvent()
+    if roleEvent and roleEvent.event then
+        return roleEvent.event.pvp_info
+    end
+end
+
+---监听界面打开
+---@param name string 界面名称
+function RelicTeamModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.RelicTeamToggleView.Name)
+        local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicView.Name)
+        if ctrl then
+            ctrl:ShowScene(false)
+        end
+    end
+end
+
+--离开战斗，回到遗迹页面
+function RelicTeamModel:ReturnPanel(isWin, id)
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicView.Name)
+    if isWin then
+        if ctrl then
+            ctrl:SetLockFinishEventBtnBol(false)
+            ctrl:UpdateView()
+        end
+    end
+    if ctrl then
+        ctrl:ShowScene(true)
+    end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.RelicTeamEmbattleView.Name)
+    if id == require("SettlementModel").FunctionEnum.Next then
+        return
+    end
+    self:ShowWindows()
+end
+
+function RelicTeamModel:ShowWindows()
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicTeamToggleView.Name)
+    if not ctrl then
+        return
+    end
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.RelicTeamToggleView.Name)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicView.Name)
+    if ctrl then
+        ctrl:ShowScene(true)
+    end
+end
+
+--region 时间相关
+--更改活动状态和下一个时间节点
+function RelicTeamModel:ChangeStatusAndNextTimeLine()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local exploreHour = self:GetExploreTime()
+    if serverTime > self.start_time and serverTime <= self.team_time then
+        self.status = self.relicStatus.team
+        self.nextTime = self.team_time
+    elseif serverTime > self.team_time and serverTime <= self.fight_time then
+        --serverTime为本地时区的服务器时间戳, 转为服务器时区
+        --下方调用_G.TimeUtil.timeReverse转回本地时区
+        local zeroTime = _G.TimeUtil.GetDayBySix(serverTime)
+        local fightStartTime = zeroTime + (exploreHour[1][1] * 3600) + (exploreHour[1][2] * 60)
+        local fightEndTime = zeroTime + (exploreHour[2][1] * 3600) + (exploreHour[2][2] * 60)
+        local timetable = _G.TimeUtil.date("*t", serverTime)
+        if serverTime >= fightStartTime and serverTime < fightEndTime then
+            self.status = self.relicStatus.explore
+            timetable.hour = exploreHour[2][1]
+            timetable.min = exploreHour[2][2]
+            timetable.sec = 0
+            self.nextTime = _G.TimeUtil.timeReverse(timetable)
+        elseif serverTime < fightStartTime then
+            self.status = self.relicStatus.idle
+            timetable.hour = exploreHour[1][1]
+            timetable.min = 0
+            timetable.sec = 0
+            self.nextTime = _G.TimeUtil.timeReverse(timetable)
+        elseif serverTime >= fightEndTime then
+            self.status = self.relicStatus.idle
+            timetable.hour = exploreHour[1][1]
+            timetable.min = 0
+            timetable.sec = 0
+            self.nextTime = _G.TimeUtil.timeReverse(timetable) + 86400
+        end
+    elseif serverTime > self.fight_time and serverTime <= self.end_time then
+        self.status = self.relicStatus.settle
+        self.nextTime = self.end_time
+    else
+        self.status = self.relicStatus.close
+    end
+    _G.Events:GetInstance():Broadcast(_G.eRelicTeam.RelicTeamChangeStatus, self.status, self.nextTime)
+    return self.status, self.nextTime
+end
+
+function RelicTeamModel:CheckAutoTeamStatus()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local time = serverTime - self.team_time
+    return time <= 3600 and time >= 0
+end
+
+--获取探索时间段
+function RelicTeamModel:GetExploreTime()
+    return _G.ConfigManager.discrete_cfg[125103]
+end
+
+--获取活动状态和下一个时间节点
+function RelicTeamModel:GetStatusAndNextTimeLine()
+    return self.status, self.nextTime
+end
+
+---根据上次体力恢复事件刷新计时器
+---@param energy_time number 上次体力恢复时间
+function RelicTeamModel:UpdateTimer()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if self.energy > relic_cfg.physical[1][1] then
+        self.energy_time = serverTime
+    else
+        if (serverTime - self.energy_time) >= relic_cfg.physical[2][1] then
+            local num = math.floor((serverTime - self.energy_time) / relic_cfg.physical[2][1])
+            for i = 1, num do
+                if self.energy < relic_cfg.physical[1][1] then
+                    self:AddEnergy(relic_cfg.physical[2][2])
+                    self.energy_time = self.energy_time + relic_cfg.physical[2][1]
+                else
+                    break
+                end
+            end
+        end
+    end
+    if serverTime > self.end_time then
+        if self.timer then
+            self.timer:Stop()
+            self.timer = nil
+        end
+    end
+end
+
+function RelicTeamModel:GetNextEnergyTime()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local nextTime = 0
+    local nextFullTime = 0
+    if self.energy < relic_cfg.physical[1][1] then
+        nextTime = self.energy_time + relic_cfg.physical[2][1] - serverTime
+        nextFullTime = nextTime + (relic_cfg.physical[1][1] - self.energy - 1) * relic_cfg.physical[2][1]
+    end
+    return nextTime, nextFullTime
+end
+
+---根据下次时间结点刷新计时器
+function RelicTeamModel:UpdateActivityTimer()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if serverTime >= self.nextTime then
+        self:ChangeStatusAndNextTimeLine()
+    end
+    if serverTime > self.end_time then
+        if self.activityTimer then
+            self.activityTimer:Stop()
+            self.activityTimer = nil
+        end
+    end
+end
+
+--今天是第几天
+function RelicTeamModel:GetNowDay()
+    local nowTime = _G.TimeUtil.GetServerUnixTime()
+    return _G.math.ceil((nowTime - self.start_time) / 86400)
+end
+
+--现在该取relic_cfg里第几天的配置
+function RelicTeamModel:GetNowExploreDay()
+    local time = _G.TimeUtil.GetServerUnixTime() - self.team_time
+    time = time > 0 and _G.math.ceil((time) / 86400) or 1
+    time = time > #relic_cfg.skills and #relic_cfg.skills or time
+    return time
+end
+
+--返回开始结束时间
+function RelicTeamModel:GetTime()
+    return self.start_time, self.end_time, self.fight_time
+end
+
+---@param memberList tbale relic.i_member
+---@param sortType number 1 队长最前 2 自己最前
+function RelicTeamModel:SetTeamHeadItem(headT, teamInfo, sortType)
+    local headTable = _G.GetAutoGoTable(headT)
+    local memberList
+    if teamInfo.role_info then
+        if sortType == 2 then
+            memberList = self:GetSortMemberInfoSimple(teamInfo, sortType)
+        else
+            memberList = teamInfo.role_info
+        end
+        for i = 1, 3 do
+            local obj = headTable["obj_headItem" .. i]
+            if memberList[i] then
+                obj:SetActiveE(1)
+                _G.UIUtils.SetPlayerHeadItemNew(obj, memberList[i], 1, true)
+            else
+                obj:SetActiveE(0)
+            end
+        end
+        headT:SetActiveE(1)
+    elseif teamInfo.member_list then
+        if sortType == 2 then
+            memberList = self:GetSortMemberInfo(teamInfo, sortType)
+        else
+            memberList = teamInfo.member_list
+        end
+        for i = 1, 3 do
+            local obj = headTable["obj_headItem" .. i]
+            if memberList[i] then
+                obj:SetActiveE(1)
+                _G.UIUtils.SetPlayerHeadItemNew(obj, memberList[i].role_info, 1, true)
+            else
+                obj:SetActiveE(0)
+            end
+        end
+        headT:SetActiveE(1)
+    else
+        headT:SetActiveE(0)
+    end
+end
+
+--获取排列过的成员列表
+function RelicTeamModel:GetSortMemberInfo(teamInfo, sortType)
+    local index
+    sortType = sortType or 1
+    local uid = sortType == 1 and teamInfo.leader_uid or _G.PlayerModel:GetInstance():GetPlayerUid()
+    for k, v in ipairs(teamInfo.member_list) do
+        if v.role_info.uid == uid then
+            index = k
+            break
+        end
+    end
+    if index and index ~= 1 then
+        local T = table.remove(teamInfo.member_list, index)
+        table.insert(teamInfo.member_list, 1, T)
+    end
+    return teamInfo.member_list
+end
+
+--获取排列过的成员列表
+function RelicTeamModel:GetSortMemberInfoSimple(teamInfo, sortType)
+    local index
+    sortType = sortType or 1
+    local uid = sortType == 1 and teamInfo.leader_uid or _G.PlayerModel:GetInstance():GetPlayerUid()
+    for k, v in ipairs(teamInfo.role_info) do
+        if v.role_info.uid == uid then
+            index = k
+            break
+        end
+    end
+    if index and index ~= 1 then
+        local T = table.remove(teamInfo.role_info, index)
+        table.insert(teamInfo.role_info, 1, T)
+    end
+    return teamInfo.role_info
+end
+
+--更新给出的援助信息
+function RelicTeamModel:FreshAssistInfo()
+    self.assistInfo = {}
+    for k, v in ipairs(self.team_info.member_list) do
+        self.assistInfo[v.role_info.uid] = {}
+    end
+    for k, v in ipairs(self.team_info.member_list) do
+        for key, value in pairs(self.assistInfo) do
+            if key ~= v.role_info.uid then
+                value[v.role_info.uid] = value[v.role_info.uid] or { role = v.role_info }
+            end
+        end
+        for k1, v1 in ipairs(v.assist_info or {}) do
+            if self.assistInfo[v1.uid] then
+                if self.assistInfo[v1.uid][v.role_info.uid] then
+                    self.assistInfo[v1.uid][v.role_info.uid].c_info = v1.c_info
+                else
+                    self.assistInfo[v1.uid][v.role_info.uid] = { role = v.role_info, c_info = v1.c_info }
+                end
+            end
+        end
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamAssist.id)
+end
+
+--更新收到的援助信息
+function RelicTeamModel:FreshReceiveAssistInfo()
+    self.receivAssistInfo = {}
+    local roleInfoT = {}
+    for k, v in ipairs(self.team_info.member_list) do
+        self.receivAssistInfo[v.role_info.uid] = {}
+        roleInfoT[v.role_info.uid] = v.role_info
+    end
+    for k, v in ipairs(self.team_info.member_list) do
+        for key, value in pairs(self.receivAssistInfo) do
+            if key ~= v.role_info.uid then
+                value[v.role_info.uid] = value[v.role_info.uid] or { role = v.role_info }
+            end
+        end
+        for k1, v1 in ipairs(v.assist_info or {}) do
+            if self.receivAssistInfo[v.role_info.uid] then
+                if self.receivAssistInfo[v.role_info.uid][v1.uid] then
+                    self.receivAssistInfo[v.role_info.uid][v1.uid].c_info = v1.c_info
+                else
+                    self.receivAssistInfo[v.role_info.uid][v1.uid] = { role = roleInfoT[v1.uid], c_info = v1.c_info }
+                end
+            end
+        end
+    end
+end
+
+--获取每个队员给出的援助信息
+function RelicTeamModel:GetGiveAssistInfo(uid)
+    if not self.assistInfo then
+        self:FreshAssistInfo()
+    end
+    if uid then
+        return self.assistInfo[uid]
+    end
+    return self.assistInfo
+end
+
+function RelicTeamModel:CheckAssistRedPoint()
+    if not self.team_info or self.status == self.relicStatus.settle or self.status == self.relicStatus.close then
+        return false
+    end
+    local info = self:GetGiveAssistInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    for k, v in pairs(info) do
+        if not v.c_info then
+            return true
+        end
+    end
+    return false
+end
+
+--检查卡牌能不能援助
+function RelicTeamModel:CheckCardCanAssist(uid, playerUid)
+    local info = self:GetGiveAssistInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    for k, v in pairs(info) do
+        if v.c_info and v.c_info.uid == uid and playerUid ~= k then
+            return false
+        end
+    end
+    return true
+end
+
+--获取每个队员收到的援助信息
+function RelicTeamModel:GetReceiveAssistInfo(uid)
+    if not self.receivAssistInfo then
+        self:FreshReceiveAssistInfo()
+    end
+    if uid then
+        return self.receivAssistInfo[uid]
+    end
+    return self.receivAssistInfo
+end
+
+--获取阵营图片
+function RelicTeamModel:GetCampIma(camp)
+    camp = camp or self:GetCamp()
+    return camp == 1 and "ImagesH5/hRelic/ui_zgzf_blue_img" or
+        "ImagesH5/hRelic/ui_zgzf_red_img"
+end
+
+--获取阵营名字
+function RelicTeamModel:GetCampName(camp)
+    camp = camp or self:GetCamp()
+    return self:GetCamp() == 1 and _G.GetLangPackValue(90033500075) or _G.GetLangPackValue(90033500074)
+end
+
+--获取队伍战斗力
+function RelicTeamModel:GetTeamPower()
+    local power = 0
+    if self.status == self.relicStatus.team then
+        for k, v in ipairs(self.team_info.member_list) do
+            power = power + v.role_info.power
+        end
+    else
+        for k, v in ipairs(self.team_info.member_list) do
+            power = power + v.power
+        end
+    end
+    return power
+end
+
+--获取队伍珠宝总数
+function RelicTeamModel:GetAllJewel()
+    self.allJewel = 0
+    if self.team_info then
+        for k, v in pairs(self.team_info.member_list or {}) do
+            v.jewel = v.jewel or 0
+            self.allJewel = self.allJewel + v.jewel
+        end
+    end
+    return self.allJewel
+end
+
+--检查自己是不是队长
+function RelicTeamModel:CheckLeader()
+    if self.team_info then
+        return self.team_info.leader_uid == _G.PlayerModel:GetInstance():GetPlayerUid()
+    end
+    return false
+end
+
+--获取战斗地图
+function RelicTeamModel:GetFightMap()
+    if self:CheckHaveEventNow() then
+        local info = self:GetPVPInfo()
+        local day = self:GetNowExploreDay()
+        if info and info.scene then
+            return info.scene
+        end
+        return relic_events_cfg[self.role_event.event.event_sid].scene[day] or 502010110
+    end
+    return 502010110
+end
+
+--获取积分
+function RelicTeamModel:GetScore()
+    return self.score
+end
+
+--清除掉层记号
+function RelicTeamModel:ClearFallFlag()
+    self.multiple = 1
+    self.fallFlag = nil
+end
+
+--获取掉层记号
+function RelicTeamModel:GetFallFlag()
+    if self.fallFlag and self.fallFlag ~= 0 then
+        return true
+    end
+    return false
+end
+
+--设置队伍更新记号
+function RelicTeamModel:SetTeamUpdateBol(bol)
+    self.teamUpdateBol = bol
+end
+
+--清除队伍更新记号
+function RelicTeamModel:ClearTeamUpdateBol()
+    self.teamUpdateBol = nil
+end
+
+--获取队伍更新记号
+function RelicTeamModel:GetTeamUpdateBol()
+    if self.status and self.status ~= self.relicStatus.close then
+        return self.teamUpdateBol
+    end
+end
+
+--清除被攻击记号
+function RelicTeamModel:ClearAttackedBol()
+    self.attackedBol = nil
+end
+
+--获取被攻击记号
+function RelicTeamModel:GetAttackedBol()
+    if self.status and self.status ~= self.relicStatus.close then
+        return self.attackedBol
+    end
+end
+
+--清除新申请记号
+function RelicTeamModel:ClearNewRequestBol()
+    self.newRequestBol = nil
+end
+
+--获取新申请记号
+function RelicTeamModel:GetNewRequestBol()
+    if self.status and self.status == self.relicStatus.team then
+        return self.newRequestBol
+    end
+end
+
+--清除新邀请记号
+function RelicTeamModel:ClearNewInviteBol()
+    self.newInviteBol = nil
+end
+
+--获取新邀请记号
+function RelicTeamModel:GetNewInviteBol()
+    if self.status and self.status == self.relicStatus.team and not self.team_info then
+        return self.newInviteBol
+    end
+end
+
+--检查满体力红点
+function RelicTeamModel:CheckFullEnergyRed()
+    if self.status and self.status ~= self.relicStatus.close and self.energy >= relic_cfg.physical[1][1] and self.status == self.relicStatus.explore then
+        return true
+    end
+    return false
+end
+
+--检查是否布阵
+function RelicTeamModel:CheckArray()
+    if self.array and self.array.sits then
+        for i = 1, 5 do
+            if self.array.sits[i] ~= 0 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--检查满体力红点
+function RelicTeamModel:CheckFullEnergyRed()
+    if self.status and self.status ~= self.relicStatus.close and self.energy >= relic_cfg.physical[1][1] and self.status == self.relicStatus.explore then
+        return true
+    end
+    return false
+end
+
+--获取势力头像
+function RelicTeamModel:GetCampHeadInfo()
+    return self.campHeadInfo
+end
+
+--获取势力人数
+function RelicTeamModel:GetCampNum()
+    return self.campNum
+end
+
+function RelicTeamModel:AddBuff(args)
+    self.buff_count = self.buff_count or {}
+    local haveBol
+    for k, v in ipairs(self.buff_count) do
+        if v.key == args.sid then
+            if args.factNum then
+                v.value = args.factNum
+            else
+                v.value = args.fixNum + v.value
+            end
+            haveBol = true
+            break
+        end
+    end
+    if not haveBol then
+        table.insert(self.buff_count, { key = args.sid, value = args.factNum or args.fixNum })
+        self:SortBuff()
+    end
+    self:CalBuffAttNum()
+end
+
+function RelicTeamModel:SortBuff()
+    table.sort(self.buff_count, function(a, b)
+        local cfgA = _G.ConfigManager.relic_effect_cfg[a.key]
+        local cfgB = _G.ConfigManager.relic_effect_cfg[b.key]
+        if cfgA.grade ~= cfgB.grade then
+            return cfgA.grade > cfgB.grade
+        else
+            return a.key < b.key
+        end
+    end)
+end
+
+function RelicTeamModel:GetBuffNum(sid)
+    for k, v in ipairs(self.buff_count or {}) do
+        if v.key == sid then
+            return v.value
+        end
+    end
+    return 0
+end
+
+function RelicTeamModel:CalBuffAttNum()
+    self.buffAtt = { atk = 0, def = 0, max_hp = 0, bre = 0 }
+    for k, v in ipairs(self.buff_count or {}) do
+        local data = _G.ConfigManager.relic_effect_cfg[v.key]
+        for k1, v1 in ipairs(data.attribute) do
+            if self.buffAtt[v1[1]] then
+                self.buffAtt[v1[1]] = self.buffAtt[v1[1]] + tonumber(v1[3]) * v.value
+            end
+        end
+    end
+end
+
+function RelicTeamModel:GetBuffCount()
+    return self.buff_count or {}
+end
+
+function RelicTeamModel:GetBuffAttNum(attName)
+    if attName then
+        return _G.AttributeClassManager:GetInstance():GetShowProp(attName, 2, self.buffAtt[attName], 1, nil, true)
+    end
+    return self.buffAtt
+end
+
+function RelicTeamModel:GetBuffPowerRatio()
+    local ratio = 1
+    for k, v in ipairs(self.buff_count) do
+        ratio = relic_effect_cfg[v.key].power / 10000 * v.value + ratio
+    end
+    return ratio
+end
+
+function RelicTeamModel:GetDataFromCfg()
+    local giftActivity = require "ActivitySynManager":GetInstance():GetChildAcitivity(10014, 100081)
+    if giftActivity then
+        self.typeClass = giftActivity:GetActivityTypeCls()
+        self.model_cfg = giftActivity:GetActivityTypeCls():GetModelCfgByCondition()
+    end
+end
+
+function RelicTeamModel:SetMyTeamPower(num, noBuffNum)
+    local info = self:GetTeamRoleInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    if info then
+        info.power = num
+    end
+    if noBuffNum then
+        self.nowPowerNoBuff = noBuffNum
+    end
+end
+
+function RelicTeamModel:GetMyTeamPower()
+    local info = self:GetTeamRoleInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    if info then
+        return info.power or 0
+    end
+    return 0
+end
+
+function RelicTeamModel:GetMyTeamPowerNoBuff()
+    return self.nowPowerNoBuff or 0
+end
+
+function RelicTeamModel:UpdateMyTeamPower()
+    local ratio = self:GetBuffPowerRatio()
+    local info = self:GetTeamRoleInfo(_G.PlayerModel:GetInstance():GetPlayerUid())
+    if info then
+        info.power = self:GetMyTeamPowerNoBuff() * ratio
+    end
+    return self.nowPowerNoBuff
+end
+
+--进遗迹是否弹阵容提示
+function RelicTeamModel:CheckShowArrayTips()
+    if self.status == self.relicStatus.explore then
+        local lastTime = _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.RelicTeamArrayTips, 0)
+        local serverTime = _G.TimeUtil.GetServerUnixTime()
+        if lastTime == 0 or (lastTime ~= 0 and not _G.TimeUtil.CheckTheSameDay(lastTime, serverTime)) then
+            _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.RelicTeamArrayTips, serverTime)
+            return self:CheckArrayCondition()
+        end
+    end
+    return false
+end
+
+--检查阵容条件
+function RelicTeamModel:CheckArrayCondition()
+    local eleDic = {}
+    local proDic = {}
+    local sidDic = {}
+    local starDic = {}
+    local orderDic = {}
+    local totalNum = 0
+    ---@type CardData
+    local cardData, ele, pro
+    for i, v in pairs(self.array.sits) do
+        if v > 0 then
+            cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, v)
+            if not cardData then
+                local cardInfo = self:GetMyAssistCards()
+                for key, value in ipairs(cardInfo) do
+                    if value.c_info.uid == v then
+                        cardData = _G.CardData.New()
+                        cardData:Parse(value.card or value.c_info)
+                    end
+                end
+            end
+            ele = cardData:GetElement()
+            pro = cardData:GetProfessional()
+            eleDic[ele] = eleDic[ele] and eleDic[ele] + 1 or 1
+            proDic[pro] = proDic[pro] and proDic[pro] + 1 or 1
+            starDic[cardData:GetStar()] = starDic[cardData:GetStar()] and starDic[cardData:GetStar()] + 1 or 1
+            orderDic[cardData:GetGrade()] = orderDic[cardData:GetGrade()] and orderDic[cardData:GetGrade()] + 1 or 1
+            sidDic[cardData.sid] = true
+            totalNum = totalNum + 1
+        end
+    end
+
+    local conIds = self:GetGarrayCondition()
+    local flag, condition
+    for i = 1, #conIds do
+        condition = _G.ConfigManager.system_trial_star_cfg[conIds[i]].condition[1]
+        flag = false
+        if condition[1] == FSE.leastEle then
+            if eleDic[condition[3]] ~= nil and eleDic[condition[3]] >= condition[2] then
+                flag = true
+            end
+        elseif condition[1] == FSE.mostEle then
+            if eleDic[condition[3]] == nil or eleDic[condition[3]] <= condition[2] then
+                flag = true
+            end
+        elseif condition[1] == FSE.leastPro then
+            if proDic[condition[3]] ~= nil and proDic[condition[3]] >= condition[2] then
+                flag = true
+            end
+        elseif condition[1] == FSE.mostPro then
+            if proDic[condition[3]] == nil or proDic[condition[3]] <= condition[2] then
+                flag = true
+            end
+        elseif condition[1] == FSE.mulEle then
+            flag = true
+            for i = 3, 6 do
+                if eleDic[condition[i]] == nil or eleDic[condition[i]] < 1 then
+                    flag = false
+                    break
+                end
+            end
+        elseif condition[1] == FSE.appoint2 then
+            if sidDic[condition[2]] or sidDic[condition[3]] then
+                flag = true
+            end
+        elseif condition[1] == FSE.noPro then
+            if proDic[condition[2]] ~= nil and proDic[condition[2]] > 0 then
+                flag = true
+            end
+            if proDic[condition[3]] ~= nil and proDic[condition[3]] > 0 then
+                flag = true
+            end
+        elseif condition[1] == FSE.allPro then
+            if proDic[condition[2]] ~= nil and proDic[condition[2]] == totalNum then
+                flag = true
+            end
+        elseif condition[1] == FSE.diffEle then
+            if _G.table.count(eleDic) >= condition[2] then
+                flag = true
+            end
+        elseif condition[1] == FSE.leastStar then
+            local num = 0
+            for k, v in pairs(starDic) do
+                if k >= condition[3] then
+                    num = num + v
+                    if num >= condition[2] then
+                        flag = true
+                        break
+                    end
+                end
+            end
+        elseif condition[1] == FSE.leastOrder then
+            local num = 0
+            for k, v in pairs(orderDic) do
+                if k >= condition[3] then
+                    num = num + v
+                    if num >= condition[2] then
+                        flag = true
+                        break
+                    end
+                end
+            end
+        end
+        if flag then
+            break
+        end
+    end
+    return flag
+end
+
+function RelicTeamModel:CheckCardIsDebuff(cardData)
+    local conIds = self:GetGarrayCondition()
+    local condition
+    for i = 1, #conIds do
+        condition = _G.ConfigManager.system_trial_star_cfg[conIds[i]].condition[1]
+        if condition[1] == 7 then --策划说先写死限制职业
+            local pro = cardData:GetProfessional()
+            if pro == condition[2] or pro == condition[3] then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function RelicTeamModel:JumpGift()
+    local giftActivity = require "ActivitySynManager":GetInstance():GetChildAcitivity(10014, 100081)
+    if not self.status or (self.status ~= self.relicStatus.idle and self.status ~= self.relicStatus.explore) or not giftActivity then
+        _G.PopWindowManager:GetInstance():ShowAllTips(3602)
+    elseif self.team_info then
+        local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RelicTeamToggleView.Name)
+        if ctrl then
+            ctrl:SwitchToggle("gift")
+        else
+            _G.DelayFrameDo(function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RelicTeamToggleView.Name, "gift")
+            end)
+        end
+    else
+        local msg = {}
+        msg.name = _G.GetPlayerName()
+        msg.type = 1
+        msg.power = 0
+        self:CreateTeam(msg, function()
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RelicTeamToggleView.Name, "gift")
+        end)
+    end
+end
+
+function RelicTeamModel:ShowRankUp(addNum, lanID)
+    self.rankUpList = self.rankUpList or {}
+    local content = _G.GetLangPackValue(lanID, addNum)
+    table.insert(self.rankUpList, content)
+    if not self.rankUpTimer then
+        self.rankUpTimer = _G.TimerManager:GetInstance():GetTimer(0.5, self.UpdateRankTimer, self, false, false, true)
+        self.rankUpTimer:Start()
+    end
+end
+
+function RelicTeamModel:UpdateRankTimer()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if serverTime > self.end_time then
+        if self.rankUpTimer then
+            self.rankUpTimer:Stop()
+            self.rankUpTimer = nil
+        end
+    end
+    local ctrl1 = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.PowerUpView.Name)
+    local ctrl2 = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.FloatTipsView.Name)
+    local ctrl3 = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.CommonAwardView.Name)
+    local ctrl4 = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.OptionDialogView.Name)
+    local ctrl5 = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.OptionDialogByToggleView.Name)
+
+    if not ctrl1 and not ctrl2 and not ctrl3 and not ctrl4 and not ctrl5 then
+        if self.rankUpList and self.rankUpList[1] then
+            require("CommonTipManager").OpenRankUpView(self.rankUpList[1])
+            table.remove(self.rankUpList, 1)
+        else
+            if self.rankUpTimer then
+                self.rankUpTimer:Stop()
+                self.rankUpTimer = nil
+            end
+        end
+    end
+end
+
+function RelicTeamModel:GetRankData(nowBol)
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    self.lastGetRankTime = self.lastGetRankTime or (serverTime + 601)
+    if nowBol or (self.lastGetRankTime - serverTime > 600) then
+        require("RecordRankModel"):GetInstance():GetListInfoByPage(
+            require("RankUtils").RankType.AncientGodPersonalPoints, nil, 2)
+        require("RecordRankModel"):GetInstance():GetListInfoByPage(require("RankUtils").RankType.AncientGodAllianceTeam,
+            nil, 2)
+    end
+end
+
+--- 监测自己的排行榜有没有提升
+function RelicTeamModel:CheckSelfRank(type)
+    local value, lanID
+    if type == require("RankUtils").RankType.AncientGodPersonalPoints then
+        value = self.score
+        lanID = 90033500241
+    elseif type == require("RankUtils").RankType.AncientGodAllianceTeam then
+        value = self:GetAllJewel()
+        lanID = 90033500240
+    end
+    local listRankDatas = require("RecordRankModel"):GetInstance():GetListData(type)
+    if listRankDatas == nil then
+        return
+    end
+
+    local selfUid = _G.PlayerModel:GetInstance():GetPlayerUid()
+
+    local oldRank = 0
+
+    for k, v in pairs(listRankDatas) do
+        if v.role_info.uid == selfUid then
+            oldRank = k
+        end
+    end
+
+    local newRank
+    for i, v in pairs(listRankDatas) do
+        local bol
+        if v.score then
+            bol = value > v.score
+        elseif v.gem then
+            bol = value > v.gem
+        end
+        if bol then
+            newRank = i
+            break
+        end
+    end
+    if newRank and newRank < oldRank then
+        self:ShowRankUp(newRank, lanID)
+        --self:GetRankData(true)
+        local temp = listRankDatas[oldRank]
+        table.remove(listRankDatas, oldRank)
+        table.insert(listRankDatas, newRank, temp)
+    end
+end
+
+function RelicTeamModel:GetFinishEventNumInNowLayer()
+    return self.role_event.all_e_num or 0
+end
+
+function RelicTeamModel:SetFinishEventNumInNowLayer(num)
+    self.role_event.all_e_num = num or 0
+end
+
+---销毁对象时,析构函数
+function RelicTeamModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.activityTimer then
+        self.activityTimer:Stop()
+        self.activityTimer = nil
+    end
+    if self.rankUpTimer then
+        self.rankUpTimer:Stop()
+        self.rankUpTimer = nil
+    end
+    self.upLayerTipsBol = nil
+    self.activity = nil
+end
+
+return RelicTeamModel

@@ -1,0 +1,1231 @@
+local RecordRankNet = require("RecordRankNet")
+local RankUtils = require("RankUtils")
+
+---@class RecordRankModel : Singleton
+---@field GetInstance fun():RecordRankModel
+---@field mainRankDatas table<number, record_rank.i_first>      主界面数据
+---@field listRankDatas table<RankUtils.RankType, RecordRankData[]>         各排行榜数据
+---@field selfRankDatas table<number, RecordRankData>           自己的排行榜数据
+---@field linkDatas table<number, RecordRankLinkData>           各排行榜点赞记录, table<排行榜类型,记录数据>
+---@field linkCounts table<number, number>                      今日点赞状态, table<玩家uid, 次数>
+---@field awardDatas table<number, RecordRankAwardData>         各排行榜奖励记录, table<排行榜类型,奖励数据>
+---@field lstAwardCfg table<number, rank_cfg[]>                 各排行奖励配置表
+---@field bookDatas table<number, record_rank.i_achieve>        灵域薄首通数据
+---@field bookAwardDatas table<number, boolean>                 灵域薄首通奖励
+---@field lstBookCfg table<number, rank_achievement[]>          灵域薄配置表
+local RecordRankModel = _G.BaseClass("RecordRankModel", _G.GameDataModelBase)
+local PowerToTheTopModel = require("PowerToTheTopModel"):GetInstance()
+
+function RecordRankModel:__init()
+    self.lstAwardCfg = {}
+
+    ---@type table<RankUtils.RankType, RankDataBase>   各排行榜数据缓存
+    self.rankDataDict = {}
+    for _, cfg in pairs(_G.ConfigManager.rank_cfg) do
+        local lst = self.lstAwardCfg[cfg.type_rank]
+        if not lst then
+            lst = {}
+            self.lstAwardCfg[cfg.type_rank] = lst
+        end
+        table.insert(lst, cfg)
+    end
+
+    self.lstBookCfg = {}
+    for _, cfg in pairs(_G.ConfigManager.rank_achievement) do
+        local lst = self.lstBookCfg[cfg.tab]
+        if not lst then
+            lst = {}
+            self.lstBookCfg[cfg.tab] = lst
+        end
+        table.insert(lst, cfg)
+    end
+    --对id进行从小到大排序
+    for _, lst in pairs(self.lstBookCfg) do
+        table.sort(
+            lst,
+            function(a, b)
+                return a.id < b.id
+            end
+        )
+    end
+
+    --注册事件
+    _G.Events:GetInstance():AddListener(_G.eRecordRankEvent.RecordRankAwardUpdate, self.OnAwardNodeUpdate, self)
+    _G.Events:GetInstance():AddListener(_G.eRecordRankEvent.RecordRankFirstClearUpdate, self.OnFirstClearUpdate, self)
+end
+
+function RecordRankModel:Dispose()
+    self.mainRankDatas = nil
+    self.listRankDatas = nil
+    self.selfRankDatas = nil
+    self.linkDatas = nil
+    self.linkCounts = nil
+    self.bookDatas = nil
+    self.bookAwardDatas = nil
+
+    --移除事件
+    _G.Events:GetInstance():RemoveListener(_G.eRecordRankEvent.RecordRankAwardUpdate, self.OnAwardNodeUpdate, self)
+    _G.Events:GetInstance():RemoveListener(
+        _G.eRecordRankEvent.RecordRankFirstClearUpdate,
+        self.OnFirstClearUpdate,
+        self
+    )
+end
+
+---获取主界面排行信息
+---@param rankId number
+---@return record_rank.i_first
+function RecordRankModel:GetMainData(rankId)
+    if not self.mainRankDatas then
+        return nil
+    end
+    local d = self.mainRankDatas[rankId]
+    if d and d.value <= 0 then
+        d = nil --无效进度值, 置为nil
+    end
+    return d
+end
+
+---获取排行榜数据
+---@param rankId number
+---@return RecordRankData[]
+function RecordRankModel:GetListData(rankId)
+    if not self.listRankDatas then
+        return nil
+    end
+    return self.listRankDatas[rankId]
+end
+
+---获取自己的排行数据
+---@param rankId number
+---@param inRankCache boolean       在排行榜缓存数据中取值
+---@return RecordRankData,number    自己的数据, 自己的排名
+function RecordRankModel:GetSelfData(rankId, inRankCache)
+    if not inRankCache then
+        if not self.selfRankDatas then
+            return nil, -1
+        end
+        return self.selfRankDatas[rankId], -1
+    end
+    --从排行榜缓存中取值
+    local list = self:GetListData(rankId)
+    if not list then
+        return nil
+    end
+    local selfUid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    for rank, d in pairs(list) do
+        if d.role_info.uid == selfUid then
+            return d, rank
+        end
+    end
+    return nil, -1
+end
+
+---获取自己的空数据
+---@param rankId number
+---@return RecordRankData
+function RecordRankModel:GetSelfEmptyData(rankId)
+    return {
+        type = rankId,
+        value = 0,
+        point = _G.PlayerModel:GetInstance():GetPoint(),
+        role_info = _G.PlayerModel:GetInstance():GetIRroleTable()
+    }
+end
+
+---清空自己的排行数据
+---@return void
+function RecordRankModel:ClearSelfData()
+    self.selfRankDatas = nil
+end
+
+---是否已对目标角色进行点赞
+---@param rankId number
+---@param uid number
+---@return boolean
+function RecordRankModel:IsLinked(rankId, uid)
+    if not self.linkDatas then
+        return false
+    end
+    local linkRecord = self.linkDatas[rankId]
+    if not linkRecord then
+        return false
+    end
+
+    return linkRecord.state[uid] and linkRecord.state[uid] > 0 or false
+end
+
+---能否对目标角色进行点赞, 如不能返回tip_id
+---@param rankId number
+---@param uid number
+---@return boolean,number   是否可以点赞, 对应的tip_id
+function RecordRankModel:CanLink(rankId, uid)
+    if not self.linkDatas then
+        return false, 0
+    end
+    local linkRecord = self.linkDatas[rankId]
+    if not linkRecord then
+        return true, 0
+    end
+
+    --检查次数是否已满
+    local maxCount = _G.ConfigManager.discrete_cfg[109102][1][2]
+    if linkRecord.count >= maxCount then
+        return false, 740103
+    end
+    --检查是否已经点赞
+    if linkRecord.state[uid] and linkRecord.state[uid] > 0 then
+        return false, 740104
+    end
+    
+    return true, 0
+end
+
+---是否有点赞奖励
+---@return boolean
+function RecordRankModel:HasLinkAward()
+    return self:GetLinkCount(1) <= 0
+end
+
+---获取今日对某玩家总共点赞次数
+---@param uid number
+---@return number
+function RecordRankModel:GetLinkPlayerCount(uid)
+    if not self.linkCounts then
+        return 0
+    end
+    return self.linkCounts[uid] or 0
+end
+
+---获取奖励配置列表
+---@param rankId number
+---@return rank_cfg[]
+function RecordRankModel:GetAwardCfg(rankId)
+    return self.lstAwardCfg[rankId]
+end
+
+---获取节点达成记录(返回nil则表示无人达成)
+---@param rankId number
+---@param id number         奖励ID
+---@return RecordRankAwardRecordData
+function RecordRankModel:GetAwardRecord(rankId, id)
+    if not self.awardDatas then
+        return nil
+    end
+    local recordData = self.awardDatas[rankId]
+    if not recordData then
+        return nil
+    end
+    return recordData.records[id]
+end
+
+---能否领取节点奖励
+---@param rankId number
+---@param id number         奖励ID
+---@return RecordRankAwardRecordData
+function RecordRankModel:CanGetAward(rankId, id)
+    if not self.awardDatas then
+        return false
+    end
+    local recordData = self.awardDatas[rankId]
+    return not recordData or not recordData.get[id]
+end
+
+---获取上榜人数
+---@param rankId number
+---@return number
+function RecordRankModel:GetRankPlayerCount(rankId)
+    if not self.listRankDatas then
+        return 0
+    end
+    local lst = self.listRankDatas[rankId]
+    if not lst then
+        return 0
+    end
+    return #lst
+end
+
+---是否有可领取奖励
+---@param rankId number
+---@return boolean
+function RecordRankModel:HasAwardReceive(rankId)
+    if not self.awardDatas then
+        return false
+    end
+    local awardRecord = self.awardDatas[rankId]
+    if not awardRecord then
+        return false
+    end
+    for id, _ in pairs(awardRecord.records) do
+        if not awardRecord.get[id] then
+            return true
+        end
+    end
+    return false
+end
+
+---获取今日已点赞总数
+---@param defaultValue number   未初始化时的返回值, 默认: 0
+---@return number
+function RecordRankModel:GetLinkCount(defaultValue)
+    if not self.linkDatas then
+        return defaultValue or 0
+    end
+    local count = 0
+    for _, d in pairs(self.linkDatas) do
+        count = count + d.count
+    end
+    return count
+end
+
+---获取灵域薄配置
+---@param type number
+---@return rank_achievement[]
+function RecordRankModel:GetBookCfg(type)
+    return self.lstBookCfg[type]
+end
+
+---获取灵域薄首通玩家
+---@param sid number    @rank_achievement.id
+---@return record_rank.i_achieve
+function RecordRankModel:GetBookRecord(sid)
+    if not self.bookDatas then
+        return nil
+    end
+    return self.bookDatas[sid]
+end
+
+---是否可领取灵域薄奖励
+---@param sid number    @rank_achievement.id
+---@return boolean
+function RecordRankModel:CanGetBookAward(sid)
+    if not self.bookAwardDatas then
+        return false
+    end
+    if self.bookAwardDatas[sid] then
+        return false
+    end
+    return true
+end
+
+---获取奖励标题
+---@param rankId number @1-5雷风水火土死魂塔, 6神, 7冒险, 8死魂塔主塔
+---@param type number   @ 1排行列表, 2奖励列表
+---@return string
+function RecordRankModel:GetTitleDescription(rankId, type)
+    if rankId == 1 then
+        return _G.GetLangPackValue(type == 1 and 90029400161 or 90029400169)
+    elseif rankId == 2 then
+        return _G.GetLangPackValue(type == 1 and 90029400162 or 90029400170)
+    elseif rankId == 3 then
+        return _G.GetLangPackValue(type == 1 and 90029400163 or 90029400171)
+    elseif rankId == 4 then
+        return _G.GetLangPackValue(type == 1 and 90029400164 or 90029400172)
+    elseif rankId == 5 then
+        return _G.GetLangPackValue(type == 1 and 90029400165 or 90029400173)
+    elseif rankId == 6 then
+        return _G.GetLangPackValue(type == 1 and 90029400166 or 90029400174)
+    elseif rankId == 7 then
+        return _G.GetLangPackValue(type == 1 and 90029400159 or 90029400167)
+    elseif rankId == 8 then
+        return _G.GetLangPackValue(type == 1 and 90029400160 or 90029400168)
+    end
+    return "Title"
+end
+
+---获取进度描述信息
+---@param rankId number @1-5雷风水火土死魂塔, 6神, 7冒险, 8死魂塔主塔
+---@param value number  @进度值（积分或者放置关卡sid,死魂塔层数）
+---@param shortText boolean  生成短文本
+---@return string
+function RecordRankModel:GetProgressDescription(rankId, value, shortText)
+    if rankId >= 1 and rankId <= 6 then
+        --积分榜
+        return shortText and tostring(value) or _G.GetLangPackValue(90025700025, value)
+    elseif rankId == 7 then
+        local cfg = _G.ConfigManager.afk_cfg[value]
+        if cfg then
+            local progress = cfg.chapter .. "-" .. cfg.section
+            return shortText and progress or _G.GetLangPackValue(90025311601, progress)
+        end
+    elseif rankId == 8 then
+        --local cfg = _G.ConfigManager.tower_cfg[value]
+        --if cfg then
+        --    local progress = tostring(cfg.layer)
+        --    return shortText and progress or _G.GetLangPackValue(90025311701, progress)
+        --end
+        local progress = tostring(value)
+        return shortText and progress or _G.GetLangPackValue(90025311701, progress)
+    elseif rankId == 9 then
+        value = _G.UIUtils.NumberToUnitStr_CardFightNum(value)
+        return shortText and value or _G.GetLangPackValue(90025700007, value)
+    elseif rankId == 10 then
+        if value > 0 then
+            value = require "SecretRealmModel":GetInstance():GetName(value)
+        else
+            value = ""
+        end
+        return value
+    elseif self:GetRankData(rankId) then
+        return self:GetRankData(rankId):GetProgressDescription(value, shortText)
+    end
+    return tostring(value)
+end
+
+---获取奖励目标描述
+---@param rankId number @1-5雷风水火土死魂塔, 6神, 7冒险, 8死魂塔主塔
+---@param value number  @进度值（积分或者放置关卡sid,死魂塔层数）
+---@return string
+function RecordRankModel:GetTargetDescription(rankId, value)
+    if rankId == 1 then
+        return _G.GetLangPackValue(90029400179, value)
+    elseif rankId == 2 then
+        return _G.GetLangPackValue(90029400180, value)
+    elseif rankId == 3 then
+        return _G.GetLangPackValue(90029400181, value)
+    elseif rankId == 4 then
+        return _G.GetLangPackValue(90029400182, value)
+    elseif rankId == 5 then
+        return _G.GetLangPackValue(90029400183, value)
+    elseif rankId == 6 then
+        return _G.GetLangPackValue(90029400184, value)
+    elseif rankId == 7 then
+        local cfg = _G.ConfigManager.afk_cfg[value]
+        if cfg then
+            return _G.GetLangPackValue(90029400177, cfg.chapter)
+        end
+    elseif rankId == 8 then
+        local cfg = _G.ConfigManager.tower_cfg[value]
+        if cfg then
+            return _G.GetLangPackValue(90029400178, tostring(cfg.layer))
+        end
+    elseif rankId == 9 then
+        value = _G.GameUtil.NumberToUnitWord(value)
+        return _G.GetLangPackValue(90025700007, value)
+    elseif self:GetRankData(rankId) then
+        return self:GetRankData(rankId):GetTargetDescription(value)
+    end
+    return tostring(value)
+end
+
+---获取首通目标描述
+---@param type number   @8放置冒险
+---@param value number  @进度值（积分或者放置关卡sid）
+---@return string
+function RecordRankModel:GetBookTargetDescription(type, value)
+    if type == 8 then
+        local cfg = _G.ConfigManager.afk_cfg[value]
+        if cfg then
+            return cfg.chapter .. "-" .. cfg.section
+        end
+    end
+    return tostring(value)
+end
+
+--region ------------网络接口处理------------
+
+---从服务器拉取数据
+function RecordRankModel:GetDataFormServer()
+    --初始化状态
+    local count = 0
+    local function callback()
+        count = count + 1
+        if count >= 3 then
+            self:ParseData() --全部初始化完成, 调用ParseData进入下一步
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RecordRankMainView.Name)
+            if view then
+                view:UpdateAllRank()
+            end
+            view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RecordRankListView.Name)
+            if view then
+                view:SetRank(view.rankId)
+                view:SetView("rank")
+            end
+        end
+    end
+
+    self:GetLinkRecordInfo(callback)
+    self:GetAllDataOfRecursive({ 1, 2, 3, 4, 5, 6, 7, 8, 9 }, callback)
+    self:GetAllBookInfo(callback)
+end
+
+---递归的拉取每个排行榜的数据(拉取排行榜数据和奖励数据)
+---@param list number[]             需要请求的排行榜列表
+---@param callback fucntion         结束后执行回调函数
+function RecordRankModel:GetAllDataOfRecursive(list, callback)
+    if not list or #list <= 0 then
+        if callback then
+            callback()
+        end
+        return
+    end
+    local rankId = table.remove(list, 1)
+
+    local count = 0
+    local function finish()
+        count = count + 1
+        if count >= 2 then
+            self:GetAllDataOfRecursive(list, callback)
+        end
+    end
+    self:GetListInfo(rankId, finish)
+    self:GetAwardInfo(rankId, finish)
+end
+
+---注册监听, 玩家达成排行榜目标(刷新红点)
+---@param rankId number
+function RecordRankModel:OnAwardNodeUpdate(rankId)
+    if not rankId then
+        return
+    end
+    --拉取排行榜, 刷新红点
+    self:GetAwardInfo(
+        rankId,
+        function()
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.RecordRankAward.id,
+                rankId
+            )
+            if AppSetting.IsXzns then
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                        _G.ConfigManager.redpoint_cfg.RecordRankChallenge.id
+                )
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                        _G.ConfigManager.redpoint_cfg.RecordRankDevelop.id
+                )
+            end
+            -- if rankId == 7 then
+            --     --如果是放置关卡, 刷新放置首通状态
+            --     require "PingDingLingYuModel":GetInstance():GetInfo()
+            -- end
+        end
+    )
+end
+
+---注册监听, 玩家达成首通目标
+---@param data record_rank.i_node[]
+function RecordRankModel:OnFirstClearUpdate(data)
+    if not data then
+        return
+    end
+
+    if not self.bookDatas then
+        self.bookDatas = {}
+    end
+    for _, d in pairs(data) do
+        self.bookDatas[d.sid] = d
+    end
+
+    --刷新红点信息
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RecordRankBook.id)
+
+    if AppSetting.IsXzns then
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.RecordRankChallenge.id
+        )
+    end
+end
+
+---获取 排行榜一级界面 信息
+---@param callback fun():void
+function RecordRankModel:GetMainInfo(callback)
+    RecordRankNet:GetInstance():GetMainInfo(_G.handlerbind(self, self.OnMainInfoCallback, callback))
+end
+
+---回调监听一级界面数据
+---@param msg record_rank.s2c_record_rank_first_info
+---@param callback fun():void
+function RecordRankModel:OnMainInfoCallback(msg, callback)
+    if not msg then
+        return
+    end
+
+    if msg.roles then
+        self.mainRankDatas = {}
+        for _, d in pairs(msg.roles) do
+            self.mainRankDatas[d.type] = d
+        end
+    else
+        self.mainRankDatas = nil
+    end
+
+    if callback then
+        callback()
+    end
+end
+
+---获取排行榜列表数据
+---@param rankId number
+---@param callback fun():void
+function RecordRankModel:GetListInfo(rankId, callback)
+    if self.listRankDatas then
+
+        self.listRankDatas[rankId] = nil
+    end
+
+    RecordRankNet:GetInstance():GetListInfo(rankId, 1, _G.handlerbind(self, self.OnListInfoCallback, rankId, callback))
+end
+
+---获取排行榜列表数据(page填几就拉几页的数据)
+---@param rankId number
+---@param callback fun():void
+function RecordRankModel:GetListInfoByPage(rankId, callback, page)
+    self.nowGettingPage = self.nowGettingPage or {}
+    if not self.nowGettingPage[rankId] then 
+        if self.listRankDatas then
+            self.listRankDatas[rankId] = nil
+        end
+        self.nowGettingPage[rankId] = 1
+        RecordRankNet:GetInstance():GetListInfo(rankId, 1, _G.handlerbind(self, self.GetListInfoByPageCallBack, rankId, callback,page, self.nowGettingPage[rankId]))
+    else 
+        self.nowGettingPage[rankId] = self.nowGettingPage[rankId] + 1
+        RecordRankNet:GetInstance():GetListInfo(rankId, self.nowGettingPage[rankId], _G.handlerbind(self, self.GetListInfoByPageCallBack, rankId, callback,page, self.nowGettingPage[rankId]))
+    end
+end
+
+function RecordRankModel:GetListInfoByPageCallBack(msg, rankId, callback, page, nowPage)
+    self:OnListInfoCallback(msg, rankId, nil, nowPage)
+    local num = 0
+    if msg.rankers then 
+        num = #msg.rankers
+    elseif  msg.ranks then
+        num = #msg.ranks
+    elseif  msg.deads then
+        num = #msg.deads
+    end
+    if page == nowPage or num < self.rankDataDict[rankId]:GetPageNum() then 
+        if callback then 
+            callback()
+        end
+        self.nowGettingPage[rankId] = nil
+    else 
+        self:GetListInfoByPage(rankId, callback, page)
+    end
+end
+
+---回调监听排行列表数据
+---@param msg rank.s2c_rank_record_rank
+---@param callback fun():void
+function RecordRankModel:OnListInfoCallback(msg, rankId, callback, nowPage)
+    if not self.listRankDatas then
+        self.listRankDatas = {}
+        if self.refreshPowerRankTime then
+            _G.coroutine.stopwaiting(self.refreshPowerRankTime)
+            self.refreshPowerRankTime = nil
+        end
+    end
+
+    if self:GetRankData(rankId) then
+        --nowPage表明现在传过来的是第几页的排行
+        self.rankDataDict[rankId]:RefreshServerData(msg, nowPage)
+    else
+        self.rankDataDict[rankId] = RankUtils.NewRankDataBase(rankId,msg)
+    end
+    --nowPage表明现在传过来的是第几页的排行，所以要在rank字段加上前面页数的排名
+    local first = nowPage and (self.rankDataDict[rankId]:GetPageNum() * (nowPage - 1)) or 0
+    if msg.rankers then
+        local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+        local lst = {}
+        for rank, d in ipairs(msg.rankers) do
+            lst[rank + first] = {
+                type = d.type,
+                value = d.value,
+                point = d.point,
+                role_info = {
+                    uid = d.uid,
+                    name = d.name,
+                    style = d.portrait,
+                    frame = d.frame,
+                    level = d.lv,
+                    title = d.title
+                }
+            }
+            if rankId == 9 and d.uid == uid then
+                self.lastPowerRank = rank
+            end
+        end
+        self.listRankDatas[rankId] = lst
+    elseif msg.deads then
+        local lst = {}
+        --死魂岛或者死魂试炼排行榜
+        for rank, d in ipairs(msg.deads) do
+            lst[rank + first] = {
+                type = rankId,
+                value = d.count_pass,
+                point = d.role_info.point,
+                role_info = d.role_info
+            }
+        end
+        self.listRankDatas[rankId] = lst
+    elseif msg.ranks then
+        for rank, d in ipairs(msg.ranks) do
+            d.point = 0
+            if d.value then
+                d.value = d.value[1]
+            end
+        end
+        self.listRankDatas[rankId] = msg.ranks
+    else
+        self.listRankDatas[rankId] = nil
+    end
+    self:RefreshPowerRank()
+
+    if callback then
+        callback()
+    end
+end
+
+--- 监测自己的排行榜有没有提升
+function RecordRankModel:CheckSelfRank(type, value, lanID)
+    if self.listRankDatas == nil or self.listRankDatas[type] == nil then
+        return
+    end
+
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(146) then
+        if PowerToTheTopModel.PowerToTheTopPanDuan() then
+            return
+        end
+    end
+
+    local selfUid = _G.PlayerModel:GetInstance():GetPlayerUid()
+
+    local oldRank = 0
+
+    for k, v in pairs(self.listRankDatas[type]) do
+        if v.role_info.uid == selfUid then
+            oldRank = k
+        end
+    end
+
+    local newRank
+    for i, v in pairs(self.listRankDatas[type]) do
+        if value > v.value then
+            newRank = i
+            break
+        end
+    end
+
+    if newRank then
+        if newRank < oldRank or oldRank == 0 then
+            oldRank = newRank
+            local content = _G.GetLangPackValue(lanID, newRank)
+            require("CommonTipManager").OpenRankUpView(content)
+        end
+        --- 排名有变化，立刻去拉取对应排行数据
+        self.powerRank = type
+        self:GetListInfo(type)
+    end
+end
+
+function RecordRankModel:RefreshPowerRank()
+    if self.refreshPowerRankTime then
+        return
+    end
+    self.refreshPowerRankTime = DelayDo(1,function()
+        if  self.powerRank == nil or self.listRankDatas[self.powerRank] == nil then
+            return
+        end
+        local selfUid = _G.PlayerModel:GetInstance():GetPlayerUid()
+
+        local power = 0
+        local cards = require("CardResonanceModel"):GetInstance():GetAllPosCards()
+        for _, v in pairs(cards) do
+            power = power + v.power
+        end
+        local newtable = self.listRankDatas[self.powerRank]
+        for k, v in pairs(self.listRankDatas[self.powerRank]) do
+            if v.role_info.uid == selfUid then
+                v.value = power
+                break
+            end
+        end
+
+        table.sort(newtable,function(a,b)
+            if a.value == b.value then
+                return true
+            end
+            return a.value > b.value
+        end)
+        self.listRankDatas[self.powerRank] = newtable
+        self.powerRank = nil
+        self.refreshPowerRankTime = nil
+    end)
+end
+
+--获取放置通关进度
+function RecordRankModel:CheckAfkList()
+    local cfg = require "AfkModel":GetInstance():GetPreviousSectionCfg()
+    if cfg then
+        _G.DelayDo(1, function()
+            self:CheckSelfRank(7, cfg.id, 91307420710)
+        end)
+    end
+    return cfg
+end
+
+--获取放置阵容最高战力
+function RecordRankModel:CheckAfkPowerList()
+    local power = 0
+    local cards
+    cards = require("CardResonanceModel"):GetInstance():GetAllPosCards()
+    --local power = _G.PlayerModel:GetInstance():GetCorePower()
+    --if power == nil or power == 0 then
+    --    power = _G.StorageManager:GetInstance():GetPlayerPower()
+    --end
+    for _, v in pairs(cards) do
+        power = power + v.power
+    end
+    if power then
+        if self.popTime then
+            _G.coroutine.stopwaiting(self.popTime)
+            self.popTime = nil
+        end
+        self.popTime = _G.DelayDo(1, function()
+            self:CheckSelfRank(9, power, 91307420711)
+        end)
+    end
+end
+
+---获取自己的排行数据
+---@param rankId number
+---@param callback fun():void
+function RecordRankModel:GetSelfInfo(rankId, callback)
+    if self.selfRankDatas then
+        self.selfRankDatas[rankId] = nil
+    end
+    if rankId == 9 then
+        self:OnSelfInfoCallback({ score = _G.StorageManager:GetInstance():GetPlayerPower() }, rankId, callback)
+        return
+    elseif rankId == 10 then
+        self:OnSelfInfoCallback({ score = require "SecretRealmModel":GetInstance():GetMaxSid() }, rankId, callback)
+        return
+    end
+    RecordRankNet:GetInstance():GetSelfInfo(rankId, _G.handlerbind(self, self.OnSelfInfoCallback, rankId, callback))
+end
+
+---回调监听自己的排行数据
+---@param msg any
+---@param callback fun():void
+function RecordRankModel:OnSelfInfoCallback(msg, rankId, callback)
+    local value = msg.score or msg.high_floor or msg.sid
+
+    ---死魂塔此处传的是tower_cfg.id, 需要转为层数
+    if rankId == 8 then
+        if value and value > 0 then
+            local cfg = _G.ConfigManager.tower_cfg[value]
+            if cfg then
+                value = cfg.layer
+            end
+        else
+            --最低显示1层
+            value = 1
+        end
+    end
+
+    if not self.selfRankDatas then
+        self.selfRankDatas = {}
+    end
+    self.selfRankDatas[rankId] = {
+        type = rankId,
+        value = value,
+        point = _G.PlayerModel:GetInstance():GetPoint(),
+        role_info = _G.PlayerModel:GetInstance():GetIRroleTable()
+    }
+
+    if callback then
+        callback()
+    end
+end
+
+---获取灵域薄点赞记录
+---@param callback fucntion
+function RecordRankModel:GetLinkRecordInfo(callback)
+    self.linkDatas = nil
+    self.linkCounts = nil
+    RecordRankNet:GetInstance():GetLinkRecordInfo(_G.handlerbind(self, self.OnLinkRecordInfoCall, callback))
+end
+
+---回调监听点赞记录
+---@param msg record_rank.s2c_record_day_point
+---@param callback fun():void
+function RecordRankModel:OnLinkRecordInfoCall(msg, callback)
+    if not msg then
+        return
+    end
+    self.linkDatas = {}
+    self.linkCounts = {}
+    if msg.point then
+        for _, v in pairs(msg.point) do
+            ---@type RecordRankLinkData
+            local d = { count = #v.uids, state = {} }
+            for _, uid in pairs(v.uids) do
+                d.state[uid] = 1
+                self.linkCounts[uid] = (self.linkCounts[uid] or 0) + 1
+            end
+            self.linkDatas[v.type] = d
+        end
+    end
+
+    if callback then
+        callback()
+    end
+end
+
+---灵域簿点赞
+---@param rankId number     排行榜类型
+---@param uid numerb        玩家uid
+---@param callback function 回调函数
+function RecordRankModel:DoLink(rankId, uid, callback)
+    RecordRankNet:GetInstance():DoLink(rankId, uid, _G.handlerbind(self, self.OnLinkCallback, rankId, uid, callback))
+end
+
+---回调监听点赞
+---@param msg public.s2c_common_ack
+---@param callback fun(msg:any):void
+function RecordRankModel:OnLinkCallback(msg, rankId, uid, callback)
+    if not msg or msg.ack ~= 1 then
+        return
+    end
+
+    --记录点赞状态
+    if not self.linkDatas then
+        self.linkDatas = {}
+    end
+    local linkRecord = self.linkDatas[rankId]
+    if not linkRecord then
+        linkRecord = { count = 0, state = {} }
+        self.linkDatas[rankId] = linkRecord
+    end
+    linkRecord.count = linkRecord.count + 1
+    linkRecord.state[uid] = 1
+    --对某玩家的总点赞次数
+    if not self.linkCounts then
+        self.linkCounts = {}
+    end
+    self.linkCounts[uid] = (self.linkCounts[uid] or 0) + 1
+
+    --同步点赞次数
+    --因为排行榜不会很快同步状态, 因此不应该直接增加次数(下次打开页面又会还原)
+    --此处做法为使用"点赞次数"+"自己今日对uid点赞次数"作为总次数计算
+    --服务器约2小时同步一次, 此做法存在一定逻辑问题但不大, 实际运营时更是问题不大, 作为性能优化手段是合理的
+    --local rankList = self.listRankDatas and self.listRankDatas[rankId]
+    --if rankList then
+    --    for _, d in pairs(rankList) do
+    --        if uid == d.role_info.uid then
+    --            d.point = d.point + 1
+    --            break
+    --        end
+    --    end
+    --end
+    --同步自己的点赞次数
+    if uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+        --local selfData = self.selfRankDatas and self.selfRankDatas[rankId]
+        --if selfData then
+        --    selfData.point = selfData.point + 1
+        --end
+        _G.PlayerModel:GetInstance():AddPoint(1)
+    end
+
+    --如果有奖励
+    if msg.award then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    end
+
+    if callback then
+        callback(msg)
+    end
+end
+
+---获取奖励数据
+---@param rankId number     排行榜类型
+---@param callback function 回调函数
+function RecordRankModel:GetAwardInfo(rankId, callback)
+    if self.awardDatas then
+        self.awardDatas[rankId] = nil
+    end
+    RecordRankNet:GetInstance():GetAwardInfo(rankId, _G.handlerbind(self, self.OnAwardInfoCallback, rankId, callback))
+end
+
+---回调监听奖励记录
+---@param msg record_rank.s2c_record_rank_node_info
+---@param rankId number     排行榜类型
+---@param callback fun(msg:any):void
+function RecordRankModel:OnAwardInfoCallback(msg, rankId, callback)
+    if not self.awardDatas then
+        self.awardDatas = {}
+    end
+    local awardData = self.awardDatas[rankId]
+    if not awardData then
+        awardData = { get = {}, records = {} }
+        self.awardDatas[rankId] = awardData
+    end
+
+    if msg.nodes then
+        for _, node in pairs(msg.nodes) do
+            awardData.records[node.sid] = {
+                time = node.time,
+                role_info = {
+                    uid = node.uid,
+                    name = node.name,
+                    style = node.portrait,
+                    frame = node.frame,
+                    level = node.lv,
+                    title = node.title
+                }
+            }
+        end
+    end
+    if msg.award then
+        for _, sid in pairs(msg.award) do
+            awardData.get[sid] = true
+        end
+    end
+    if callback then
+        callback()
+    end
+end
+
+---领取奖励
+---@param idList table         奖励ID表
+---@param callback function 回调函数
+function RecordRankModel:GetAward(idList, callback)
+    RecordRankNet:GetInstance():GetAward(idList, _G.handlerbind(self, self.OnAwardCallback, idList, callback))
+end
+
+---回调监听领取奖励
+---@param msg public.s2c_common_ack
+---@param rankId number     排行榜类型
+---@param callback fun(msg:any):void
+function RecordRankModel:OnAwardCallback(msg, idList, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    for _, id in ipairs(idList) do
+        local cfg = _G.ConfigManager.rank_cfg[id]
+        if not cfg then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("unknown rank_cfg.id=" .. id)
+            end
+        else
+            --更新领取状态
+            if not self.awardDatas then
+                self.awardDatas = {}
+            end
+            local awardData = self.awardDatas[cfg.type_rank]
+            if not awardData then
+                awardData = { get = {}, records = {} }
+                self.awardDatas[cfg.type_rank] = awardData
+            end
+            awardData.get[id] = true
+        end
+    end
+
+    --如果有奖励
+    if msg.award then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    end
+
+    if callback then
+        callback(msg)
+    end
+end
+
+---获取灵域薄首通状态(每个type返回1个数据)
+---@param types number[]    type类型
+---@param callback function 回调函数
+function RecordRankModel:GetBookInfo(types, callback)
+    self.bookDatas = nil
+    self.bookAwardDatas = nil
+    RecordRankNet:GetInstance():GetBookInfo(types, _G.handlerbind(self, self.OnBookInfoCallback, callback))
+end
+
+---拉取全部type首通状态
+---@param callback function 回调函数
+---@return void
+function RecordRankModel:GetAllBookInfo(callback)
+    --拉取全部type首通状态
+    local types, exists = {}, {}
+    for _, cfg in pairs(_G.ConfigManager.rank_achievement) do
+        if not exists[cfg.type] then
+            exists[cfg.type] = true
+            table.insert(types, cfg.type)
+        end
+    end
+    if #types > 0 then
+        self:GetBookInfo(types, callback)
+    elseif callback then
+        callback()
+    end
+end
+
+---回调监听灵域薄首通状态
+---@param msg  record_rank.s2c_record_rank_achieve_info
+---@param callback fun():void
+function RecordRankModel:OnBookInfoCallback(msg, callback)
+    self.bookDatas = {}
+    self.bookAwardDatas = {}
+
+    if msg.achieve then
+        for _, d in pairs(msg.achieve) do
+            self.bookDatas[d.sid] = d
+        end
+    end
+    if msg.achieve_award then
+        for _, sid in pairs(msg.achieve_award) do
+            self.bookAwardDatas[sid] = true
+        end
+    end
+
+    if callback then
+        callback()
+    end
+end
+
+---获取灵域薄首通状态详情(排行数据)
+---@param sid number        rank_achievement.id
+---@param callback fun(data:record_rank.i_node[]):void 回调函数
+function RecordRankModel:GetBookDetailsInfo(sid, callback)
+    RecordRankNet:GetInstance():GetBookDetailsInfo(
+        sid,
+        _G.handlerbind(self, self.OnBookDetailsInfoCallback, sid, callback)
+    )
+end
+
+---回调监听灵域薄首通状态详情(排行数据)
+---@param msg record_rank.s2c_record_rank_achieve_rank
+---@param callback fun(data:record_rank.i_node[]):void
+function RecordRankModel:OnBookDetailsInfoCallback(msg, sid, callback)
+    if callback then
+        callback(msg.role_info)
+    end
+end
+
+---领取灵域薄奖励
+---@param sid number        rank_achievement.id
+---@param callback function 回调函数
+function RecordRankModel:GetBookAward(sid, callback)
+    RecordRankNet:GetInstance():GetBookAward(sid, _G.handlerbind(self, self.OnBookAwardCallback, sid, callback))
+end
+
+---回调监听领取灵域薄奖励
+---@param msg public.s2c_common_ack
+---@param sid number
+---@param callback fun(msg:any):void
+function RecordRankModel:OnBookAwardCallback(msg, sid, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    --更新领取状态
+    if not self.bookAwardDatas then
+        self.bookAwardDatas = {}
+    end
+    self.bookAwardDatas[sid] = true
+
+    --如果有奖励
+    if msg.award then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    end
+
+    if callback then
+        callback(msg)
+    end
+end
+
+--endregion
+
+--region ------------类型定义------------
+
+---@class RecordRankData        排行榜数据
+---@field type number                   @1-5雷风水火土死魂塔, 6神, 7冒险, 8死魂塔主塔
+---@field value number                  @进度值（积分或者放置关卡sid,死魂塔层数）
+---@field point number                  @获得的点赞数量
+---@field role_info role.i_role         @角色信息(模拟对象, 不含主城形象丶光环信息)
+
+---@class RecordRankAwardData       排行榜奖励数据
+---@field get table<number,boolean>                         @(自己)当前已领取的奖励数据
+---@field records table<number, RecordRankAwardRecordData>  @已达成玩家的数据
+---
+---@class RecordRankAwardRecordData 排行榜奖励达成玩家数据
+---@field time number                   @达成时间
+---@field role_info role.i_role         @角色信息(模拟对象, 不含主城形象丶光环信息)
+
+---@class RecordRankLinkData    单个排行榜的点赞记录
+---@field count number                  @当前已点赞次数
+---@field state table<number,number>    @table<玩家uid, 点赞次数>
+
+--endregion
+
+function RecordRankModel:OnCardPowerChange(uid)
+    if self.powerTipTimer then
+        return
+    end
+    if self:GetListData(9) == nil then
+        return
+    end
+    if not require("CardResonanceModel"):GetInstance():CheckCardIsInPos(uid) then
+        return
+    end
+    self.powerTipTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdatePowerRank, self, true, false, true)
+    self.powerTipTimer:Start()
+end
+
+function RecordRankModel:UpdatePowerRank()
+    local power = _G.StorageManager:GetInstance():GetPlayerPower()
+    local rank = 0
+    local err = true
+    for i, v in pairs(self.listRankDatas[9]) do
+        if v.value then
+            if power > v.value then
+                rank = i
+                break
+            end
+        else
+            if _G.AppSetting.DEBUG and err then
+                err = false
+                _G.LogError(v, "灵域簿排行榜数据乱码, 联系下后台")
+            end
+        end
+    end
+    if rank > 0 then
+        if self.lastPowerRank == nil or rank < self.lastPowerRank then
+            self.lastPowerRank = rank
+            --local content = _G.GetLangPackValue(90025700058, rank)
+            --require("CommonTipManager").OpenRankUpView(content)
+        end
+    end
+    self.powerTipTimer:Stop()
+    self.powerTipTimer = nil
+end
+
+---检测传奇排行是否显示，及红点（id为6）
+function RecordRankModel:CheckGodShow()
+    --是否显示"传奇"标签, 以开服天数为准
+    local cfg = _G.ConfigManager.discrete_cfg[106706]
+
+    if _G.GlobalConditionManager.CheckConditionByArray(cfg) then
+        return true
+    end
+
+    return false
+
+    -- if not cfg or _G.PlayerModel:GetInstance():GetServerOpenDuration() <= cfg[1][1] * 86400 then
+    --     return false
+    -- end
+    -- return true
+end
+
+---@param rankType RankUtils.RankType @ 排行榜类型
+---@return RankDataBase|nil 排行榜数据
+function RecordRankModel:GetRankData(rankType)
+    if self.rankDataDict == nil then
+        self.rankDataDict = {}
+    end
+    if self.rankDataDict[rankType] then
+        return self.rankDataDict[rankType]
+    else
+        self.rankDataDict[rankType] = RankUtils.NewRankDataBase(rankType)
+    end
+    return self.rankDataDict[rankType]
+end
+
+return RecordRankModel

@@ -1,0 +1,436 @@
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleTower : AIHelperModuleBaseNumberMock	    @AI助手-死魂塔
+---@field layers tower_cfg[]            @当前死魂塔层数配置(从1开始, 至最顶层)
+---@field index number                  @已执行次数
+---@field enter boolean                 @能否进入战斗
+local AIHelperModuleTower = _G.BaseClass("AIHelperModuleTower", base)
+
+function AIHelperModuleTower:__init()
+    --只取主塔类型ID
+    ---@type DeadsoulTowerModel
+    local model = require("DeadsoulTowerModel"):GetInstance()
+    self.layers = model:InitTowerInfo(model.MianTower)
+end
+
+---是否满足模块使用条件
+function AIHelperModuleTower:IsActive()
+    return self.index <= self.number and self.enter
+end
+
+---重置状态
+function AIHelperModuleTower:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.enter = true
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleTower:Check(callback)
+    self.index = 1
+    self.enter = false
+    self:CheckEnterState()
+
+    if callback then
+        callback(true)
+    end
+end
+
+---获取当前执行状态
+function AIHelperModuleTower:GetExecuteState()
+    return {
+        total = self.number,
+        index = self.index,
+        layer = self:GetCurrentLayer(),
+    }
+end
+
+---执行逻辑
+function AIHelperModuleTower:Execute(callback)
+    self.index = self.index + 1
+    --执行状态检测
+    self:CheckEnterState()
+    if not self.enter then
+        if callback then
+            callback(false, nil)
+        end
+        return
+    end
+
+    ---检测是否正在战斗中
+    if _G.MainManager:GetInstance():IsFighting(false) then
+        if callback then
+            callback(false, self:CreateFailureResults(90028010143, _G.GetLangPackValue(self.cfg.name)))
+        end
+        return
+    end
+
+    ---@type DeadsoulTowerModel
+    local model = require("DeadsoulTowerModel"):GetInstance()
+
+    local towerCfg = self.layers[self:GetCurrentLayer() + 1]
+    AIHelperModuleTower.Fight(model.MianTower, towerCfg, callback)
+end
+
+---显示执行状态
+function AIHelperModuleTower:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    if state and state.layer then
+        item.aortext_tip.text = _G.GetLangPackValue(90023200002, state.layer + 1)
+    elseif not self.mock then
+        item.aortext_tip.text = state and (state.index .. "/" .. state.total) or ""
+    end
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleTower:ShowExecuteResult(item, success, results)
+    base.ShowExecuteResult(self, item, success, results)
+    if not success then
+        return
+    end
+    self.Util.ShowAwardListOfMsg(item, results)
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleTower:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+---获取当前执行标题
+function AIHelperModuleTower:GetExecuteTitle(state)
+    if state and state.layer then
+        --return _G.GetLangPackValue(self.cfg.title, state.layer + 1)
+        return _G.GetLangPackValue(self.cfg.title)
+    end
+    return base.GetExecuteTitle(self, state)
+end
+
+---检查关卡状态
+---@return void
+function AIHelperModuleTower:CheckEnterState()
+    --判断是否达到终点
+    local layer, maxLayer = self:GetCurrentLayer(), self:GetMaxLayer()
+    self.enter = layer == 0 or layer < maxLayer
+end
+
+---获取塔的当前层数
+---@return number
+function AIHelperModuleTower:GetCurrentLayer()
+    ---@type DeadsoulTowerModel
+    local model = require("DeadsoulTowerModel"):GetInstance()
+
+    ---@type number
+    local layer = model.LandFloor or 0
+    if layer > 0 then
+        layer = _G.ConfigManager.tower_cfg[layer].layer
+    end
+    return layer
+end
+
+---获取塔的最大层数
+---@return number
+function AIHelperModuleTower:GetMaxLayer()
+    return #self.layers
+end
+
+---主塔模式是否满足快速挑战的要求
+---@return boolean
+function AIHelperModuleTower:CheckQuickPower()
+    ---@type DeadsoulTowerModel
+    local model = require("DeadsoulTowerModel"):GetInstance()
+    --获取当前层数及其id
+    local floor = model.LandFloor
+    local towerId = self.layers[floor].id
+
+    return _G.DeadsoulTowerManager:GetInstance():CheckQuickPower(towerId)
+end
+
+---发起战斗请求
+---@param type number       @元素塔类型
+---@param towerCfg tower_cfg
+---@param callback fun(ok:boolean,results:any,isFight:boolen):void 结束回调
+---@return void
+function AIHelperModuleTower.Fight(type, towerCfg, callback)
+    ---@type DeadsoulTowerManager
+    local towerManager = _G.DeadsoulTowerManager:GetInstance()
+    ---@type DeadsoulTowerModel
+    local towerModel = require("DeadsoulTowerModel"):GetInstance()
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+
+    ---清除缓存数据
+    local function clear()
+        embattleModel:ClearLastAssist()
+        towerManager:ClearStatisticsData()
+        towerManager:ClearCurFightArg()
+    end
+    local function response(success, results, isFight)
+        clear()
+
+        if not callback then
+            return
+        end
+        callback(success, results, isFight)
+    end
+    clear()
+
+    local towerId = towerCfg.id
+    --获取当前怪物组和布阵id
+    local monsterGroups = towerCfg.monster[1]
+    ---@type number[]
+    local embattleIds = {
+        type == towerModel.MianTower and _G.EmbattleType.Tower or
+        type == _G.CardElementType.Thunder and _G.EmbattleType.Tower1 or
+        type == _G.CardElementType.Wind and _G.EmbattleType.Tower2 or
+        type == _G.CardElementType.Water and _G.EmbattleType.Tower3 or
+        type == _G.CardElementType.Fire and _G.EmbattleType.Tower4 or
+        type == _G.CardElementType.Earth and _G.EmbattleType.Tower5
+    }
+    if not monsterGroups or #monsterGroups <= 0 then
+        response(false, nil, false)
+        return
+    end
+    if #monsterGroups > 1 then
+        embattleIds[1] = embattleIds[1] * 1000 + 1
+        for i = 2, #monsterGroups do
+            embattleIds[i] = embattleIds[i - 1] + 1
+        end
+    end
+    --检查每个布阵中是否有角色
+    for _, embattleId in ipairs(embattleIds) do
+        if not embattleModel:CheckBattle(embattleId) then
+            response(false, nil, false)
+            return
+        end
+    end
+
+    ---多场次战斗时, 顺序打完每一场战斗
+    ---@type fun():void
+    local nextFight
+
+    ---@param lastTowerId number    塔ID
+    local function update(lastTowerId)
+        --更新爬塔奖励数据
+        local towerAwardList = towerModel.AwardDatas
+        if not _G.table.isEmptyOrNil(towerAwardList) then
+            for _, v in ipairs(towerAwardList) do
+                if v.cfg.tower == type and lastTowerId >= v.sid and not v.isGet then
+                    v.CanTake = true
+                end
+            end
+        end
+
+        --弹出礼包
+        if type == towerModel.MianTower then
+            require "PopUpGiftBagModel":GetInstance():IsArriveDeadTower(lastTowerId)
+        else
+            require "PopUpGiftBagModel":GetInstance():IsElementTower(lastTowerId)
+        end
+    end
+    ---发起层数结算
+    ---@param lastTowerId number    塔ID
+    ---@param lastMsg any
+    local function towerResult(lastTowerId, lastMsg)
+        --重新拉取塔信息
+        if type == towerModel.MianTower then
+            require("DeadsoulTowerNet"):GetInstance():DeadSoulIsland(
+                nil,
+                function(msg)
+                    towerModel.LandFloor = msg.high_floor
+                    towerModel.target_list = msg.target_list or {}
+                    towerModel.award_list = msg.award_list or {}
+
+                    --检测是否开启试炼
+                    local unlocakCfg = _G.ConfigManager.discrete_cfg[102301]
+                    if
+                        unlocakCfg and towerModel.LandFloor >= unlocakCfg[1][1] and
+                        _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Deadsoul)
+                    then
+                        --死魂塔试炼开启红点
+                        if not towerModel.IsOpenWx then
+                            require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                                _G.ConfigManager.redpoint_cfg.DeadsoulMain.id
+                            )
+                        end
+                        towerModel.IsOpenWx = true
+                    end
+
+                    --发起事件广播
+                    _G.Events:GetInstance():Broadcast(
+                        _G.ePlayAactionEvent.PlayAaction,
+                        {
+                            _G.ActiveTaskEnum.ConditionEnum.Section.DeadsoulFoor
+                        },
+                        1
+                    )
+                    _G.Events:GetInstance():Broadcast(_G.ePopGiftEvent.FinishDead)
+
+                    update(lastTowerId)
+
+                    --刷新红点状态
+                    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DeadsoulPack.id)
+                    require("RedPointManager"):GetInstance():RefreshNode(
+                        _G.ConfigManager.redpoint_cfg.DeadSoulDailyReward.id
+                    )
+                    require("RedPointManager"):GetInstance():RefreshNodeByAllParams( --首通奖励
+                        _G.ConfigManager.redpoint_cfg.DeadsoulFirst.id
+                    )
+
+                    response(true, lastMsg, true)
+                end
+            )
+        else
+            towerManager:GetPractice(
+                function()
+                    update(lastTowerId)
+
+                    --刷新红点状态
+                    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                        _G.ConfigManager.redpoint_cfg.DeadsoulFirst.id
+                    )
+                    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                        _G.ConfigManager.redpoint_cfg.DeadsoulTarget.id
+                    )
+
+                    response(true, lastMsg, true)
+                end
+            )
+        end
+    end
+    ---发起战斗结算
+    ---@param monsterGroup number 战斗场景
+    ---@param data any  战斗结算参数
+    local function fightResult(monsterGroup, data)
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            data,
+            function(msg)
+                if msg.md5_error == "1" then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                elseif msg.md5_error == "2" then
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                end
+
+                if not msg.winner or not msg.winner[1] then
+                    response(false, nil, true)
+                    --失败时开启NPC助战
+                    --require "FriendHelpModel":GetInstance():OpenNpc(nil, nil, 3)
+                    return
+                end
+
+                --获取奖励
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+                towerManager:SetMonsterPass(monsterGroup)
+                towerManager:SetCurStatisticsData(_G.BattleManager:GetInstance():GetStatistics(), monsterGroup)
+                if towerManager:CheckCurChallengeIsPass() then
+                    --发起关卡结算请求
+                    towerResult(towerId, msg)
+                else
+                    --开始下一关战斗
+                    nextFight()
+                end
+            end
+        )
+    end
+    ---发起战斗请求
+    ---@param monsterGroup number
+    local function fightBegin(monsterGroup)
+        require("DeadsoulTowerNet"):GetInstance():DeadSoulFight(
+            { fid = towerId, monster_id = monsterGroup },
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil, true)
+                    return
+                end
+
+                towerManager:SetCurFightArg(msg.fight_arg, msg.fight_arg.sid)
+                towerManager:SetBattleFirst(false)
+
+                --广播事件
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, { _G.SeasonTaskID.Deadsoul }, 1)
+
+                --计算战斗结果
+                -- _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+                -- local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+                -- if not record or not record.result then
+                --     response(false, nil, true)
+                --     return
+                -- end
+                --如果战斗失败
+                -- local tab = record.result
+                -- if not tab.winner[1] then
+                --     response(false, nil, true)
+                --     --失败时开启NPC助战
+                --     --require "FriendHelpModel":GetInstance():OpenNpc(nil, nil, 3)
+                --     return
+                -- end
+                local tab = nil
+
+                fightResult(monsterGroup, tab)
+            end
+        )
+    end
+    ---更新布阵阵容
+    ---@param embattleId number 布阵id
+    ---@param monsterGroup number
+    ---@param isMultiple booelan  是否为多队战斗
+    local function updateEmbattle(embattleId, monsterGroup, isMultiple)
+        if isMultiple then
+            local array = embattleModel.curEmbattleArray[embattleId] or { 0, 0, 0, 0, 0 }
+            local skills = embattleModel.embattleSkillIndexArray[embattleId] or { 0, 0, 0 }
+            local pets = embattleModel.embattlePetSkillIndexArray[embattleId] or { 0, 0, 0 }
+            require("EmbattleNet"):GetInstance():UpdateEmbattle(
+                { 0 },
+                { array },
+                function(msg)
+                    if not msg or msg.ack ~= 1 then
+                        response(false, nil, true)
+                        return
+                    end
+                    fightBegin(monsterGroup)
+                end,
+                { skills },
+                { pets }
+            )
+        else
+            embattleModel:SaveEmbattleDataNew(
+                embattleId,
+                function(respCode)
+                    if respCode ~= 0 then
+                        response(false, nil, true)
+                        return
+                    end
+                    fightBegin(monsterGroup)
+                end,
+                _G.EmbattleSaveType.server,
+                true,
+                nil
+            )
+        end
+    end
+
+    --进入下一次战斗
+    local index = 1
+    nextFight = function()
+        if not monsterGroups or index > #monsterGroups then
+            response(false, nil, true)
+            return
+        end
+        updateEmbattle(embattleIds[index], monsterGroups[index], #monsterGroups > 1)
+        index = index + 1
+    end
+
+    --清除以前的战斗状态, 然后开始执行战斗
+    towerManager.pass = _G.DeepCopyCfgTable(monsterGroups)
+    towerManager:SetBattleFirst(true)
+    require("DeadsoulTowerNet"):GetInstance():Leave(
+        function(msg)
+            nextFight()
+        end
+    )
+end
+
+return AIHelperModuleTower

@@ -1,0 +1,1106 @@
+local ShopNet = require "ShopNet"
+
+---@class ShopModel : GameDataModelBase
+---@field GetInstance fun() : ShopModel
+---@field redPointParams table<number,number[]>  红点参数: <商店ID, (商店ID+合并参数)列表 > + <合并参数, 商店ID列表>
+---@field redPointStates table<number,number[]|{__t:number}>    商店红点状态: <商店ID, 商品序号列表>
+local ShopModel = _G.BaseClass("ShopModel", _G.GameDataModelBase)
+
+local tipsID = {
+    RefreshCeil = 230301,
+    NotItem = 230302,
+    CoinLimit = 230303,
+    buySure = 240305
+}
+
+_G.TipsID = tipsID
+
+---创建对象时,入口构造函数
+function ShopModel:__init()
+    self.cfg = _G.ConfigManager.shop_list_cfg
+    self.shop = {}
+    self.curFunctionOpenID = 25
+    self.UnlockFunsId = {}
+    ---商店红点 有第一次功能解锁 每次刷新倒计时结束 两个条件
+    self.redPointStates = {}
+    self.InitParseList = {}
+    self.pageList = {}
+    for k, v in pairs(self.cfg) do
+        local data = v
+        if not self.pageList[v.tab] then
+            self.pageList[v.tab] = {}
+            self.pageList[v.tab].list = {}
+            self.pageList[v.tab].name = data.name
+            self.pageList[v.tab].show = false
+            self.pageList[v.tab].tab = data.tab
+            self.pageList[v.tab].spriteName = data.image
+            self.pageList[v.tab].id = k
+        end
+        --ZHJH-5308 联赛商店拆分成三个页签
+        if v.function_open == 152 then
+            for i = 1, 3 do
+                self.pageList[v.tab].list[i] = {}
+                self.pageList[v.tab].list[i].subname = 90021600078 + i
+                self.pageList[v.tab].list[i].shopID = data.id
+                self.pageList[v.tab].list[i].show = true
+            end
+        else
+            self.pageList[v.tab].list[v.order] = {}
+            self.pageList[v.tab].list[v.order].subname = data.subname
+            self.pageList[v.tab].list[v.order].shopID = data.id
+            self.pageList[v.tab].list[v.order].id = k
+        end
+        if v.function_open == 158 then
+            ---和策划约定规则：功能id是158的都直接显示
+            self.pageList[v.tab].list[v.order].show = true
+        else
+            self.pageList[v.tab].list[v.order].show = false
+        end
+    end
+    ---shopid={true or false}
+
+    --初始化红点参数列表
+    self.redPointParams = {}
+    ---@type table<number,number[]>   <tab标签丶商店ID列表>
+    local tabsList = {}
+    for _, v in pairs(self.cfg) do
+        self.redPointParams[v.id] = { v.id }
+        local tabs = tabsList[v.tab]
+        if tabs then
+            _G.table.insert(tabs, v.id)
+        else
+            tabsList[v.tab] = { v.id }
+        end
+    end
+    local tabMergeIndex = 1000
+    for _, tabs in pairs(tabsList) do
+        if #tabs > 1 then
+            local mergeIndex = tabMergeIndex
+            tabMergeIndex = tabMergeIndex + 1
+            for _, sid in pairs(tabs) do
+                --在列表头部插入合并参数
+                _G.table.insert(self.redPointParams[sid], 1, mergeIndex)
+            end
+            --存储合并参数对应的商店ID列表
+            self.redPointParams[mergeIndex] = tabs
+        end
+    end
+end
+
+function ShopModel:InitFunction()
+    _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnEvent_CheckLock, self)
+    _G.Events:GetInstance():AddListener(_G.eAFKAactionEnum.AfkSectionPass, self.OnAactionEnent, self)
+    if not self.updateTimer then
+        self.updateTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false, true)
+        self.updateTimer:Start()
+    end
+end
+
+---初始数据
+function ShopModel:InitShopData()
+    for i, v in pairs(self.cfg) do
+        self.shop[i] = {
+            sid = self.cfg[i].id,
+            name = _G.LangUtil.GetLangPackValue(self.cfg[i].name),
+            interval_time = self.cfg[i].interval_time * 3600,
+            count_refresh = self.cfg[i].count_refresh,
+            currency_type = self.cfg[i].currency_type,
+            price_refresh = _G.DeepCopyCfgTable(self.cfg[i].price_refresh),
+            type = self.cfg[i].type,
+            Unlock = false,
+            RefreshCount = 0,
+            bubble_chat = self.cfg[i].bubble_chat,
+            bubble_upgrade = self.cfg[i].bubble_upgrade,
+            bubble_end = self.cfg[i].bubble_end,
+            bubble_continuous = self.cfg[i].bubble_continuous,
+            bubble_hidden = self.cfg[i].bubble_hidden,
+            tab = self.cfg[i].tab,
+            order = self.cfg[i].order,
+            curLevel = self:SetShopLevel(i),
+            Material = {},
+            time = 0,
+            item = {},
+            freeTimes = 0,
+            function_open = self.cfg[i].function_open,
+            spInterval_time = self.cfg[i].time * 3600,
+        }
+        self.UnlockFunsId[i] = self.cfg[i].function_open
+        for n = 1, self.shop[i].count_refresh + 1 do
+            if n > #self.shop[i].price_refresh then
+                self.shop[i].Material[n] = self.shop[i].price_refresh[#self.shop[i].price_refresh]
+            else
+                self.shop[i].Material[n] = self.shop[i].price_refresh[n]
+            end
+        end
+    end
+end
+
+---监听玩家行为
+function ShopModel:OnAactionEnent()
+    self:CheckShopFreshByAfk()
+end
+
+---销毁对象时,析构函数
+function ShopModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eAFKAactionEnum.AfkSectionPass, self.OnAactionEnent, self)
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnEvent_CheckLock, self)
+    self:ClearShopTimer()
+end
+
+--region 子类重写
+function ShopModel:GetDataFormServer()
+    if _G.table.isEmptyOrNil(self.shop) then
+        self:InitShopData()
+    end
+    self.ParseCount = 0
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(25) then
+        local allShopCount = 0
+        for i, v in _G.pairs(self.shop) do
+            if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.cfg[i].function_open) then
+                if v.type == 2 or v.type == 3 or v.type == 4 then
+                    self.shop[i].Unlock = false
+                else
+                    self.ParseCount = self.ParseCount + 1
+                end
+                allShopCount = allShopCount + 1
+            end
+        end
+        if allShopCount >= #self.shop then
+            _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnEvent_CheckLock, self)
+        end
+        for i, v in _G.pairs(self.shop) do
+            if self.cfg[i].function_open == 158 or _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.cfg[i].function_open) then
+                if v.type == 2 or v.type == 3 or v.type == 4 then
+                else
+                    local msg = { shop_id = i }
+                    ShopNet:GetInstance():GetShopInfo(msg, _G.handlerbind(self, self.InitParseData, function() end, v
+                        .sid))
+                end
+            end
+        end
+    else
+        self.super.ParseData(self)
+    end
+end
+
+---当前放置通关 是否解锁新商店等级
+function ShopModel:CheckShopFreshByAfk()
+    if not self:GetFunctionOpen() then
+        return
+    end
+    local maxCount = 0
+    local newAfkId
+    if self.shop then
+        for k, v in pairs(self.shop) do
+            newAfkId = self:SetShopLevel(v.sid)
+            if newAfkId then
+                if v.curLevel < newAfkId then
+                    v.curLevel = newAfkId
+                end
+            else
+                maxCount = maxCount + 1
+            end
+        end
+    end
+    if maxCount == #self.shop then
+        _G.Events:GetInstance():RemoveListener(_G.eAFKAactionEnum.AfkSectionPass, self.OnAactionEnent, self)
+    end
+end
+
+---设置商店当前等级 返回下一等级放置条件
+function ShopModel:SetShopLevel(shopid)
+    local AfkModelIns = require "AfkModel":GetInstance()
+    local curAfkSid = AfkModelIns:GetLastSection()
+    if #self.cfg[shopid].bubble_up_con > 0 then
+        local bubble_up_con = _G.DeepCopyCfgTable(self.cfg[shopid].bubble_up_con)
+        _G.table.sort(
+            bubble_up_con,
+            function(a, b)
+                return a < b
+            end
+        )
+        for k, v in pairs(bubble_up_con) do
+            if v > curAfkSid then
+                return v
+            end
+        end
+    end
+    return nil
+end
+
+---监听功能开放
+function ShopModel:OnEvent_CheckLock(id)
+    for k, v in _G.pairs(self.UnlockFunsId) do
+        if v == id then
+            self.ParseCount = self.ParseCount + 1
+            local msg = { shop_id = k }
+            ShopNet:GetInstance():GetShopInfo(msg, _G.handlerbind(self, self.InitParseData, function()
+                self:RefreshRedPoint(k)
+            end, k))
+        end
+    end
+end
+
+---解析数据
+function ShopModel:InitParseData(data, call, ShopID, idIs)
+    if idIs then
+        if self.InitParseList[idIs] == nil or self.InitParseList[idIs] == false then
+            self.InitParseList[idIs] = true
+        end
+    end
+    self.ParseCount = self.ParseCount - 1
+    self:ParseData(data, ShopID)
+    if self.ParseCount == 0 then
+        if call then
+            call()
+        end
+        self.super.ParseData(self)
+        self:CheckShopViewOpenToFresh()
+    end
+    _G.Events:GetInstance():Broadcast(_G.eShopStatus.Update,ShopID)
+end
+
+---当所有商店数据解析完成
+function ShopModel:ParseData(data, ParseCount)
+    if not _G.table.isEmptyOrNil(data) and data.ack == 1 then
+        if _G.table.isEmptyOrNil(data.info) then
+            local shop, shopLis, itemCfg
+            if _G.ShopID.PvpAllHeros == ParseCount then
+                shop = self.shop[_G.ShopID.PvpAllHeros]
+                shopLis = require "SeasonModel":GetInstance():GetCfg().shop
+                itemCfg = _G.ConfigManager.season_shop_cfg
+            elseif _G.ShopID.ArenaPeak == ParseCount then
+                shop = self.shop[_G.ShopID.ArenaPeak]
+                shopLis = require "ArenaPeakModel":GetInstance():GetCfg().shop
+                itemCfg = _G.ConfigManager.arena_shop_cfg
+            elseif _G.ShopID.SpiritualRealm == ParseCount then
+                shop = self.shop[_G.ShopID.SpiritualRealm]
+                shopLis = require "SpiritualRealmModel":GetInstance():GetShopItemList()
+                itemCfg = _G.ConfigManager.arena_shop_cfg
+            end
+            --local Id = require "SeasonModel":GetInstance():GetCurSeasonId()
+            --local seasonId = Id * 100
+            if not shop then
+                _G.LogError("shop数据为空， 商店Id: " .. tostring(ParseCount))
+                return
+            end
+            shop.Unlock = true
+            shop.RefreshCount = 0
+            shop.curLevel = self:SetShopLevel(shop.sid)
+            shop.item = {}
+            local buys = data.s_info.buys
+            local i = 1
+            for _, v in pairs(shopLis) do
+                shop.item[i] = require("SeasonShopItemData").New(i)
+                shop.item[i]:Parse(itemCfg[v])
+                i = i + 1
+            end
+            if buys then
+                for i = 1, #buys do
+                    for _, v in pairs(shop.item) do
+                        if buys[i].id == v.sid then
+                            v.BuyTime = buys[i].buy_times
+                            break
+                        end
+                    end
+                end
+            end
+            _G.SortList(
+                shop.item,
+                function(a)
+                    return -a.Order
+                end
+            )
+            self.pageList[shop.tab].show = true
+            self.pageList[shop.tab].list[shop.order].show = true
+            -- 排序
+            shop.item = self:OrderSort(shop.item)
+            shop.SPitem = self:OrderSort(shop.SPitem)
+            self:CheckRefreshRed(shop, false)
+            return
+        end
+        local shop = self.shop[data.info.shop_id]
+        shop.Unlock = true
+        shop.RefreshCount = data.info.refresh_times
+        shop.curLevel = self:SetShopLevel(shop.sid)
+        shop.time = data.info.refresh_second
+        shop.spTime = data.info.refresh_second1
+        shop.item = {}
+        shop.SPitem = {}
+        if data.info.shop_item_id then
+            for i = 1, #data.info.shop_item_id do
+                shop.item[i] = require("ShopItemData").New(i)
+                shop.item[i]:Parse(data.info.shop_item_id[i], ParseCount)
+                shop.freeTimes =
+                    require "HellRoadModel":GetInstance():GetNumber({ _G.PrivilegeType.Shop.Refresh, data.info.shop_id }) -
+                    data.info.free_times
+            end
+        end
+        if data.info.shop_item_id1 then
+            for i = 1, #data.info.shop_item_id1 do
+                shop.SPitem[i] = require("ShopItemData").New(i)
+                data.info.shop_item_id1[i].sp = true
+                shop.SPitem[i]:Parse(data.info.shop_item_id1[i], ParseCount)
+            end
+        end
+        self.pageList[shop.tab].show = true
+        self.pageList[shop.tab].list[shop.order].show = true
+        -- 排序
+        shop.item = self:OrderSort(shop.item)
+        shop.SPitem = self:OrderSort(shop.SPitem)
+        for i = #shop.SPitem, 1, -1 do
+            table.insert(shop.item, 1, shop.SPitem[i])
+        end
+        self:CheckRefreshRed(shop, false)
+    end
+end
+
+---更新红点状态
+---@param force boolean 是否强制刷新全部状态
+function ShopModel:CheckRefreshRed(shop, force)
+    --ZHJH-4859【客户端】公会商店-装备红点显示优化
+    --移除商品红点显示
+
+    -- local needSaveStates = false
+    -- local states = self.redPointStates[shop.sid]
+    -- if not states and not force then
+    --     states = self:ReadRedPointStates(shop.sid)
+    --     self.redPointStates[shop.sid] = states
+    -- end
+    -- if force or not states or states.__t ~= shop.time then --重置红点状态
+    --     force = true
+    --     needSaveStates = true
+    --     states = { __t = shop.time }
+    --     self.redPointStates[shop.sid] = states
+    -- end
+
+    -- --检查是否存在商品
+    -- if not shop.item or #shop.item == 0 then
+    --     return
+    -- end
+
+    -- --检查此商店是否显示
+    -- local cfg = self.cfg[shop.sid]
+    -- local tabs = cfg and self.pageList and self.pageList[cfg.tab]
+    -- local shopTab = tabs and tabs.list[cfg.order]
+    -- if shopTab and not shopTab.show then
+    --     return
+    -- end
+
+    -- --检查是否显示装备红点(是装备且比角色穿戴的更好)
+    -- local equipModel = require("EquipmentModel"):GetInstance()
+    -- local commendCards, haveRedPoint
+    -- for _, v in ipairs(shop.item) do
+    --     local index = _G.table.indexof(states, v.index)
+    --     if force or index then
+    --         haveRedPoint = false
+    --         --判断商品是否已解锁
+    --         local unlock = self:CheckShopItemUnlock(shop.sid, v, false)
+    --         if unlock then
+    --             --获取物品类别然后判断是否更好
+    --             local type
+    --             local sid, element
+    --             ---TODO:不同的道具数据结构不一样，读的商品表配置也不一样，后续遇到其他结构的商品就逐一兼容
+    --             if v.ItemCfg and (v.ItemCfg.id or v.ItemCfg.ID) then
+    --                 ---TODO:该类型的数据结果目前是灵契(饰品)的数据结构，所以没有element数据
+    --                 type = _G.StorageManager:GetInstance():CheckSidType(v.ItemCfg.id)
+    --                 sid = v.ItemCfg.id
+    --             else
+    --                 local cfg = _G.ConfigManager.shop_pools_cfg[v.sid]
+    --                 type = cfg and _G.StorageManager:GetInstance():CheckSidType(cfg.item[1])
+    --                 sid = cfg and cfg.item[1]
+    --                 element = cfg and cfg.item[3]
+    --             end
+    --             if element and type == _G.StorageType.Equipment then
+    --                 if not commendCards then
+    --                     commendCards = require("CardResonanceModel"):GetInstance():GetAllPosCards()
+    --                 end
+    --                 local recommenCards = equipModel:GetCommendCardsBySidAndEle(sid, element, commendCards)
+    --                 if recommenCards and #recommenCards > 0 then
+    --                     haveRedPoint = true
+    --                 end
+    --             end
+    --         end
+    --         if not haveRedPoint and index then
+    --             needSaveStates = true
+    --             _G.table.remove(states, index)
+    --         elseif haveRedPoint and not index then
+    --             needSaveStates = true
+    --             _G.table.insert(states, v.index)
+    --         end
+    --     end
+    -- end
+
+    -- if needSaveStates then
+    --     self:SaveRedPointStates(shop.sid, states)
+    -- end
+end
+
+---保存红点状态
+---@param shopId number 商店ID
+function ShopModel:SaveRedPointStates(shopId, states)
+    _G.PlayerPrefsManager.SetTable('ShopRedPoint' .. shopId, states)
+end
+
+---读取红点状态
+---@param shopId number 商店ID
+function ShopModel:ReadRedPointStates(shopId)
+    return _G.PlayerPrefsManager.GetTable('ShopRedPoint' .. shopId)
+end
+
+---检查商店商品是否已解锁
+---@param shopId number 商店ID
+---@param data ShopItemData
+---@param getTip boolean 获取tip信息
+---@return boolean,string
+function ShopModel:CheckShopItemUnlock(shopId, data, getTip)
+    if shopId ~= 7 and shopId ~= 9 or not data.Restrict or not data.Restrict[1] then
+        return true, nil
+    end
+
+    ---@type boolean,string
+    local isLock, tip = false
+    if data.Restrict[1][1] == 2 then
+        local nowChpater = require("AfkModel"):GetInstance():GetCurAfkChapter() or 1
+        if data.Restrict[1][2] <= nowChpater then
+            isLock = true
+            if getTip then
+                local afk = _G.ConfigManager.afk_cfg[data.Restrict[1][2]]
+                tip = _G.GetLangPackValue(90029400059, afk.chapter, afk.section)
+            end
+        end
+    elseif data.Restrict[1][1] == 1 then
+        local achieve, ConfigManager =
+            require("ArenaPeakModel"):GetInstance():GetAchieveDan(data.Restrict[1][2])
+        if not achieve then
+            isLock = true
+            if getTip then
+                tip = _G.GetLangPackValue(90029400098, _G.GetLangPackValue(ConfigManager.name))
+            end
+        end
+    elseif data.Restrict[1][1] == 3 then
+        local achieve =
+            require("ArenaPeakModel"):GetInstance().seasonStartTime or _G.TimeUtil.GetServerUnixTime()
+        local num = _G.TimeUtil.GetInterValDayByGame(_G.TimeUtil.GetServerUnixTime(), achieve)
+        if data.Restrict[1][2] - num > 0 then
+            isLock = true
+            if getTip then
+                tip = _G.GetLangPackValue(90029400066, data.Restrict[1][2] - num)
+            end
+        end
+    elseif data.Restrict[1][1] >= 4 and data.Restrict[1][1] <= 6 then --问鼎灵域历史参与段位
+        local achieve, cfg = require("SpiritualRealmModel"):GetInstance():CheckHistoryRank(data.Restrict[1])
+        if not achieve then
+            isLock = true
+            if getTip then
+                tip = _G.GetLangPackValue(90029400098, _G.GetLangPackValue(90030700000 + data.Restrict[1][1] - 3))
+            end
+        end
+    end
+
+    return not isLock, tip
+end
+
+---保存商店下次刷新时间
+function ShopModel:SetLocalFreshTime(shopId, time, interval_time)
+    _G.PlayerPrefsManager.SetInt("ShopFreshDeadLine" .. shopId, time + interval_time)
+end
+
+---保存商店特殊商品下次刷新时间
+function ShopModel:SetLocalSPFreshTime(shopId, time, interval_time)
+    if not time then
+        return
+    end
+    _G.PlayerPrefsManager.SetInt("ShopSPFreshDeadLine" .. shopId, time + interval_time)
+end
+
+---商店计时器每一秒进行刷新 检测是否有需要刷新的商店数据
+function ShopModel:UpdateTime()
+    local needGetDataIds = {}
+    for k, v in pairs(self.shop) do
+        if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.cfg[v.sid].function_open) then
+            if v.sid ~= 6 and v.sid ~= 7 and v.sid ~= 9 then
+                if v.time + v.interval_time - _G.TimeUtil.GetServerUnixTime() < 0 then
+                    _G.table.insert(needGetDataIds, v.sid)
+                end
+            end
+            if v.spInterval_time > 0 and v.spTime then
+                if v.spTime + v.spInterval_time - _G.TimeUtil.GetServerUnixTime() < 0 and not _G.table.ContainsValue(needGetDataIds, v.sid) then
+                    _G.table.insert(needGetDataIds, v.sid)
+                end
+            end
+
+            -- 在现有商店级刷新检测后，新增商品级刷新检测
+            -- 检测特殊商品的商品级刷新
+            ---@type ShopItemData[]
+            local spItemList = v.SPitem
+            if spItemList then
+                for _, itemData in ipairs(spItemList) do
+                    if itemData:CanRefresh() then
+                        -- 该商品需要刷新，加入请求队列
+                        if not _G.table.ContainsValue(needGetDataIds, v.sid) then
+                            _G.table.insert(needGetDataIds, v.sid)
+                        end
+                        break  -- 该商店已加入队列，跳过其他商品检测
+                    end
+                end
+            end
+        end
+    end
+    if #needGetDataIds > 0 then
+        for i = 1, #needGetDataIds do
+            local msg = { shop_id = needGetDataIds[i] }
+            if self.InitParseList[needGetDataIds[i]] == nil then
+                self.InitParseList[needGetDataIds[i]] = true
+            end
+            if self.InitParseList[needGetDataIds[i]] then
+                self.InitParseList[needGetDataIds[i]] = false
+                ShopNet:GetInstance():GetShopInfo(msg, _G.handlerbind(self, self.InitUpdateParseData, needGetDataIds[i]))
+            end
+        end
+    end
+end
+
+function ShopModel:InitUpdateParseData(data, ShopID, idIs)
+    if idIs then
+        if self.InitParseList[idIs] == nil or self.InitParseList[idIs] == false then
+            self.InitParseList[idIs] = true
+        end
+    end
+    if _G.table.isEmptyOrNil(self.shop) then
+        self:InitShopData()
+    end
+    self:ParseData(data, ShopID)
+    self:CheckShopViewOpenToFresh()
+    _G.Events:GetInstance():Broadcast(_G.eShopStatus.Update,ShopID)
+end
+
+---如果界面打开 则刷新逻辑和6点刷新逻辑 需同步界面
+function ShopModel:CheckShopViewOpenToFresh()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ShopView.Name)
+    if view then
+        view:InitView()
+    end
+end
+
+---购买物品
+function ShopModel:BuyItem(ShopID, item, count, call)
+    if item == nil then
+        return
+    end
+    if item.cfg then
+        if not _G.StorageManager:GetInstance():CheckItem(item.cfg.currency_type, item.cfg.price) then
+            _G.PopWindowManager:GetInstance():ShowAllTips(tipsID.CoinLimit)
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.GetItemWayView.Name,
+                item.cfg.currency_type
+            )
+            return
+        end
+    end
+    local msg = {}
+    msg.items = {}
+    local itemCur = {}
+    itemCur.buy_num = count
+    itemCur.buy_type = item.sp and 2 or 1
+    if item.cfg.item then
+        msg.shop_id = ShopID
+        itemCur.index = item.index
+    else
+        msg.shop_id = ShopID
+        itemCur.id = item.sid
+    end
+    -- msg.buy_type = item.sp and 2 or 1
+    if count < 1 then
+        count = 1
+    end
+    -- msg.buy_num = count
+
+
+    table.insert(msg.items, itemCur)
+
+    if item.cfg.currency_type == 12 then
+        --     end
+        -- )
+        -- _G.GlobalInterface.ConsumeHYShowTips(
+        --     _G.ComsumeHYType.Token,
+        --     item.price,
+        --     function()
+        ShopNet:GetInstance():BuyItem(msg, _G.handlerbind(self, self.BuyItemSuc, item, count, ShopID, call))
+    else
+        ShopNet:GetInstance():BuyItem(msg, _G.handlerbind(self, self.BuyItemSuc, item, count, ShopID, call))
+    end
+end
+
+---购买物品返回
+function ShopModel:BuyItemSuc(data, item, count, ShopID, call)
+    if data.ack ~= 1 then
+        return
+    end
+    _G.StorageManager:GetInstance():ConsumeItem(item.cfg.currency_type, 0, item.cfg.price * count)
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+    item.BuyTime = item.BuyTime + count
+
+    if call ~= nil then
+        call()
+    end
+end
+
+---购买物品
+function ShopModel:BuyAllItem(ShopID, items, datas, call)
+    if items == nil then
+        return
+    end
+
+    -- if item.cfg then
+    --     if not _G.StorageManager:GetInstance():CheckItem(item.cfg.currency_type, item.cfg.price) then
+    --         _G.PopWindowManager:GetInstance():ShowAllTips(tipsID.CoinLimit)
+    --         _G.UIManager:GetInstance():OpenWindow(
+    --             _G.ConfigManager.ui_cfg.GetItemWayView.Name,
+    --             item.cfg.currency_type
+    --         )
+    --         return
+    --     end
+    -- end
+    local msg = {}
+    msg.shop_id = ShopID
+    msg.items = datas
+    ShopNet:GetInstance():BuyItem(msg, _G.handlerbind(self, self.BuyAllItemSuc, items, datas, ShopID, call))
+end
+
+---获取商品预先购买
+function ShopModel:GetRemember(ShopID, call)
+    if ShopID == nil then
+        return
+    end
+    local msg = {}
+    msg.shop_id = ShopID
+    ShopNet:GetInstance():GetRemember(msg, function(_data)
+        if _data.ack == 1 then
+            if call then
+                call(_data.data)
+            end
+        end
+    end)
+end
+
+---商品预先购买设置
+function ShopModel:RememberSave(ShopID, list, call)
+    if ShopID == nil then
+        return
+    end
+    local msg = {}
+    msg.shop_id = ShopID
+    msg.save_data = list
+    ShopNet:GetInstance():RememberSave(msg, function(_data)
+        if _data.ack == 1 then
+            if call then
+                call()
+            end
+        end
+    end)
+end
+
+---购买物品返回
+function ShopModel:BuyAllItemSuc(data, items, datas, ShopID, call)
+    if data.ack ~= 1 then
+        return
+    end
+
+    for i = 1, #items do
+        items[i].BuyTime = items[i].BuyTime + datas[i].buy_num
+        _G.StorageManager:GetInstance():ConsumeItem(items[i].cfg.currency_type, 0, items[i].cfg.price * datas[i].buy_num)
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+
+    if call ~= nil then
+        call()
+    end
+end
+
+---刷新商店
+function ShopModel:RefreshShop(ShopID, call)
+    if
+        self.shop[ShopID].freeTimes <= 0 and
+        not _G.StorageManager:GetInstance():CheckItem(
+            self.shop[ShopID].currency_type,
+            self.shop[ShopID].Material[self.shop[ShopID].RefreshCount + 1]
+        )
+    then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.GetItemWayView.Name,
+            self.shop[ShopID].currency_type
+        )
+        return
+    end
+
+    if self.shop[ShopID].RefreshCount >= self.shop[ShopID].count_refresh and self.shop[ShopID].freeTimes <= 0 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(tipsID.RefreshCeil)
+        return
+    end
+    ---region 临时 ZHJ-13066【客户端】商城资源替换
+    local count = self.shop[ShopID].Material[self.shop[ShopID].RefreshCount + 1]
+    --临时添加
+    _G.PopWindowManager:GetInstance():ShowAllTips(
+        240303,
+        nil,
+        function()
+            local msg = {}
+            msg.shop_id = ShopID
+            ShopNet:GetInstance():RefreshShop(msg, _G.handlerbind(self, self.RefreshShopSuc, ShopID, call))
+        end,
+        nil,
+        nil,
+        nil,
+        count,
+        self.shop[ShopID].count_refresh - self.shop[ShopID].RefreshCount,
+        self.shop[ShopID].count_refresh
+    )
+end
+
+---刷新商店成功
+function ShopModel:RefreshShopSuc(data, ShopID, call)
+    if data.ack ~= 1 then
+        return
+    end
+    if not table.isEmptyOrNil(data) then
+        local shop = self.shop[data.info.shop_id]
+        shop.RefreshCount = data.info.refresh_times
+        if shop.freeTimes <= 0 then
+            _G.StorageManager:GetInstance():ConsumeItem(shop.currency_type, 0, shop.Material[shop.RefreshCount])
+        end
+        shop.time = data.info.refresh_second
+        shop.spTime = data.info.refresh_second1
+        shop.freeTimes =
+            require "HellRoadModel":GetInstance():GetNumber({ _G.PrivilegeType.Shop.Refresh, data.info.shop_id }) -
+            data.info.free_times
+        shop.item = {}
+        local temp = {}
+        if not _G.table.isEmptyOrNil(data.info.shop_item_id) then
+            for i = 1, #data.info.shop_item_id do
+                local cfg = _G.ConfigManager.shop_pools_cfg[data.info.shop_item_id[i].good_id]
+                if not _G.table.isEmptyOrNil(cfg.conditions) then
+                    local bool_checkRoleLevel =
+                        _G.GlobalConditionManager.CheckCondition(cfg.conditions[1][1], cfg.conditions[1][2])
+                    if not bool_checkRoleLevel then
+                    else
+                        temp = {}
+                        temp = require("ShopItemData").New(i)
+                        temp:Parse(data.info.shop_item_id[i], ShopID)
+                        table.insert(shop.item, temp)
+                    end
+                else
+                    temp = {}
+                    temp = require("ShopItemData").New(i)
+                    temp:Parse(data.info.shop_item_id[i], ShopID)
+                    table.insert(shop.item, temp)
+                end
+            end
+        end
+        --data.info.shop_item_id1 = data.info.shop_item_id1 or {}
+        if not _G.table.isEmptyOrNil(data.info.shop_item_id1) then
+            shop.SPitem = {}
+            for i = 1, #data.info.shop_item_id1 do
+                local cfg = _G.ConfigManager.shop_pools_cfg[data.info.shop_item_id1[i].good_id]
+                data.info.shop_item_id1[i].sp = true
+                temp = {}
+                temp = require("ShopItemData").New(i)
+                temp:Parse(data.info.shop_item_id1[i], ShopID)
+                table.insert(shop.SPitem, temp)
+            end
+        end
+        shop.item = self:OrderSort(shop.item)
+        shop.SPitem = self:OrderSort(shop.SPitem)
+        for i = #shop.SPitem, 1, -1 do
+            table.insert(shop.item, 1, shop.SPitem[i])
+        end
+
+        --更新红点状态
+        self:CheckRefreshRed(shop, true)
+        self:RefreshRedPoint(ShopID)
+    end
+    if call ~= nil then
+        call()
+    end
+end
+
+---通过货品id直接购买
+---@param shopID number 商店ID
+---@param ItemID number 商品ID
+---@param call number 购买成功回调
+function ShopModel:GetGoodsIndexByID(shopID, ItemID, call)
+    if not self.shop[shopID] then
+        return
+    end
+    for i, v in pairs(self.shop[shopID].item) do
+        if v.sid == ItemID then
+            self:BuyItem(shopID, i, call)
+            break
+        end
+    end
+end
+
+---通过货品id获取数据
+---@param shopID number 商店ID
+---@param ItemID number 商品ID
+function ShopModel:GetGoodsDataByID(shopID, ItemID)
+    if not self.shop[shopID] then
+        return
+    end
+    for i, v in pairs(self.shop[shopID].item) do
+        if v.sid == ItemID then
+            return self.shop[shopID].item[i]
+        end
+    end
+end
+
+function ShopModel:GetShop()
+    return self.shop
+end
+
+---打开界面
+function ShopModel:OpenShop(index, hideFun, openFun)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ShopView.Name, index, hideFun, openFun)
+end
+
+---获取对应商店数据
+function ShopModel:GetShopInServer(ShopID, call)
+    -- 这里的调用应该是在商店初始化后，如果有人改错了，请修改
+    -- if _G.table.isEmptyOrNil(self.shop) then
+    --     self:InitShopData()
+    -- end
+    local msg = { shop_id = ShopID }
+    ShopNet:GetInstance():GetShopInfo(
+        msg,
+        function(data)
+            if data.ack ~= 1 then
+                --这里不能影响其他的刷新，必须返回
+                if call then
+                    call()
+                end
+                return
+            end
+            self:ParseData(data, ShopID)
+            if call then
+                call()
+            end
+            self:CheckShopViewOpenToFresh()
+        end
+    )
+end
+
+--endregion
+
+--- 根据 shop_pools_cfg 中的 order 字段，对item进行排序,并将其返回
+---@param itemList table 待排序的item列表
+---@return table
+function ShopModel:OrderSort(itemList)
+    if not itemList then
+        return itemList
+    end
+    local goodsList = {}
+    local goods = {}
+    local goodsIndexs = {}
+    for _, v in ipairs(itemList) do
+        if v.cfg and v.cfg.order and v.cfg.order > 0 then
+            -- 固定排序
+            if not goods[v.cfg.order] then
+                -- 记录出现的固定排序
+                goods[v.cfg.order] = {}
+                _G.table.insert(goodsIndexs, v.cfg.order)
+            end
+            -- 记录固定排序出现的item
+            _G.table.insert(goods[v.cfg.order], v)
+        else
+            -- 默认排序
+            _G.table.insert(goodsList, v)
+        end
+    end
+    -- 如果没有固定排序的物品，直接返回原列表
+    if goodsIndexs then
+        -- 升序排列出现的固定排序
+        _G.table.sort(goodsIndexs)
+        --- 排序后的goodsList
+        local var2 = {}
+        --- 默认排序的item列表的取值进度
+        local index = 1
+        -- 使用固定排序进行重新排列
+        for _, v in ipairs(goodsIndexs) do
+            -- 如果列表中的物品数量小于当前物品的排序，则使用默认排序的物品将对应缺少的物品数量补上
+            if v > #var2 + 1 then
+                -- 默认排序的物品不足时，跳过
+                if index - 1 < #goodsList then
+                    local minNum = _G.math.min(#goodsList, v - 1)
+                    _G.table.move(goodsList, index, minNum, #var2 + 1, var2)
+                    index = minNum + 1
+                end
+            end
+            -- 将同一排列顺序的物品插入尾部
+            _G.table.move(goods[v], 1, #goods[v], #var2 + 1, var2)
+        end
+        -- 将剩下的默认排序的物品插入尾部
+        if index - 1 < #goodsList then
+            _G.table.move(goodsList, index, #goodsList, #var2 + 1, var2)
+        end
+        return var2
+    end
+    return itemList
+end
+
+---清理计时器
+function ShopModel:ClearShopTimer()
+    if self.updateTimer then
+        self.updateTimer:Stop()
+    end
+    self.updateTimer = nil
+end
+
+---获取红点参数列表
+---@return table<number,number[]>
+function ShopModel:GetRedPointParams()
+    return self.redPointParams
+end
+
+---获取商店对应的红点参数(优先返回综合参数)
+---@param shopId number
+---@return number
+function ShopModel:GetShopFirstRedPointParam(shopId)
+    local params = self.redPointParams and self.redPointParams[shopId]
+    if params then
+        return params[1]
+    end
+    return shopId
+end
+
+---刷新红点状态
+---@param params number?    刷新指定参数, 不传则刷新所有参数
+function ShopModel:RefreshRedPoint(params)
+    local redpointManager = require("RedPointManager"):GetInstance()
+    if not params then
+        redpointManager:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Shop.id)
+        return
+    end
+
+    local shopIds = self.redPointParams and self.redPointParams[params]
+    if not shopIds then
+        shopIds = { params }
+    end
+
+    for _, param in ipairs(shopIds) do
+        redpointManager:RefreshNode(_G.ConfigManager.redpoint_cfg.Shop.id, param)
+    end
+end
+
+---获取红点状态
+---@param params number
+function ShopModel:GetRedPoint(params)
+    if not self.redPointStates then
+        return 0
+    end
+
+    local shopIds = self.redPointParams and self.redPointParams[params]
+    if not shopIds then
+        shopIds = { params }
+    end
+
+    local num = 0
+    for _, shopId in ipairs(shopIds) do
+        local states = self.redPointStates[shopId]
+        if states then
+            num = num + #states
+        end
+    end
+    return num
+end
+
+---更新商品红点状态
+---@param shopId number
+---@param force boolean 是否强制刷新全部状态
+---@param refreshRedpoint boolean?  是否刷新红点
+function ShopModel:UpdateRedPointStates(shopId, force, refreshRedpoint)
+    local shopData = self.shop and self.shop[shopId]
+    if shopData then
+        self:CheckRefreshRed(shopData, force)
+    end
+    if refreshRedpoint then
+        self:RefreshRedPoint(shopId)
+    end
+end
+
+---获取商品是否提示红点
+---@param shopId number
+---@param itemIndex number
+---@return boolean
+function ShopModel:IsItemRedPoint(shopId, itemIndex)
+    local states = self.redPointStates and self.redPointStates[shopId]
+    if not states or not _G.table.indexof(states, itemIndex) then
+        return false
+    end
+    return true
+end
+
+---移除商品红点
+---@param shopId number
+---@param itemIndex number
+---@param saveStates boolean?   保存红点状态到磁盘
+---@param refreshRedpoint boolean?  是否刷新红点
+function ShopModel:RemoveItemRedPoint(shopId, itemIndex, saveStates, refreshRedpoint)
+    local states = self.redPointStates and self.redPointStates[shopId]
+    if not states then
+        return
+    end
+    local index = _G.table.indexof(states, itemIndex)
+    if not index then
+        return
+    end
+    _G.table.remove(states, index)
+    if saveStates then
+        self:SaveRedPointStates(shopId, states)
+    end
+    if refreshRedpoint then
+        self:RefreshRedPoint(shopId)
+    end
+end
+
+function ShopModel:GetShopList()
+    if AppSetting.IsXzns then
+        for  k,v in pairs(self.pageList) do
+            v.show=self.cfg[v.id]
+            if v.show then
+                v.show=self.cfg[v.id].is_hide==0
+            end
+            for  key,value in pairs(v.list) do
+                if value.show and self.cfg[value.id] then
+                    value.show=self.cfg[value.id].is_hide==0
+                elseif value.show then
+                    value.show=self.cfg[v.id].is_hide==0
+                end
+            end
+        end
+    end
+    return self.pageList
+end
+
+---获取商品下次刷新时间
+---@param type number 1为日刷-2为周刷-3为月刷
+---@param target number 对应type参数的目标日
+function ShopModel:GetGoodNextRefreshTime(type,target)
+    local nextTime = 0
+    if type == 1 then
+        --日刷
+        nextTime = TimeUtil.GetNextDayHourTime(target)
+    elseif type == 2 then
+        --周刷
+        nextTime = TimeUtil.GetNextWeekdayTime(target)
+    elseif type == 3 then
+        --月刷
+        nextTime = TimeUtil.GetNextMonthDayTime(target)
+    else
+        _G.LogError("ShopID商品刷新参数配置有问题")
+    end
+    return nextTime
+end
+
+return ShopModel

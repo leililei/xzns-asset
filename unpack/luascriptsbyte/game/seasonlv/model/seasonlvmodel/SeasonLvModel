@@ -1,0 +1,517 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.SeasonLv.Model.SeasonLvModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/05/17
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local base = require "SeasonBaseModel"
+---@class SeasonLvModel : SeasonBaseModel	中文描述
+local SeasonLvModel = _G.BaseClass("SeasonLvModel", base)
+
+---@return SeasonLvModel SeasonLvModel
+function SeasonLvModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---战令信息
+---@class  SeasonLvModel_storeinfo
+---@field time number 本轮赛季战令开启时间
+---@field exp number 赛季经验 累计
+---@field sid number 战令的id
+---@field is_buy number 是否是豪华0:不是 1：是）
+---@field normal_award_list  table<number,boolean> 已经领取的普通奖励 [id]=true
+---@field up_award_list table<number,boolean> 已经领取的豪华奖励  [id]=true
+
+---
+---创建对象时,入口构造函数
+function SeasonLvModel:__init()
+    self.redPointId = _G.ConfigManager.redpoint_cfg.FirstStore.id
+    self.curFunctionOpenID = _G.FunctionID.SeasonLv
+    local parameters = _G.ConfigManager.discrete_cfg[105101][1]
+    --- 0.5 (105101,2#1 赛季战令经验兑换比例（每日任务活跃#赛季战令经验）)
+    self.expBl = parameters[2] / parameters[1]
+
+    self.EndTime = 0
+    ---true功能已初始
+    self.isOpen = false
+    ---@type SeasonLvModel_storeinfo
+    self.store = {
+        ---战令的id
+        sid = 0,
+        ---本轮赛季战令开启时间
+        time = 0,
+        ---赛季经验 累计
+        exp = 0,
+        ---是否是豪华 （0:不是 1：是）
+        is_buy = 0,
+        ---已经领取的普通奖励id
+        normal_award_list = {},
+        ---已经领取的豪华奖励id
+        up_award_list = {}
+    }
+    ---当前活跃值 用于计算活跃度增量
+    self.OldActivenum = 0
+    self.discountItemId = 203030801
+
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+--region 重写父类方法
+--- 网络请求初始化
+function SeasonLvModel:GetDataFormServer()
+    self.isOpen = false
+    ---@param msg store_season_battle.s2c_store_season_battle_info
+    require("SeasonLvNet"):GetInstance():GetInfo(
+        function(msg)
+            local data = msg.season_info
+            self:ParseData(data)
+
+            if self.reconnectEndCall then
+                self.reconnectEndCall()
+                self:UpdataView()
+            end
+        end
+    )
+
+    -- ---@type store_season_battle.c2s_store_season_battle_buy_exp
+    -- local data = {}
+    -- data.lv = 5
+    -- require("SeasonLvNet"):GetInstance():GetBuy(
+    --     data,
+    --     function(msg)
+    --
+    if _G.AppSetting.DEBUG then
+        _G.Log("", "<color=red>" .. ">>>" .. "</color>")
+    end
+    --     end
+    -- )
+end
+
+---数据解析完成
+---@param data SeasonLvModel_storeinfo
+function SeasonLvModel:ParseData(data)
+    self.isOpen = data ~= nil
+
+    data = data or {}
+
+    local parameters = _G.ConfigManager.season_cfg[require("SeasonModel"):GetInstance():GetCurSeasonId()]
+    --- 战令id
+    self.store.sid = parameters.store_battle_pass[1]
+
+    self.store.time = data.time or 0
+    self.store.is_buy = data.is_buy or 0
+
+    ---当前玩家累计经验
+    self.store.exp = data.exp or 0
+
+    if data.normal_award_list ~= nil then
+        for i = 1, #data.normal_award_list do
+            self:SetAward(data.normal_award_list[i], false)
+        end
+    end
+
+    if data.up_award_list ~= nil then
+        for i = 1, #data.up_award_list do
+            self:SetAward(data.up_award_list[i], true)
+        end
+    end
+
+    local seasonCfg = require("SeasonModel"):GetInstance():GetCfg()
+    self.EndTime = self.store.time + 86400 * seasonCfg.duration
+
+    if _G.PlayerPrefsManager.GetInt("SeasonLvStart", 0) == 0 then
+        if self.isOpen then
+            _G.PlayerPrefsManager.SetInt("SeasonLv" .. self.store.sid, 0)
+        else
+            _G.PlayerPrefsManager.SetInt("SeasonLv" .. self.store.sid, 1)
+        end
+        _G.PlayerPrefsManager.SetInt("SeasonLvStart", 1)
+
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FirstStore.id)
+    end
+    self.super.ParseData(self)
+end
+
+function SeasonLvModel:OnSeasonStart()
+    _G.PlayerPrefsManager.SetInt("SeasonLvStart", 0)
+    self:GetDataFormServer()
+end
+
+function SeasonLvModel:OnSettlement()
+    _G.PlayerPrefsManager.SetInt("SeasonLvStart", 0)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonLvView.Name)
+end
+
+function SeasonLvModel:OnSeasonEnd()
+    _G.PlayerPrefsManager.SetInt("SeasonLvStart", 0)
+end
+
+---初始化功能逻辑
+function SeasonLvModel:InitFunction()
+    self.OldActivenum = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.ResProp, _G.ResPropID.ActiveValue)
+    self:UpdataView()
+end
+
+function SeasonLvModel:UpdataView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SeasonLvView.Name)
+    if view then
+        view:UpdataView()
+    end
+end
+
+---打开界面
+function SeasonLvModel:OpenView()
+    _G.PlayerPrefsManager.SetInt("SeasonLv" .. self.store.sid, 1)
+
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FirstStore.id)
+
+    if self.isOpen ~= true then
+        _G.PopWindowManager:GetInstance():ShowAllTips(400101)
+        return
+    end
+    if self.EndTime <= _G.TimeUtil.GetServerUnixTime() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(620101)
+        return
+    end
+
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SeasonLvView.Name)
+end
+
+---@return boolean true已购买豪华
+function SeasonLvModel:GetIsUp()
+    return self.store.is_buy == 1
+end
+
+function SeasonLvModel:SetIsUp()
+    self.store.is_buy = 1
+    self:RedCheck()
+end
+
+
+---是否领取奖励
+function SeasonLvModel:IsAward(id, isUp)
+    if isUp then
+        return self.store.up_award_list[id] == true
+    else
+        return self.store.normal_award_list[id] == true
+    end
+end
+---设置已领取
+function SeasonLvModel:SetAward(id, isUp)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("SeasonLvModel:SetAward id无效:" .. tostring(id))
+        end
+        return
+    end
+    if isUp then
+        self.store.up_award_list[id] = true
+    else
+        self.store.normal_award_list[id] = true
+    end
+end
+
+---设置所有满足条件的奖励为已购买
+function SeasonLvModel:SetAllAward()
+    local lv = self:GetLvExp()
+    local id = self.store.sid
+    ---@type store_season_battle_cfg
+    local cfg = _G.ConfigManager.store_season_battle_cfg[id]
+    local content = cfg.content
+    for i = 1, #content do
+        local info = _G.ConfigManager.store_season_battlecon_cfg[content[i]]
+        if lv >= info.level then
+            self:SetAward(info.id, false)
+            if self:GetIsUp() then
+                self:SetAward(info.id, true)
+            end
+        end
+    end
+end
+
+function SeasonLvModel:OnMallCashListener(data)
+    local cfg = _G.ConfigManager.store_season_battle_cfg[data.sid]
+    if cfg ~= nil and cfg.type == 1 then
+        self:SetIsUp()
+        if _G.StorageManager:GetInstance():CheckItem(self.discountItemId, 1) then
+            _G.StorageManager:GetInstance():ConsumeItem(self.discountItemId, nil , 1)
+        end
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FirstStore.id)
+    end
+end
+
+---购买豪华
+function SeasonLvModel:BuyUp(id, price_id)
+    require("MallManager"):GetInstance():BuyActiveGift(
+        price_id,
+        nil,
+        id
+    )
+end
+
+---购买经验
+function SeasonLvModel:GetBuyExp(lv, consume)
+    ---@type store_season_battle.c2s_store_season_battle_buy_exp
+    local pbdata = {}
+    pbdata.lv = lv
+    require("SeasonLvNet"):GetInstance():GetBuyExp(
+        pbdata,
+        function(data)
+            if data.ack == 1 then
+                _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, 0, consume)
+                self:OnSixClockUpdate(_G.handler(self, self.OnInitFunction))
+
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.FirstStore.id
+                )
+            end
+        end
+    )
+end
+
+---领奖
+---@param id number 奖励id
+---@param isUp boolean 奖励类型 true，豪华
+function SeasonLvModel:GetAward(id, isUp)
+    ---@type store_season_battle.c2s_store_season_battle_award
+    local pbdata = {}
+    pbdata.id = id
+    pbdata.type = isUp and 1 or 0
+    require("SeasonLvNet"):GetInstance():GetAward(
+        pbdata,
+        function(data)
+            if data.ack == 1 then
+                self:SetAward(id, isUp)
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+                self:UpdataView()
+
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.FirstStore.id
+                )
+            end
+        end
+    )
+end
+
+---一键领奖
+---@param id number 奖励id
+---@param isUp boolean 奖励类型 true，豪华
+function SeasonLvModel:GetAwardAll()
+    require("SeasonLvNet"):GetInstance():GetAwardAll(
+        function(data)
+            if data.ack == 1 then
+                self:SetAllAward()
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+                self:OnSixClockUpdate(_G.handler(self, self.OnInitFunction))
+                local lv = self:GetLvExp()
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.SeasonLv}, lv, true)
+
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.FirstStore.id
+                )
+            end
+        end
+    )
+end
+---获取等级
+---@return  number,number,number  等级, 当前经验, 最大经验
+function SeasonLvModel:GetLvExp(sumexp)
+    if not self.countCfgArr then
+        ---@type store_season_battle_cfg
+        local cfg = _G.ConfigManager.store_season_battle_cfg[self.store.sid]
+        local content = table.values(cfg.content)
+        --table.sort(content)
+        local conIds = content
+
+        local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+        ---@type store_season_battlecon_cfg[]
+        self.countCfgArr = {}
+        ---@type store_season_battlecon_cfg
+        local cfgItem
+        local id
+        for i = 1, #conIds do
+            id = conIds[i]
+            if id == nil or id == 0 then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError(" 配置id 无效  store_season_battlecon_cfg.content id:" .. tostring(id))
+                end
+                cfgItem = nil
+            else
+                cfgItem = store_season_battlecon_cfg[conIds[i]]
+            end
+            if cfgItem then
+                table.insert(self.countCfgArr, cfgItem)
+            end
+        end
+    end
+
+    local lv = 0
+    local max = 0
+    local exp = 0
+    local sumexp = sumexp or self.store.exp
+    local cfginfo
+    for i = 1, #self.countCfgArr do
+        cfginfo = self.countCfgArr[i]
+        local subexp = cfginfo.conditions[2]
+        if subexp == nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("未配置经验 store_season_battlecon_cfg." .. cfginfo.id)
+            end
+            subexp = 0
+            sumexp = 0
+        end
+        if sumexp >= subexp then
+            sumexp = sumexp - subexp
+            lv = cfginfo.level
+        else
+            exp = sumexp
+            max = subexp
+            break
+        end
+    end
+
+    return lv, exp, max
+end
+
+--region --------------------------------------红点 奖励解锁--------
+function SeasonLvModel:RedCheck()
+    -- ---@type store_battle_pass_cfg
+    -- local cfg = _G.ConfigManager.store_battle_pass_cfg[self.sid]
+    -- ---{关卡id =true,} 奖励解锁的值
+    -- self.conditionsAfkParam = {}
+    -- ---True有可领取
+    -- self.isHaveGet = false
+    -- local store_battle_content_cfg = _G.ConfigManager.store_battle_content_cfg
+    -- ---@type store_battle_content_cfg
+    -- local cfgitem
+    -- local cType, cValue, id
+    -- for i = 1, #cfg.content do
+    --     ---奖励内容id
+    --     id = cfg.content[i]
+    --     cfgitem = store_battle_content_cfg[id]
+    --     ---条件类型
+    --     cType = cfgitem.conditions[1]
+    --     ---条件参数
+    --     cValue = cfgitem.conditions[2]
+    --     if cType == _G.GlobalConditionManager.ConditionType.afk then
+    --         ----如果没解锁 就标记
+    --         if _G.GlobalConditionManager.CheckCondition(cType, cValue) == false then
+    --             self.conditionsAfkParam[cValue] = true
+    --         else
+    --             ---如果解锁了 就记录是否已领取
+    --             if self.isHaveGet == false then
+    --                 ---如果 有一个奖励没领 就标记
+    --                 if not self:IsAward(id, false) then
+    --                     self.isHaveGet = true
+    --                 elseif self:GetIsUp() and not self:IsAward(id, true) then
+    --                     self.isHaveGet = true
+    --                 end
+    --             end
+    --         end
+    --     else
+    --
+    if _G.AppSetting.DEBUG then
+        _G.Log("", "<color=red>" .. "不是设定的 通用检测类型" .. "</color>")
+    end
+    --         break
+    --     end
+    -- end
+    -- require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.BattleGrowth.id)
+end
+
+function SeasonLvModel:IsHaveGet()
+    return self.isHaveGet == true
+end
+
+function SeasonLvModel:AddListener()
+    -- _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.PlayAaction, self.OnAactionEnent, self)
+end
+
+---监听玩家操作
+function SeasonLvModel:OnAactionEnent(id, parmas, isfh)
+    -- local type = id[1]
+    -- if type == nil then
+    --     return
+    -- end
+    -- if type == _G.ActiveTaskEnum.ConditionEnum.AFK.IsPass then
+    --     ---如果没有可领取  并且有解锁
+    --     if self.isHaveGet == false and self.conditionsAfkParam[id[2]] == true then
+    --         ---检测红点
+    --         self:RedCheck()
+    --         self.conditionsAfkParam[id[2]] = nil
+    --     end
+    -- end
+end
+
+function SeasonLvModel:RemoveListener()
+    _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.PlayAaction, self.OnAactionEnent, self)
+end
+
+--endregion------------------------------------红点 奖励解锁--------
+
+---@field exp number 增加的经验
+function SeasonLvModel:ExpUpdata(exp)
+    self.store.exp = self.store.exp + exp
+    self.store.exp = _G.GameUtil.FormatNum(self.store.exp)
+    self:UpdataView()
+    local lv = self:GetLvExp()
+    _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.SeasonLv}, lv, true)
+end
+
+--endregion
+---销毁对象时,析构函数
+function SeasonLvModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+function SeasonLvModel:CheckRedPoint()
+    --判断是否存在赛季活动
+    if not self:CheckIsOpen() then
+        return false
+    end
+    -- --判断是否存在赛季战令并且未点击过
+    -- local redCheckOpen = _G.PlayerPrefsManager.GetInt("SeasonLv" .. self.store.sid, 0)
+    -- if redCheckOpen == 0 then
+    --     return true
+    -- end
+    --判断是否有可领取
+    local lv = self:GetLvExp()
+    local id = self.store.sid
+    ---@type store_season_battle_cfg
+    local cfg = _G.ConfigManager.store_season_battle_cfg[id]
+    local content = cfg.content
+    local isCanGet = false
+    for i = 1, #content do
+        local info = _G.ConfigManager.store_season_battlecon_cfg[content[i]]
+        if lv >= info.level then
+            local isGet1 = require("SeasonLvModel"):GetInstance():IsAward(info.id, false)
+            if not isGet1 then
+                isCanGet = true
+                break
+            end
+            local isGet2 = require("SeasonLvModel"):GetInstance():IsAward(info.id, true)
+            if not isGet2 and self:GetIsUp() then
+                isCanGet = true
+                break
+            end
+        end
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(isCanGet, "是否可以领取战令")
+    end
+    return isCanGet
+end
+
+function SeasonLvModel:ReConnect(endcall)
+    self.reconnectEndCall = endcall
+    self:GetDataFormServer()
+end
+
+-- function SeasonLvModel:OpenView(open,close,...)
+--     _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SeasonLvView.Name,...)
+-- end
+
+return SeasonLvModel

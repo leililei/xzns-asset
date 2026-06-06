@@ -1,0 +1,326 @@
+-----------------------------------------------------------------------
+-- C:\alpha_JT\Client\Assets\Resources\LuaScripts\Game\Activity\Model\SpBoxSynModel.lua
+-- Created by ly
+-- DateTime: 2024/09/14
+-- Description 此处填写描述
+-- 生命周期Awake,Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local base = require "ActivitySynTypeBase"
+---@class SpBoxSynModel : ActivitySynTypeBase	惊喜宝箱GM活动
+local SpBoxSynModel = _G.BaseClass("SpBoxSynModel", base)
+local boxType = {
+    ["new"] = 1,
+    ["upgrating"] = 2,
+    ["canOpen"] = 3
+}
+
+---创建对象时,入口构造函数
+function SpBoxSynModel:__init()
+    self.ActivityId = self.curActivityClass:GetActivityID()
+    self:SetSelfData(self.curActivityClass.cfg.self_info)
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.RefreshRedPoint, self)
+    self:RefreshRedPoint()
+end
+
+---获取服务器数据
+function SpBoxSynModel:GetDataFormServer()
+    self:ParseData()
+end
+
+---解析数据
+---@param data table 服务器返回数据
+function SpBoxSynModel:ParseData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+
+function SpBoxSynModel:SetSelfData(info)
+    self.coins = {}
+    info = info.surprise_box
+    self.maxTimes = info.max_times
+    self.up_list = info.up_list
+    self.coins = {}
+    self.coinIndex = {}
+    self.gm_cfg = info.gm_cfg
+    self.up_times = info.up_times or 0
+    self.open_num = info.open_num or 0
+    self.max_num = info.max_num or 0
+    for k, v in ipairs(info.coin_list or {}) do
+        self.coins[v.key] = v.value
+    end
+    for k, v in ipairs(info.gm_cfg) do
+        if not v.next_sid or v.next_sid == 0 then
+            self.coinIndex[1] = v.sid
+        end
+        if not self.coins[v.sid] then
+            self.coins[v.sid] = 0
+        end
+    end
+    for i = 2, #info.gm_cfg do
+        for k, v in ipairs(info.gm_cfg) do
+            if v.next_sid == self.coinIndex[i - 1] then
+                self.coinIndex[i] = v.sid
+                break
+            end
+        end
+    end
+
+    require("SpBoxManager"):GetInstance():SetActivityModel(self)
+end
+
+-- function SpBoxSynModel:InitFunction()
+-- end
+
+function SpBoxSynModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SpBoxView.Name, self.curActivityClass)
+    self:RefreshRedPoint()
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+
+function SpBoxSynModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.SpBoxView.Name
+end
+
+-- function SpBoxSynModel:IsShowBtn()
+--     return false
+-- end
+
+---初始化红点树
+function SpBoxSynModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckRedPoint }
+    self.redpointTree = { false }
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function SpBoxSynModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---检查红点
+function SpBoxSynModel:CheckRedPoint()
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    local value = _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.SpBoxRed, curTime - 86400)
+    if _G.TimeUtil.GetDayBySix(value) ~= _G.TimeUtil.GetDayBySix(curTime) then
+        return 1
+    end
+    return 0
+end
+
+---自身活动代币增加
+function SpBoxSynModel:SetCoin(coins)
+    if coins then
+        if self.coins[coins.key] then
+            self.coins[coins.key] = self.coins[coins.key] + coins.value
+            local tmp = {}
+            _G.table.insert(tmp, coins.key)
+            _G.table.insert(tmp, coins.value)
+            _G.table.insert(tmp, self.coins[coins.key])
+            _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, { { type = tmp } })
+        end
+        self.curActivityClass.typeClass:RefreshRedPoint()
+
+        local win = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SpBoxView.Name)
+        if win then
+            win:UpdateView()
+        end
+    end
+end
+
+function SpBoxSynModel:GetCoin(sid)
+    return self.coins[sid]
+end
+
+function SpBoxSynModel:BuyBox(num, call)
+    local pb = {}
+    pb.id = self.ActivityId
+    pb.sid = self.coinIndex[#self.coinIndex]
+    pb.times = num
+    require "SpBoxNet":GetInstance():BuyBox(pb, function(msg)
+        if msg.ack == 1 then
+            local cfg = self:GetBoxCfgBySid(pb.sid)
+            for k, v in pairs(cfg.consume) do
+                _G.StorageManager:GetInstance():ConsumeItem(v.type[1], 0, v.type[2] * num)
+            end
+            self:SetCoin({ key = pb.sid, value = num })
+            if call then
+                call()
+            end
+        end
+    end)
+end
+
+function SpBoxSynModel:UpgrateBox(sidList, type, call)
+    local pb = {}
+    pb.id = self.ActivityId
+    pb.sid_list = sidList
+    pb.type = type or 1
+    require "SpBoxNet":GetInstance():UpgrateBox(pb, function(msg)
+        if msg.ack == 1 then
+            if self.up_times == 0 then
+                for k, v in pairs(pb.sid_list) do
+                    self:SetCoin({ key = v, value = -1 })
+                end
+            end
+            self.up_list = msg.sid_list
+            if pb.type == 1 then
+                self.up_times = self.up_times + 1
+            else
+                self.up_times = self.maxTimes
+            end
+            if call then
+                call()
+            end
+        end
+    end)
+end
+
+function SpBoxSynModel:GetList(call)
+    local pb = {}
+    pb.id = self.ActivityId
+    require "SpBoxNet":GetInstance():GetList(pb, function(msg)
+        if msg.ack == 1 then
+            self.awardNameList = msg.sid_list
+            if call then
+                call(msg)
+            end
+        end
+    end)
+end
+
+function SpBoxSynModel:OpenBox(call)
+    local pb = {}
+    pb.id = self.ActivityId
+    require "SpBoxNet":GetInstance():OpenBox(pb, function(msg)
+        if msg.ack == 1 then
+            local num = #self.up_list
+            self.up_list = nil
+            self.up_times = 0
+            self.open_num = self.open_num + num
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if call then
+                call()
+            end
+        end
+    end)
+end
+
+function SpBoxSynModel:GetBoxList()
+    local boxList = {}
+    local num = 0
+    for i = 1, #self.coinIndex do
+        for j = 1, self.coins[self.coinIndex[i]] do
+            num = num + 1
+            boxList[num] = self.coinIndex[i]
+            if num >= 5 then
+                return boxList
+            end
+        end
+    end
+    return { boxList[1] }
+end
+
+function SpBoxSynModel:GetBoxCfgBySid(sid)
+    for k, v in ipairs(self.gm_cfg) do
+        if v.sid == sid then
+            return v
+        end
+    end
+end
+
+function SpBoxSynModel:GetUpList()
+    return self.up_list
+end
+
+function SpBoxSynModel:GetUpTimes()
+    return self.up_times
+end
+
+function SpBoxSynModel:GetMaxTimes()
+    return self.maxTimes
+end
+
+function SpBoxSynModel:GetAwardNameList()
+    return self.awardNameList
+end
+
+function SpBoxSynModel:CheckBoxSidIndex(sid)
+    for k, v in pairs(self.coinIndex) do
+        if v == sid then
+            return k
+        end
+    end
+end
+
+function SpBoxSynModel:GetBoxSpriteBySid(sid)
+    local cfg = self:GetBoxCfgBySid(sid)
+    if cfg then
+        return cfg.resource
+    end
+end
+
+function SpBoxSynModel:GetConsume(sid)
+    local cfg = self:GetBoxCfgBySid(sid)
+    if cfg then
+        return cfg.consume
+    end
+end
+
+function SpBoxSynModel:GetAwardData()
+    local list = {}
+    for k, v in pairs(self.gm_cfg) do
+        list[k] = {}
+        local cfg = _G.ConfigManager.drop_cfg[v.drop_sid]
+        if not cfg then
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("未找到奖励配置 id = " .. v.drop_sid)
+            end
+            return
+        end
+        if cfg.fixed_drop and cfg.fixed_drop[1] then
+            for i = 1, #cfg.fixed_drop do
+                _G.table.insert(list[k], { cfg.fixed_drop[i][1], cfg.fixed_drop[i][2], 1 })
+            end
+        end
+        if cfg.content1 and cfg.content1[1] then
+            local max = 0
+            for i = 1, #cfg.content1 do
+                max = max + cfg.content1[i][3]
+            end
+            for i = 1, #cfg.content1 do
+                _G.table.insert(list[k], { cfg.content1[i][1], cfg.content1[i][2], cfg.content1[i][3] / max })
+            end
+        end
+        if cfg.content2 and cfg.content2[1] then
+            local max = 0
+            for i = 1, #cfg.content2 do
+                max = max + cfg.content2[i][3]
+            end
+            for i = 1, #cfg.content2 do
+                _G.table.insert(list[k], { cfg.content2[i][1], cfg.content2[i][2], cfg.content2[i][3] / max })
+            end
+        end
+    end
+    return list
+end
+
+---刷新奖励红点
+function SpBoxSynModel:RefreshRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+function SpBoxSynModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.RefreshRedPoint, self)
+    self.super.Dispose(self)
+end
+
+return SpBoxSynModel

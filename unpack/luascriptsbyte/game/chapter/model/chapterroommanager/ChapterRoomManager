@@ -1,0 +1,856 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Chapter.Model.ChapterRoomManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/07/26
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+local ChapterRoomClass = require "ChapterRoomClass"
+local ChapterNet = require "ChapterNet"
+---房间状态监测方法
+local CheckRoomStateFunc = {
+    [_G.MiniMapInfoType.npc] = function(cfg)
+        --房间任务
+        if #cfg.task_id > 0 then
+            for i = 1, #cfg.task_id do
+                if
+                    not _G.GlobalConditionManager.CheckCondition(
+                        _G.GlobalConditionManager.ConditionType.doneTask,
+                        cfg.task_id[i]
+                    )
+                 then
+                    return false
+                end
+            end
+        end
+        return true
+    end,
+    [_G.MiniMapInfoType.monster] = function(cfg)
+        --敌人
+        if cfg.battle_serial and #cfg.battle_serial > 0 then
+            for i = 1, #cfg.battle_serial do
+                if not _G.ChapterRoomManager:GetInstance():GetRoomEnemyBattle(cfg.battle_serial[i]) then
+                    return false
+                end
+            end
+        end
+        return true
+    end,
+    [_G.MiniMapInfoType.box] = function(cfg)
+        --宝箱
+        local boxes = _G.WorldItemManager:GetInstance():GetItemSidsByType(_G.WorldItemType.Box, cfg.MapID)
+        for i = 1, #boxes do
+            if not _G.WorldItemManager:GetInstance():GetInteractionBySid(boxes[i]) then
+                return false
+            end
+        end
+        return true
+    end
+}
+
+---@class ChapterRoomManager:Singleton	中文描述
+---@field GetInstance fun():ChapterRoomManager
+---@field private enemyBattlemMGDs table 当前关卡打过的怪物组列表
+---@field private cardBaseData table 卡牌数据表
+---@field private curSectionAward table 当前关卡获得奖励组
+---@field private curRoomSettlementAward table 当前房间怪物战斗奖励
+---@field private rooms table 房间对象列表
+---@field private curAllRoomSceneSid table 所有房间场景ID列表
+---@field private sceneRunPlayerSids table 跑图角色列表
+local ChapterRoomManager = _G.BaseClass("ChapterRoomManager", _G.Singleton)
+_G.ChapterRoomManager = ChapterRoomManager
+
+---类的构造函数
+function ChapterRoomManager:__init()
+end
+
+---类的析构函数
+function ChapterRoomManager:Dispose()
+    if self.rooms then
+        for i = 1, #self.rooms do
+            self.rooms[i]:Dispose()
+        end
+    end
+    self.rooms = nil
+end
+--region内部方法
+
+--region初始化
+---初始化关卡数据
+---@param data table 关卡数据(已完成的事件，已打过的战斗,卡牌剩余血量/怒气百分比)
+------@param data instance.s2c_instance_enter
+function ChapterRoomManager:InitSectionData(data)
+    self.joinRoomSid = data.last_room
+    self.enemyBattlemMGDs = {}
+    if data.pass then
+        for i = 1, #data.pass do
+            self.enemyBattlemMGDs[data.pass[i]] = true
+        end
+    end
+    self.cardBaseData = {}
+    if data.cards then
+        self:SetCardBaseData(data.cards)
+    end
+    self.enterEmptyRoom = {}
+    if data.empty_room then
+        for i = 1, #data.empty_room do
+            self.enterEmptyRoom[data.empty_room[i]] = true
+        end
+    end
+    _G.EventManager:GetInstance():InitEventData(data.event)
+    self.curSectionAward = {}
+    self.curRoomSettlementAward = {}
+    ---主线副本已重置任务sid
+    self.reset_tasks = data.reset_tasks or {}
+
+    --region -------------------------------------进入关卡设置任务--------
+    local TaskModule = _G.TaskModule:GetInstance()
+    local taskinfoArr = {}
+    for i = 1, #self.reset_tasks do
+        local taskid = self.reset_tasks[i]
+        if TaskModule:IsCompletedTask(taskid) then
+            TaskModule:DelCompletedTask(taskid)
+            local taskinfo = TaskModule:GetTaskInfoWithID(taskid)
+            if taskinfo ~= nil then
+                table.insert(taskinfoArr, taskinfo)
+            end
+        end
+    end
+    if #taskinfoArr > 0 then
+        TaskModule:RemoveTaskInfos(taskinfoArr)
+    end
+
+    --endregion-----------------------------------进入关卡设置任务--------
+
+    self:SetisShowSectioninfo(false)
+end
+---初始化房间
+function ChapterRoomManager:InitRoom()
+    self.rooms = {}
+    for i = 1, #self.sectionCfg.rooms do
+        self.rooms[self.sectionCfg.rooms[i]] = ChapterRoomClass.New(self.sectionCfg.rooms[i])
+    end
+    self.curRoomSid = 0
+    self.curAllRoomSceneSid = {}
+    local cfg = nil
+    for _, room in pairs(self.rooms) do
+        _G.table.insert(self.curAllRoomSceneSid, room.cfg.MapID)
+    end
+end
+---初始化跑图主控角色
+function ChapterRoomManager:InitSceneRunPlayers()
+    self.sceneRunPlayerSids = {}
+    self:SetSceneRunPlayer(_G.PlayerModel:GetInstance():GetRoleSid(), _G.SceneRunPlayerWeight.city)
+    if self.sectionCfg and self.sectionCfg.Operator > 0 then
+        self:SetSceneRunPlayer(self.sectionCfg.Operator, _G.SceneRunPlayerWeight.storyBattle)
+    end
+end
+--endregion
+
+--region房间逻辑
+---进入房间
+---@param id number room id
+---@param doorid number 传送门id
+---@param immediately boolean 是否立即切换(不用镜头移动)
+function ChapterRoomManager:EnterRoom(id, doorid, immediately)
+    if not self.rooms[id] then
+        return
+    end
+    self.changeRoomImmediately = immediately
+    self.rooms[id]:CheckEnterRoom(_G.handlerbind(self, self.OnCheckEnterRoomCall, id, doorid))
+end
+---检测进入房间返回
+---@param success boolean 是否进入成功
+function ChapterRoomManager:OnCheckEnterRoomCall(success, sid, doorid)
+    if not success then
+        require "ChapterModel":GetInstance():SetBehavioralPriority(success)
+        return
+    end
+    if self.curRoomSid > 0 then
+        self.rooms[self.curRoomSid]:ExitRoom()
+        if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+            local tb = _G.PlayerPrefsManager.GetTable(_G.LoginManager:GetInstance():GetCreatePlayerKey(), true)
+            _G.table.insert(tb.empty_room, self.joinRoomSid)
+            ---@type main_room_cfg
+            local cfg = _G.ConfigManager.main_room_cfg[self.joinRoomSid]
+            for _, v in pairs(cfg.event_id) do
+                _G.table.insert(tb.event, v)
+            end
+            tb.cards = require("EmbattleModel"):GetInstance():GetEmbattleData(_G.EmbattleType.section)
+            tb.last_room = sid
+            _G.PlayerPrefsManager.SetTable(_G.LoginManager:GetInstance():GetCreatePlayerKey(), tb, true)
+        end
+    end
+    self.joinRoomSid = sid
+    self.changeRoomImmediately = nil
+    self:DoBeforeRoomStory(self.joinRoomSid, _G.handlerbind(self, self.PlayChangeRoomEffect, doorid))
+end
+function ChapterRoomManager:PlayChangeRoomEffect(doorid)
+    if self.curRoomSid > 0 and _G.WorldManager:GetInstance():CheckSceneSameRes(self.rooms[self.joinRoomSid].cfg.MapID) then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.FastLoadingView.Name,
+            function()
+                _G.WorldManager:GetInstance():EnterWorld(
+                    self.rooms[self.joinRoomSid].cfg.MapID,
+                    _G.handler(self, self.OnEnterWorldDone),
+                    doorid,
+                    nil,
+                    self.curAllRoomSceneSid,
+                    self.changeRoomImmediately
+                )
+            end
+        )
+    else
+        _G.WorldManager:GetInstance():EnterWorld(
+            self.rooms[self.joinRoomSid].cfg.MapID,
+            _G.handler(self, self.OnEnterWorldDone),
+            doorid,
+            nil,
+            self.curAllRoomSceneSid,
+            self.changeRoomImmediately
+        )
+    end
+end
+---切换场景后回调
+function ChapterRoomManager:OnEnterWorldDone()
+    require "ChapterModel":GetInstance():SetBehavioralPriority(false)
+    local cache = self:CacheRoom()
+    if cache then
+        return
+    end
+    self.curRoomSid = self.joinRoomSid
+    if self.changeRoomImmediately then
+        _G.WorldManager:GetInstance():HideLastScene()
+    end
+    self.rooms[self.curRoomSid]:EnterRoom()
+
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        _G.ChapterRoomManager:GetInstance():TriggerRoomEnemyBattle(1, 707010119, _G.handler(self, self.OnBattleEnd))
+    end
+end
+--endregion
+
+--region --------------------------------------进入房间前剧情--------
+
+------进入房间的剧情表现
+function ChapterRoomManager:DoBeforeRoomStory(roomid, call)
+    local cfg = _G.ConfigManager.main_room_cfg[roomid]
+    --- 未通关播放剧情
+    local NowStory = cfg.BeforeRoomStoryID[1]
+    local id = NowStory and tonumber(NowStory[1]) -- 800010431
+    if id ~= nil then
+        _G.AutomaticPlayStory.PlayStoryByID(id, call)
+    else
+        if call then
+            call()
+        end
+    end
+end
+
+--endregion------------------------------------进入房间前剧情--------
+
+--region资源缓存
+-----计算所有房间的缓存资源路径
+function ChapterRoomManager:CalculateAllRoomCacheRes()
+    local playerSids = {}
+    local WorldManagerIns = _G.WorldManager:GetInstance()
+    for key, _ in pairs(self.rooms) do
+        local cfg = _G.ConfigManager.main_room_cfg[key]
+        if WorldManagerIns:CheckSceneSameRes(cfg.MapID) then
+            local sids = self:CalculateBattleRole(cfg)
+            for sid, num in pairs(sids) do
+                if not playerSids[sid] then
+                    playerSids[sid] = num
+                elseif playerSids[sid] < num then
+                    playerSids[sid] = num
+                end
+            end
+        end
+    end
+    local effectRes = {}
+    local playerRes = {}
+    local sidArray = {}
+    for sid, num in pairs(playerSids) do
+        local monstercfg = _G.ConfigManager.monster_cfg[sid]
+        if monstercfg == nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" monster_cfg 未找到 id " .. sid)
+            end
+            return
+        end
+        ---@type card_cfg
+        local cfg = _G.ConfigManager.card_cfg[monstercfg.CardID]
+        if cfg == nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" card_cfg 未找到 id " .. monstercfg.CardID)
+            end
+            return
+        end
+        if not playerRes[cfg.ModelPathLow] or playerRes[cfg.ModelPathLow] < num then
+            playerRes[cfg.ModelPathLow] = num
+        end
+        _G.table.insert(sidArray, sid)
+    end
+    local effects = self:CalculateBattleEffect(sidArray)
+    for path, _ in pairs(effects) do
+        effectRes[path] = true
+    end
+    return playerRes, effectRes
+end
+-----计算战斗角色资源
+function ChapterRoomManager:CalculateBattleRole(cfg)
+    local playerSids = {}
+    local cacheFunc = function(sids)
+        for i = 1, #sids do
+            if sids[i] > 0 then
+                if not playerSids[sids[i]] then
+                    playerSids[sids[i]] = 1
+                else
+                    playerSids[sids[i]] = playerSids[sids[i]] + 1
+                end
+            end
+        end
+    end
+    for i = 1, #cfg.battle_serial do
+        local sids = _G.BattleManager:GetInstance():GetDefaultDefenserSids(cfg.battle_serial[i])
+        cacheFunc(sids)
+        sids = _G.BattleManager:GetInstance():GetDefaultAttackSids(cfg.battle_serial[i])
+        cacheFunc(sids)
+    end
+    return playerSids
+end
+-----计算战斗特效资源
+---@param cardSids table 所有角色的sid组
+function ChapterRoomManager:CalculateBattleEffect(cardSids)
+    local path = _G.BattleManager:GetInstance():GetEffectPathBySid(cardSids)
+    local res = {}
+    for i = 0, path.Length - 1 do
+        res[path[i]] = true
+    end
+    return res
+end
+function ChapterRoomManager:CacheRoom()
+    if self.curRoomSid > 0 then
+        local sid = _G.ConfigManager.main_room_cfg[self.curRoomSid].MapID
+        if _G.WorldManager:GetInstance():CheckSceneSameRes(sid) then
+            return false
+        end
+    end
+    _G.PoolsManager:GetInstance():ClearPoolAll(_G.ePoolType.Default)
+    coroutine.start(_G.handler(self, self.CoCacheRoomRes))
+    return true
+end
+function ChapterRoomManager:CoCacheRoomRes()
+    local playerRes, effectRes = self:CalculateAllRoomCacheRes()
+    local count = 0
+    local index = 0
+    local loadDone = false
+    local loadCallback = function()
+        index = index + 1
+        if index >= count then
+            loadDone = true
+        end
+    end
+    local PoolsManagerIns = _G.PoolsManager:GetInstance()
+    if not _G.table.isEmptyOrNil(playerRes) then
+        for path, num in pairs(playerRes) do
+            count = count + num
+            for i = 1, num do
+                PoolsManagerIns:Preload(path, loadCallback, _G.ePoolType.World, nil, i)
+            end
+        end
+    else
+        loadCallback()
+    end
+    while not loadDone do
+        _G.coroutine.waitforendofframe()
+    end
+    loadDone = false
+    count = 0
+    index = 0
+    if not _G.table.isEmptyOrNil(effectRes) then
+        for path, _ in pairs(effectRes) do
+            count = count + 1
+            PoolsManagerIns:Preload(path, loadCallback, _G.ePoolType.Default)
+        end
+    else
+        loadCallback()
+    end
+    while not loadDone do
+        _G.coroutine.waitforendofframe()
+    end
+    loadDone = false
+    PoolsManagerIns:Preload(
+        _G.ConfigManager.ui_cfg.BattleView.PrefabPath,
+        function()
+            loadDone = true
+        end,
+        _G.ePoolType.Default
+    )
+    while not loadDone do
+        _G.coroutine.waitforendofframe()
+    end
+    _G.GraphicsManager.Instance:UpdateMainCameraPosImmediate()
+    self.curRoomSid = self.joinRoomSid
+    self:OnEnterWorldDone()
+end
+--endregion
+
+--endregion
+
+--region 对外接口
+
+--region 功能接口
+-----进入关卡
+---@param sectionSid number 关卡id
+---@param exitCall function 退出回调
+---@param joinRoomSid number 房间id
+function ChapterRoomManager:JoinSection(sectionSid, exitCall, joinRoomSid)
+    if not sectionSid or sectionSid <= 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("关卡id有错  id=" .. sectionSid and sectionSid or "nil", "ChapterRoomManager:JoinSection")
+        end
+        return
+    end
+    ---@type main_section_cfg
+    self.sectionCfg = _G.ConfigManager.main_section_cfg[sectionSid]
+    if not self.sectionCfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到对应的main_section_cfg配置 sectionSid = " .. sectionSid, "ChapterRoomManager:JoinSection")
+        end
+        return
+    end
+    self.roomCount = #self.sectionCfg.rooms
+    if self.roomCount <= 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("关卡配置房间数量为0 sectionSid = " .. sectionSid, "ChapterRoomManager:JoinSection")
+        end
+        self.roomCount = nil
+        self.sectionCfg = nil
+        return
+    end
+    self.exitSectionCall = exitCall
+    if joinRoomSid and joinRoomSid > 0 then
+        self.joinRoomSid = joinRoomSid
+    else
+        self.joinRoomSid = self.joinRoomSid and self.joinRoomSid ~= 0 and self.joinRoomSid or self.sectionCfg.rooms[1]
+    end
+
+    self:InitSceneRunPlayers()
+    self:InitRoom()
+    _G.MainManager:GetInstance():ShowFightStopIcon(_G.PlayerModel:GetInstance():CheckCreateRole())
+    self:EnterRoom(self.joinRoomSid)
+end
+-----退出关卡
+function ChapterRoomManager:ExitSection()
+    ---@type EmbattleNewView
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+    if ctrl then
+        ctrl:QuitEmbattle()
+    end
+    if self.exitSectionCall then
+        self.exitSectionCall()
+        self.exitSectionCall = nil
+    end
+    if self.rooms then
+        for i = 1, #self.rooms do
+            self.rooms[i]:Dispose()
+        end
+    end
+    self.rooms = nil
+    self.sectionCfg = nil
+    self.roomCount = nil
+    self.curRoomSid = nil
+    self.curSectionAward = nil
+    self.curRoomSettlementAward = nil
+    self.sceneRunPlayerSids = nil
+    self.curAllRoomSceneSid = nil
+    self.enemyBattlemMGDs = nil
+    self.cardBaseData = nil
+    self.curEnemyBoxAward = nil
+    self.enterEmptyRoom = nil
+    self.reset_tasks = nil
+    -- if _G.PlayerModel:GetInstance():CheckCreateRole() then
+    --     ChapterNet:GetInstance():AccessLeaveSection()
+    -- end
+    _G.EventManager:GetInstance():ClearEventData()
+    _G.PoolsManager:GetInstance():ClearPoolAll(_G.ePoolType.Default)
+    _G.PoolsManager:GetInstance():ClearPoolAll(_G.ePoolType.World)
+    _G.MainManager:GetInstance():ShowFightStopIcon(true)
+    _G.StoryManager:GetInstance():StorySkipNoCall()
+end
+-----切换房间
+---@param dir number 方向 1.左 2.右 3.上 4.下
+---@param doorsid number 传送至下一个场景的传送门sid
+function ChapterRoomManager:ChangeRoom(dir, doorsid)
+    local id = self.rooms[self.joinRoomSid]:GetRoomSidByDir(dir)
+    if id <= 0 then
+        return
+    end
+    self:EnterRoom(id, doorsid)
+end
+-----触发房间事件
+---@param index number 当前房间事件序列号
+---@param callback function 事件完成回调
+function ChapterRoomManager:TriggerRoomEvent(index, callback)
+    self.rooms[self.joinRoomSid]:TriggerEvent(index, callback)
+end
+---触发房间敌人战斗
+---@param index number 房间战斗序列号
+---@param sid number 敌人物件表sid
+---@param callback function 结束回调
+function ChapterRoomManager:TriggerRoomEnemyBattle(index, sid, callback)
+    self.rooms[self.joinRoomSid]:TriggerRoomEnemyBattle(index, sid, callback)
+end
+---检测房间是否探索完成
+---@param sid number 房间sid
+---@return boolean 是否探索完成
+function ChapterRoomManager:CheckRoomExplore(sid)
+    if not self.rooms or not self.rooms[sid] then
+        return false
+    end
+    return self.rooms[sid]:CheckRoonExporeDone()
+end
+---回到安全点
+function ChapterRoomManager:GoToSafePoint()
+    if not self.joinRoomSid or self.joinRoomSid <= 0 then
+        return
+    end
+    if not self.rooms[self.joinRoomSid] then
+        return
+    end
+    self.rooms[self.joinRoomSid]:GoToSafePoint()
+end
+---重置当前房间
+function ChapterRoomManager:ResetCurRoom()
+    if not self.joinRoomSid or self.joinRoomSid <= 0 then
+        return
+    end
+    if not self.rooms[self.joinRoomSid] then
+        return
+    end
+    self.rooms[self.joinRoomSid]:ResetRoom()
+end
+--endregion
+
+--region 数据接口
+---设置关卡数据
+---@param data table 关卡数据(进入关卡时调用)
+function ChapterRoomManager:SetSectionData(data)
+    self:InitSectionData(data)
+end
+---检测房间敌人战斗是否打过
+---@param index number 战斗组序列
+---@param sid number 房间sid
+---@return boolean 是否打过
+function ChapterRoomManager:CheckRoomMonstergroupDone(index, sid)
+    sid = sid or self.joinRoomSid
+    local cfg = self.rooms[sid].cfg
+    if cfg.battle_serial[index] and cfg.battle_serial[index] > 0 then
+        return self:GetRoomEnemyBattle(cfg.battle_serial[index])
+    end
+    return false
+end
+-----检测房间Npc事件是否完成
+---@param index number 房间配置事件序列号
+---@param sid number 房间id(默认不填取当前房间)
+---@return boolean 是否完成
+function ChapterRoomManager:CheckNpcEventDone(index, sid)
+    sid = sid or self.joinRoomSid
+    return self.rooms[sid]:CheckRoomEventDone(index)
+end
+---设置房间敌人已通过战斗组数据
+---@param mgpID number monster_group_cfg配置ID
+function ChapterRoomManager:SetRoomEnemyBattle(mgpID)
+    self.enemyBattlemMGDs[mgpID] = true
+end
+---获取敌人战斗是否打过
+---@param mgpID number 怪物组ID
+---@return boolean 是否打过
+function ChapterRoomManager:GetRoomEnemyBattle(mgpID)
+    return self.enemyBattlemMGDs and self.enemyBattlemMGDs[mgpID] or false
+end
+---获取房间敌人怪物组ID
+---@param index number 战斗组序列
+---@param sid number 房间sid
+---@return number 怪物组ID
+function ChapterRoomManager:GetRoomMonstergroupID(index, sid)
+    sid = sid or self.joinRoomSid
+    local cfg = self.rooms[sid].cfg
+    return cfg.battle_serial[index] or 0
+end
+-----获取当前房间配置
+---@return main_room_cfg_Item 房间配置
+function ChapterRoomManager:GetCurRoomCfg()
+    return (self.rooms and self.joinRoomSid) and self.rooms[self.joinRoomSid].cfg or nil
+end
+-----获取当前房间Sid
+---@return number 房间sid
+function ChapterRoomManager:GetCurRoomID()
+    return self.joinRoomSid or 0
+end
+---获取当前已探索的房间数量
+---@param callback function 更新回调
+---@return number 探索的房间数量
+function ChapterRoomManager:GetPassRoomCount(callback)
+    local count = 0
+    if self.rooms then
+        for _, room in pairs(self.rooms) do
+            if room:CheckRoonExporeDone() then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+---获取房间总数
+---@return number 房间总数
+function ChapterRoomManager:GetRoomCount()
+    return self.roomCount
+end
+--设置本次关卡是否已显示关卡信息
+function ChapterRoomManager:SetisShowSectioninfo(isbool)
+    self.isShowSectioninfo = isbool
+end
+--获取本次关卡是否已显示关卡信息 bool
+function ChapterRoomManager:GetisShowSectioninfo()
+    return self.isShowSectioninfo
+end
+-----检测当前房间是否进入过
+---@return boolean 是否进入过
+function ChapterRoomManager:CheckRoomPass()
+    if not self.joinRoomSid or self.joinRoomSid == 0 then
+        return false
+    end
+    return self.rooms[self.joinRoomSid]:CheckRoomEnter()
+end
+---获取卡牌基础数据(血量+怒气 百分比)
+---@param uid number 卡牌uid
+---@return number|number 血量百分比，怒气百分比
+function ChapterRoomManager:GetCardBaseData(uid)
+    local data = self.cardBaseData[uid] or {1, 1}
+    return data[1], data[2]
+end
+local CardBaseDataRatioHP = 0.0001
+local CardBaseDataRatioMP = 0.001
+---设置卡牌基础数据
+---@param data table 卡牌数据({uid,hp,mp})
+---@param reset boolean 是否需要重置血量
+function ChapterRoomManager:SetCardBaseData(data, reset)
+    if data then
+        for i = 1, #data do
+            self.cardBaseData[data[i].uid] = {
+                (data[i].hp or 0) * CardBaseDataRatioHP,
+                (data[i].mp or 0) * CardBaseDataRatioMP
+            }
+        end
+    end
+    if not reset then
+        return
+    end
+    local ids = {}
+    local insert = _G.table.insert
+    for id, value in pairs(self.cardBaseData) do
+        if value[1] > 0 then
+            insert(ids, id)
+        end
+    end
+    for i = 1, #ids do
+        self.cardBaseData[ids[i]] = nil
+    end
+end
+---检测空房间是否进入过
+---@param sid number 空房间
+---@return boolean 是否进入过
+function ChapterRoomManager:CheckEmptyRoomEnter(sid)
+    if not self.enterEmptyRoom then
+        return false
+    end
+    local enter = self.enterEmptyRoom[sid] or false
+    if not enter then
+        enter = self.rooms and self.rooms[sid] and self.rooms[sid]:CheckRoomEnter() or false
+    end
+    return enter
+end
+--endregion
+
+--region 关卡奖励
+---保存当前关卡战斗奖励
+function ChapterRoomManager:SaveSectionAward(award)
+    if award then
+        for key, value in pairs(award) do
+            if not self.curSectionAward[value[1]] then
+                self.curSectionAward[value[1]] = {value[1], 0}
+            end
+            self.curSectionAward[value[1]][2] = self.curSectionAward[value[1]][2] + value[2]
+        end
+    end
+end
+----保存当前房间结算奖励
+function ChapterRoomManager:SaveSettlementAward(award)
+    self.curRoomSettlementAward = {}
+    if award then
+        for key, value in pairs(award) do
+            _G.table.insert(self.curRoomSettlementAward, value)
+        end
+    end
+end
+---设置关卡奖励不为新
+function ChapterRoomManager:SetAwardNewState()
+    local award = self:GetSectionAward()
+    for sid, value in pairs(award) do
+        _G.StorageManager:GetInstance():SetItemIsNewState(sid, false)
+    end
+end
+---获取当前关卡奖励
+function ChapterRoomManager:GetSectionAward()
+    return self.curSectionAward or {}
+end
+---获取当前房间奖励
+function ChapterRoomManager:GetCurRoomSettleAward()
+    return self.curRoomSettlementAward or {}
+end
+---设置当前敌人宝箱奖励
+---@param award table 敌人绑定得宝箱奖励
+function ChapterRoomManager:SetCurEnemyBoxAward(award)
+    self.curEnemyBoxAward = award
+end
+---获取当前得敌人宝箱奖励
+---@return table 敌人绑定得宝箱奖励
+function ChapterRoomManager:GetCurEnemyBoxAward()
+    return {award = self.curEnemyBoxAward}
+end
+--endregion
+
+--region 跑图角色相关
+---设置跑图角色阵容
+---@param sid number 跑图角色
+---@param weight number 权重(值越大，优先取)
+function ChapterRoomManager:SetSceneRunPlayer(sid, weight)
+    self.sceneRunPlayerSids[weight] = sid
+end
+---获取跑图主控角色id
+---@return number card_cfg的id
+function ChapterRoomManager:GetSceneRunPlayer()
+    local sid, weight
+    if self.sceneRunPlayerSids then
+        for key, value in pairs(self.sceneRunPlayerSids) do
+            if weight == nil then
+                sid = value
+                weight = key
+            else
+                if weight < key then
+                    weight = key
+                    sid = value
+                end
+            end
+        end
+    end
+    return sid
+end
+--endregion
+
+--region 探索度相关
+---获取房间探索状态
+---@param id number 房间sid
+---@return 变量类型 中文描述
+function ChapterRoomManager:GetRoomExploreState(id)
+    local cfg = _G.ConfigManager.main_room_cfg[id]
+    local states = {}
+    for i = 1, #cfg.Type2 do
+        if CheckRoomStateFunc[cfg.Type2[i]] then
+            states[cfg.Type2[i]] = CheckRoomStateFunc[cfg.Type2[i]](cfg)
+        end
+    end
+    return states
+end
+---检测房间是否探索过
+---@param sid number 房间sid
+---@return boolean 是否探索
+function ChapterRoomManager:CheckRoomDone(sid)
+    if self.rooms then
+        return self.rooms[sid]:CheckRoonExporeDone()
+    else
+        return false
+    end
+end
+---检测房间是否进入过
+---@param sid number 房间sid
+---@return boolean 是否进入
+function ChapterRoomManager:CheckRoomEnter(sid)
+    if self.rooms then
+        return self.rooms[sid]:CheckRoomEnter()
+    else
+        return false
+    end
+end
+
+---获取当前挑战中的关卡id
+---@return number _0没挑战
+function ChapterRoomManager:GetNowFightScetion()
+    local nowSectionID = 0
+    if self.sectionCfg then
+        nowSectionID = self.sectionCfg.id
+    end
+    return nowSectionID
+end
+
+--endregion
+
+--region --------------------------------------关卡房间任务--------
+
+---是否为当前关卡重置的任务id
+---@param sid number 房间sid
+---@return boolean true 是重置的任务id
+function ChapterRoomManager:CheckResetTaskid(taskid)
+    if self.reset_tasks == nil then
+        return false
+    end
+    local id =
+        _G.table.find(
+        self.reset_tasks,
+        function(id)
+            return id == taskid
+        end
+    )
+    return id ~= nil
+end
+
+--endregion
+
+--region 暂停界面相关
+---手动退出关卡
+function ChapterRoomManager:ExitSectionSelf(call)
+    self:ExitSection()
+    local instance = _G.PlayerModel:GetInstance()
+    local function OnEnterCall()
+        if call then
+            call(
+                function()
+                    _G.DelayDo(
+                        0.1,
+                        function()
+                            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+                        end
+                    )
+                end
+            )
+        else
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+        end
+    end
+    if instance:CheckCreateRole() then
+        _G.WorldManager:GetInstance():EnterWorld(instance:GetCurCitySid(), OnEnterCall)
+    else
+        require("PlayerNewCreateController"):GetInstance():CreatePlayer()
+    end
+end
+--endregion
+
+--endregion
+-----触发房间事件 全局方法，供配置调用
+---@param clickparam table 配置参数
+---@param npc WorldNPCItem NPC对象
+function ChapterRoomManager.HandleRoomEvent(clickparam, npc)
+    ChapterRoomManager:GetInstance():TriggerRoomEvent(npc.ItemData.EnterFightId, _G.handler(npc, npc.NpcDoEventDone))
+end

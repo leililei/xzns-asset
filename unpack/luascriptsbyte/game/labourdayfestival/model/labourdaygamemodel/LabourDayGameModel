@@ -1,0 +1,451 @@
+---@class LabourDayGameModel : GameDataModelBase	中文描述
+---@field cfg relic_events_gm_cfg
+local LabourDayGameModel = _G.BaseClass("LabourDayGameModel", _G.GameDataModelBase)
+
+function LabourDayGameModel:GetInfoCall(activity)
+    self.activity = activity
+    self.active_StartTime = activity.cfg.time.start_time
+    self.active_EndTime = activity.cfg.time.start_time + activity.cfg.time.run_time
+    self:ParseData(activity.cfg.self_info)
+    self:InitFunction()
+end
+
+---创建对象时,入口构造函数
+function LabourDayGameModel:__init()
+    self.gifts={}
+    self.roleInfo={}
+    self.cfg=_G.ConfigManager.relic_events_gm_cfg
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnGetUpdate, self)
+end
+
+function LabourDayGameModel:Dispose()
+    self.gifts={}
+    self.roleInfo={}
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnGetUpdate, self)
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+---数据解析完成
+function LabourDayGameModel:ParseData(data)
+    self.data = {}
+    self.data = data.secret_trail
+    self.super.ParseData(self)
+end
+
+function LabourDayGameModel:InitFunction()
+    if _G.table.isEmptyOrNil(self.data) then
+        return
+    end
+    ---日志
+    self.logs=self.data.event_log or {}
+    ---当前事件
+    self.nowEvent=self.data.event_id or 0
+    ---已领取奖励index列表
+    self.GotAward=self.data.count_award or {}
+    ---前进次数
+    self.GoAll=self.data.progress_times or 0
+    ---在自己前面的玩家
+    self.nextRole=self.data.role_value or {}
+    ---当前倍率
+    self.multiple=self.data.multiple or 1
+    ---已领取的额外奖励次数
+    self.extraAwardGotTime=self.data.battle_award_times or 0
+    self:InitGmCfg()
+    
+    self.battlePassActivity = require("ActivitySynManager"):GetInstance():GetChildAcitivity(
+            10088,
+            self.activity:GetJumpType(),
+            self.activity:GetMainType()
+    )
+    ---@type DrawUpBattlePassModel
+    local battlePassModel = self.battlePassActivity and self.battlePassActivity:GetActivityTypeCls()
+    local isBuy = battlePassModel and battlePassModel.isBuy or false
+    if not isBuy and battlePassModel then
+        _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    end
+end
+
+function LabourDayGameModel:InitGmCfg()
+    local data=self.data.gm_cfg
+    self.costSid=data.coin_sid
+    self.distance=data.distance
+    self.rankAward=data.rank_sids
+    self.awardPreview= {}
+    for i = 1, #data.count_award do
+        self.awardPreview[data.count_award[i].index]=data.count_award[i]
+    end
+    self.extraAward=data.battle_award
+    self.multipleList=data.multiple_condition
+    self.multipleDic={}
+    for i = 1, #self.multipleList do
+        self.multipleDic[self.multipleList[i].key]=self.multipleList[i]
+    end
+end
+
+function LabourDayGameModel:OnMallCashListener(data)
+    if not data.activity_id or not self.battlePassActivity or  data.activity_id ~= self.battlePassActivity.activityID then
+        return
+    end
+    if data.cash_rmb and data.cash_rmb > 0 then
+        require("RedPointManager"):GetInstance():RefreshNode(self.activity.typeClass:GetRedpointIDByIndex(4))
+        _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    end
+end
+---领取额外奖励
+function LabourDayGameModel:GetAllExtraAward(callback)
+    local data={0}
+    self.activity.typeClass:GetActivityAward(data,function(msg)
+        if msg.ack==1 then
+            if not table.isEmptyOrNil(msg.award) then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                        msg)
+            else
+                local award={}
+                local count =self.GoAll-self.extraAwardGotTime+(self.nowEvent>0 and self.multiple or 0)
+                for i = 1, #self.extraAward do
+                    award[i]={}
+                    award[i].type={}
+                    local type=self.extraAward[i].type
+                    if #type==5 then
+                        local activit=require("ActivitySynManager"):GetInstance():GetChildAcitivity(type[2], type[3])
+                        award[i].type= {0,activit.activityID,type[4],type[5]*count}
+                    else
+                        for t = 1, #type do
+                            award[i].type[t]=type[t]
+                        end
+                        award[i].type[2]= type[2]*count
+                    end
+                end
+                msg.award={}
+                msg.award.item=award
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                        msg)
+            end
+            self.extraAwardGotTime=self.GoAll+(self.nowEvent>0 and self.multiple or 0)
+            require("RedPointManager"):GetInstance():RefreshNode(self.activity.typeClass:GetRedpointIDByIndex(4))
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+---领取累计进度奖励
+function LabourDayGameModel:GetAllAccumulativeAward(callback)
+    local data=self:GetCanGetAllAccumulativeIndex()
+    self.activity.typeClass:GetActivityAward(data,function(msg)
+        if msg.ack==1 then
+            if not table.isEmptyOrNil(msg.award) then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                        msg)
+            end
+            for i = 1, #data do
+                table.insert(self.GotAward,data[i])
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(self.activity.typeClass:GetRedpointIDByIndex(3))
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+---获取可领取累计进度奖励下标
+function LabourDayGameModel:GetCanGetAllAccumulativeIndex()
+    local indexs={}
+    for k,v in pairs(self.awardPreview) do
+        if (table.isEmptyOrNil(self.GotAward) or not table.ContainsValue(self.GotAward,k)) and v.count<=self.GoAll then
+            table.insert(indexs,v.index)
+        end
+    end
+    return indexs
+end
+---获取进度内未领取或下一个大奖数据
+function LabourDayGameModel:GetNowBigPrizeData()
+    local data=nil
+    for k,v in pairs(self.awardPreview) do
+        if (table.isEmptyOrNil(self.GotAward) or not table.ContainsValue(self.GotAward,k) ) and v.big_award==1 then
+            if not data then
+                data=v
+            elseif v.count<data.count then
+                data=v
+            end
+        end
+    end
+    if table.isEmptyOrNil(data) then
+        for k,v in pairs(self.awardPreview) do
+            if v.big_award==1 then
+                if data and v.count>data.count then
+                    data=v
+                else
+                    data=v
+                end
+            end
+        end
+    end
+    return data
+end
+---下一个事件
+function LabourDayGameModel:NextEvent(callback)
+    local pb={activity_id=self.activity.activityID}
+        require "LabourDayGameNet":GetInstance():NextEvent(pb,function(msg)
+            if msg.ack==1 then
+                self.nowEvent=msg.event_sid
+                _G.StorageManager:GetInstance():Consume({type={0,self.activity:GetTypeId(),self.activity:GetJumpType(),self.costSid,self.multiple}})
+                require("RedPointManager"):GetInstance():RefreshNode(self.activity.typeClass:GetRedpointIDByIndex(4))
+                if callback  then
+                    callback()
+                end
+            end
+        end)
+end
+---完成事件
+function LabourDayGameModel:ComplatEvent(param,callback)
+    local pb={activity_id=self.activity.activityID}
+    local cfg=self.cfg[self.nowEvent]
+    if param and cfg.event_type==6 or cfg.event_type==7 then
+        pb.args={param}
+    end
+    require "LabourDayGameNet":GetInstance():ComplateEvent(pb,function(msg)
+        if msg.ack==1 then
+            self.nowEvent=0
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self.logs=msg.add_event_show
+            self.nextRole=msg.role_value
+            self.GoAll=self.GoAll+self.multiple
+            require("RedPointManager"):GetInstance():RefreshNode(self.activity.typeClass:GetRedpointIDByIndex(3))
+            require("RedPointManager"):GetInstance():RefreshNode(self.activity.typeClass:GetRedpointIDByIndex(2))
+            if callback  then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---获取参与服务器列表
+function LabourDayGameModel:GetServerList(callback)
+    if self.server_list then
+        callback(self.server_list)
+    else
+        local pb={activity_id=self.activity.activityID}
+        require "LabourDayGameNet":GetInstance():GetServeList(pb,function(msg)
+            if msg.ack == 1 then
+                self.server_list = msg
+                if callback then
+                    callback(self.server_list)
+                end
+            end
+        end)
+    end
+end
+---设置倍率
+function LabourDayGameModel:SetMultiple(num, callback)
+    local pb={activity_id=self.activity.activityID,multiple=num}
+    require "LabourDayGameNet":GetInstance():SetMultiple(pb,function(msg)
+        if msg.ack == 1 then
+            self.multiple = num
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+---获取排行榜
+function LabourDayGameModel:GetRank(callback)
+    local msg = {page = 1,id = self.activity.activityID}
+    require("LabourDayGameNet"):GetInstance():GetRank(msg, function(data)
+        self.RankData = data.ranks
+        local playeruid=_G.PlayerModel:GetInstance():GetPlayerUid()
+        if not table.isEmptyOrNil(self.RankData) then
+            for i = 1, #self.RankData do
+                local data=self.RankData[i]
+                if data.role_info.uid==playeruid then
+                    data.role_info=_G.PlayerModel:GetInstance():GetIRroleTable()
+                    break
+                end
+            end
+        end
+        if callback then
+            callback()
+        end
+    end
+    )
+end
+---更新排行榜
+function LabourDayGameModel:UpdateRank(callback)
+    if not table.isEmptyOrNil(self.RankData) then
+        local newRank,oldRank
+        local playeruid=_G.PlayerModel:GetInstance():GetPlayerUid()
+        local newValue=self.GoAll*self.distance
+        for i = 1, #self.RankData do
+            local data=self.RankData[i]
+            if data.role_info.uid==playeruid then
+                oldRank=i
+                data.value[1]=newValue
+            end
+            if newValue>data.value[1] then
+                newRank=i
+            end
+            if (not oldRank and newRank) or (oldRank and newRank and oldRank<newRank) then
+                break
+            end
+        end
+        if (not oldRank and newRank) or (oldRank and newRank and oldRank<newRank) or (not oldRank and not newRank and newValue>0) then
+            self:GetRank(callback)
+        else
+            if callback then
+                callback()  
+            end  
+        end
+    else
+        self:GetRank(callback)
+    end
+end
+---获取自己的排行信息
+function LabourDayGameModel:GetMyRank()
+    local playeruid=_G.PlayerModel:GetInstance():GetPlayerUid()
+    local newValue=(self.GoAll-(self.nowEvent>0 and self.multiple or 0))*self.distance
+    local data={}
+    local rank=0
+    if not table.isEmptyOrNil(self.RankData) then
+        for i = 1, #self.RankData do
+            local _data=self.RankData[i]
+            if _data.role_info.uid==playeruid then
+                rank=i
+                data=self.RankData[i]
+            end
+        end
+    end
+    if table.isEmptyOrNil(data) then
+        data.value={newValue}
+        data.role_info=_G.PlayerModel:GetInstance():GetIRroleTable()
+    end
+    return data,rank
+end
+---获取事件日志
+function LabourDayGameModel:GetEventLog()
+    return self.logs or {}
+end
+---获取自己排行前一个人的信息
+function LabourDayGameModel:GetNextRole()
+    return self.nextRole or {}
+end
+
+--获取所有事件文本
+function LabourDayGameModel:GetEventShowTxtTable()
+    local T = {}
+    local str1, str2
+    if not table.isEmptyOrNil(self.logs) then
+        for k, v in ipairs(self.logs) do
+            if k <= 3 then
+                local cfg = self.cfg[v.event_sid]
+                if cfg.event_type == 6 and cfg.event_type == 7  then
+                    str1 = _G.GetLangPackValue(tonumber(v.args[1]) == 1 and cfg.desc[2][1] or cfg.desc[2][2])
+                    table.insert(T, str1)
+                    str2 = _G.GetLangPackValue(cfg.desc[1][1])
+                    table.insert(T, str2)
+                elseif cfg.desc[1] then
+                    str1 = _G.GetLangPackValue(cfg.desc[2][1])
+                    table.insert(T, str1)
+                    str2 = _G.GetLangPackValue(cfg.desc[1][1])
+                    table.insert(T, str2)
+                end
+            end
+        end
+        T = table.reverseTable(T)
+    end
+    if self.nowEvent>0 then
+        local cfg = self.cfg[self.nowEvent]
+        str1 = _G.GetLangPackValue(cfg.desc[1][1])
+        table.insert(T, str1)
+    end
+    if table.isEmptyOrNil(T) or #T<3 then
+        table.insert(T,1,_G.GetLangPackValue(90034800208))
+        table.insert(T,1,_G.GetLangPackValue(90034800207))
+    end
+    return T
+end
+function LabourDayGameModel:UpDateNextRole(callback)
+    local playeruid=_G.PlayerModel:GetInstance():GetPlayerUid()
+    if self.GoAll*self.distance>=0 and not table.isEmptyOrNil(self.nextRole) and self.nextRole[1]~=playeruid and  self.GoAll*self.distance>=self.nextRole[2] then
+        local _,myrank=self:GetMyRank()
+        if myrank>0 then
+            if myrank==1 then
+                self.nextRole={}
+                self.nextRole[1]=playeruid
+            else
+                self.nextRole={self.RankData[myrank-1].role_info.uid,self.RankData[myrank-1].value[1]}
+            end
+        else
+            self.nextRole={self.RankData[#self.RankData].role_info.uid,self.RankData[#self.RankData].value[1]}
+        end
+        callback()
+    else
+        callback()
+    end
+    
+end
+---获得当前倍数 不传则为当前选中倍数
+function LabourDayGameModel:GetNowMultipleTxtByIndex(index)
+    local multipleData={}
+    if not index then
+        multipleData=self.multipleDic[self.multiple]
+    else
+        multipleData =self.multipleList[index]
+    end
+    return string.format("X%s",multipleData.key)
+end
+function LabourDayGameModel:CheckEnoughCostToNext()
+    return self.activity.typeClass:GetCoinNumber()>=self.multiple
+end
+function LabourDayGameModel:GetNowGoAllPregress()
+    return self.GoAll*self.distance
+end
+function LabourDayGameModel:GetExtraAwardData()
+    return self.extraAward , self.GoAll- self.extraAwardGotTime+(self.nowEvent>0 and self.multiple or 0)
+end
+function LabourDayGameModel:CheckCoinId(sid)
+    return  self.activity and  (sid==self.costSid) or false
+end
+function LabourDayGameModel:GetCoinNumber()
+    return  self.activity and  self.activity.typeClass:GetCoinNumber() or 0
+end
+---是否有代币可使用或存在未处理事件
+function LabourDayGameModel:CheckHasCoinOrEvent()
+    if self.nowEvent>0 then
+        return 1
+    end
+    return self:GetCoinNumber()>0 and 1 or 0
+end
+---是否存在未领取的前进讲理1
+function LabourDayGameModel:CanGetGoAward()
+    local indexs=self:GetCanGetAllAccumulativeIndex()
+    return table.isEmptyOrNil(indexs) and 0 or 1
+end
+---是否存在可领取的额外奖励
+function LabourDayGameModel:CanGetExtraAward()
+    local CanGetCount=self.GoAll- self.extraAwardGotTime+(self.nowEvent>0 and self.multiple or 0)
+    if not self.battlePassActivity then
+        self.battlePassActivity = require("ActivitySynManager"):GetInstance():GetChildAcitivity(
+                10088,
+                self.activity:GetJumpType(),
+                self.activity:GetMainType()
+        )
+    end
+    ---@type DrawUpBattlePassModel
+    local battlePassModel = self.battlePassActivity and self.battlePassActivity:GetActivityTypeCls()
+    local isBuy = battlePassModel and battlePassModel.isBuy or false
+    return (isBuy and CanGetCount>0) and 1 or 0
+end
+
+function LabourDayGameModel:CheckToDayIsShowBigPrize()
+    local nowTime=_G.TimeUtil.GetServerUnixTime()
+    local today=_G.TimeUtil.GetIntervalDayBySix1(self.activity.cfg.time.start_time,nowTime)+1
+    local timestring =_G.PlayerPrefsManager.GetString("LabourDayGameBigPrize")
+    local lasttime= string.IsNullOrEmpty(timestring) and 0 or tonumber(timestring)
+    local lastDay=_G.TimeUtil.GetIntervalDayBySix1(self.activity.cfg.time.start_time,lasttime)+1
+    return today~=lastDay
+end
+
+return LabourDayGameModel

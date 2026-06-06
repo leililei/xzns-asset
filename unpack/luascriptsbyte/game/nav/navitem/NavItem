@@ -1,0 +1,207 @@
+-----------------------------------------------------------------------
+-- D:.ProjectHZ.Alpha.Client.Assets.Resources.LuaScripts.Game.Nav.NavItem	(修改路径必须修正此项!)
+-- Created by wyx
+-- DateTime: 2020/04/02
+-- Description: 单条寻路
+-----------------------------------------------------------------------
+
+-- region寻路事件枚举类
+---面向对象的寻路事件定义
+---@class ENavItemEventSource
+---@field NavDontArrive string @寻路不可达
+---@field Naving string @寻路中
+---@field NavComplete string @寻路完成
+local ENavItemEventSource = {"NavDontArrive", "Naving", "NavComplete"}
+---@class NavItemEvent : BaseEventEnum @寻路事件
+---@field public EnumValue ENavItemEventSource @寻路事件
+local NavItemEvent = _G.BaseClass("NavItemEvent", _G.BaseEventEnum)
+NavItemEvent.EnumValue = _G.CreateEventEnumValueTable(ENavItemEventSource)
+---@type NavItemEvent @寻路事件
+_G.NavItemEvent = NavItemEvent
+-- endregion
+
+-- region寻路类
+---@field DoNavObjUid number 寻路物体uid
+---@field Speed number 寻路的速度
+---@field NavDoorSidQueue number[] 通过传送门Sid队列,只在玩家跨场景寻路是有这个值
+---@field Target NavParam 寻路参数
+---@class NavItem:BaseEvent 单条寻路Item
+local NavItem = _G.BaseClass("NavItem", _G.BaseEvent)
+---@param param NavParam
+---@param queue number[] 通过传送门Sid队列,只在玩家跨场景寻路是有这个值
+function NavItem:__init(param, queue)
+    self.Target = param
+    self.Speed = param.Speed
+    self.DoNavObjUid = param.Object.Uid
+    self.NavDoorSidQueue = queue
+end
+---类的析构函数
+function NavItem:Dispose()
+    self.Target = nil
+    self.DoNavObjUid = nil
+    self.NavDoorSidQueue = nil
+    self:RemoveAllListeners()
+end
+
+-- 寻找寻路物体
+---@param uid number 寻路物体uid
+---@return WorldBaseItem
+function NavItem:GetDoNavObjByUid(uid)
+    local world = _G.WorldManager:GetInstance():GetCurWorld()
+    if world ~= nil then
+        local item = world:GetItemInfo(uid)
+        return item
+    else
+        return nil
+    end
+end
+
+---执行寻路队列
+function NavItem:DoNavQueue()
+    if self.NavDoorSidQueue and #self.NavDoorSidQueue > 0 then
+        self.DoorItem = _G.NavManager:GetInstance():GetSceneDoorItemBySid(self.NavDoorSidQueue[1])
+        if self.DoorItem then
+            self:DoMoveStep(self.DoorItem)
+        end
+    end
+end
+
+---移动到对应点
+---@param position UnityEngine.Vector3
+---@param speed number
+function NavItem:DoNavByPosition(position, speed)
+    local Obj = self:GetDoNavObjByUid(self.DoNavObjUid)
+    if not Obj then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("找不到Obj uid:" .. tostring(self.DoNavObjUid))
+        end
+        return false, true
+    end
+    local navComplete = Obj.GotoEnd or _G.handler(self, self.OnNavComplete)
+    local isArrive, isTooClose = Obj:GotoPoint(position, navComplete, speed)
+    if not isArrive then
+        self:DispatchEvent(NavItemEvent, NavItemEvent.EnumValue.NavDontArrive, self.DoNavObjUid)
+    else
+        if not isTooClose then
+            _G.Events:GetInstance():Broadcast(_G.eNav.Naving, self.DoNavObjUid)
+            self:DispatchEvent(NavItemEvent, NavItemEvent.EnumValue.Naving, self.DoNavObjUid)
+        end
+    end
+    return isArrive, isTooClose
+end
+
+function NavItem:OnNavComplete()
+    if self.DoNavObjUid == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("self.DoNavObjUid == nil  =>[ NavItem:OnNavComplete()")
+        end
+        return
+    end
+
+    local con1 = self.NavDoorSidQueue == nil
+    if con1 then
+        _G.Events:GetInstance():Broadcast(_G.eNav.NavComplete, self.DoNavObjUid)
+        self:DispatchEvent(NavItemEvent, NavItemEvent.EnumValue.NavComplete, self.DoNavObjUid)
+        _G.NavManager:GetInstance():DeleteNavItemByUid(self.DoNavObjUid, true)
+    end
+end
+
+---寻路暂停启动
+---(和跳跃等特殊动作关联)
+---@param isPause boolean 是否暂停 true 暂停 false 继续
+function NavItem:OnNavPause(isPause)
+    local Obj = self:GetDoNavObjByUid(self.DoNavObjUid)
+    if not Obj then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("找不到Obj uid:" .. tostring(self.DoNavObjUid))
+        end
+        return
+    end
+
+    if isPause == true then
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red><size=20>" .. self.DoNavObjUid .. "   寻路暂停" .. "</size></color>")
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red><size=20>" .. self.DoNavObjUid .. "   寻路继续" .. "</size></color>")
+        end
+    end
+
+    if isPause == true then
+        -- TODO:这里有可能调用BaseItem:GotoPoint的情况,所以此处特殊处理
+        local GotoEnd = Obj.GotoEnd
+        Obj:NavInterruptMove()
+        Obj.GotoEnd = GotoEnd
+    elseif isPause == false then
+        local position = self.Target.Position
+        local speed = self.Speed
+        self:DoNavByPosition(position, speed)
+    end
+end
+
+-- 切换场景的回调,判断是否进行下一步寻路
+function NavItem:OnNavSceneSwitchContinue()
+    if _G.WorldManager:GetInstance():GetCurWorldSid() == self.Target.TargetSceneSid then
+        self:OnNavSceneSwitchComplete()
+        return
+    end
+    if self.NavDoorSidQueue and #self.NavDoorSidQueue > 0 then
+        -- 出队
+        _G.table.remove(self.NavDoorSidQueue, 1)
+        if #self.NavDoorSidQueue > 0 then
+            local doorItem = self:GetSceneDoorItemBySid(self.NavDoorSidQueue[1])
+            if doorItem then
+                -- 执行下次单步操作
+                self:DoMoveStep(doorItem)
+            end
+        end
+    end
+end
+
+---执行单步寻路
+---@param doorItem WorldDoorItem 场景中的传送门
+function NavItem:DoMoveStep(doorItem)
+    doorItem.Enable = true
+    self.Target.Position = _G.Vector3.New(doorItem.Transform:GetPosition())
+    self:DoNavByPosition(_G.Vector3.New(doorItem.Transform:GetLocalPosition()))
+end
+
+---寻路打断
+---@param isDrag boolean 是否通过摇杆移动
+function NavItem:OnNavInterruptMove(isDrag)
+    local Obj = self:GetDoNavObjByUid(self.DoNavObjUid)
+    if not Obj then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("找不到Obj uid:" .. tostring(self.DoNavObjUid))
+        end
+        return
+    end
+    if Obj:GetMoveState() then
+        if isDrag then
+            Obj:StopGoto()
+        else
+            Obj:NavInterruptMove()
+        end
+    end
+
+    if self.NavDoorSidQueue and #self.NavDoorSidQueue > 0 then
+        ---清除门传送门
+        self.NavDoorSidQueue = {}
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("不处于寻路中")
+        end
+    end
+    _G.NavManager:GetInstance():DeleteNavItemByUid(self.DoNavObjUid)
+end
+
+function NavItem:OnNavSceneSwitchComplete()
+    if _G.AppSetting.DEBUG then
+        _G.Log("<color=red><size=20>" .. "玩家到达指定场景后的寻路结束    " .. "</size></color>")
+    end
+    _G.Events:GetInstance():Broadcast(_G.eNav.NavComplete, self.DoNavObjUid)
+    self:DispatchEvent(NavItemEvent, NavItemEvent.EnumValue.NavComplete, self.DoNavObjUid)
+end
+-- endregion
+return NavItem, NavItemEvent

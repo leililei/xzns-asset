@@ -1,0 +1,505 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Chapter.Model.ChapterRoomClass	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/07/23
+-- Description: 关卡房间类
+-----------------------------------------------------------------------
+
+---@field public LeftRoom number 左边房间
+---@field public RightRoom number 右边房间
+---@field public UpRoom number 上边房间
+---@field public DownRoom number 下边房间
+local roomDirection = {
+    "LeftRoom",
+    "RightRoom",
+    "UpRoom",
+    "DownRoom"
+}
+---@field public story number 剧情
+---@field public popwindow number 弹窗
+local enterTipsType = {
+    story = 1,
+    popwindow = 2
+}
+
+---@field public Enter number 进入
+---@field public Done number 探索完
+local RoomState = {
+    Enter = 1,
+    Done = 2
+}
+
+local ChapterNet = require "ChapterNet"
+
+---@class ChapterRoomClass	中文描述
+local ChapterRoomClass = _G.BaseClass("ChapterRoomClass", _G.LogicClass)
+
+---类的构造函数
+---@param id number 房间id
+function ChapterRoomClass:__init(id)
+    self.sid = id
+    ---@type main_room_cfg
+    self.cfg = _G.ConfigManager.main_room_cfg[id]
+    self.doors = {}
+    self.enemys = {}
+    self.boxes = {}
+    self.roomState = 0
+    self.safePoint = {x = 0, y = 0, z = 0}
+    self:Init()
+end
+
+---类的析构函数
+function ChapterRoomClass:Dispose()
+    self.sid = nil
+    self.cfg = nil
+    self.doors = nil
+    self.roomState = nil
+    self.safePoint = nil
+    self.enemys = nil
+    self.boxes = nil
+end
+
+--region 初始化相关
+function ChapterRoomClass:Init()
+    self:InitCfgData()
+    self:InitRoomData()
+end
+---初始化配置数据
+function ChapterRoomClass:InitCfgData()
+    local cfg = _G.ConfigManager.scene_cfg[self.cfg.MapID]
+    local data = _G.require(cfg.TiledResLua)
+    local doors = data.WorldItemDatas.Door
+    local sid = 0
+    if doors and #doors > 0 then
+        for i = 1, #doors do
+            sid = self:GetRoomSidByDir(doors[i].EnterFightId)
+            if sid > 0 then
+                cfg = _G.ConfigManager.main_room_cfg[sid]
+                if cfg and #cfg.params_condition > 0 then
+                    _G.table.insert(self.doors, {uid = doors[i].Uid, dir = doors[i].EnterFightId})
+                end
+            end
+        end
+    end
+    local enemys = data.WorldItemDatas.Enemy
+    if enemys then
+        for i = 1, #enemys do
+            sid = _G.ConfigManager.object_world_cfg[enemys[i].Sid].Params[1]
+            _G.table.insert(self.enemys, {uid = enemys[i].Uid, sid = enemys[i].Sid, mgpID = sid})
+        end
+    end
+    local boxes = data.WorldItemDatas.Box
+    if boxes then
+        for i = 1, #boxes do
+            _G.table.insert(self.boxes, boxes[i].Sid)
+        end
+    end
+end
+---初始化房间数据
+function ChapterRoomClass:InitRoomData()
+    if _G.ChapterRoomManager:GetInstance():CheckEmptyRoomEnter(self.sid) then
+        self.roomState = RoomState.Enter
+    end
+
+    self:UpdateRoomState()
+end
+function ChapterRoomClass:InitDoorLockEffect()
+    for i = #self.doors, 1, -1 do
+        local door = _G.WorldItemManager:GetInstance():GetItemByUid(self.doors[i].uid)
+        door:CreateLockEffect()
+    end
+end
+--endregion
+
+--region内部方法
+---根据方向获取房间ID
+---@param dir number 方向
+---@return number 房间sid
+function ChapterRoomClass:GetRoomSidByDir(dir)
+    if roomDirection[dir] then
+        return self.cfg[roomDirection[dir]] or 0
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("传入的方向不正确 dir = " .. dir, "ChapterRoomClass:GetRoomSidByDir")
+    end
+    return 0
+end
+-----检测房间是否锁住(将锁住的传送门记录下来，做表现和刷新逻辑)
+---@param dir number 方向 dir
+---@param dooruid number 传送门uid
+---@return boolean 是否锁住(true 锁住 false 解锁)
+function ChapterRoomClass:CheckRoomLock(dir)
+    local sid = self:GetRoomSidByDir(dir)
+    local cfg = _G.ConfigManager.main_room_cfg[sid]
+    if not cfg then
+        return false
+    end
+    return not _G.GlobalConditionManager.CheckConditionArrays(cfg.params_condition)
+end
+---展示房间锁定tips
+---@param _t number 限制条件类型
+function ChapterRoomClass:ShowLockTips(_t)
+    local tip
+    if #self.cfg.conditon_dia_tip == 1 then
+        tip = self.cfg.conditon_dia_tip[1]
+    elseif #self.cfg.conditon_dia_tip > 1 then
+        for i = 1, #self.cfg.conditon_dia_tip do
+            if not self.cfg.conditon_dia_tip[i][3] and not tip then
+                tip = self.cfg.conditon_dia_tip[i]
+            elseif _t and self.cfg.conditon_dia_tip[i][3] == _t then
+                tip = self.cfg.conditon_dia_tip[i]
+                break
+            end
+        end
+    end
+    if tip then
+        if tip[1] == enterTipsType.story then --剧情提示
+            _G.AutomaticPlayStory.PlayStoryByID(tip[2])
+        elseif tip[1] == enterTipsType.popwindow then
+            _G.PopWindowManager:GetInstance():ShowAllTips(tip[2])
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log("未定义类型提示 type = " .. tip[1], "ChapterRoomClass:ShowLockTips")
+            end
+        end
+    end
+end
+---当事件完成回调
+---@param success boolean 是否完成
+---@param goSafe boolean 是否需要重置到安全点
+function ChapterRoomClass:OnEventDoneCall(success, goSafe)
+    if self.onEventDoneCall then
+        self.onEventDoneCall(success)
+        self.onEventDoneCall = nil
+    end
+    if success then
+        self:UpdateDoorState()
+        self:UpdateRoomState()
+        self:InitDoorLockEffect()
+    elseif goSafe then
+        self:GoToSafePoint()
+    end
+end
+---当战斗完成回调
+---@param success boolean 是否完成
+function ChapterRoomClass:OnRoomEnemyBattleEndCall(success)
+    if self.onEnemyBattleCall then
+        self.onEnemyBattleCall(success)
+        self.onEnemyBattleCall = nil
+    end
+    if success then
+        self:UpdateDoorState()
+        self:UpdateRoomState()
+    else
+        self:GoToSafePoint()
+    end
+    self:InitDoorLockEffect()
+end
+-----更新传送门的状态
+function ChapterRoomClass:UpdateDoorState()
+    for i = #self.doors, 1, -1 do
+        if not self:CheckRoomLock(self.doors[i].dir) then
+            local door = _G.WorldItemManager:GetInstance():GetItemByUid(self.doors[i].uid)
+            if door then
+                door:PlayUnLockEffect()
+                _G.table.remove(self.doors, i)
+            end
+        end
+    end
+end
+---更新房间状态
+function ChapterRoomClass:UpdateRoomState()
+    if self.roomState == 0 then
+        return
+    end
+    if self.roomState == RoomState.Done then
+        return
+    end
+    for i = 1, #self.cfg.battle_serial do
+        if not _G.ChapterRoomManager:GetInstance():GetRoomEnemyBattle(self.cfg.battle_serial[i]) then
+            return
+        end
+    end
+    for i = 1, #self.cfg.task_id do
+        if
+            not _G.GlobalConditionManager.CheckCondition(
+                _G.GlobalConditionManager.ConditionType.doneTask,
+                self.cfg.task_id[i]
+            )
+         then
+            return
+        end
+    end
+    local objectCfg
+    for i = 1, #self.cfg.BoxID do
+        objectCfg = _G.ConfigManager.object_world_cfg[self.cfg.BoxID[i]]
+        if _G.tonumber(objectCfg.ClickParams[1]) == 1 then --普通宝箱
+            if not _G.WorldItemManager:GetInstance():GetInteractionBySid(self.cfg.BoxID[i]) then
+                return
+            end
+        end
+    end
+    self.roomState = RoomState.Done
+
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {_G.ActiveTaskEnum.ConditionEnum.Section.exploreRoom, self.cfg.id},
+        1,
+        true
+    )
+end
+---检测当前是否是空房间
+function ChapterRoomClass:CheckRoomEmpty()
+    return true
+end
+--region事件监听
+---当道具更新
+function ChapterRoomClass:OnItemUpdate()
+    self:UpdateDoorState()
+end
+---当宝箱交互后回调
+function ChapterRoomClass:OnBoxInteractionDoneCall(sid)
+    local ChapterModel = require "ChapterModel":GetInstance()
+    local sectionSid = ChapterModel:GetCurExploreSection()
+    ChapterModel:SetSectionExplore(sectionSid)
+end
+---当任务完成回调
+function ChapterRoomClass:OnTaskDoneCall()
+    self:UpdateDoorState()
+end
+---当任务接取回调
+function ChapterRoomClass:OnTaskAcceptCall()
+    self:UpdateDoorState()
+end
+--endregion
+
+--region 剧情
+------进入房间的剧情表现
+function ChapterRoomClass:DoJoinRoomStory()
+    -- _G.WorldManager:GetInstance():HideLastScene()
+    _G.WorldItemManager:GetInstance():ShowOrHideByType(_G.WorldItemType.Door, false)
+    _G.TimerManager:GetInstance():GetTimer(1, self.DoJoinRoomStoryStart, self, true, true):Start()
+end
+
+------进入房间的剧情表现
+function ChapterRoomClass:DoJoinRoomStoryStart()
+    --- 未通关播放剧情
+    local NowStory = self.cfg.JoinRoomStoryID[1]
+    --- 通关过播放剧情
+    local keepStory = self.cfg.JoinRoomStoryID[2]
+    if NowStory == nil then
+        NowStory = keepStory
+    elseif NowStory[1] == 0 or self.roomState >= RoomState.Enter then
+        NowStory = keepStory
+    end
+    if table.isEmptyOrNil(NowStory) == false and tonumber(NowStory[1] or 0) > 0 then
+        local index = 0
+        local PlayOver = _G.handler(self, self.PlayJoinRoomEventStory)
+        local function Play()
+            index = index + 1
+            local Rfun = _G.handler(self, Play)
+            if index == #NowStory then
+                Rfun = PlayOver
+            end
+            _G.AutomaticPlayStory.PlayStoryByID(NowStory[index], Rfun)
+        end
+        Play()
+    else
+        self:PlayJoinRoomEventStory()
+    end
+end
+
+function ChapterRoomClass:PlayJoinRoomEventStory()
+    local eventIndex = self.cfg.JoinRoomID
+    local eventid = self.cfg.event_id[eventIndex]
+    if eventid ~= nil and tonumber(eventid) > 0 and self:CheckRoomEventDone(eventIndex) == false then
+        self:TriggerEvent(eventIndex, _G.handler(self, self.OnJoinRoomStoryPlayEnd))
+    else
+        self:OnJoinRoomStoryPlayEnd()
+    end
+end
+function ChapterRoomClass:OnJoinRoomStoryPlayEnd()
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    if not player then
+        return
+    end
+    _G.TaskModule:GetInstance():ReceiveSectionBranchTaskTask(self.cfg.Section, self.sid)
+    self.roomState = RoomState.Enter
+    local x, y, z = _G.WorldManager:GetInstance():GetCurWorldPlayer().Transform:GetLocalPosition()
+    self.safePoint.x = x
+    self.safePoint.y = y
+    self.safePoint.z = z
+    local UIManagerIns = _G.UIManager:GetInstance()
+    local ui_cfg = _G.ConfigManager.ui_cfg
+    if UIManagerIns:IsActiveWindow(ui_cfg.EmbattleView.Name) or _G.BattleManager:GetInstance():CheckInBattle() then
+        return
+    end
+    UIManagerIns:ShowWindow(ui_cfg.MainView.Name)
+    _G.WorldItemManager:GetInstance():ShowOrHideByType(_G.WorldItemType.Door, true)
+    local tMainView = UIManagerIns:GetWindow(ui_cfg.MainView.Name)
+    if tMainView ~= nil and tMainView.View ~= nil then
+        --判断显示关卡标题
+        tMainView.View:InFb()
+    end
+    self:UpdateDoorState()
+    _G.WorldManager:GetInstance():GetCurWorld():ChangeCameraBattle()
+    UIManagerIns:OpenWindow(ui_cfg.ChapterObjectTagView.Name)
+end
+--endregion
+
+--endregion
+
+--region 对外接口
+---检测房间是否可以进入
+---@param call function 检测回调
+function ChapterRoomClass:CheckEnterRoom(call)
+    if #self.cfg.params_condition > 0 then
+        local DeepCopyCfgTable = _G.DeepCopyCfgTable
+        local remove = _G.table.remove
+        local checkFunc = _G.GlobalConditionManager.CheckMainEventCondition
+        local _t
+        for i = 1, #self.cfg.params_condition do
+            local param = DeepCopyCfgTable(self.cfg.params_condition[i])
+            _t = remove(param, 1)
+            if not checkFunc(_t, param) then
+                call(false)
+                self:ShowLockTips(_t)
+                return
+            end
+        end
+    end
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        -- 进入房间
+        ---进入房间前添加交互开关
+        require "ChapterModel":GetInstance():SetBehavioralPriority(true)
+        ChapterNet:GetInstance():AccessEnterRoom(
+            self.sid,
+            function(data)
+                if data.ack == 1 then
+                    call(true)
+                else
+                    call(false)
+                end
+            end,
+            self:CheckRoomEmpty() and 0 or 1
+        )
+    else
+        call(true)
+    end
+end
+---进入房间
+---@param call function 进入完成回调
+function ChapterRoomClass:EnterRoom(call)
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.OnItemUpdate, self)
+    _G.WorldItemManager:GetInstance():RegiestWorldItemEvent(
+        _G.WorldItemManager.ItemEvent.interactionDone,
+        self.OnBoxInteractionDoneCall,
+        self
+    )
+    _G.TaskModule:GetInstance():ListenerAddTaskComplete(self.OnTaskDoneCall, self)
+    _G.TaskModule:GetInstance():AddListener(
+        _G.TaskModuleEvent,
+        _G.TaskModuleEvent.EnumValueTable.TaskClaim,
+        self.OnTaskAcceptCall,
+        self
+    )
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    self:InitDoorLockEffect()
+    self:DoJoinRoomStory()
+end
+---退出房间
+function ChapterRoomClass:ExitRoom()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.OnItemUpdate, self)
+    _G.WorldItemManager:GetInstance():UnRegiestWorldItemEvent(
+        _G.WorldItemManager.ItemEvent.interactionDone,
+        self.OnBoxInteractionDoneCall,
+        self
+    )
+    _G.TaskModule:GetInstance():ListenerRemoveTaskComplete(self.OnTaskDoneCall, self)
+    _G.TaskModule:GetInstance():RemoveListener(
+        _G.TaskModuleEvent,
+        _G.TaskModuleEvent.EnumValueTable.TaskClaim,
+        self.OnTaskAcceptCall,
+        self
+    )
+end
+---触发房间事件
+---@param index number 事件序列号
+---@param doneCall function 事件完成回调
+function ChapterRoomClass:TriggerEvent(index, doneCall)
+    self.onEventDoneCall = doneCall
+    _G.EventManager:GetInstance():StartEvent(self.cfg.event_id[index], _G.handler(self, self.OnEventDoneCall))
+end
+-----检测房间Npc事件是否完成
+---@param index number 房间配置事件序列号
+---@return boolean 是否完成
+function ChapterRoomClass:CheckRoomEventDone(index)
+    if index > #self.cfg.event_id then
+        return false
+    end
+    return _G.EventManager:GetInstance():GetEventDone(self.cfg.event_id[index])
+end
+---触发房间敌人战斗
+---@param index number 房间战斗序列号
+---@param sid number 敌人物件表sid
+---@param callback function 事件完成回调
+function ChapterRoomClass:TriggerRoomEnemyBattle(index, sid, callback)
+    self.onEnemyBattleCall = callback
+    local enter = function()
+        _G.BattleManager:GetInstance():EnterFight(
+            _G.BattleControllerType.chapterEnemy,
+            self.cfg.battle_serial[index],
+            _G.handler(self, self.OnRoomEnemyBattleEndCall),
+            sid
+        )
+    end
+     local EmbattleModel = require "EmbattleModel":GetInstance()
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        if not EmbattleModel:CheckEmbattleData(_G.EmbattleType.section) then
+            EmbattleModel:SaveEmbattleDataNew(
+                _G.EmbattleType.section,
+                function()
+                    enter()
+                end,
+                _G.EmbattleSaveType.server,
+                false,
+                EmbattleModel:GetEmbattleData(_G.EmbattleType.AFKOnly)
+            )
+        else
+            enter()
+        end
+    else
+        enter()
+    end
+end
+---检测房间是否探索完
+---@return boolean 是否探索完
+function ChapterRoomClass:CheckRoonExporeDone()
+    return self.roomState == RoomState.Done
+end
+---检测房间是否进入过
+---@return boolean 是否进入过
+function ChapterRoomClass:CheckRoomEnter()
+    return self.roomState >= RoomState.Enter
+end
+---去到安全点
+function ChapterRoomClass:GoToSafePoint()
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    player:SetInitPosition(self.safePoint)
+    player:SetClickTarget()
+    _G.Events:GetInstance():Broadcast(_G.WorldItemManager.ItemEvent.resetPlayerSafePoint)
+end
+---重置房间
+function ChapterRoomClass:ResetRoom()
+    local worldmanager = _G.WorldManager:GetInstance()
+    worldmanager:SetPlayerPosition()
+    worldmanager:GetCurWorld():ResetAllItem()
+    worldmanager = nil
+    self:DoJoinRoomStory()
+    _G.Events:GetInstance():Broadcast(_G.WorldItemManager.ItemEvent.resetPlayerSafePoint)
+end
+--endregion
+
+return ChapterRoomClass

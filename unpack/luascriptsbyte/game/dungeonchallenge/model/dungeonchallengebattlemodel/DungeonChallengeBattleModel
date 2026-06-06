@@ -1,0 +1,510 @@
+local DungeonChallengeNet = require("DungeonChallengeNet")
+local DungeonChallengeEquipData = require("DungeonChallengeEquipData")
+local DungeonChallengeIllustrationModel = require("DungeonChallengeIllustrationModel")
+local DungeonChallengeModel = require("DungeonChallengeModel")
+---装备槽位状态(大于0表示当前装备序号)
+local EquipSolts = {
+    None = 0,      --未使用
+    Disabled = -1, --已禁用
+}
+
+--装备槽位选择状态
+local EquipSoltFlags = {
+    Normal = 0,    --正常
+    Ok = 1,        --可使用(绿色)
+    Error = 2,     --不可使用(红色)
+    HighLight = 3, --高亮显示
+}
+
+---@class DungeonChallengeBattleModel:GameDataModelBase 装备合成闯关_战斗
+---@field GetInstance fun():DungeonChallengeBattleModel
+-----------------------------------------------------------------------
+---@field maxChapterIndex number                                @最大通关关卡序号
+---@field chapterCfgs dungeon_challenge_cfg[]                   @关卡配置
+-----------------------------------------------------------------------
+---@field chapterIndex number                                   @挑战中的关卡序号
+---@field cardSid number                                        @挑战中的卡牌sid
+---@field monsterGroupId number                                 @挑战中地图sid
+---@field monsterIndex number                                   @挑战中怪物序号
+---@field fightArg fight.i_fight_arg                            @战斗参数
+---@field equips table<number,DungeonChallengeEquipData>        @当前穿戴中的装备
+---@field usableEquips DungeonChallengeEquipData[]              @当前可用装备(背包)
+---@field isChangedEquip boolean                                @装备状态是否已被改变
+local DungeonChallengeBattleModel = _G.BaseClass("DungeonChallengeBattleModel", _G.GameDataModelBase)
+
+DungeonChallengeBattleModel.EquipSolts = EquipSolts
+DungeonChallengeBattleModel.EquipSoltFlags = EquipSoltFlags
+
+function DungeonChallengeBattleModel:__init()
+    --初始化关卡配置
+    self.chapterCfgs = {}
+    for _, cfg in pairs(_G.ConfigManager.dungeon_challenge_cfg) do
+        table.insert(self.chapterCfgs, cfg)
+    end
+    table.sort(self.chapterCfgs, function(a, b)
+        return a.id < b.id
+    end)
+
+    self.maxChapterIndex = 0
+    self.chapterIndex = 0
+    self.chapterLevel = 0
+    self.cardSid = 0
+end
+
+function DungeonChallengeBattleModel:Dispose()
+end
+
+---解析服务器传过来的数据
+---@param msg dungeon_challenge.s2c_info
+function DungeonChallengeBattleModel:ParseData(msg)
+    if not msg then
+        self.super.ParseData(self)
+        return
+    end
+    self:ClearChallenging()
+
+    --当前关卡信息
+    for index, cfg in ipairs(self.chapterCfgs) do
+        if cfg.id == msg.max_chapter then
+            self.maxChapterIndex = index
+        end
+        if cfg.id == msg.chapter then
+            self.chapterIndex = index
+        end
+    end
+    self.chapterLevel = msg.level
+    --当前选中的卡牌
+    self.cardSid = msg.card
+    --当前挑战中地图id
+    self.monsterGroupId = msg.monster_sid
+    self.monsterIndex = 1
+    if self:IsChallenging() and msg.level and msg.level > 0 then
+        local cfg = self.chapterCfgs[self.chapterIndex]
+        if cfg then
+            for i, id in ipairs(cfg.level) do
+                if id == msg.level then
+                    self.monsterIndex = i
+                    break
+                end
+            end
+        end
+    end
+    --解析装备数据
+    self:ParseEquips(msg.put_equip, true)
+    self:ParseUsableEquips(msg.equip_list, false)
+
+    self.super.ParseData(self)
+end
+
+---处理结算数据
+---@param msg fight.s2c_fight_result
+function DungeonChallengeBattleModel:ParseSettlementData(msg)
+    if not msg or msg.ack ~= 1 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(msg, "结算数据异常")
+        end
+        return
+    end
+
+    -- if not msg.args or #msg.args == 0 then
+    --     return
+    -- end
+    self.monsterGroupId = msg.args[1] or 0 --monster_group_cfg
+
+    if self.monsterGroupId > 0 then
+        --继续挑战
+        self.monsterIndex = self.monsterIndex + 1
+        self:SetLevelID()
+        local usableEquips = msg.args
+        table.remove(usableEquips, 1)
+        self:ParseUsableEquips(usableEquips, false)
+        --图鉴卡牌检测
+        DungeonChallengeIllustrationModel:GetInstance():AddEquip(usableEquips)
+        DungeonChallengeModel:GetInstance():GetSomeEquip(usableEquips)
+
+        require("DungeonChallengeModel"):GetInstance():SettlementToTask()
+    else
+        --解锁下一关
+        if self.chapterIndex == self.maxChapterIndex + 1 then
+            self.maxChapterIndex = self.chapterIndex
+        end
+        self:ClearChallenging()
+    end
+end
+
+---解析装备数据
+---@param datas dungeon_challenge.i_equip[]
+---@param override? boolean 是否覆盖数据, 默认true
+---@return DungeonChallengeEquipData[]
+function DungeonChallengeBattleModel:ParseEquips(datas, override)
+    if override or override == nil then
+        self.equips = nil
+        self.usableEquips = nil
+    end
+
+    if not datas or #datas == 0 then
+        return
+    end
+
+    self.equips = self.equips or {}
+    for _, d in ipairs(datas) do
+        local cfg = _G.ConfigManager.dungeon_challenge_equip_cfg[d.sid]
+        if cfg then
+            local data = DungeonChallengeEquipData.New(cfg)
+            if d.type == 1 then
+                --穿戴中的装备
+                self.equips[d.index] = data
+            else
+                --临时装备
+                self.usableEquips = self.usableEquips or {}
+                if d.index >= 1 and d.index <= #self.usableEquips then
+                    table.insert(self.usableEquips, d.index, data)
+                else
+                    table.insert(self.usableEquips, data)
+                end
+            end
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError(string.format(
+                    "找不到配置表dungeon_challenge_equip_cfg.id=%s",
+                    d.sid
+                ))
+            end
+        end
+    end
+end
+
+---解析可用装备数据
+---@param datas number[]
+---@param override? boolean 是否覆盖数据, 默认true
+function DungeonChallengeBattleModel:ParseUsableEquips(datas, override)
+    if override or override == nil then
+        self.usableEquips = nil
+    end
+
+    if not datas or #datas == 0 then
+        return
+    end
+    self.usableEquips = self.usableEquips or {}
+    for _, sid in ipairs(datas) do
+        local cfg = _G.ConfigManager.dungeon_challenge_equip_cfg[sid]
+        if cfg then
+            table.insert(self.usableEquips, DungeonChallengeEquipData.New(cfg))
+        else
+            _G.LogError(string.format(
+                "找不到配置表dungeon_challenge_equip_cfg.id=%s",
+                sid
+            ))
+        end
+    end
+end
+
+---移除装备数据
+---@param ... dungeon_challenge.i_equip
+function DungeonChallengeBattleModel:RemoveEquips(...)
+    ---@type dungeon_challenge.i_equip[]
+    local equipDatas = { ... }
+    table.sort(equipDatas, function(a, b)
+        return a.index > b.index --index大的排前面
+    end)
+    for _, data in ipairs(equipDatas) do
+        if data.type == 1 then
+            --穿戴中的装备
+            if self.equips then
+                self.equips[data.index] = nil
+            end
+        else
+            --临时装备
+            if self.usableEquips then
+                table.remove(self.usableEquips, data.index)
+            end
+        end
+    end
+end
+
+--region ==============================数据==============================
+
+---获取关卡配置
+---@return dungeon_challenge_cfg[]
+function DungeonChallengeBattleModel:GetChapterCfgs()
+    return self.chapterCfgs
+end
+
+---获取最大通关关卡序号
+---@return number
+function DungeonChallengeBattleModel:GetMaxChapterIndex()
+    return self.maxChapterIndex or 0
+end
+
+---获取当前挑战中的地图id
+---@return number
+function DungeonChallengeBattleModel:GetMonsterGroupId()
+    return self.monsterGroupId or 0
+end
+
+---获取当前挑战中的卡牌sid
+---@return number
+function DungeonChallengeBattleModel:GetCardSid()
+    return self.cardSid or 0
+end
+
+---获取当前穿戴中的装备
+---@return table<number,DungeonChallengeEquipData>
+function DungeonChallengeBattleModel:GetEquips()
+    return self.equips
+end
+
+---获取当前穿戴中的装备的属性
+---@return table<number,DungeonChallengeEquipData>
+function DungeonChallengeBattleModel:GetEquipsAttr()
+    return self.equips
+end
+
+---获取可用装备(背包)
+---@return DungeonChallengeEquipData[]
+function DungeonChallengeBattleModel:GetUsableEquips()
+    return self.usableEquips
+end
+
+---是否正在挑战中
+function DungeonChallengeBattleModel:IsChallenging()
+    return self.chapterIndex and self.chapterIndex > 0
+end
+
+---获取当前挑战中的章节序号
+---@return number
+function DungeonChallengeBattleModel:GetChallengingIndex()
+    if self:IsChallenging() then
+        return self.chapterIndex or 0
+    end
+    return 0
+end
+
+---设置挑战过的最大关卡序号
+function DungeonChallengeBattleModel:SetLevelID()
+    local chapterIndex = self:GetChallengingIndex()
+    local monsterID = self:GetChallengingMonsterIndex()
+    if self.chapterCfgs[chapterIndex] then
+        self.chapterLevel = self.chapterCfgs[chapterIndex].level[monsterID]
+    end
+end
+
+---获取挑战过的最大关卡序号
+---@return number
+function DungeonChallengeBattleModel:GetLevelID()
+    return self.chapterLevel or 0
+end
+
+---获取当前挑战中的怪物序号
+---@return number
+function DungeonChallengeBattleModel:GetChallengingMonsterIndex()
+    return self.monsterIndex or 1
+end
+
+--重置当前关卡状态
+function DungeonChallengeBattleModel:ClearChallenging()
+    self.chapterIndex = 0
+    self.cardSid = 0
+    self.monsterGroupId = 0
+    self.monsterIndex = 0
+    self.equips = nil
+    self.usableEquips = nil
+    self.isChangedEquip = nil
+    self.fightArg = nil
+end
+
+---是否装备状态已被改变
+---@return boolean
+function DungeonChallengeBattleModel:IsChangedEquip()
+    return self.isChangedEquip or false
+end
+
+---设置装备状态是否已被改变
+---@param isChanged boolean
+function DungeonChallengeBattleModel:SetChangeEquip(isChanged)
+    self.isChangedEquip = isChanged or false
+end
+
+---获取当前战斗参数
+---@return fight.i_fight_arg
+function DungeonChallengeBattleModel:GetFightArg()
+    return self.fightArg
+end
+
+--endregion
+
+--region ==============================网络接口: 准备阶段(战前)==============================
+
+---重置当前章节
+---@param callback fun(msg:public.s2c_common_ack) 回调
+function DungeonChallengeBattleModel:ResetChapter(callback)
+    DungeonChallengeNet:GetInstance():ResetChapter(function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        --重置关卡状态
+        self:ClearChallenging()
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---选择章节
+---@param index number 章节序号
+---@param callback fun(msg:public.s2c_common_ack) 回调
+function DungeonChallengeBattleModel:ChooseChapter(index, callback)
+    DungeonChallengeNet:GetInstance():ChooseChapter(self.chapterCfgs[index].id, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        --解析数据
+        self.chapterIndex = index
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---选择卡牌
+---@param sid number 卡牌sid
+---@param callback fun(msg:dungeon_challenge.s2c_choose_card) 回调
+function DungeonChallengeBattleModel:ChooseCard(sid, callback)
+    DungeonChallengeNet:GetInstance():ChooseCard(sid, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        --解析数据
+        self.cardSid = sid
+        self.monsterGroupId = msg.monster_sid
+        self.monsterIndex = 1
+        self:ParseUsableEquips(msg.equip_list, true)
+        --图鉴卡牌检测
+        DungeonChallengeIllustrationModel:GetInstance():AddEquip(msg.equip_list or {})
+        DungeonChallengeModel:GetInstance():GetSomeEquip(msg.equip_list or {})
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+--endregion
+
+--region ==============================网络接口: 战斗中==============================
+
+---同步装备状态至服务器
+---@param list dungeon_challenge.i_equip[]
+---@param callback fun(msg:public.s2c_common_ack) 回调
+function DungeonChallengeBattleModel:SynchronizeEquips(list, callback)
+    DungeonChallengeNet:GetInstance():RemoveEquip(list, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        --重新解析数据
+        self:ParseEquips(list, true)
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+--合并装备
+---@param first dungeon_challenge.i_equip 装备1
+---@param second dungeon_challenge.i_equip 装备2
+---@param equipSid number 装备sid
+---@param callback fun(msg:public.s2c_common_ack) 回调
+function DungeonChallengeBattleModel:ConflateEquip(first, second, equipSid, callback)
+    local equipIndex = 0
+    local equipCfg = _G.ConfigManager.dungeon_challenge_equip_cfg[first.sid]
+    if equipCfg and equipCfg.merge_equip then
+        for i, sid in ipairs(equipCfg.merge_equip) do
+            if sid == equipSid then
+                equipIndex = i
+                break
+            end
+        end
+    end
+    if equipIndex <= 0 then
+        return
+    end
+
+    DungeonChallengeNet:GetInstance():ConflateEquip(first, second, equipIndex, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        --销毁旧装备
+        self:RemoveEquips(first, second)
+        --添加新装备
+        self:ParseEquips(
+            {
+                { type = first.type, index = first.index, sid = equipSid },
+            },
+            false
+        )
+        --图鉴卡牌检测
+        DungeonChallengeIllustrationModel:GetInstance():AddEquip({ equipSid })
+        DungeonChallengeModel:GetInstance():GetSomeEquip({ equipSid }, true)
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---发起战斗请求
+---@param callback fun(msg:dungeon_challenge.s2c_fight) 回调
+function DungeonChallengeBattleModel:Fight(callback)
+    DungeonChallengeNet:GetInstance():Fight(function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        --处理数据(清空临时装备背包)
+        self.usableEquips = nil
+        --记录战斗参数
+        self.fightArg = msg.fight_arg
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+--endregion
+
+---检测是否显示主入口红点
+---@return number
+function DungeonChallengeBattleModel:CheckRedPoint()
+    local v = _G.PlayerPrefsManager.GetInt("DungeonChallengeBattleView", 0)
+    if v ~= 1 then
+        return 1
+    end
+    return 0
+end
+
+---设置红点隐藏
+function DungeonChallengeBattleModel:SetRedPointHidden()
+    _G.PlayerPrefsManager.SetInt("DungeonChallengeBattleView", 1)
+    require("RedPointManager"):GetInstance():RefreshNode(
+        _G.ConfigManager.redpoint_cfg.dungeon.id
+    )
+end
+
+---返回游戏主界面
+---@return void
+function DungeonChallengeBattleModel:ReturnPanel()
+    ---@type DungeonChallengeBattleView
+    local window = _G.UIManager:GetInstance():GetWindowCtrl(
+        _G.ConfigManager.ui_cfg.DungeonChallengeBattleView.Name
+    )
+    if window then
+        window:UpdateView(true)
+    else
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.DungeonChallengeBattleView.Name
+        )
+    end
+end
+
+return DungeonChallengeBattleModel

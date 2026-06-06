@@ -1,0 +1,314 @@
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleSociatyWitchTrials : AIHelperModuleBaseNumberMock	    @AI助手-公会魔女试炼
+---@field index number                  @已执行次数
+---@field count number                  @剩余挑战次数
+---@field canSweep boolean              @能否进行扫荡
+local AIHelperModuleSociatyWitchTrials = _G.BaseClass("AIHelperModuleSociatyWitchTrials", base)
+
+---是否显示此模块(功能是否开启)
+function AIHelperModuleSociatyWitchTrials:IsEnabled()
+    if not base.IsEnabled(self) then
+        return false
+    end
+    --检查是否加入了公会
+    if not require("SociatyManager"):GetInstance():HasSociaty() then
+        return false
+    end
+    --检查是否满足试炼开启条件
+    --TODO
+
+    return true
+end
+
+---是否满足模块使用条件
+function AIHelperModuleSociatyWitchTrials:IsActive()
+    return self.index <= self.number
+end
+
+---获取Number范围
+function AIHelperModuleSociatyWitchTrials:GetCountRange()
+    return 0, 2
+end
+
+---重置状态
+function AIHelperModuleSociatyWitchTrials:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.count = 1
+    self.canSweep = true
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleSociatyWitchTrials:Check(callback)
+    self.index = 1
+    self.count = 0
+    self.canSweep = false
+
+    --最大可挑战次数
+    local maxCount = self:GetMaxCount()
+    if maxCount <= 0 then
+        if callback then
+            callback(true)
+        end
+        return
+    end
+    --获取今日已挑战次数
+    local model = require("SociatyModel"):GetInstance()
+    model:InitYHModel(
+        function(msg, isOk)
+            local ok = msg and msg.ack == 1
+            if isOk and ok and msg.feast_info then
+                --能否扫荡
+                self.canSweep = self:CheckSweep(msg.feast_info.dps)
+                --剩余次数
+                self.count = maxCount - msg.feast_info.challenge_times
+                if self.count < 0 then
+                    self.count = 0
+                end
+                model:UpdateSociatyYHNum(self.count)
+            end
+            if callback then
+                callback(ok)
+            end
+        end
+    )
+end
+
+---获取当前执行状态
+function AIHelperModuleSociatyWitchTrials:GetExecuteState()
+    return {
+        total = self.number,
+        index = self.index
+    }
+end
+
+---执行逻辑
+function AIHelperModuleSociatyWitchTrials:Execute(callback)
+    if self.count <= 0 then
+        if callback then
+            callback(false, self:CreateFailureResults(self.cfg.fail_tip))
+        end
+        return
+    end
+    self:ExecuteChallenge(callback)
+end
+
+---显示执行状态
+function AIHelperModuleSociatyWitchTrials:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    if not self.mock then
+        item.aortext_tip.text = state and (state.index .. "/" .. state.total) or ""
+    end
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleSociatyWitchTrials:ShowExecuteResult(item, success, results)
+    base.ShowExecuteResult(self, item, success, results)
+    if not success then
+        return
+    end
+    self.Util.ShowAwardListOfMsg(item, results)
+    if results and results.dps then
+        item.aortext_tip.text = _G.GetLangPackValue(90029400153) .. _G.UIUtils.NumberToUnitStr(results.dps)
+    else
+        item.aortext_tip.text = ""
+    end
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleSociatyWitchTrials:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+---获取最大可挑战次数
+---@return number
+function AIHelperModuleSociatyWitchTrials:GetMaxCount()
+    --获取最大可挑战次数
+    local cfg = _G.ConfigManager.discrete_cfg[102801]
+    if not cfg then
+        return 0
+    end
+    --受VIP加成影响
+    local count = cfg[1][1]
+    local vipData = require "PrivilegeManager":GetInstance():GetPrivilegeData({_G.PrivilegeType.VIP.GongHui_Boss})
+    if not _G.table.isEmptyOrNil(vipData) then
+        count = count + vipData[1]
+    end
+    return count
+end
+
+---检查是否可以扫荡
+---@param dps number
+---@return boolean
+function AIHelperModuleSociatyWitchTrials:CheckSweep(dps)
+    --检查dps要求
+    if dps < _G.ConfigManager.guild_boss_reward_cfg[1].damage then
+        return false
+    end
+    ---检查afk关卡要求
+    local afkCfg = _G.ConfigManager.discrete_cfg[102802]
+    if afkCfg and not require("AfkModel"):GetInstance():CheckSectionIsPass(afkCfg[1][1]) then
+        return false
+    end
+    return true
+end
+
+---执行挑战逻辑
+---@param callback fun(success:boolean, results:any):void
+---@return void
+function AIHelperModuleSociatyWitchTrials:ExecuteChallenge(callback)
+    if self.count <= 0 then
+        if callback then
+            callback(false, nil)
+        end
+        return
+    end
+
+    ---检测是否正在战斗中
+    if _G.MainManager:GetInstance():IsFighting(false) then
+        if callback then
+            callback(false, self:CreateFailureResults(90028010143, _G.GetLangPackValue(self.cfg.name)))
+        end
+        return
+    end
+
+    self.index = self.index + 1
+    self.count = self.count - 1
+
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+
+    local function response(success, results)
+        if not callback then
+            return
+        end
+        callback(success, results)
+    end
+
+    --检查布阵中是否有角色
+    local embattleId = _G.EmbattleType.sociatyBoss
+    if not embattleModel:CheckBattle(embattleId) then
+        response(false, nil)
+        return
+    end
+
+    ---发起战斗结算
+    ---@param data any
+    ---@return void
+    local function fightResult(data)
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            data,
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+                if msg.md5_error == "1" then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                elseif msg.md5_error == "2" then
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                end
+
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+                --msg.dps = data.atk_dps and data.atk_dps[1] or 0
+                msg.dps = msg.atk_dps
+                response(true, msg)
+            end
+        )
+    end
+    ---发起战斗请求
+    ---@param bossId number
+    local function fightBegin(bossId)
+        require("SociatyNet"):GetInstance():ChangllengeBossFight(
+            {boss_id = bossId},
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+
+                --计算战斗结果
+                -- _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+                -- local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+                -- if not record or not record.result then
+                --     response(false, nil)
+                --     return
+                -- end
+                -- local tab = record.result
+
+                --fightResult(tab)
+                fightResult(nil)
+            end
+        )
+    end
+
+    ---更新布阵阵容
+    ---@param embattleId number 布阵id
+    local function updateEmbattle(embattleId)
+        embattleModel:SaveEmbattleDataNew(
+            embattleId,
+            function(respCode)
+                if respCode ~= 0 then
+                    response(false, nil)
+                    return
+                end
+                local cfg = _G.ConfigManager.guild_boss_cfg[1] --魔女试炼配置: id=1
+                if not cfg then
+                    response(false, nil)
+                    return
+                end
+                fightBegin(cfg.id)
+            end,
+            _G.EmbattleSaveType.server,
+            true,
+            nil
+        )
+    end
+
+    updateEmbattle(embattleId)
+end
+
+---执行扫荡逻辑
+---@param callback fun(success:boolean, results:any):void
+---@return void
+function AIHelperModuleSociatyWitchTrials:ExecuteSweep(callback)
+    if self.count <= 0 or not self.canSweep then
+        if callback then
+            callback(false, nil)
+        end
+        return
+    end
+    --mock模式, 直接消耗所有次数
+    local count = self.mock and self.count or 1
+
+    self.index = self.index + 1
+    self.count = self.count - count
+
+    require("SociatyNet"):GetInstance():SweepBossFight(
+        {boss_id = 1, sweep_num = count},
+        function(msg)
+            if msg.ack ~= 1 then
+                if callback then
+                    callback(false, nil)
+                end
+                return
+            end
+            --获取奖励信息
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            --处理缓存
+            require "SociatyModel":GetInstance():CreateUnopenedBox()
+            require "SociatyModel":GetInstance():UpdateSociatyYHNum(self.count)
+
+            if callback then
+                callback(true, msg)
+            end
+        end
+    )
+end
+
+return AIHelperModuleSociatyWitchTrials

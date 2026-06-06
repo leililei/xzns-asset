@@ -1,0 +1,1622 @@
+-----------------------------------------------------------------------
+-- E:.01.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DrawCard.Model.DrawModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/11/20
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local DrawNet = require "DrawNet"
+local SDKDef = require("SDKDef")
+
+---@class DrawModel : Singleton	中文描述
+---@field godCfg limited_roller_cfg     降神召唤池配置
+---@field FiveLinesOfRecruitmentClass FiveLinesOfRecruitmentModel 五行招募累计
+local DrawModel = _G.BaseClass("DrawModel", _G.GameDataModelBase)
+
+---@return DrawModel DrawModel
+function DrawModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+local ZhaoMuXiaoHao = {
+    PuTo = 203020100,
+    WuXi = 203020200,
+    YouQingDian = _G.ResPropID.Friendship,
+    God = (function()
+        --在IIFE中执行一系列逻辑
+        local poolCfg = _G.ConfigManager.discrete_cfg[104314]
+        if not poolCfg then
+            return 0
+        end
+        ---@type limited_roller_cfg
+        local cfg = _G.ConfigManager.limited_roller_cfg[poolCfg[1][1]]
+        if not cfg then
+            return 0
+        end
+        return cfg.ticket[1]
+    end)()
+}
+
+---创建对象时,入口构造函数
+function DrawModel:__init()
+    self.curFunctionOpenID = 24
+    self.Pools = {}
+    self.BefallGift = {}
+    ---心愿单数据
+    self.wish_card = {
+        [1] = {id = 0, isGet = false, index = 0},
+        [2] = {id = 0, isGet = false, index = 0},
+        [3] = {id = 0, isGet = false, index = 0}
+    }
+    self.ShowXinYuanPool = {
+        [_G.CardPoolID.Normal] = true,
+        [_G.CardPoolID.Thunder] = true,
+        [_G.CardPoolID.Wind] = true,
+        [_G.CardPoolID.Water] = true,
+        [_G.CardPoolID.Fire] = true,
+        [_G.CardPoolID.Earth] = true
+    }
+    self.wish_get = {}
+    ---@type table<any,lucky_roller_cfg>
+    self.cfg = _G.ConfigManager.lucky_roller_cfg
+    self.CurDrawCardData = {}
+    ---累计招募次数
+    self.exit_num = 0
+    --累计招募已领取奖励时的抽卡次数
+    self.award_num = 0
+    --累计招募奖励当前已领取轮次的星级
+    self.got_star_con = 0
+    --累计招募奖励当前轮次星级
+    self.star_con = 0
+    --轮次index
+    self.award_index = 0
+    ---抽卡数
+    self.KaPao = 0
+    ---心愿单多少次显示
+    self.XinYuanDanNum = _G.ConfigManager.discrete_cfg[104505][1][1] or 0
+    ---心愿单相关招募累计次数
+    self.XinYuanDanDrawNum = 0
+    ---当前星级更新
+    self.GengHuan = true
+    ---当前抽卡进度更新
+    self.isDrawUpdateAwardFlag = true
+    self.isDrawRewardRedRead = false
+    self.isDrawRewardRedEnable = false
+    self.datalistitem = {}
+    self.datalistitem.award = {
+        item = {}
+    }
+    self.special_pool = {}
+
+    self.NextAward = {index = 0, LastTime = 0, num = 0}
+    self.Awards = {}
+    self.lingquaward_num = true
+    ---记录招募卷是否充足
+    ---@field PuTo bool 普通
+    ---@field WuXing bool 五行
+    ---@field YouQingDian bool 友情点
+    self.ZhaoMuJuan = {}
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.VIP, self.UpdateDrawRewardRed, self)
+end
+
+---计算当天五行池
+function DrawModel:CulcPropPoolToday()
+    -- local time =
+    --     _G.TimeUtil.GetInterValDayByGame(_G.PlayerModel:GetInstance().open_time, _G.TimeUtil.GetServerUnixTime())
+
+    -- time = time % 5 + 1
+
+    --self.PropPoolToday = _G.PropPoolID[time]
+    self.PropPoolToday = _G.PlayerPrefsManager.GetInt("PropPoolID")
+    if self.PropPoolToday == nil or self.PropPoolToday == 0 then
+        self.PropPoolToday = _G.PropPoolID[1]
+    end
+end
+
+---获取当天五行池
+function DrawModel:GetPropPool()
+    return self.PropPoolToday
+end
+
+---销毁对象时,析构函数
+function DrawModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.VIP, self.UpdateDrawRewardRed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnDrawGodOpenCall, self)
+end
+
+---初始化数据
+function DrawModel:GetDataFormServer(call)
+    self:CulcPropPoolToday()
+
+    for i, v in pairs(self.cfg) do
+        self.Pools[i] = {}
+        self.Pools[i].cfg = v
+        self.Pools[i].day_count = 0
+        self.Pools[i].total_count = 0
+        self.Pools[i].wish_card = {0, 0}
+        self.Pools[i].free_times = 0
+    end
+    self:GetDrawCardInfo(call)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(52) and not self.addGodFunctionListener then
+        self.addGodFunctionListener = true
+        _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnDrawGodOpenCall, self)
+    end
+    self:GengXingShuJu()
+    _G.PlayerPrefsManager.SetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "NomalDraw", 0)
+    _G.PlayerPrefsManager.SetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "DrawWuXi", 0)
+    _G.PlayerPrefsManager.SetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "DrawGod", 0)
+    _G.PlayerPrefsManager.SetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "DrawYouQingDian", 0)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DrawButton.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.NomalDraw.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FriendDraw.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GodDraw.id)
+end
+
+function DrawModel:OnDrawGodOpenCall(id)
+    if id == 52 then
+        self.addGodFunctionListener = nil
+        _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnDrawGodOpenCall, self)
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GodDraw.id)
+    end
+end
+
+---心愿单领取判断
+function DrawModel:WishList()
+    if self.exit_num >= self.XinYuanDanNum then
+        return true
+    end
+    return false
+end
+
+---显示修改
+function DrawModel:imageXianShi()
+    local ID = {}
+    _G.table.insert(ID, require "PrivilegeManager":GetInstance():GetPrivilegeDataNew({_G.PrivilegeType.DrawCard.Count}))
+    _G.table.insert(
+        ID,
+        require "PrivilegeManager":GetInstance():GetPrivilegeDataNew({_G.PrivilegeType.VIP.unlockFunction})
+    )
+    for _, value in pairs(ID) do
+        for _, v2 in pairs(value) do
+            if self.Pools ~= nil and self.Pools[v2[2]] ~= nil then
+                if v2[3] > self.Pools[v2[2]].free_times then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+---获取抽奖信息
+function DrawModel:GetDrawCardInfo(call)
+    DrawNet:GetInstance():GetDrawCardInfo(_G.handlerbind(self, self.GetDrawCardInfoSuc, call))
+end
+
+function DrawModel:NewDay_count()
+    local count = (_G.PlayerModel:GetInstance():DayCount() or 0) + 1
+    _G.PlayerModel:GetInstance():Accumulative(count)
+    --_G.PlayerModel:GetInstance():CumulativeLogin()
+end
+
+---获取抽奖信息
+function DrawModel:GetDrawCardInfoSuc(data, call)
+    if data.day_count ~= nil then
+        for _, v in pairs(data.day_count) do
+            self.Pools[v.key].day_count = v.value
+        end
+    end
+    self.XinYuanDanDrawNum = 0
+    if data.total_count ~= nil then
+        for _, v in pairs(data.total_count) do
+            self.Pools[v.key].total_count = v.value
+            if self.ShowXinYuanPool[v.key] then
+                self.XinYuanDanDrawNum = self.XinYuanDanDrawNum + v.value
+            end
+        end
+    end
+    if self.ShowXinYuanPool[_G.CardPoolType.God] then
+        self.XinYuanDanDrawNum = data.b_all_num + self.XinYuanDanDrawNum
+    end
+    self.exit_num = data.exit_num
+    self.award_num = data.award_num
+
+    require "IllustrationModel":GetInstance().Maxstars = (data.star_con or 1)
+    self:GengXingDqXingJi()
+    if self.star_con == nil or self.star_con == 0 then
+        self.star_con = 1
+    end
+    self.got_star_con = self.star_con
+    self.award_index = (data.award_index or 0) + 1
+    self:CalcAwardTime()
+
+    -- if self.award_index == nil or self.award_index == 0 then
+    --     self.award_index = 1
+    -- end
+    if data.wish_card ~= nil then
+        for _, v in pairs(data.wish_card) do
+            self.wish_card[v.index].id = v.card_sid
+            self.wish_card[v.index].index = v.index
+            self.wish_card[v.index].isGet = v.is_ld
+        end
+    end
+    for i, v in pairs(self.Pools) do
+        if v.cfg.pool_type == _G.CardPoolType.Prop then
+            self.Pools[i].Lock = true
+        end
+    end
+    if data.special_pool ~= nil then
+        for _, v in pairs(data.special_pool) do
+            self.Pools[v].Lock = false
+        end
+    end
+    if data.free_times ~= nil then
+        for _, v in pairs(data.free_times) do
+            self.Pools[v.key].free_times = v.value
+        end
+    end
+    self.Pools[self.PropPoolToday].Lock = false
+    self.godCardSid = data.befall_card
+    self.godCount = data.b_day_num
+    self.godMaxCount = data.b_all_num
+    if data.befall_card_num then
+        for _, v in pairs(data.befall_card_num) do
+            if v.key == 0 then
+                self.godCardDrawInfo = v.value
+                break
+            end
+        end
+        if not self.godCardDrawInfo then
+            self.godCardDrawInfo = 0
+        end
+    else
+        self.godCardDrawInfo = 0
+    end
+
+    ---(降神招募)已使用魂玉召唤次数
+    self.god_diamond_times = data.befall_diamond_times or 0
+    ---(降神招募)总共可使用魂玉次数(配置表丶服务器数据总和, 暂无服务器数据)
+    self.god_diamond_total_times = self:GetGodCfg().count_diamond
+    ---(降神招募)魂玉单抽消耗数量
+    self.god_diamond_consume_num = self:GetGodCfg().ticket_2[1]
+
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.WishListView.Name)
+
+    if data.element_award ~= nil then
+        self.KaPao = data.element_award
+    end
+
+    --降神礼包购买次数
+    self.BefallGift = {}
+    if data.befall_gift then
+        for _, v in ipairs(data.befall_gift) do
+            self.BefallGift[v.k] = v.v
+        end
+    end
+
+    if window then
+        window.View:DangQianXuanZhe()
+    end
+    self:RefreshDrawRewardRed()
+    if call ~= nil then
+        call()
+    end
+    self.super.ParseData(self)
+    --self:imageXianShi()
+end
+
+function DrawModel:JianLiChouKa(type, call)
+    local msg = {}
+    msg.element = type
+    msg.num = 1
+    DrawNet:GetInstance():ChoKaDrawCard(msg, _G.handlerbind(self, self.JianLiChouKaDrawCardSuc, type, call))
+end
+
+---奖励抽卡返回
+function DrawModel:JianLiChouKaDrawCardSuc(data, type, call)
+    if data.ack ~= 1 then
+        return
+    end
+    self.KaPao = self.KaPao - 1
+    if data.award.item ~= nil then
+        --local cardUidList = {}
+        --local cardstarList = {}
+        --local cardCfg = _G.ConfigManager.card_cfg
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        self.CurDrawCardData = {}
+        for _, v in pairs(data.award.item) do
+            -- cardUidList[v.type[2]] = true
+            -- cardstarList[v.type[2]] = v.type[3]
+            -- --心愿单新加星级判断，移除，自选卡不算心愿单，仅显示。
+            -- for key, value in pairs(self.wish_card) do
+            --     if value.id == v.type[1] and cardCfg[value.id].Grade == cardCfg[v.type[1]].Grade then
+            --         _G.table.insert(self.wish_get, value.id)
+            --         self.wish_card[key].isGet = true
+            --     end
+            -- end
+            local info = {}
+            info.sid = v.type[1]
+            info.cfg = _G.ConfigManager.card_cfg[info.sid]
+            info.star = v.type[3]
+            _G.table.insert(self.CurDrawCardData, info)
+        end
+    -- local cardList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    -- for _, v in pairs(cardList) do
+    --     if cardUidList[v.uid] ~= nil then
+    --         v:upStarCardAward(cardstarList[v.uid])
+    --         self.CurDrawCardData[v.uid] = v
+    --     end
+    -- end
+    end
+    if call ~= nil then
+        call(1, 2)
+    end
+end
+
+---抽卡
+function DrawModel:DrawCard(poolID, type, call)
+    local num = 0
+    if type == DrawType.once then
+        num = 1
+    elseif type == DrawType.TenTimes then
+        num = 10
+    end
+    if
+        not _G.StorageManager:GetInstance():CheckItem(
+            self.Pools[poolID].cfg.ticket[1],
+            0,
+            self.Pools[poolID].cfg.ticket[2] * num
+        )
+     then
+        return
+    end
+    if self.Pools[poolID].day_count + num > self.Pools[poolID].cfg.limit_daily then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130102)
+        return
+    end
+    local list = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    if _G.table.count(list) + num > _G.StorageManager:GetInstance():GetStorageCapacity(_G.StorageID.Card) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130101)
+        return
+    end
+    local msg = {}
+    msg.pool = poolID
+    msg.type = type
+    msg.is_resolve = true
+    DrawNet:GetInstance():DrawCard(msg, _G.handlerbind(self, self.DrawCardSuc, poolID, type, call))
+end
+
+---抽卡返回
+---@param data lucky_draw.s2c_ld_execute
+function DrawModel:DrawCardSuc(data, poolID, type, call)
+    if data.ack ~= 1 then
+        return
+    end
+
+    local num = 0
+    if type == DrawType.once then
+        num = 1
+    elseif type == DrawType.TenTimes then
+        num = 10
+    end
+    local RecordTotalZhaomuModelIns = require "RecordTotalZhaomuModel":GetInstance()
+    --累计招募活动是否开启或结束
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(56) and not RecordTotalZhaomuModelIns:CheckIsOver() then
+        RecordTotalZhaomuModelIns:GetInfo(
+            function()
+                RecordTotalZhaomuModelIns:RefreshRedPoint()
+            end
+        )
+    end
+
+    self.Pools[poolID].day_count = self.Pools[poolID].day_count + num
+    self.Pools[poolID].total_count = self.Pools[poolID].total_count + num
+
+    if self.ShowXinYuanPool[poolID] then
+        self.XinYuanDanDrawNum = self.XinYuanDanDrawNum + num
+    end
+    if self.cfg[poolID].is_cumulative then
+        self.exit_num = self.exit_num + num
+    end
+    if data.add_element_award ~= 0 then
+        self.KaPao = self.KaPao + data.add_element_award
+    end
+    if data.total_award ~= nil or data.add_element_award ~= 0 then
+        local award = _G.ConfigManager.lucky_goal_cfg[self.star_con].bonus
+        self.award_num = self.award_num + award[self.award_index][1]
+
+        self.award_index = self.award_index + 1
+        if self.award_index > _G.table.count(award) then
+            self.award_index = self.award_index - _G.table.count(award)
+        end
+        self:GengXingDqXingJi()
+        self:CalcAwardTime()
+        -- _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        local datalistitem = {}
+        datalistitem.award = {
+            item = {}
+        }
+        if data.total_award == nil then
+            data.total_award = {}
+        end
+        for key, value in pairs(data.total_award) do
+            _G.table.insert(self.datalistitem.award.item, value[1])
+            _G.table.insert(datalistitem.award.item, value[1])
+        end
+    end
+    self.isDrawUpdateAwardFlag = true
+    --五行召唤, 额外获取奖励
+    if data.element_award then
+        _G.StorageManager:GetInstance():ReceiveAwardData({award = data.element_award})
+        if not self.wuxingAward then
+            ---@type table<number,number> 五行召唤奖励(每召唤一次, 额外获取n枚五行商店代币)
+            self.wuxingAward = {}
+        end
+        for _, v in pairs(data.element_award.item) do
+            if v.type then
+                local currencySid, currencyNum = table.unpack(v.type)
+                self.wuxingAward[currencySid] = (self.wuxingAward[currencySid] or 0) + currencyNum
+            end
+        end
+    end
+
+    if data.resolve_award then
+        local aw = {award = data.resolve_award}
+        _G.StorageManager:GetInstance():ReceiveAwardData(aw)
+        --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, aw)
+        self.CurDrawAwardData = aw
+    end
+    if num == 1 then
+        local HellRoadModel = require "HellRoadModel"
+        local freeCount = HellRoadModel:GetInstance():GetNumber({_G.PrivilegeType.DrawCard.Count, poolID})
+        if self.Pools[poolID].free_times + num <= freeCount then
+            self.Pools[poolID].free_times = self.Pools[poolID].free_times + num
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.NomalDraw.id)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DrawButton.id)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FriendDraw.id)
+        else
+            self.Pools[poolID].free_times = freeCount
+            _G.StorageManager:GetInstance():ConsumeItem(
+                self.Pools[poolID].cfg.ticket[1],
+                0,
+                self.Pools[poolID].cfg.ticket[2] * num
+            )
+        end
+    else
+        _G.StorageManager:GetInstance():ConsumeItem(
+            self.Pools[poolID].cfg.ticket[1],
+            0,
+            self.Pools[poolID].cfg.ticket[2] * num
+        )
+    end
+
+    if data.award and data.award.item ~= nil then
+        --local cardUidList = {}
+        --local cardstarList = {}
+        local cardCfg = _G.ConfigManager.card_cfg
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        self.CurDrawCardData = {}
+        for _, v in pairs(data.award.item) do
+            --cardUidList[v.type[2]] = true
+            --cardstarList[v.type[2]] = v.type[3]
+            --心愿单新加星级判断,wish_get理论上没用了已经，不过防止策划反复横跳先保留
+            for key, value in pairs(self.wish_card) do
+                if value.id == v.type[1] and cardCfg[value.id].Grade == cardCfg[v.type[1]].Grade then
+                    _G.table.insert(self.wish_get, value.id)
+                    self.wish_card[key].isGet = true
+                end
+            end
+
+            local info = {}
+            info.sid = v.type[1]
+            info.cfg = _G.ConfigManager.card_cfg[info.sid]
+            info.star = v.type[3]
+            _G.table.insert(self.CurDrawCardData, info)
+        end
+        -- local cardList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+        -- for _, v in pairs(cardList) do
+        --     if cardUidList[v.uid] ~= nil then
+        --         v:upStarCardAward(cardstarList[v.uid])
+        --         self.CurDrawCardData[v.uid] = v
+        --     end
+        -- end
+        require "PopUpGiftBagModel":GetInstance():IsRecruitCard(data.award.item)
+        local is_bless = self.cfg[poolID].is_bless
+        if is_bless then
+            require "RecruitingBlessingsModel":GetInstance():AddScore(num)
+        end
+    end
+    local id
+    if poolID == 101 then
+        id = 1
+    elseif poolID == 201 then
+        id = 2
+    else
+        id = 3
+    end
+    self:RefreshDrawRewardRed()
+    _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, { _G.SeasonTaskID.Draw, id }, num)
+    _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, { _G.SeasonTaskID.Draw, 0 }, num)
+    ---taptap评论跳转相关
+    self:TapTapDiscuss()
+    --抽卡行为上报
+    local simpleDataModel = require("PlayerSimpleDataModel"):GetInstance()
+    local actionNum = simpleDataModel:GetGameAction(SDKDef.GameAction.EveryDraw40) + num
+    if actionNum >= 10 then
+        actionNum = actionNum - 10
+        _G.SDKManager:GetInstance():GameAction(SDKDef.GameAction.EveryDraw40, 1)
+    end
+    simpleDataModel:SetGameAction(SDKDef.GameAction.EveryDraw40, actionNum)
+
+    if call ~= nil then
+        call(num)
+    end
+end
+
+local SDKManager=_G.SDKManager:GetInstance()
+---taptap评论跳转
+function DrawModel:TapTapDiscuss()
+    local date=_G.ConfigManager.discrete_cfg[201801]
+    if SDKManager:GetChannelChildId()>0 and _G.GameUtil.GetFunctionData(_G.FunctionBlock.taptapevaluation) == SDKManager:GetChannelChildId() 
+            and _G.GlobalConditionManager.CheckConditionArraysCustomUnlockTip(date) then   
+        local creatroletime= _G.PlayerModel:GetInstance():GetCreateRoleTime()
+        local day=_G.TimeUtil.GetIntervalDayBySix1(creatroletime,_G.TimeUtil.GetServerUnixTime())+1
+        local hasScard=false
+        for k,v in pairs(self.CurDrawCardData) do
+            if v.cfg.Order>=4 then
+                hasScard=true
+            end
+        end
+        if (day==1 or day==3 or day==7 ) and hasScard and  _G.PlayerPrefsManager.GetInt("firstGetS+Card"..day,0)==0 then
+            self.IsShowTapTapDiscuss=true
+        end
+    end
+
+end
+
+--把五行和自动送还的奖励集合到一个方法里弹tips
+function DrawModel:PopAwardTips()
+    if self.popTipsAward and #self.popTipsAward > 0 then 
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.DrawFloatTipsView.Name,
+            nil,
+            nil,
+            function()
+                self.popTipsAward = {}
+            end,
+            self.popTipsAward
+        )
+    end
+end
+
+function DrawModel:AutoCardResolve(data, awardList)
+    self.datalistitem.award.item = {}
+
+    if data == nil then
+        return
+    end
+    local isAuto = require("CardInfoManager").GetPlayerPrefs_CardIsAutoResolve()
+    if isAuto == false then
+        return
+    end
+
+    if awardList then
+        local aw = {award = {}}
+        aw.award.item = {}
+        for _, value in pairs(awardList) do
+            table.insert(aw.award.item, value)
+        end
+        if #aw.award.item > 0 then 
+            self.popTipsAward = self.popTipsAward or {}
+            for i = 1, #aw.award.item do 
+                table.insert(self.popTipsAward, aw.award.item[i].type)
+            end
+            --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, aw)
+        end
+    end
+    -- local resolveCfg_grade = _G.ConfigManager.discrete_cfg[103705]
+    -- resolveCfg_grade = resolveCfg_grade and resolveCfg_grade[1][1] or 1
+
+    -- local cards =
+    --     _G.table.chooseToArray(
+    --     data,
+    --     function(k, v)
+    --         return v.Grade <= resolveCfg_grade
+    --     end
+    -- )
+    -- local uids =
+    --     _G.table.toArray(
+    --     cards,
+    --     function(v)
+    --         return v.uid
+    --     end
+    -- )
+    -- require("CardInfoManager").CardAutoResolve(uids)
+    self.datalist = nil
+end
+
+---计算当前奖励显示轮次
+function DrawModel:GengXingDqXingJi()
+    if self.GengHuan then
+        -- body
+        local newStarCon = self.star_con
+        if self.award_index == 0 or self.award_index == 1 then
+            self.GengHuan = false
+            local Maxstars = require "IllustrationModel":GetInstance().Maxstars or 0
+            local diyiCi = true
+            local goal = _G.ConfigManager.lucky_goal_cfg
+            for i = 1, _G.table.count(goal) do
+                if goal[i].condition > Maxstars and diyiCi then
+                    diyiCi = false
+                    newStarCon = i - 1
+                elseif goal[i].condition == Maxstars and diyiCi then
+                    newStarCon = i
+                end
+            end
+            if newStarCon == 0 then
+                newStarCon = 1
+            end
+        end
+        self.star_con = newStarCon
+    end
+end
+
+---领取普通池和五行池累计招募额外奖励
+function DrawModel:GetAward(call, datalist, awardList)
+    if #self.datalistitem.award.item > 0 then
+        for key, value in pairs(self.datalistitem.award.item) do
+            local _, type = _G.StorageManager:GetInstance():CheckSidType(value.type[1])
+            local num = _G.StorageManager:GetInstance():GetItemCountByID(type, value.type[1])
+            if value.type[3] ~= num then
+                self.datalistitem.award.item[key].type[3] = num + value.type[2]
+                num = num + value.type[2]
+            end
+        end
+        _G.StorageManager:GetInstance():ReceiveAwardData(self.datalistitem)
+    end
+    if datalist ~= nil then
+        if #self.datalistitem.award.item > 0 then
+            _G.UIUtils.ShowCommonAward(
+                self.datalistitem,
+                _G.handlerbind(self, self.AutoCardResolve, datalist, awardList)
+            )
+        else
+            self:AutoCardResolve(datalist, awardList)
+        end
+    else
+        if #self.datalistitem.award.item > 0 then
+            _G.UIUtils.ShowCommonAward(
+                self.datalistitem,
+                _G.handlerbind(self, self.AutoCardResolve, self.datalist, awardList)
+            )
+        end
+    end
+    if call ~= nil then
+        call()
+    --return 1
+    end
+    -- self.datalistitem.award.item = {}
+end
+
+---获取五行额外奖励, 并且清空缓存
+function DrawModel:GetWuxingAwardThenClear()
+    if not self.wuxingAward then
+        return
+    end
+    ---@type { type:number[] }[]
+    local item = {}
+    for sid, num in pairs(self.wuxingAward) do
+        local own = _G.StorageManager:GetInstance():GetItemCountBySid(sid) or 0
+        table.insert(item, {type = {sid, num, own + num}})
+    end
+    self.wuxingAward = nil
+    if #item <= 0 then
+        return
+    end
+    ---@type award.i_award 模拟服务器数据
+    local data = {award = {item = item}}
+    self.popTipsAward = self.popTipsAward or {}
+    for i = 1, #data.award.item do 
+        table.insert(self.popTipsAward, data.award.item[i].type)
+    end
+    --_G.UIUtils.ShowCommonAward(data)
+end
+
+---获取五行额外的奖励信息
+---@return number,number 对应物品id和数量
+function DrawModel:GetWuxingAwardInfos()
+    local cfg = _G.ConfigManager.discrete_cfg[100411]
+    if cfg and cfg[1] and #cfg[1] >= 2 then
+        return table.unpack(cfg[1])
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("invaild discrete_cfg.id=" .. 100411)
+        end
+        return 0, 0
+    end
+end
+
+---计算当前普通次数
+function DrawModel:CalcAwardTime()
+    local goal = _G.ConfigManager.lucky_goal_cfg
+
+    if goal[self.star_con] == nil or goal[self.star_con].bonus[self.award_index] == nil then
+        if _G.AppSetting.DEBUG then
+            _G.Log("资源加载错误")
+        end
+        return
+    end
+    local num = goal[self.star_con].bonus[self.award_index][1]
+    self.NextAward.index = self.award_num
+    self.NextAward.num = num
+    self.NextAward.LastTime = self.award_num
+end
+
+-- function DrawModel:awardnum()
+--     local cfg = _G.ConfigManager.discrete_cfg[100401]
+--     local Tiao = _G.table.count(cfg)
+--     local num = 0
+--     for key, value in pairs(cfg) do
+--         num = num + value[1]
+--     end
+--     local CiShu = _G.math.modf(self.exit_num / num) * Tiao
+
+--     local yushu = self.exit_num - num * _G.math.modf(self.exit_num / num)
+
+--     local e = 0
+--     local jia = 0
+--     for i = 1, Tiao do
+--         e = e + cfg[i][1]
+--         if yushu >= e then
+--             jia = i
+--         end
+--     end
+--     --self.award_num = CiShu + jia
+--     self:CalcAwardTime()
+-- end
+
+---领取额外奖励返回
+-- function DrawModel:GetAwardSuc(data, call)
+--     if data.ack ~= 1 then
+--         return
+--     end
+--     self.lingquaward_num = true
+--     -- self:awardnum()
+--     _G.StorageManager:GetInstance():ReceiveAwardData(data)
+--     table.insert(self.Awards, data)
+--     if self.datalist ~= nil then
+--         _G.UIUtils.ShowCommonAward(data, _G.handlerbind(self, self.AutoCardResolve, self.datalist))
+--     else
+--         _G.UIUtils.ShowCommonAward(data)
+--     end
+--     -- self.NextAward.LastTime = self.exit_num
+--     if call ~= nil then
+--         call()
+--     end
+-- end
+
+---获取额外奖励
+function DrawModel:GetAwards(poolID, WishList, call)
+    if _G.table.isEmptyOrNil(self.Awards) then
+        return
+    end
+
+    local data = {award = {item = {}, overflow = {}}}
+    for _, v in pairs(self.Awards) do
+        if v.award.item then
+            _G.table.insertto(data.award.item, v.award.item)
+        end
+        if v.award.overflow then
+            _G.table.insertto(data.award.overflow, v.award.overflow)
+        end
+    end
+    self.Awards = {}
+
+    _G.UIUtils.ShowCommonAward(data)
+end
+
+---六点刷新
+function DrawModel:OnSixClockUpdate(enccall)
+    self:Update()
+
+    --重置魂玉召唤次数
+    self.god_diamond_times = 0
+    --TODO: 刷新界面UI, 考虑使用委托回调的方式而不是直接调用???
+    ---@type {View: DrawUpMainView}
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DrawUpMainView.Name)
+    if window and window.View and not window.View:IsNil() then
+        window.View:LoadDiamondTimes()
+        window.View:LoadConsumesInfos()
+    end
+
+    --invoke base.OnSixClockUpdate
+    _G.GameDataModelBase.OnSixClockUpdate(self, enccall)
+
+    local week = _G.TimeUtil.GetDateTime(_G.TimeUtil.GetServerUnixTime()).week
+    if week == 1 then
+        _G.PlayerPrefsManager.SetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "GodSpecialGiftRegular", 0)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GiftofGod.id)
+    end
+end
+
+---解锁五行卡池
+function DrawModel:UnlockPool(poolID, call)
+    if not _G.StorageManager:GetInstance():CheckItem(_G.ResPropID.Diamond, _G.ConfigManager.discrete_cfg[100403][1][1]) then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, _G.ResPropID.Diamond)
+        return
+    end
+    local msg = {}
+    msg.pool = poolID
+    DrawNet:GetInstance():UnlockPool(msg, _G.handlerbind(self, self.UnlockPoolSuc, poolID, call))
+end
+
+---解锁五行卡池返回
+function DrawModel:UnlockPoolSuc(data, poolID, call)
+    if data.ack ~= 1 then
+        return
+    end
+    table.insert(self.special_pool, poolID)
+    self.Pools[poolID].Lock = false
+    _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, 0, _G.ConfigManager.discrete_cfg[100403][1][1])
+    --_G.StorageID.ResProp,()
+
+    if call ~= nil then
+        call()
+    end
+end
+
+---设置心愿单
+function DrawModel:SetWishList(poolID, pos)
+    local msg = {}
+    msg.cards = {}
+    local shu = poolID
+    msg.cards[1] = {key = pos, value = shu}
+    self.wish_card[pos].id = shu
+    self.wish_card[pos].index = pos
+    DrawNet:GetInstance():SetWishList(msg, _G.handlerbind(self, self.SetWishListSuc))
+end
+
+---设置心愿单返回
+function DrawModel:SetWishListSuc(data, call)
+    if data.ack ~= 1 then
+        return
+    end
+    if call ~= nil then
+        call()
+    end
+end
+
+---获取解锁的卡池
+function DrawModel:GetUnlockPool()
+    return self.special_pool
+end
+
+---获取卡池数据
+function DrawModel:GetPoolsData()
+    return self.Pools
+end
+
+---获取当次抽卡数据
+function DrawModel:GetCurDrawCardInfo()
+    return self.CurDrawCardData
+end
+
+---获取下一个可领取的奖励
+---@return number[][] @{{抽卡次数，奖励id，数量}}
+function DrawModel:GetAwardPre()
+    self:GengXingDqXingJi()
+    local turnTotalNum = self:GetTurnTotalDrawCount()
+    local nowTurnDrawStart = math.floor(self.exit_num / turnTotalNum) * turnTotalNum
+    local bonus = _G.ConfigManager.lucky_goal_cfg[self.star_con].bonus
+    local index = 1
+    while nowTurnDrawStart < self.exit_num do
+        nowTurnDrawStart = nowTurnDrawStart + bonus[index][1]
+        if nowTurnDrawStart > self.exit_num then
+            break
+        end
+        index = index + 1
+    end
+    local bonus = _G.ConfigManager.lucky_goal_cfg[self.star_con].bonus[index]
+    local item = _G.ConfigManager.lucky_goal_cfg[self.star_con].item
+    return bonus, bonus[2] == 0 and item or bonus[2], item
+end
+
+---获取一个轮次的总抽卡数
+---默认每个轮次相同才能计算当前奖励位置
+---@return number
+function DrawModel:GetTurnTotalDrawCount()
+    if not self.turnTotalNum then
+        self.turnTotalNum = 0
+        local bonus = _G.ConfigManager.lucky_goal_cfg[self.got_star_con].bonus
+        for i = 1, #bonus do
+            self.turnTotalNum = self.turnTotalNum + bonus[i][1]
+        end
+    end
+    return self.turnTotalNum
+end
+
+---获取未领取的全部奖励
+---@return number[][] @{{奖励id，数量}}
+function DrawModel:GetTotalAward()
+    self:GengXingDqXingJi()
+    if not self.isDrawUpdateAwardFlag and self.toGetAwardsCache then
+        return self.toGetAwardsCache
+    end
+    self.isDrawUpdateAwardFlag = false
+    local turnTotalNum = self:GetTurnTotalDrawCount()
+    local nowTurnDrawStart = math.floor(self.award_num / turnTotalNum) * turnTotalNum
+    local drawCount = self.award_num
+    local index = 1
+    local bonus = _G.ConfigManager.lucky_goal_cfg[self.got_star_con].bonus
+    while nowTurnDrawStart + bonus[index][1] <= drawCount do
+        nowTurnDrawStart = bonus[index][1] + nowTurnDrawStart
+        index = index + 1
+    end
+    local star_con = self.got_star_con
+    --从下一位开始计算
+    if index > #bonus then
+        index = 1
+        star_con = self.star_con
+    end
+    local togetAwardsDic = {}
+    while drawCount + bonus[index][1] <= self.exit_num do
+        drawCount = bonus[index][1] + drawCount
+        if bonus[index][2] ~= 0 then --五行卡单独处理
+            if togetAwardsDic[bonus[index][2]] then
+                togetAwardsDic[bonus[index][2]] = togetAwardsDic[bonus[index][2]] + bonus[index][3]
+            else
+                togetAwardsDic[bonus[index][2]] = bonus[index][3]
+            end
+        else
+            local sid = _G.ConfigManager.lucky_goal_cfg[self.got_star_con].item
+            if togetAwardsDic[sid] then
+                togetAwardsDic[sid] = togetAwardsDic[sid] + bonus[index][3]
+            else
+                togetAwardsDic[sid] = bonus[index][3]
+            end
+        end
+        index = index + 1
+        if index > #bonus then
+            index = 1
+            star_con = self.star_con
+        end
+    end
+    self.toGetAwardsCache = {}
+    for sid, num in pairs(togetAwardsDic) do
+        self.toGetAwardsCache[#self.toGetAwardsCache + 1] = {sid, num}
+    end
+    table.sort(
+        self.toGetAwardsCache,
+        function(l, r)
+            local itemCfg = _G.ConfigManager.item_cfg
+            if itemCfg[l[1]].Quality ~= itemCfg[r[1]].Quality then
+                return itemCfg[l[1]].Quality > itemCfg[r[1]].Quality
+            end
+            return l[1] < r[1]
+        end
+    )
+    return self.toGetAwardsCache
+end
+
+---领取累计奖励
+---@param callback fun()
+function DrawModel:GetDrawExAward(callback, isSpAward)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(159) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(340603)
+        return
+    end
+
+    local net = require "DrawNet":GetInstance()
+
+    local recieveAwardPre = function()
+        local turnTotalNum = self:GetTurnTotalDrawCount()
+        local nowTurnDrawStart = math.floor(self.exit_num / turnTotalNum) * turnTotalNum
+        local index = 0
+        while nowTurnDrawStart <= self.exit_num do
+            local bonusItem = _G.ConfigManager.lucky_goal_cfg[self.got_star_con].bonus[index]
+            if bonusItem then
+                if bonusItem[1] + nowTurnDrawStart > self.exit_num then
+                    break
+                end
+                nowTurnDrawStart = bonusItem[1] + nowTurnDrawStart
+            end
+            index = index + 1
+        end
+
+        self.award_num = nowTurnDrawStart
+        self.award_index = index
+        self.isDrawUpdateAwardFlag = true
+
+        self:GengXingDqXingJi()
+        self.got_star_con = self.star_con
+        self:CalcAwardTime()
+    end
+    local recieveAward = function(awardData)
+        _G.StorageManager:GetInstance():ReceiveAwardData(awardData)
+        if #awardData.award.item > 0 then
+            _G.UIUtils.ShowCommonAward(awardData)
+        end
+    end
+
+    if isSpAward then
+        local msg = {}
+        msg.element = 1
+        msg.num = 1
+        net:GetDrawExAward(
+            function(data)
+                net:ChoKaDrawCard(
+                    msg,
+                    function(data)
+                        if data.ack ~= 1 then
+                            return
+                        end
+                        recieveAwardPre()
+                        if data.award.item ~= nil then
+                            recieveAward(data)
+                        end
+                        _G.Events:GetInstance():Broadcast(_G.eDraw.RefreshDrawView)
+                        self:RefreshDrawRewardRed()
+                        if callback then
+                            callback()
+                        end
+                    end
+                )
+            end
+        )
+    else
+        ---@param data lucky_draw.s2c_get_total_award
+        net:GetDrawExAward(
+            function(data)
+                if data.add_element_award ~= 0 then
+                    self.KaPao = self.KaPao + data.add_element_award
+                end
+                recieveAwardPre()
+                if data.total_award ~= nil or data.add_element_award ~= 0 then
+                    if data.total_award == nil then
+                        data.total_award = {}
+                    end
+                    local datalistitem = {}
+                    datalistitem.award = {
+                        item = {}
+                    }
+                    for key, value in ipairs(data.total_award.item) do
+                        _G.table.insert(datalistitem.award.item, value)
+                    end
+                    recieveAward(datalistitem)
+                end
+                _G.Events:GetInstance():Broadcast(_G.eDraw.RefreshDrawView)
+                self:RefreshDrawRewardRed()
+                if callback then
+                    callback()
+                end
+            end
+        )
+    end
+end
+
+---时间到了刷新
+function DrawModel:Update()
+    self:CulcPropPoolToday()
+    if self.Pools then
+        for i, v in pairs(self.Pools) do
+            self.Pools[i].day_count = 0
+            self.Pools[i].Lock = true
+        end
+    end
+    self.Pools[self.PropPoolToday].Lock = false
+    self:GetDrawCardInfo(
+        function()
+            local DrawView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DrawView.Name)
+            local PropDrawSelectView =
+                _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.PropDrawSelectView.Name)
+            local GodSpecialGiftRegularView =
+                _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GodSpecialGiftRegularView.Name)
+            if DrawView ~= nil then
+                DrawView.View:Update()
+            end
+            if PropDrawSelectView ~= nil then
+                PropDrawSelectView.View:Update()
+            end
+            if GodSpecialGiftRegularView ~= nil then
+                GodSpecialGiftRegularView.View:UpdateView(true)
+            end
+            --刷新降神特惠礼包红点
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GiftofGod.id)
+        end
+    )
+    --self:NewDay_count()
+end
+
+---获取(付费)降神特惠礼包已购买次数
+function DrawModel:GetGiftBuyCount(id)
+    if not self.BefallGift then
+        return 0
+    end
+    return self.BefallGift[id] or 0
+end
+
+--region 红点数据更新
+function DrawModel:GengXingShuJu(Id)
+    local Prop = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Prop)
+    if Id == nil then
+        self:PuTongPanDuan(Prop)
+        self:WuXiPanDuan(Prop)
+        self:YouQingDianPanDuan()
+        self:GodPanDuan()
+    elseif ZhaoMuXiaoHao.PuTo == Id then
+        self:PuTongPanDuan(Prop)
+    elseif ZhaoMuXiaoHao.WuXi == Id then
+        self:WuXiPanDuan(Prop)
+    elseif ZhaoMuXiaoHao.YouQingDian == Id then
+        self:YouQingDianPanDuan()
+    elseif ZhaoMuXiaoHao.God == Id then
+        self:GodPanDuan()
+    end
+    if Id ~= nil then
+        return self.ZhaoMuJuan[Id]
+    else
+        return 0
+    end
+end
+
+function DrawModel:PuTongPanDuan(prop)
+    local PuTo = prop[ZhaoMuXiaoHao.PuTo]
+    if PuTo ~= nil and PuTo.count > 9 then
+        if _G.PlayerPrefsManager.GetInt("NomalDraw_PropNum", 0) < 10 then
+            self.ZhaoMuJuan[ZhaoMuXiaoHao.PuTo] = true
+        else
+            self.ZhaoMuJuan[ZhaoMuXiaoHao.PuTo] = false
+            _G.PlayerPrefsManager.SetInt("NomalDraw_PropNum", PuTo.count)
+        end
+    elseif self:imageXianShi() then
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.PuTo] = true
+    else
+        -- body
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.PuTo] = false
+        if PuTo then
+            _G.PlayerPrefsManager.SetInt("NomalDraw_PropNum", PuTo.count)
+        end
+    end
+end
+
+function DrawModel:RefreshPuTongRedPoint()
+    local count = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.Prop, ZhaoMuXiaoHao.PuTo)
+    _G.PlayerPrefsManager.SetInt("NomalDraw_PropNum", count)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.NomalDraw.id)
+end
+
+function DrawModel:WuXiPanDuan(prop)
+    local WuXi = prop[ZhaoMuXiaoHao.WuXi]
+    if WuXi ~= nil and WuXi.count > 9 then
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.WuXi] = true
+    else
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.WuXi] = false
+    end
+end
+
+function DrawModel:YouQingDianPanDuan()
+    local YouQingDian = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.ResProp, _G.ResPropID.Friendship)
+    if YouQingDian ~= nil and YouQingDian > 99 then
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.YouQingDian] = true
+    else
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.YouQingDian] = false
+    end
+end
+
+---获取降神卡池配置
+---@return limited_roller_cfg
+function DrawModel:GetGodCfg()
+    if not self.godCfg then
+        local poolCfg = _G.ConfigManager.discrete_cfg[104314]
+        if not poolCfg then
+            return nil
+        end
+        self.godCfg = _G.ConfigManager.limited_roller_cfg[poolCfg[1][1]]
+    end
+    return self.godCfg
+end
+
+function DrawModel:GodPanDuan()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(52) then
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.God] = false
+        return
+    end
+    local God = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.Prop, ZhaoMuXiaoHao.God)
+    if God ~= nil and God > 9 then
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.God] = true
+    else
+        self.ZhaoMuJuan[ZhaoMuXiaoHao.God] = false
+    end
+end
+
+--#endregion
+
+--#region 降神召唤
+---获取绝卡的卡牌
+function DrawModel:GetCard()
+    local StorageManager = _G.StorageManager:GetInstance()
+    local tb = {}
+    local cardList = self:GetGodCfg().limited_item[1] or {}
+    for _, v in pairs(cardList) do
+        local data = StorageManager:GetMaxStarCardBySid(v)
+        if not data then
+            data = StorageManager:GetItemDataClass(v, 1)
+        end
+        if v == self.godCardSid then
+            _G.table.insert(tb, 1, data)
+        else
+            _G.table.insert(tb, data)
+        end
+    end
+    local max = _G.ConfigManager.discrete_cfg[103704][1][1]
+    ---@param a CardData
+    _G.SortList(
+        tb,
+        function(a)
+            local god = a:GetElement() == _G.CardElementType.God and 1 or 0
+            local isCur = a.sid == self.godCardSid and 1 or 0
+            local haveCard = a.sid ~= a.uid and 1 or 0
+            local isMax = a.star < max and 1 or 0
+            return isCur, isMax, god, haveCard, a.sid
+        end
+    )
+    return tb
+end
+
+---设置降神卡牌
+function DrawModel:SetGodCard(sid, callback)
+    require "DrawNet":GetInstance():SetGodCard(
+        {sid = sid},
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            self.godCardSid = sid
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---获取降神召唤预览奖励
+function DrawModel:GetGodPreAward()
+    local Card
+    local tb
+    if self.godCardSid > 0 then
+        local data
+        data = _G.StorageManager:GetInstance():GetMaxStarCardBySid(self.godCardSid)
+        if not data then
+            data = _G.StorageManager:GetInstance():GetItemDataClass(self.godCardSid, 1)
+        end
+        local per = self:GetGodCfg().limited_item[2][1]
+        Card = {data = data, per = per / 10000}
+    end
+    local Award = {}
+    if Card then
+        Award[1] = Card
+    end
+    local AllPer = Card and 1 - Card.per or 1
+    local itemAward = self:GetGodCfg().pool
+    local allPower = 0
+    for i, v in ipairs(itemAward) do
+        local data = _G.StorageManager:GetInstance():GetItemDataClass(v[1], v[2])
+        _G.table.insert(Award, {data = data, per = v[3]})
+        allPower = v[3] + allPower
+    end
+    for i, v in ipairs(Award) do
+        if Card then
+            if i > 1 then
+                v.per = _G.math.ceil(AllPer / allPower * v.per * 10000) / 10000
+            end
+        else
+            v.per = _G.math.ceil(AllPer / allPower * v.per * 10000) / 10000
+        end
+    end
+    return Award
+end
+
+---降神抽取
+---@param num number @召唤次数
+---@param consumeType number @1招募券召唤, 2魂玉召唤
+function DrawModel:DrawGodCard(consumeType, num, call, cancelCall)
+    if self.godCardSid <= 0 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(260101)
+        if cancelCall then
+            cancelCall()
+        end
+        return
+    end
+
+    local material = _G.DeepCopyCfgTable(self:GetGodCfg().ticket)
+    material[2] = material[2] * num
+    if self.godCount + material[2] > self:GetGodCfg().limit_daily then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130102)
+        if cancelCall then
+            cancelCall()
+        end
+        return
+    end
+
+    local msg = {}
+    msg.consume_type = consumeType
+    msg.draw_times = num
+    DrawNet:GetInstance():DrawGodCard(msg, _G.handlerbind(self, self.DrawGodCardSuc, material, call, consumeType, num))
+end
+
+function DrawModel:OpenViewEndTOBack(call)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DrawView.Name)
+    if not view then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DrawView.Name, 1, call)
+    end
+end
+
+---@param consumeType numeber @1招募券召唤, 2魂玉召唤
+function DrawModel:DrawGodCardSuc(data, material, call, consumeType, num)
+    -- local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DrawView.Name)
+    -- if window and window.View and not window.View:IsNil() then
+    --     window.View.GodDraw.isClick = false
+    --     window.View:LoadGodConsumesInfos()
+    -- end
+    if data.ack ~= 1 then
+        return
+    end
+    if consumeType == 1 then
+        --消耗招募券
+        _G.StorageManager:GetInstance():ConsumeItem(material[1], nil, material[2])
+        if self.ShowXinYuanPool[_G.CardPoolType.God] then
+            self.XinYuanDanDrawNum = self.XinYuanDanDrawNum + num
+        end
+    else
+        --消耗魂玉
+        local consumeNum = self:GetGodDiamondConsume(num)
+        self:AddGodDiamondTimes(num)
+        _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, 0, consumeNum)
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    self.godCount = self.godCount + material[2]
+    self.godMaxCount = self.godMaxCount + material[2]
+
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GodDraw.id)
+    _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.Draw, 4}, num)
+    _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.Draw, 0}, num)
+
+    local reset = self:UpdateGodDrawInfo(data, consumeType)
+    if call then
+        call(data, reset)
+    end
+end
+
+--region 降神招募- 魂玉召唤
+---获取已使用魂玉召唤次数
+---@return number
+function DrawModel:GetGodDiamondTimes()
+    return self.god_diamond_times or 0
+end
+
+---增加已使用魂玉召唤次数
+---@param num number 次数
+---@return number   当前次数
+function DrawModel:AddGodDiamondTimes(num)
+    self.god_diamond_times = (self.god_diamond_times or 0) + num
+    return self.god_diamond_times
+end
+
+---获取魂玉召唤次数上限
+---@return number
+function DrawModel:GetGodDiamondTotalTimes()
+    local num = self.god_diamond_total_times or 0
+    local data =
+        require "PrivilegeManager":GetInstance():GetPrivilegeData({_G.PrivilegeType.LimitedTimePrivilege.ShopNumAdd, 1})
+    if data[1] then
+        num = data[1] + num
+    end
+    return num
+end
+
+---获取魂玉召唤消耗
+---@param num number        召唤次数
+---@return number,number    @需要消耗的魂玉数量, @特权折扣信息
+function DrawModel:GetGodDiamondConsume(num)
+    local consume = (self.god_diamond_consume_num or 0) * num
+    local discount = 1
+
+    --获取降神召唤(魂玉)折扣特权
+    local privilege =
+        require "PrivilegeManager":GetInstance():GetPrivilegeData(
+        {_G.PrivilegeType.LimitedTimePrivilege.GodDrawDiamondReduce}
+    )
+    if privilege and privilege[1] then
+        local poolId, _discount = self:GetGodPrivilegeDiamondDiscount()
+        local poolCfg = _G.ConfigManager.discrete_cfg[104314]
+        if poolCfg and poolId == poolCfg[1][1] and _discount > 0 then --判断poolId是否为当前降神召唤
+            discount = 1 - _discount
+        end
+    end
+    if discount > 0 and discount < 1 then
+        --小数不能准确表示, 在向上取整时应额外减去一个很小的偏移值
+        consume = math.ceil(consume * discount - 0.0001)
+    end
+
+    return consume, discount
+end
+
+---获取降神特权折扣信息
+---@return number,number  @对应池子ID, @折扣比例0.0-1.0, 10%折扣表示为0.1
+function DrawModel:GetGodPrivilegeDiamondDiscount()
+    local monthCfg = _G.ConfigManager.store_month_cfg[405001]
+    if not monthCfg then
+        return 0, 0
+    end
+
+    local poolId, discount = 0, 0
+    for _, privilegeId in pairs(monthCfg.extra_first) do
+        local d = _G.ConfigManager.privilege_cfg[privilegeId]
+        if d and d.privilege[1][1] == _G.PrivilegeType.LimitedTimePrivilege.GodDrawDiamondReduce then
+            --策划说降神召唤只会同时存在一个, 特权配置里也不对同时存在多个降神召唤池子的折扣配置, 因此直接退出循环
+            poolId = d.privilege[1][2]
+            discount = d.privilege[1][3] * 0.0001
+            break
+        end
+    end
+    return poolId, discount
+end
+
+---是否拥有降神特权折扣
+---@return boolean
+function DrawModel:HasGodPrivilegeDiamondDiscount()
+    if not require("MonthlyModel"):GetInstance():IsHavePrivi(405001) then
+        return false
+    end
+    --判断poolId是否为当前降神召唤
+    local poolId = self:GetGodPrivilegeDiamondDiscount()
+    local poolCfg = _G.ConfigManager.discrete_cfg[104314]
+    if not poolCfg or poolId ~= poolCfg[1][1] then
+        return false
+    end
+    return true
+end
+
+--endregion
+
+---更新卡的召唤次数
+---@param data public.s2c_common_ack
+function DrawModel:UpdateGodDrawInfo(data, type)
+    if not data then
+        return
+    end
+    -- if not self.godCardDrawInfo[self.godCardSid] then
+    --     self.godCardDrawInfo[self.godCardSid] = 0
+    -- end
+    if data.award then
+        local isHave = false
+        if data.award.item then
+            for k, v in ipairs(data.award.item) do
+                if v.type[1] == self.godCardSid then
+                    self.godCardDrawInfo = 0
+                    isHave = true
+                else
+                    self.godCardDrawInfo = self.godCardDrawInfo + 1
+                end
+            end
+        end
+        if data.award.overflow then
+            -- for _, v in ipairs(data.award.overflow) do
+            --     if v.type[1] == self.godCardSid then
+            --         self.godCardDrawInfo = 0
+            --         isHave = true
+            --     else
+            --         self.godCardDrawInfo = self.godCardDrawInfo + 1
+            --     end
+            -- end
+            _G.PopWindowManager:GetInstance():ShowAllTips(380104)
+            self:GetDrawCardInfo(
+                function()
+                    local GodDrawView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GodDrawView.Name)
+                    if GodDrawView ~= nil then
+                        GodDrawView.View:RefreshView()
+                    end
+                end
+            )
+        end
+    -- if isHave then
+    --     self.godCardDrawInfo = 0
+    -- end
+    end
+end
+
+---获取每张卡的抽取信息
+function DrawModel:GetGodCardInfo(sid)
+    return self.godCardDrawInfo
+end
+
+---是否显示心愿单
+function DrawModel:IsShowXinYuanDan(poolID)
+    return self.ShowXinYuanPool[poolID]
+end
+
+function DrawModel:OnMallCashListener(data)
+    local infocfgs = _G.ConfigManager.discrete_cfg[104313][1]
+    if not _G.table.ContainsValue(infocfgs, data.sid) then
+        return
+    end
+    if not self.BefallGift[data.sid] then
+        self.BefallGift[data.sid] = 1
+    else
+        self.BefallGift[data.sid] = self.BefallGift[data.sid] + 1
+    end
+end
+
+function DrawModel:RefreshDrawRewardRed()
+    if _G.ConfigManager.redpoint_cfg.DrawReward then
+        self.isDrawRewardRedEnable = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(159)
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DrawReward.id)
+    end
+end
+
+---重置vip累充红点
+function DrawModel:UpdateDrawRewardRed()
+    if not self.isDrawRewardRedEnable and _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(159) then
+        self.isDrawRewardRedRead = false
+        self:RefreshDrawRewardRed()
+    end
+end
+
+---vip不满足时，本次登录显示红点；vip满足时，每次进度满了都显示红点
+function DrawModel:SetDrawRewardRedRead()
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(159) then
+        return
+    end
+    if self.NextAward and (self.exit_num - self.NextAward.LastTime) >= self.NextAward.num then
+        self.isDrawRewardRedRead = true
+        self:RefreshDrawRewardRed()
+    end
+end
+
+function DrawModel:GetDrawRewardRedRead()
+    return self.isDrawRewardRedRead
+end
+
+---获取五行招募累计GM数据
+function DrawModel:GetFiveLinesOfRecruitment()
+    if self.FiveLinesOfRecruitmentClass and self.FiveLinesOfRecruitmentClass:GetTime() > 0 then
+        return self.FiveLinesOfRecruitmentClass
+    end
+    return nil
+end
+
+---设置五行招募累计GM数据
+function DrawModel:SetFiveLinesOfRecruitment(class)
+    self.FiveLinesOfRecruitmentClass = class
+end
+
+---五行招募次数累计
+function DrawModel:ChangeFLORTimes(times)
+    if self.FiveLinesOfRecruitmentClass then
+        self.FiveLinesOfRecruitmentClass.CurTimes = self.FiveLinesOfRecruitmentClass.CurTimes + times
+    end
+end
+
+---五行招募奖励领取次数累计
+function DrawModel:ChangeAwardTimes(times)
+    if self.FiveLinesOfRecruitmentClass then
+        self.FiveLinesOfRecruitmentClass.Info.award_times = self.FiveLinesOfRecruitmentClass.Info.award_times + times
+    end
+end
+
+--检查祝福招募功能开启
+---return boolean number 是否开启  剩余招募次数
+function DrawModel:CheckBlessOpen()
+    local num = self.Pools[101].total_count
+    --普通招募+五行招募次数
+    _G.Log(num, "普通招募次数")
+    for i = 301, 305 do
+        num = num + self.Pools[i].total_count
+    end
+    _G.Log(num, "总招募次数")
+    return num >= _G.ConfigManager.discrete_cfg[104514][1][1], _G.ConfigManager.discrete_cfg[104514][1][1] - num
+end
+
+--endregion
+
+return DrawModel

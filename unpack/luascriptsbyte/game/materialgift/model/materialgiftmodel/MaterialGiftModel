@@ -1,0 +1,475 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie.alpha_JT.Client.Assets.Resources.LuaScripts.Game.MaterialGift.Model.MaterialGiftModel	(修改路径必须修正此项!)
+-- Created by huangbaiying
+-- DateTime: 2024/03/15
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+local base = _G.GameDataModelBase
+---@class MaterialGiftModel:GameDataModelBase    中文描述
+---@field GetInstance fun():MaterialGiftModel
+---@field GiftList List 礼包数据
+---@field giftTimes List 礼包剩余时间
+local MaterialGiftModel = _G.BaseClass("MaterialGiftModel", base)
+local targetCfg = _G.ConfigManager.store_target_cfg
+local StateType = {
+    close = 0,
+    open = 1,
+    unOpen = 2
+}
+local table = _G.table
+local TimeUtil = _G.TimeUtil
+
+---类的构造函数
+function MaterialGiftModel:__init()
+    -- self.curFunctionOpenID = _G.FunctionID.MaterialGift
+    self.GiftList = {}
+    self.giftTimes = {}
+	--ZHJH5ZHJH-5772 【5月版本】程序主单号ZHJH-6073 材料礼包换新SevenGiftModel，这个弃用
+    -- for k, v in pairs(targetCfg) do
+    --     local data = {}
+    --     data.id = v.id
+    --     data.type = v.type
+    --     data.giftList = v.store_extra
+    --     data.continueTime = v.disappear
+    --     data.state = StateType.unOpen
+    --     data.condition_type = v.condition_type
+    --     data.buyList = {}
+    --     data.curDay = 0
+    --     data.buyCount = 0
+    --     self.GiftList[data.id] = data
+    -- end
+    -- _G.Events:GetInstance():AddListener(_G.eAfkEvents.Pass, self.CheckOpen, self)
+end
+
+function MaterialGiftModel:GetDataFormServer()
+    --require("MaterialGiftNet"):GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---解析数据
+---@param data table 服务器返回数据
+function MaterialGiftModel:ParseData(data)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.InitGiftActive, self)
+    _G.Events:GetInstance():AddListener(_G.eMainViewShow.Fort, self.InitGiftActive1, self)
+    _G.Events:GetInstance():RemoveListener(_G.eAfkEvents.Pass, self.CheckOpen, self)
+    if _G.table.isEmptyOrNil(data) then
+        if self.endCallback then
+            self.endCallback()
+        end
+        self.endCallback = nil
+        return
+    end
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    for k, v in pairs(data.gift) do
+        if self.GiftList[v.sid] then
+            local data = self.GiftList[v.sid]
+            data.buyCount = 0
+            data.startTime = v.start_time
+            if v.cash_gift then
+                for k, id in pairs(v.cash_gift) do
+                    data.buyList[id] = 1
+                    data.buyCount = data.buyCount + 1
+                end
+            end
+            if data.buyCount == 7 then
+                self:CloseActive(v.sid)
+            elseif v.start_time + (data.continueTime * 86400) <= curTime + 1 then
+                self:CloseActive(v.sid)
+            elseif v.start_time + (data.continueTime * 86400) > curTime then
+                data.curDay = math.ceil((curTime - v.start_time) / 86400)
+                self.giftTimes[v.sid] = (data.continueTime * 86400) - curTime + v.start_time
+                data.state = StateType.open
+                if not data.show then
+                    -- local MainOpenViewFunItem = {}
+                    -- MainOpenViewFunItem.OpenViewFun = function()
+                    --     self:OpenWindow(data.type)
+                    -- end
+                    -- _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.MaterialGift)
+                    self:ShowGiftUI(data.type, true)
+                else
+                    local view = self:GetWindow(data.type)
+                    if view then
+                        view:UpdateItems()
+                    end
+                end
+                data.show = true
+            else
+                data.state = StateType.unOpen
+            end
+            --self.GiftList[v.sid].buyList = v.cash_gift
+        end
+    end
+    if self.sendBuy then
+        local data = {}
+        data.award = {}
+        data.award.item = self.curBuyGift.goods
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+        self.sendBuy = false
+        if self.mallCall then
+            self.mallCall()
+        end
+    end
+    if not table.isEmptyOrNil(self.giftTimes) then
+        self:StartTimer()
+    end
+    self.initDataDoneTag = nil
+    if self.endCallback then
+        self.endCallback(self.__cname)
+    end
+    self.endCallback = nil
+end
+
+---重连成功调用
+---@param endcall function 完成回调
+function MaterialGiftModel:ReConnect(endcall)
+    self:GetDataFormServer()
+    if endcall ~= nil then
+        endcall(self.__cname)
+    end
+end
+
+function MaterialGiftModel:CheckOpen()
+    local bol = true
+    for k, v in pairs(self.GiftList) do
+        if v.state == StateType.unOpen then
+            if _G.GlobalConditionManager.CheckConditionByArray(v.condition_type) then
+                self:OpenActive(v.id)
+            end
+            bol = false
+        end
+    end
+    if bol then
+        _G.Events:GetInstance():RemoveListener(_G.eAfkEvents.Pass, self.CheckOpen, self)
+    end
+end
+
+---购买礼包
+function MaterialGiftModel:BuyGift(data, sid, callBack)
+    self.curBuyGift = data
+    self.curSid = sid
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    self.mallCall = callBack
+    require("MallManager"):GetInstance():BuyActiveGift(data.price, nil, data.id)
+end
+
+function MaterialGiftModel:OnMallCashListener(data)
+    if data.sid == self.curBuyGift.id then
+        local curGiftData = self.GiftList[self.curSid]
+        curGiftData.buyList[data.sid] = 1
+        curGiftData.buyCount = curGiftData.buyCount + 1
+        if curGiftData.buyCount == 7 then
+            self:CloseActive(self.curSid)
+        end
+        if self.mallCall then
+            self.mallCall()
+            self.mallCall = nil
+        end
+        _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    end
+end
+
+---初始化功能逻辑
+function MaterialGiftModel:InitFunction()
+    ---ZHJH-5591 第二赛季临时处理
+    for k, v in pairs(self.GiftList) do
+        if v.state == StateType.open then
+            if v.id == 1200001 then
+                if require("SeasonModel"):GetInstance():GetCurSeasonId() > 1 then
+                    self:CloseActive(1200001)
+                end
+            elseif v.id == 1200002 then
+                if require("SeasonModel"):GetInstance():GetCurSeasonId() > 2 then
+                    self:CloseActive(1200002)
+                end
+            end
+        end
+    end
+end
+
+---类的析构函数
+function MaterialGiftModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eAfkEvents.Pass, self.CheckOpen, self)
+    _G.Events:GetInstance():RemoveListener(_G.eMainViewShow.Fort, self.InitGiftActive1, self)
+end
+
+---获取礼包数据
+function MaterialGiftModel:GetGiftData(type, ignoreOpen)
+    for k, v in pairs(self.GiftList) do
+        if v.type == type and (v.state == StateType.open or ignoreOpen) then
+            return v
+        end
+    end
+    return nil
+end
+
+function MaterialGiftModel:CheckIsOpen(type)
+    if not type then
+        return
+    end
+    for k, v in pairs(self.GiftList) do
+        if v.type == type and v.state == StateType.open then
+            return true
+        end
+    end
+    return false
+end
+
+---检测魂链礼包
+function MaterialGiftModel.CheckHLGift()
+    return MaterialGiftModel:GetInstance():CheckIsOpen(1)
+end
+
+---检测灵脉礼包
+function MaterialGiftModel.CheckLMGift()
+    return MaterialGiftModel:GetInstance():CheckIsOpen(2)
+end
+
+---检测灵兽礼包
+function MaterialGiftModel.CheckPetGift()
+    return MaterialGiftModel:GetInstance():CheckIsOpen(4)
+end
+
+---检查礼包是否能够激活
+function MaterialGiftModel:CheckGift(star)
+    for k, v in pairs(self.GiftList) do
+        if v.state == StateType.unOpen then
+            if _G.GlobalConditionManager.CheckConditionByArray(v.condition_type) then
+                self:OpenActive(v.id)
+            end
+        end
+    end
+end
+
+function MaterialGiftModel:InitGiftActive(view)
+    if view == _G.ConfigManager.ui_cfg.MainView.Name then
+        local maxStar = require "IllustrationModel":GetInstance():GetAllCardMaxStar()
+        for k, v in pairs(self.GiftList) do
+            if v.state == StateType.unOpen then
+                if _G.GlobalConditionManager.CheckConditionByArray(v.condition_type) then
+                    self:OpenActive(v.id)
+                end
+            end
+        end
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.InitGiftActive, self)
+    end
+end
+
+--ZHJH-4795 【7日粉将（英雄晋升）】通关3-12后，活动没有开启
+--为了检测开启条件，回主城的时候回调一下，如果所有礼包全部开过了注销
+function MaterialGiftModel:InitGiftActive1()
+    local bol = true
+    for k, v in pairs(self.GiftList) do
+        if v.state == StateType.unOpen then
+            if _G.GlobalConditionManager.CheckConditionByArray(v.condition_type) then
+                self:OpenActive(v.id)
+            end
+            bol = false
+        end
+    end
+    if bol then
+        _G.Events:GetInstance():RemoveListener(_G.eMainViewShow.Fort, self.InitGiftActive1, self)
+    end
+end
+
+function MaterialGiftModel:OpenActive(sid)
+    --require("MaterialGiftNet"):GetInstance():ActiveGift(sid, _G.handlerbind(self, self.ActiveCall, sid))
+end
+
+function MaterialGiftModel:ActiveCall(msg, sid)
+    if msg.ack ~= 1 then
+        return
+    end
+    local useTime = TimeUtil:GetSecondsOfDayOf6Hour()
+    local curTime = TimeUtil:GetServerUnixTime()
+    self.GiftList[sid].startTime = curTime - useTime
+    self.GiftList[sid].state = StateType.open
+    self.giftTimes[sid] = (self.GiftList[sid].continueTime * 86400) - useTime
+    self.GiftList[sid].curDay = 1
+    self:StartTimer()
+    --local MainOpenViewFunItem = {}
+    --MainOpenViewFunItem.OpenViewFun = function()
+    --    self:OpenWindow(self.GiftList[sid].type)
+    --end
+    self.GiftList[sid].show = true
+    --_G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem,_G.MainViewShowOrder.MaterialGift)
+    self:ShowGiftUI(self.GiftList[sid].type, true)
+    --是否显示主页面按钮
+    local mainFunctionId
+    if self.GiftList[sid].type == 1 then
+        mainFunctionId = _G.MainFunctionItems.MaterialCard
+    elseif self.GiftList[sid].type == 2 then
+        mainFunctionId = _G.MainFunctionItems.MaterialLM
+    elseif self.GiftList[sid].type == 3 then
+        mainFunctionId = _G.MainFunctionItems.MaterialArtifact
+    elseif self.GiftList[sid].type == 4 then
+        mainFunctionId = _G.MainFunctionItems.MaterialPet
+    end
+    local mainFunctionCfg = mainFunctionId and _G.ConfigManager.main_function_cfg[mainFunctionId]
+    if mainFunctionCfg and mainFunctionCfg.ShowInMainView then
+        _G.FunctionManager:GetInstance():OpenFunById(mainFunctionId)
+    end
+    --require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+function MaterialGiftModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckIsFirstShow }
+    self.redpointTree = { false }
+end
+
+function MaterialGiftModel:CheckIsFirstShow()
+    local value = _G.PlayerPrefsManager.GetInt("MaterialGiftModel", 0)
+    if value ~= 2 then
+        return 1
+    end
+
+    return 0
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function MaterialGiftModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+function MaterialGiftModel:TimerFunc(elapsed)
+    for k, v in pairs(self.giftTimes) do
+        v = v - elapsed
+        v = Mathf.RoundToInt(v)
+        self.giftTimes[k] = v
+        if v <= 1 then
+            self:CloseActive(k)
+            self.giftTimes[k] = nil
+            if table.isEmptyOrNil(self.giftTimes) then
+                self:StopTimer()
+            end
+        else
+            -- if self.GiftList[k].mainFunc then
+            --     self.GiftList[k].mainFunc(v)
+            -- end
+            if self.GiftList[k].timerFunc then
+                self.GiftList[k].timerFunc(v)
+            end
+        end
+    end
+end
+
+---设置主界面按钮计时器（做了又不要了，留着免得他又要加）
+function MaterialGiftModel:SetMainTimer(tb, type)
+    local list = self:GetGiftData(type)
+    if list then
+        list.mainFunc = function(v)
+            local time = TimeUtil.TimeToString(v, 1)
+            tb.aortext_time.text = time
+        end
+    end
+end
+
+function MaterialGiftModel:StartTimer()
+    if not self.timer then
+        self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.TimerFunc, self, false)
+        self.timer:Start()
+    end
+end
+
+function MaterialGiftModel:StopTimer()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+
+function MaterialGiftModel:CloseActive(sid)
+    local data = self.GiftList[sid]
+    data.state = StateType.close
+    self.mallCall = nil
+    data.mainFunc = nil
+    local view = self:GetWindow(data.type)
+    if view then
+        view:CloseView()
+    end
+    if data.type == 1 then
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.MaterialCard)
+    elseif data.type == 2 then
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.MaterialLM)
+    elseif data.type == 3 then
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.MaterialArtifact)
+    elseif data.type == 4 then
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.MaterialPet)
+    end
+end
+
+---弹出礼包界面
+---@param type boolean 展示礼包类型
+---@param isShowRedPoint boolean 是否显示红点
+function MaterialGiftModel:ShowGiftUI(type, isShowRedPoint)
+    local value = _G.PlayerPrefsManager.GetInt("MaterialGiftModel_" .. self:GetActivityId(type), 0)
+    if value == 0 then
+        ---ZHJH-3460 & ZHJH-2008
+        -- local MainOpenViewFunItem = {}
+        -- MainOpenViewFunItem.OpenViewFun = function()
+        --     self:OpenWindow(type)
+        -- end
+        -- _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.MaterialGift)
+    else
+        if isShowRedPoint then
+            self:UpdateRedPoint(1, type)
+        end
+    end
+end
+
+---打开UI界面
+---@param type number 礼包类型: 1.七日粉将(材料), 2.待定, 3.神兵礼包
+---@return void
+function MaterialGiftModel:OpenWindow(type)
+    _G.UIManager:GetInstance():OpenWindow(self:GetWindowName(type), type)
+end
+
+---获取UI界面
+---@param type number 礼包类型: 1.七日粉将(材料), 2.待定, 3.神兵礼包
+---@return MaterialGiftView
+function MaterialGiftModel:GetWindow(type)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(self:GetWindowName(type))
+    if not view or view.type ~= type then
+        return nil
+    end
+    return view
+end
+
+---获取UI界面
+---@private
+---@param type number 礼包类型: 1.七日粉将(材料), 2.待定, 3.神兵礼包
+---@return string
+function MaterialGiftModel:GetWindowName(type)
+    if type == 3 then
+        return _G.ConfigManager.ui_cfg.MaterialArtifactGiftView.Name
+    elseif type == 4 then
+        return _G.ConfigManager.ui_cfg.MaterialPetGiftView.Name
+    end
+    return _G.ConfigManager.ui_cfg.MaterialGiftView.Name
+end
+
+---通过类型获取id
+function MaterialGiftModel:GetActivityId(type)
+    if type == 1 then
+        return _G.MainFunctionItems.MaterialCard
+    elseif type == 2 then
+        return _G.MainFunctionItems.MaterialLM
+    elseif type == 4 then
+        return _G.MainFunctionItems.MaterialPet
+    end
+    return _G.MainFunctionItems.MaterialCard
+end
+
+---刷新红点
+function MaterialGiftModel:UpdateRedPoint(value, type)
+    local param = self:GetActivityId(type)
+    _G.PlayerPrefsManager.SetInt("MaterialGiftModel_" .. param, value)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.MaterialGift.id, param)
+end
+
+return MaterialGiftModel

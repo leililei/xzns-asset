@@ -1,0 +1,797 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.CycleBattlePass.Model.CycleBattlePassModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/05/22
+-- Description 三环战令数据类（深渊战令、决斗战令、灵脉战令）
+-----------------------------------------------------------------------
+
+local CycleBattlePassNet = require "CycleBattlePassNet"
+local CycleBattlePassTaskData = require("CycleBattlePassTaskData")
+
+---@class CycleBattlePassModel : GameDataModelBase 等级活到
+---@field bpInfo cycle_battle.i_cycle_battle[] 战令信息
+---@field bpNum number 开启的战令总数(以及防止策划删除一些配置)
+---@field bpOpen number 开启的战令字典（nil不存在，0未开启， 1已开启）
+---@field infoCount number 拉info次数，由于若干战令只需拉一次，这里用该变量控制请求次数
+local CycleBattlePassModel = _G.BaseClass("CycleBattlePassModel", _G.GameDataModelBase)
+
+local ConfigManager = _G.ConfigManager
+
+---用于服务器交互的战令id
+CycleBattlePassModel.BattlePassIDEnum = {
+    Arena = 1,
+    Abyss = 2,
+    Talent = 3,
+    Sociaty = 4,
+    Build = 5,
+    Spoils = 6,
+    --花神战令
+    FlowerGod = 7,
+}
+
+CycleBattlePassModel.ViewEnum = {
+    [1] = ConfigManager.ui_cfg.ArenaBattlePassView.Name,
+    [2] = ConfigManager.ui_cfg.AbyssBattlePassView.Name,
+    [3] = ConfigManager.ui_cfg.TalentBattlePassView.Name
+}
+
+---activity_info_cfg的id
+local ActivityID = {
+    [1] = 1012101,
+    [2] = 1012001,
+    [3] = 1012201,
+    [4] = 1013501,
+    [5] = 1013601,
+    [6] = 1013901,
+}
+
+---不是活动战令的openid
+local BpOpenId = {
+    [6] = 296,
+    [7] = 1020
+}
+
+---store_season_battle_cfg的id
+local StoreSeasonID = {
+    [1] = 706001,
+    [2] = 705001,
+    [3] = 707001,
+    [4] = 711001,
+    [5] = 712001,
+    [6] = 713001,
+    [7] = 714001
+}
+
+local DayExpMax = {
+    Arena = ConfigManager.discrete_cfg[114103][1][1]
+}
+
+function CycleBattlePassModel:__init()
+    self.bpNum = 0
+    self.bpOpen = {}
+    self.bpInfo = {}
+    self.taskList = {}
+    self.finishTaskList = {}
+    self.infoCount = 0
+    _G.Events:GetInstance():AddListener(_G.SpiritualRealmEvents.FightTimeChange, self.OnSpiritualRealmEnd, self)
+    _G.Events:GetInstance():AddListener(_G.BattlePassExpEvents.BPArenaNormal, self.OnArenaNormalEnd, self)
+    _G.Events:GetInstance():AddListener(_G.BattlePassExpEvents.BPArenaPeak, self.OnArenaPeakEnd, self)
+    _G.Events:GetInstance():AddListener(_G.BattlePassExpEvents.BPActive, self.OnActiveAdd, self)
+    _G.Events:GetInstance():AddListener(_G.BattlePassExpEvents.BPDungones, self.OnDungonesPass, self)
+end
+
+---@return CycleBattlePassModel CycleBattlePassModel
+function CycleBattlePassModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+function CycleBattlePassModel:GetInfo(id, callback)
+    self:InitBattlePassNum()
+    if self.infoCount == 0 then
+        CycleBattlePassNet:GetInstance():GetInfo(_G.handlerbind(self, self.GetInfoCall, callback))
+    else
+        if callback then
+            callback()
+        end
+    end
+    self.infoCount = self.infoCount + 1
+    if self.infoCount == self.bpNum then
+        --都拉完后重置为0，这样重连或者跨天可以正常拉数据
+        self.bpNum = 0
+        self.infoCount = 0
+    end
+end
+---@param msg cycle_battle.s2c_cycle_battle_info
+function CycleBattlePassModel:GetInfoCall(msg, callback)
+    local battles = msg.battles or {}
+    for _, v in pairs(battles) do
+        v.pay_award = v.pay_award or {}
+        v.free_award = v.free_award or {}
+        v.second_pay_award = v.second_pay_award or {}
+        v.path = v.path or ConfigManager.store_season_battle_cfg[StoreSeasonID[v.id]].content
+        self.bpInfo[v.id] = v
+    end
+    local unlockIds = {} --要解锁的id
+    for _, id in pairs(self.BattlePassIDEnum) do
+        if self.bpInfo[id] == nil and self.bpOpen[id] == 1 then
+            ---首次开启，需要主动向服务器解锁
+            self:UnlockBattlePass(id)
+            unlockIds[id] = true
+        elseif self.bpInfo[id] and self.bpInfo[id].e_time < _G.TimeUtil.GetServerUnixTime() then
+            ---已过期，重新解锁购买
+            self:UnlockBattlePass(id)
+            unlockIds[id] = true
+        end
+    end
+    if self.bpOpen[self.BattlePassIDEnum.Sociaty] == 1 and not unlockIds[self.BattlePassIDEnum.Sociaty] then
+        self:GetTaskInfo(self.BattlePassIDEnum.Sociaty)
+    end
+    if self.bpOpen[self.BattlePassIDEnum.Build] == 1 and not unlockIds[self.BattlePassIDEnum.Build] then
+        self:GetTaskInfo(self.BattlePassIDEnum.Build)
+    end
+    if self.bpOpen[self.BattlePassIDEnum.Spoils] == 1 and not unlockIds[self.BattlePassIDEnum.Spoils] then
+        self:GetTaskInfo(self.BattlePassIDEnum.Spoils)
+    end
+    if self.bpOpen[self.BattlePassIDEnum.FlowerGod] == 1 and not unlockIds[self.BattlePassIDEnum.FlowerGod] then
+        self:GetTaskInfo(self.BattlePassIDEnum.FlowerGod)
+    end
+    -- 广播战令数据更新事件，通知各战令模块
+     for _, v in pairs(battles) do
+       _G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.BPDataUpdate, v.id)
+    end
+    if callback then
+        callback()
+    end
+end
+
+---解锁战令
+---@param id number 用于服务器交互的战令id
+function CycleBattlePassModel:UnlockBattlePass(id, callback)
+    local pbData = {id = id}
+    CycleBattlePassNet:GetInstance():UnlockBattle(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            ---@type store_season_battle_cfg
+            local cfg = ConfigManager.store_season_battle_cfg[StoreSeasonID[id]]
+            self.bpInfo[id] = {
+                id = id,
+                path = cfg.content,
+                choose_path = 0,
+                s_time = msg.s_time,
+                e_time = msg.e_time,
+                login_count = msg.login_count,
+                exp = 0,
+                day_exp = 0,
+                is_buy = 0,
+                pay_award = {},
+                free_award = {},
+                second_pay_award ={}
+            }
+            if callback then
+                callback()
+            end
+            _G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.BPUnlock, ActivityID[id])
+            -- 广播战令数据更新事件，参数为BattlePassIDEnum
+            _G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.BPDataUpdate, id)
+            if id == self.BattlePassIDEnum.Sociaty  or id == self.BattlePassIDEnum.Build or id == self.BattlePassIDEnum.FlowerGod then
+                self:GetTaskInfo(id)
+            end
+        end
+    )
+end
+
+---选择路线
+---@param id number 用于服务器交互的战令id
+---@param path number 路线id
+function CycleBattlePassModel:ChoosePath(id, path, callback)
+    local pbData = {b_id = id, path = path}
+    CycleBattlePassNet:GetInstance():ChoosePath(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                self.bpInfo[id].choose_path = path
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+---领取奖励
+---@param id number 用于服务器交互的战令id
+---@param awardLis cycle_battle.i_battle_award[] 奖励列表
+function CycleBattlePassModel:GetAward(id, awardLis, callback)
+    local pbData = {b_id = id, b_award = awardLis}
+    CycleBattlePassNet:GetInstance():GetAward(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                for _, v in pairs(awardLis) do
+                    if v.type == 1 then
+                        _G.table.insert(self.bpInfo[id].free_award, v.sid)
+                    elseif v.type == 2 then
+                        _G.table.insert(self.bpInfo[id].pay_award, v.sid)
+                    elseif v.type == 3 then
+                        _G.table.insert(self.bpInfo[id].free_award, v.sid)
+                        _G.table.insert(self.bpInfo[id].pay_award, v.sid)
+                    elseif v.type == 4 then
+                        _G.table.insert(self.bpInfo[id].second_pay_award, v.sid)
+                    elseif v.type == 5 then
+                        _G.table.insert(self.bpInfo[id].free_award, v.sid)
+                        _G.table.insert(self.bpInfo[id].pay_award, v.sid)
+                        _G.table.insert(self.bpInfo[id].second_pay_award, v.sid)
+                    end
+                end
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+---购买经验
+---@param id number 用于服务器交互的战令id
+---@param exp number 经验值
+---@param rate number x魂玉1经验倍率
+function CycleBattlePassModel:BuyExp(id, exp, rate, callback)
+    local pbData = {id = id, exp = exp}
+    CycleBattlePassNet:GetInstance():BuyExp(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.bpInfo[id].exp = self.bpInfo[id].exp + exp
+            _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, 0, exp * rate)
+            -- _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.AddBPExpEnd)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---购买高级战令
+---@param id number 用于服务器交互的战令id
+---@param price_id number 价格档位id
+function CycleBattlePassModel:Buy(id, price_id)
+    require "MallManager":GetInstance():BuyActiveGift(price_id, nil, StoreSeasonID[id])
+end
+
+---增加经验
+---@param id number 用于服务器交互的战令id
+---@param exp number 经验值
+function CycleBattlePassModel:AddExp(id, exp)
+    local info = self.bpInfo and self.bpInfo[id]
+    if info == nil then
+        return
+    end
+    if id == self.BattlePassIDEnum.Arena then
+        if info.day_exp + exp > DayExpMax.Arena then
+            exp = DayExpMax.Arena - info.day_exp
+        end
+    end
+    info.day_exp = info.day_exp + exp
+    info.exp = info.exp + exp
+    _G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.AddBPExpEnd)
+end
+
+---增加竞技场经验
+---@param type number 竞技场类型（1.普通竞技场2.问鼎灵域3.巅峰演武）
+function CycleBattlePassModel:AddArenaExp(type)
+    local exp = ConfigManager.discrete_cfg[114102][1][type]
+    self:AddExp(self.BattlePassIDEnum.Arena, exp)
+end
+
+---问鼎灵域战斗结束添加经验
+function CycleBattlePassModel:OnSpiritualRealmEnd()
+    self:AddArenaExp(2)
+end
+
+---普通竞技场战斗结束添加经验
+function CycleBattlePassModel:OnArenaNormalEnd()
+    self:AddArenaExp(1)
+end
+
+---巅峰演武战斗结束添加经验
+function CycleBattlePassModel:OnArenaPeakEnd()
+    self:AddArenaExp(3)
+end
+
+---日常活跃度增长添加经验
+---@param liveness number 活跃度
+function CycleBattlePassModel:OnActiveAdd(liveness)
+    local rate = ConfigManager.discrete_cfg[114104][1][1]
+    self:AddExp(self.BattlePassIDEnum.Talent, liveness * rate)
+end
+
+---通关千机黑刹某层添加经验
+---@param layer number 层数
+function CycleBattlePassModel:OnDungonesPass(layer)
+    local exp = ConfigManager.discrete_cfg[114101][1][layer]
+    self:AddExp(self.BattlePassIDEnum.Abyss, exp)
+end
+
+---初始化开启的战令总数
+function CycleBattlePassModel:InitBattlePassNum()
+    ---@type activity_info_cfg
+    local cfg, funCfg
+    if self.bpNum == 0 then
+        self.bpOpen = {}
+        for i, id in pairs(ActivityID) do
+            cfg = ConfigManager.activity_info_cfg[id]
+            if cfg then
+                self.bpOpen[i] = 0
+                funCfg = _G.ConfigManager.function_open_cfg[cfg.condition_display[1]]
+                if _G.GlobalConditionManager.CheckConditionByArray(funCfg.condition_type) then
+                    self.bpOpen[i] = 1
+                    self.bpNum = self.bpNum + 1
+                end
+            end
+        end
+        for k, v in pairs(BpOpenId) do
+            self.bpOpen[k] = 0
+            if _G.GlobalConditionManager.CheckConditionByArray(ConfigManager.function_open_cfg[v].condition_type) then
+                self.bpOpen[k] = 1
+                self.bpNum = self.bpNum + 1
+            end
+        end
+    end
+end
+
+---检测红点状态
+---@param id number 用于服务器交互的战令id
+---@param lv number 当前等级
+function CycleBattlePassModel:CheckeRedPoint(id, lv)
+    if self.bpInfo == nil then --尚未查明原因，添加容错
+        return 0
+    end
+    if self.bpInfo[id] == nil then --开启新战令
+        return 0
+    end
+    if self:GetEndTime(id) < _G.TimeUtil.GetServerUnixTime() then --开启新战令
+        return 1
+    end
+    if _G.AppSetting.IsXzns and id == 3 then
+        -- 灵脉战令（每周任务）在每日任务没有解锁时，不显示红点
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(21) then
+            return 0
+        end
+    end
+    lv = lv or self:GetLvAndCurLvExp(id)
+    local path = self.bpInfo[id].choose_path
+    if path == 0 then --未选择路线
+        local key = "CycleBattlePassPath" .. id .. _G.PlayerModel:GetInstance():GetPlayerUid()
+        local time = _G.PlayerPrefsManager.GetInt(key, 0)
+        if time == _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime()) then
+            return 0
+        end
+        return 1
+    end
+    local content = ConfigManager.store_battle_theme_cfg[path].content[1]
+    local store_season_battlecon_cfg = ConfigManager.store_season_battlecon_cfg
+    local isBuy = self:GetIsBuy(id)
+    ---@type store_season_battlecon_cfg
+    local cfg, free, pay
+    for _, v in pairs(content) do
+        cfg = store_season_battlecon_cfg[v]
+        if lv >= cfg.level then
+            free = not self:CheckAwardIsGet(id, v, true)
+            pay = isBuy and not self:CheckAwardIsGet(id, v, false)
+            if free or pay then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+function CycleBattlePassModel:GetCfg(id)
+    return StoreSeasonID[id] and ConfigManager.store_season_battle_cfg[StoreSeasonID[id]] or nil
+end
+
+---获取可选路线列表
+---@param id number 用于服务器交互的战令id
+---@return number[]
+function CycleBattlePassModel:GetAllPath(id)
+    return self.bpInfo[id].path
+end
+
+---获取当前选择路线
+---@param id number 用于服务器交互的战令id
+---@return number
+function CycleBattlePassModel:GetChossePath(id)
+    return self.bpInfo[id].choose_path
+end
+
+---是否购买了高级战令(二档战令)
+---@param id number 用于服务器交互的战令id
+---@return boolean
+function CycleBattlePassModel:GetIsBuy(id)
+    return self.bpInfo[id].is_buy == 1
+end
+
+---是否购买了三挡战令
+-----@param id number 用于服务器交互的战令id
+-----@return boolean
+--function CycleBattlePassModel:GetIsBuyHigh(id)
+--    if self.bpInfo[id] and self.bpInfo[id].is_buy_high then
+--        return self.bpInfo[id].is_buy_high == 1
+--    end
+--    return false
+--end
+
+---获取战令结束时间
+---@param id number 用于服务器交互的战令id
+---@return number
+function CycleBattlePassModel:GetEndTime(id)
+    return self.bpInfo[id] and self.bpInfo[id].e_time or 0
+end
+
+---获取战令结束时间
+---@param id number 用于服务器交互的战令id
+---@return number
+function CycleBattlePassModel:GetStartTime(id)
+    return self.bpInfo[id] and self.bpInfo[id].s_time or 0
+end
+
+---获取战令总经验
+---@param id number 用于服务器交互的战令id
+---@return number
+function CycleBattlePassModel:GetExp(id)
+    return self.bpInfo[id].exp or 0
+end
+
+---获取当前等级,当前等级当前经验，当前等级总经验
+---@param id number 用于服务器交互的战令id
+---@param sCfg store_season_battle_cfg
+---@return number, number, number
+function CycleBattlePassModel:GetLvAndCurLvExp(id, sCfg)
+    local lv = 0
+    local exp = self:GetExp(id)
+    local path = self:GetChossePath(id)
+    sCfg = sCfg or _G.ConfigManager.store_season_battle_cfg[StoreSeasonID[id]]
+    if path == 0 then
+        path = sCfg.content[1]
+    end
+    local cfg = _G.ConfigManager.store_battle_theme_cfg[path]
+    local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+    local lvLis = cfg.content[1]
+    local isMaxLv = true
+    local conCfg, curLvMaxExp
+    for _, v in pairs(lvLis) do
+        conCfg = store_season_battlecon_cfg[v]
+        curLvMaxExp = conCfg.conditions[2]
+        if exp >= curLvMaxExp then
+            lv = conCfg.level
+            exp = exp - curLvMaxExp
+        else
+            isMaxLv = false
+            break
+        end
+    end
+    if isMaxLv then
+        exp = 0
+        curLvMaxExp = 0
+    end
+    return lv, exp, curLvMaxExp
+end
+
+---检测战令是否解锁
+function CycleBattlePassModel:CheckBpIsUnLock(id)
+   return self.bpInfo[id] ~= nil
+end
+
+---根据等级获取所需经验
+---@param id number 用于服务器交互的战令id
+---@param sCfg store_season_battle_cfg
+---@return number, number, number
+function CycleBattlePassModel:GetLvExpByLv(id, sCfg, lv)
+    local exp = 0
+    local path = self:GetChossePath(id)
+    sCfg = sCfg or _G.ConfigManager.store_season_battle_cfg[StoreSeasonID[id]]
+    if path == 0 then
+        path = sCfg.content[1]
+    end
+    local cfg = _G.ConfigManager.store_battle_theme_cfg[path]
+    local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+    local lvLis = cfg.content[1]
+    local conCfg, curLvMaxExp
+    for _, v in pairs(lvLis) do
+        conCfg = store_season_battlecon_cfg[v]
+        curLvMaxExp = conCfg.conditions[2]
+        if conCfg.level <= lv then
+            exp = exp + curLvMaxExp
+        end
+    end
+
+    return exp
+end
+
+---获取每日已获得经验
+---@param id number 用于服务器交互的战令id
+---@return number
+function CycleBattlePassModel:GetDayExp(id)
+    return self.bpInfo[id].day_exp or 0
+end
+
+---检查奖励是否已领取
+---@param id number 用于服务器交互的战令id
+---@param awardId number 奖励id
+---@param isFree boolean 是否是免费奖励
+---@return boolean
+function CycleBattlePassModel:CheckAwardIsGet(id, awardId, isFree)
+    if isFree then
+        return _G.table.ContainsValue(self.bpInfo[id].free_award, awardId)
+    else
+        return _G.table.ContainsValue(self.bpInfo[id].pay_award, awardId)
+    end
+end
+
+---检查三档奖励是否已领取
+---@param id number 用于服务器交互的战令id
+---@param awardId number 奖励id
+---@return boolean
+function CycleBattlePassModel:CheckHighAwardIsGet(id, awardId)
+    return _G.table.ContainsValue(self.bpInfo[id].second_pay_award, awardId)
+end
+
+---获取所有已解锁（可领取）奖励
+---@param id number 用于服务器交互的战令id
+---@param lv number 战令等级
+---@return cycle_battle.i_battle_award[]
+function CycleBattlePassModel:GetAllUnlockAwards(id, lv)
+    local awardLis = {}
+    local path = self.bpInfo[id].choose_path
+    if path == 0 then
+        return awardLis
+    end
+    local content = ConfigManager.store_battle_theme_cfg[path].content[1]
+    local store_season_battlecon_cfg = ConfigManager.store_season_battlecon_cfg
+    ---@type store_season_battlecon_cfg
+    local cfg
+    for _, v in pairs(content) do
+        cfg = store_season_battlecon_cfg[v]
+        if lv >= cfg.level then
+            if cfg.rewards_high_pay and table.count(cfg.rewards_high_pay) > 0 then
+                self:GetHighAwardPbArgs(awardLis,id,v)
+            else
+                self:GetAwardPbArgs(awardLis,id,v)
+            end
+        end
+    end
+    return awardLis
+end
+
+---是否购买三挡战令
+function CycleBattlePassModel:IsBuyHigh(id)
+    return  self.bpInfo[id].is_buy_high == 1
+end
+
+---二档战令的领取奖励pb参数组装
+function CycleBattlePassModel:GetAwardPbArgs(awardLis,id,v)
+    local isBuy = self:GetIsBuy(id)
+    local free, pay
+    free = not self:CheckAwardIsGet(id, v, true)
+    pay = isBuy and not self:CheckAwardIsGet(id, v, false)
+    if free and pay then
+        _G.table.insert(awardLis, {sid = v, type = 3})
+    elseif free then
+        _G.table.insert(awardLis, {sid = v, type = 1})
+    elseif pay then
+        _G.table.insert(awardLis, {sid = v, type = 2})
+    end
+end
+
+---三档战令的领取奖励pb参数组装
+function CycleBattlePassModel:GetHighAwardPbArgs(awardLis,id,v)
+    local isBuy = self:GetIsBuy(id)
+    local isBuyHigh = self:IsBuyHigh(id)
+    local free, pay,pay_high
+    free = not self:CheckAwardIsGet(id, v, true)
+    pay = isBuy and not self:CheckAwardIsGet(id, v, false)
+    pay_high = isBuyHigh and not self:CheckHighAwardIsGet(id, v)
+    if free and pay and pay_high then
+        _G.table.insert(awardLis, {sid = v, type = 5})
+    elseif free and pay then
+        _G.table.insert(awardLis, {sid = v, type = 3})
+    elseif free then
+        _G.table.insert(awardLis, {sid = v, type = 1})
+    elseif pay then
+        _G.table.insert(awardLis, {sid = v, type = 2})
+    elseif pay_high then
+        _G.table.insert(awardLis, {sid = v, type = 4})
+    end
+end
+
+
+---检查是否能够选择路线（未领取过任何奖励且有多条路线可选）
+---@param id number 用于服务器交互的战令id
+---@return boolean
+function CycleBattlePassModel:CheckCanSwitchPath(id)
+    local award = #self.bpInfo[id].free_award + #self.bpInfo[id].pay_award == 0
+    return award and #self.bpInfo[id].path > 1
+end
+
+---充值成功
+---@param id number 用于服务器交互的战令id
+function CycleBattlePassModel:OnMallCashEnd(id)
+    self.bpInfo[id].is_buy = 1
+end
+
+---二档战令充值成功
+---@param id number 用于服务器交互的战令id
+function CycleBattlePassModel:OnHighMallCashEnd(id)
+    self.bpInfo[id].is_buy_high = 1
+end
+
+function CycleBattlePassModel:CheckSingleIsOpen(id)
+    return self.bpOpen[id] == 1 and self.bpInfo[id] ~= nil
+end
+
+---获取任务信息
+function CycleBattlePassModel:GetTaskInfo(id)
+    local pbData = {id = id}
+    CycleBattlePassNet:GetInstance():GetTaskInfo(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:ClearTask(id)
+            self.taskList[id] = {}
+            self.finishTaskList[id] = {}
+            if msg.task then
+                for _, v in pairs(msg.task) do
+                    _G.table.insert(
+                        self.taskList[id],
+                        CycleBattlePassTaskData.New(
+                            v,
+                            function()
+                                _G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.BPTaskFinish, id)
+                            end,
+                            _G.MarkTaskType.CycleBattlePass
+                        )
+                    )
+                end
+            end
+            if msg.finish_task then
+                local iTask
+                for _, v in pairs(msg.finish_task) do
+                    iTask = {sid = v, state = _G.TaskEnum.ETaskState.Submited, target = {0}}
+                    _G.table.insert(
+                        self.taskList[id],
+                        CycleBattlePassTaskData.New(iTask, nil, _G.MarkTaskType.CycleBattlePass)
+                    )
+                    self.finishTaskList[id][v] = true
+                end
+            end
+            _G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.BPTaskUpdate, id)
+        end
+    )
+end
+
+---完成任务
+---@param finishType number 1预完成 2提交领奖
+function CycleBattlePassModel:FinishTask(id, taskIds, finishType, call)
+    if _G.table.isEmptyOrNil(taskIds) then
+        return
+    end
+    local pbData = {id = id, task_sid = taskIds, finish_type = finishType}
+    CycleBattlePassNet:GetInstance():FinishTask(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local perExp = 0
+            if id == self.BattlePassIDEnum.Sociaty then
+                perExp = _G.ConfigManager.discrete_cfg[126302][1][1]
+            elseif id == self.BattlePassIDEnum.Build then
+                perExp = _G.ConfigManager.discrete_cfg[126606][1][1]
+            elseif id == self.BattlePassIDEnum.Spoils then
+                perExp = _G.ConfigManager.discrete_cfg[126612][1][1]
+            elseif id == self.BattlePassIDEnum.FlowerGod then
+                perExp = _G.ConfigManager.discrete_cfg[202102][1][1]
+            end
+            if msg.task_finish then
+                for _, v in pairs(msg.task_finish) do
+                    if v.v == 1 then
+                        self.finishTaskList[id][v.k] = true
+                        self:AddExp(id, perExp)
+                    end
+                end
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---获取所有可完成的任务
+function CycleBattlePassModel:GetAllCanFinishTask(id)
+    local taskIds = {}
+    if self.taskList[id] then
+        for _, v in pairs(self.taskList[id]) do
+            if v.i_task.state == _G.TaskEnum.ETaskState.Submited and not self:CheckTaskIsFinish(id, v.i_task.sid) then
+                _G.table.insert(taskIds, v.i_task.sid)
+            end
+        end
+    end
+    return taskIds
+end
+
+function CycleBattlePassModel:ClearTask(id)
+    if self.taskList[id] == nil then
+        return
+    end
+    for _, v in pairs(self.taskList[id]) do
+        v:Dispose()
+    end
+    self.taskList[id] = nil
+    self.finishTaskList[id] = nil
+end
+
+function CycleBattlePassModel:CheckTaskRedPoint(id)
+    if self.taskList[id] == nil then
+        return 0
+    end
+    return #self:GetAllCanFinishTask(id) > 0 and 1 or 0
+end
+
+---获取任务数据
+function CycleBattlePassModel:GetTaskData(id)
+    return self.taskList[id] or {}
+end
+
+function CycleBattlePassModel:CheckTaskIsFinish(id, sid)
+    if self.finishTaskList[id] == nil then
+        return false
+    end
+    return self.finishTaskList[id][sid] or false
+end
+
+---更新任务数据
+function CycleBattlePassModel:UpdataTask(task)
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask:UpdataData(task)
+    return true
+end
+
+function CycleBattlePassModel:GetTaskByTaskid(taskid)
+    for _, lis in pairs(self.taskList) do
+        for _, v in pairs(lis) do
+            if v.i_task.sid == taskid then
+                return v
+            end
+        end
+    end
+    return nil
+end
+
+function CycleBattlePassModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.SpiritualRealmEvents.FightTimeChange, self.OnSpiritualRealmEnd, self)
+    _G.Events:GetInstance():RemoveListener(_G.BattlePassExpEvents.BPArenaNormal, self.OnArenaNormalEnd, self)
+    _G.Events:GetInstance():RemoveListener(_G.BattlePassExpEvents.BPArenaPeak, self.OnArenaPeakEnd, self)
+    _G.Events:GetInstance():RemoveListener(_G.BattlePassExpEvents.BPActive, self.OnActiveAdd, self)
+    _G.Events:GetInstance():RemoveListener(_G.BattlePassExpEvents.BPDungones, self.OnDungonesPass, self)
+end
+
+return CycleBattlePassModel

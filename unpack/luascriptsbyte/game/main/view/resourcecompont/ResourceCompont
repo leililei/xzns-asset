@@ -1,0 +1,428 @@
+-----------------------------------------------------------------------
+-- Created by szs on 2020.03
+-- @Description 资源组件
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+---@class ResourceCompont : Component
+---@field public go_table ResourceCompont_GoTable 中文描述
+---@field private clickCallback fun(sid:number):boolean  点击回调事件, 返回false表示使用默认事件
+local ResourceCompont = _G.BaseClass("ResourceCompont", _G.Component)
+local StorageManager = _G.StorageManager:GetInstance()
+
+function ResourceCompont:Awake()
+    ---资源item引用 复用 RsItem  默认isConsume类型不变
+    self.transArr = {}
+    -- self.CommonResource = nil
+    -- self.lyType = nil
+    -- self.pos = nil
+    -- self.AllRc = nil
+    --- 刷新后的资源
+    self.NextRs = nil
+    ---  当前正在加载创建资源
+    self.NowLoadRs = nil
+
+    ---@type DG.Tweening.Sequence
+    self.mScoreSequence = _G.DOTween:Sequence()
+    self.mScoreSequence:SetAutoKill(false)
+    self:AddEvent()
+end
+
+-- 启动
+---@param parent Transform 对应父节点 起始位置
+---@param rs ResPropID[] 要创建的资源类型 （从左往右） [[ResPropID,false(隐藏+号)],ResPropID,ResPropID  ]
+---@param lyType number 是否是自行布局 1自行布局 2 只创建所有单个资源item
+---@param pos UnityEngine.Vector3 坐标（选填）
+---@param isConsume boolean 是否是消耗资源资源栏
+function ResourceCompont:OnCreate(parent, rs, lyType, pos, isConsume)
+    self.lyType = lyType or 1
+    self.pos = pos or _G.Vector3.New(0, 0, 0)
+    if _G.IsNil(parent) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" ResourceCompont:OnCreate(  parent 参数有误")
+        end
+        return
+    end
+    self.isConsume = isConsume
+    self.AllRcConsume = {}
+    self.parent = parent
+    self.AllRc = {}
+    self:CreateItem(rs)
+end
+
+-- 解析参数
+---@return table<table<StorageID,ResPropID,boolean>>  or nil
+function ResourceCompont:Pars_rs(rs)
+    local rsDic = nil
+    for key, rs_v in pairs(rs) do
+        local respropid = nil
+        local isShowAdd = true
+        --- 消耗数量
+        local Consume = 0
+        --- 客户端 资源的 总量  客户端自己计算 ，不进入仓库
+        local client_total = 0
+
+        if type(rs_v) == "number" then
+            -- ZHJ-19611【客户端】跳转功能需要支持GM活动界面 屏蔽下方代码
+            -- ---ZHJ-19585 【恶灵入侵】恶灵入侵代币获取弹窗内，未配置获取途径。
+            -- if rs_v ==101 then
+            --     isShowAdd = false
+            -- end
+            respropid = rs_v
+        elseif type(rs_v) == "table" and rs_v[1] > 0 then
+            respropid = rs_v[1]
+            isShowAdd = rs_v[2]
+            Consume = rs_v[3]
+            client_total = rs_v[4]
+        else
+            break
+        end
+
+        local _, StorageID = _G.StorageManager:GetInstance():CheckSidType(respropid)
+        if StorageID ~= nil then
+            if rsDic == nil then
+                rsDic = {}
+            end
+            table.insert(rsDic, { StorageID, respropid, isShowAdd, Consume, client_total })
+        end
+    end
+    return rsDic
+end
+
+function ResourceCompont:CreateItem(rs)
+    if _G.IsNil(rs) then
+        rs = {
+            _G.ResPropID.Coin,
+            -- {_G.ResPropID.Coin, false},     -- 不显示 + 号
+            _G.ResPropID.Diamond,
+            _G.ResPropID.Stamina
+        }
+    end
+    local rsDic = {}
+    rsDic = self:Pars_rs(rs)
+    if rsDic == nil then
+        return
+    end
+
+    self.NowLoadRs = rs
+
+    rsDic = table.reverseTable(rsDic)
+    self.AllRc = {}
+
+    if self.lyType == 1 then
+        if _G.IsNil(self.CommonResource) then
+            self:CreateItem_CommonResource(
+                function(tran)
+                    self:CreateItem_CommonRsItem(rsDic, self.RsCompont)
+                end
+            )
+        else
+            self:CreateItem_CommonRsItem(rsDic, self.RsCompont)
+        end
+    else
+        self.CommonResource = self.parent
+        self:CreateItem_CommonRsItem(rsDic, self.parent)
+    end
+end
+
+function ResourceCompont:CreateItem_CommonResource(call)
+    local path = "UIH5/Common/CommonResource"
+
+    if self.isConsume == true then
+        if _G.AppSetting.IsXzns then
+            path = "UIH5_xzns/Common/CommonResourceConsume"
+        else
+            path = "UIH5/Common/CommonResourceConsume"
+        end
+    end
+    _G.PoolsManager:GetInstance():Spawn(
+        path,
+        _G.ePoolType.Temporary,
+        self.parent,
+        function(tran)
+            if tran == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("ResourceCompont:CreateItem_CommonResource  创建失败")
+                end
+                return
+            end
+            self.CommonResource = tran
+            self.RsCompont = tran:GetChildE(0)
+            if call ~= nil then
+                call(tran)
+            end
+        end
+    )
+end
+
+function ResourceCompont:CreateItem_CommonRsItem(rsDic, Parent)
+    local loadCount = 0
+    local loadMaxCount = #rsDic
+
+    local loadFun = function()
+        loadCount = loadCount + 1
+        if loadCount == loadMaxCount then
+            self:LoadOver()
+            return
+        end
+    end
+    local path = "UIH5/Common/CommonRsItem"
+    if self.isConsume == true then
+        path = "UIH5/Common/CommonRsConsumeItem"
+    end
+
+    --- 隐藏多余item  默认isConsume类型不变
+    for i = #self.transArr, #rsDic + 1, -1 do
+        local tran = self.transArr[i]
+        if tran ~= nil then
+            _G.GameUtil.SetActiveByCondition(tran.gameObject, false)
+        end
+    end
+    local index = 1
+    for _, v in _G.ipairs(rsDic) do
+        local tran = self.transArr[index]
+        if tran ~= nil then
+            _G.GameUtil.SetActiveByCondition(tran.gameObject, true)
+            self:SetRsItem(v, tran, loadFun)
+        else
+            _G.PoolsManager:GetInstance():Spawn(
+                path,
+                _G.ePoolType.Temporary,
+                Parent,
+                function(tran)
+                    table.insert(self.transArr, tran)
+                    self:SetRsItem(v, tran, loadFun)
+                end
+            )
+        end
+        index = index + 1
+    end
+end
+
+function ResourceCompont:SetRsItem(v, tran, loadFun)
+    if tran == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("ResourceCompont:CreateItem_CommonRsItem  创建失败")
+        end
+    else
+        local go_table = _G.GetAutoGoTable(tran, _G.handlerbind(self, self.OnClickBtn, v[1], v[2]))
+        if table.isEmptyOrNil(self.AllRc[v[1]]) then
+            self.AllRc[v[1]] = {}
+        end
+        self.AllRc[v[1]][v[2]] = go_table
+        local icon = _G.StorageManager:GetInstance():GetItemIcon(v[2])
+        go_table.aorrawimage_icon:LoadImage(
+            icon,
+            function(image)
+                if image ~= nil then
+                    _G.GameUtil.SetActiveByCondition(image.gameObject, true)
+                end
+            end
+        )
+        if v[3] then
+            go_table.aorbtn_add.gameObject:SetActiveE(1)
+            if go_table.aorimage_add ~= nil then
+                go_table.aorimage_add.gameObject:SetActiveE(1)
+            end
+        else
+            go_table.aorbtn_add.gameObject:SetActiveE(0)
+            if go_table.aorimage_add ~= nil then
+                go_table.aorimage_add.gameObject:SetActiveE(0)
+            end
+        end
+        self:UpdateRsNum(v)
+    end
+    loadFun()
+end
+
+---设置资源栏点击事件回调
+---@param func fun(sid:number):boolean  点击回调事件, 返回false表示使用默认事件
+function ResourceCompont:SetClickCallback(func)
+    self.clickCallback = func
+end
+
+---用于更新资源数量
+---@param data  table
+---@param isRoll  boolean true滚动数字 默认false
+function ResourceCompont:UpdateRsNum(data, isRoll)
+    -- 更新资源数量显示
+    local StorageID = data[1] -- 资源ID
+    local sidOrUid = data[2]  -- 子ID或用户ID
+
+    -- 检查资源是否存在
+    if _G.IsNil(self.AllRc[StorageID]) or _G.IsNil(self.AllRc[StorageID][sidOrUid]) then
+        return
+    end
+
+    -- 获取资源数量
+    local itemValue = _G.StorageManager:GetInstance():GetItemCountByID(StorageID, sidOrUid)
+
+    -- 根据特定条件更新资源数量
+    if data[5] ~= nil and data[5] ~= 0 then
+        itemValue = data[5]
+    else
+        itemValue = _G.StorageManager:GetInstance():GetItemCountByID(StorageID, sidOrUid)
+    end
+
+    -- 根据子ID或用户ID更新特定资源数量
+    local otherValue = _G.StorageManager:GetInstance():GetOtherItemCountBySid(sidOrUid)
+    if otherValue then
+        itemValue = otherValue
+    end
+
+    -- 根据是否需要数字滚动动画更新资源数量显示
+    if isRoll then
+        local mOldScore = _G.tonumber(self.AllRc[StorageID][sidOrUid].aortext_num.text) or 0
+        local newScore = itemValue
+        self:DigitalAnimation(data, mOldScore, newScore)
+    else
+        local tcountStr = self:NumberFormat(itemValue, sidOrUid)
+
+        if self.isConsume then
+            local consumeValue = data[4]
+            if consumeValue ~= nil then
+                self.AllRcConsume[sidOrUid] = consumeValue
+            elseif self.AllRcConsume[sidOrUid] ~= nil then
+                consumeValue = self.AllRcConsume[sidOrUid]
+            end
+            if consumeValue ~= nil then
+                if itemValue < consumeValue then
+                    tcountStr = "<color=red>" .. tcountStr .. "</color>"
+                end
+
+                tcountStr = _G.GameUtil.NumberToUnitStr(consumeValue) .. "/" .. tcountStr
+            end
+        end
+        self.AllRc[StorageID][sidOrUid].aortext_num.text = tcountStr
+    end
+end
+
+function ResourceCompont:DigitalAnimation(data, mOldScore, newScore)
+    if self.mScoreSequence == nil then
+        return
+    end
+    self.mScoreSequence:Append(
+        _G.DOTween.To(
+            function(value)
+                local str = _G.Mathf.Floor(value)
+                str = self:NumberFormat(str, data[2])
+                if self.AllRc[data[1]][data[2]] == nil then
+                    return
+                end
+                self.AllRc[data[1]][data[2]].aortext_num.text = str
+            end,
+            mOldScore,
+            newScore,
+            0.4
+        )
+    )
+end
+
+---格式化最终文本   体力 0/200
+function ResourceCompont:NumberFormat(nowValue, key)
+    local str = nowValue
+    if key == _G.ResPropID.Stamina then
+        str = nowValue .. "/200"
+    else
+        str = _G.GameUtil.NumberToUnitStr(nowValue)
+    end
+    return str
+end
+
+--TODO 添加一些资源改变的事件处理
+function ResourceCompont:AddEvent()
+    self:AddListener(_G.eItemUpdata.Updata, self.ResUpdata)
+    self:AddListener(_G.eItemUpdata.ResRefresh, self.ResRefresh)
+end
+
+---@param data award.i_award_item[]
+function ResourceCompont:ResUpdata(data)
+    for key, value in pairs(data) do
+        -- body
+        local type, storageId = _G.StorageManager:GetInstance():CheckSidType(value.type[1])
+
+        self:UpdateRsNum({ storageId, value.type[1] })
+    end
+end
+
+function ResourceCompont:ResRefresh()
+    for k, v in pairs(self.AllRc) do
+        for k2, _ in pairs(v) do
+            self:UpdateRsNum({ k, k2 })
+        end
+    end
+    -- self:UpdateRsNum({_G.StorageID.ResProp, _G.ResPropID.Diamond})
+    -- self:UpdateRsNum({_G.StorageID.ResProp, _G.ResPropID.Coin})
+end
+
+function ResourceCompont:RemoveEvent()
+    self:RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata)
+    self:RemoveListener(_G.eItemUpdata.ResRefresh, self.ResRefresh)
+end
+
+function ResourceCompont:OnClickBtn(go, IsOn, StorageID, Sid)
+    if go:GetName() == "@_aorbtn_tips" then
+        require("CommonTipManager"):GetInstance():OpenTip(go, Sid)
+    elseif not self.clickCallback or self.clickCallback(Sid) == false then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, Sid)
+    end
+end
+
+function ResourceCompont:Dispose()
+    self:RemoveEvent()
+    for _, tran in _G.pairs(self.transArr) do
+        _G.PoolsManager:GetInstance():Despawn(tran, _G.ePoolType.Temporary)
+    end
+    self.transArr = nil
+    self.AllRc = nil
+    if self.RsCompont then
+        _G.PoolsManager:GetInstance():Despawn(self.RsCompont.gameObject, _G.ePoolType.Temporary)
+    end
+    self.RsCompont = nil
+end
+
+--- 加载完成 再换资源 防止因异步,对象多次创建
+function ResourceCompont:LoadOver()
+    self.NowLoadRs = nil
+
+    if self.NextRs == nil then
+        if self.isConsume == true then
+            self:UpdateContentSize()
+        end
+        return
+    end
+
+    local rs = _G.DeepCopy(self.NextRs)
+    self.NextRs = nil
+    self:CreateItem(rs)
+end
+
+--- 刷新资源显示
+function ResourceCompont:RestRs(rs)
+    if self.AllRc == nil or table.count(self.AllRc) == 0 then
+        return
+    end
+    self.NextRs = rs
+
+    if self.NowLoadRs == nil then
+        self:LoadOver()
+    end
+end
+
+function ResourceCompont:UpdateContentSize()
+    self.AllObj = {}
+    self.AllContentF = self.CommonResource:GetComponentsInChildren(typeof(CS.UnityEngine.UI.ContentSizeFitter))
+    for i = 0, self.AllContentF.Length do
+        if i < self.AllContentF.Length then
+            local obj = self.AllContentF[i]
+            _G.table.insert(self.AllObj, obj)
+        end
+    end
+    for i = 1, #self.AllObj do
+        GameUtil.ReBuildRTF(self.AllObj[i])
+    end
+    CS.UnityEngine.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(
+        self.CommonResource:GetComponentE(typeof(CS.UnityEngine.RectTransform))
+    )
+end
+
+return ResourceCompont

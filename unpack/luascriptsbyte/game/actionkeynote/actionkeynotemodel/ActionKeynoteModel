@@ -1,0 +1,1457 @@
+--------------------------------------------------------------------------
+-- E:.Game.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.ActionKeynote.ActionKeynoteModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/10/13
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ActionKeynoteData = require("ActionKeynoteData")
+---@class ActionKeynoteModel : GameDataModelBase	中文描述
+local ActionKeynoteModel = _G.BaseClass("ActionKeynoteModel", _G.GameDataModelBase)
+local CS = _G.CS
+local typeof = _G.typeof
+
+local totalDays = 7
+local number_7 = 7   -- 7天
+local number_14 = 14 --14天
+local number_21 = 21 -- 21天
+
+---@return ActionKeynoteModel
+function ActionKeynoteModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function ActionKeynoteModel:__init()
+    self.endCallback = nil
+    self.curFunctionOpenID = 261
+    self.Cfg = _G.ConfigManager.mission_extra_cfg
+    self.data = {}
+    self.day_award = {}
+    self:initStaticData()
+    self.currentAlltasks = {}
+    self.dailyAlltasks = {}
+    --self.currenDay = self:GetCurrentDay()        --界面点击的天数（当前点击的天数，获取任务）
+    self.currendDay_qishu = 1 --期数
+    self.goals_award = {}
+    self.isOpenFunction = false
+    self.AllDayTasks = {}
+    for i = 1, totalDays do
+        self.AllDayTasks[i] = {}
+    end
+end
+
+function ActionKeynoteModel:Dispose()
+    self.data = nil
+    if not _G.table.isEmptyOrNil(self.currentAlltasks) then
+        for k, v in pairs(self.currentAlltasks) do
+            v:Dispose()
+        end
+    end
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.currentAlltasks = nil
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+---@return ActionKeynoteModel ActionKeynoteModel
+--- 网络请求初始化
+function ActionKeynoteModel:GetDataFormServer()
+    require("ActionKeynoteNet"):GetInstance():SendTaskGoalsGet(_G.handler(self, self.ParseData))
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+function ActionKeynoteModel:OnMallCashListener(data)
+    local time = self:GetCurrentTime()
+    if time <= 0 then
+        return
+    end
+    -- local cfg = _G.ConfigManager.store_battle_pass_cfg[data.sid]
+    if data.cash_rmb and data.cash_rmb > 0 then
+        self:AddGroup_cash(data.cash_rmb)
+
+        local store_extra_cfg = _G.ConfigManager.store_extra_cfg[data.sid]
+        if store_extra_cfg and data.sid == self.store_extra_cfgData then
+            local MallManager = require("MallManager"):GetInstance()
+            MallManager:SetItemBuyTimes(store_extra_cfg.id, store_extra_cfg.type_reset, 1)
+            self.store_extra_cfgData = nil
+        end
+        self:RefRedPointActionDay()
+        local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActionKeynoteView.Name)
+        if ctrl then
+            ctrl:DayButtonClick()
+            -- ctrl:Support()
+        end
+    end
+end
+
+---数据解析完成
+function ActionKeynoteModel:ParseData(data)
+    self.data = {}
+    self.data = data
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActionKeynoteView.Name)
+    if ctrl then
+        ctrl:DayButtonClick()
+    end
+
+    -- self:IsConnect()
+    self.super.ParseData(self)
+end
+
+---@field currentQishu number 当前的期数
+---@field currentTime number 当前期数的时间
+function ActionKeynoteModel:InitFunction()
+    if _G.table.isEmptyOrNil(self.data) then
+        return
+    end
+    self.isOpenFunction = true
+    self.AllDayTasks = {}
+    for i = 1, totalDays do
+        self.AllDayTasks[i] = {}
+    end
+    if not _G.table.isEmptyOrNil(self.currentAlltasks) then
+        for k, v in pairs(self.currentAlltasks) do
+            v:Dispose()
+        end
+    end
+    self.currenDay = self.currenDay or self:GetCurrentDay()
+    self.currentQishu = 1
+    self.taskfinsh_task = self.data.finish_task or {}
+    self.roletime = _G.PlayerModel:GetInstance().open_time or 0
+    self.currendDay_qishu = self:GetCurrentDay()
+    self.currentAlltasks = self:AddListenerTaskCheck(self.data) or {}
+    self.active_fourteen = self.data.active_fourteen or 0
+    self.active_twentyone = self.data.active_twenty_one or 0
+    self.jiequ_day = self.data.jiequ_day or { [1] = 1 }
+    --跨期且还没接任务的时候stage为0，初始化数据
+    if self.data.stage == 0 then 
+        self.goalsNum = 0
+        self.day_award = {}
+        self.goals_award = {}
+        self.group_cash = 0
+        self.cash_award = {}
+    else
+        self.goalsNum = self.data.active_seven or 0
+        self.day_award = self.data.day_award or {}
+        self.goals_award = self.data.goals_award or {}
+        --每一期充值统计
+        self.group_cash = self.data.group_cash or 0
+        --已领取充值奖励
+        self.cash_award = self.data.cash_award or {}
+    end
+    --把实际天数转成1到7天
+    self.day_award = self:FreshAwardData(self.day_award)
+    --把实际天数转成1到7天
+    self.cash_award = self:FreshAwardData(self.cash_award)
+    self:AddTaskFinshToCurrentALLtaks(self.data.finish_task)
+    --self:SetCreateRoleTime()
+    self:GetOneDayAllTask()
+    self:SendOtheJiequDay()
+    ---给任务 添加 完成事件
+    --self:SixUpdata()
+    if self.CheckShowCwzl() == false then
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.Qirizhishi)
+    end
+end
+
+----把实际天数转成1到7天
+function ActionKeynoteModel:FreshAwardData(T)
+    local t = {}
+    for i = 1, #T do 
+        table.insert(t, self:GetCurrentDay(T[i]))
+    end
+    return t
+end
+function ActionKeynoteModel:RedCheckFunction(id)
+    local flag = 0
+    if self:GetCurrentDay() < id then
+        return 0
+    end
+    local data = _G.PlayerPrefsManager.GetTable("ActionKeynoteModelID")
+    if data ~= nil then
+        for key, value in pairs(data) do
+            if value == id then
+                flag = 0
+            end
+        end
+        -- body
+    end
+    local allTask = self:GetDailyAlltasks()
+    if allTask then
+        local DailyAlltasks = allTask[id]
+        if DailyAlltasks then
+            local total = DailyAlltasks.total_recharge
+            local ids = self:GetIsGroup_cash(DailyAlltasks.group)
+            local is = self:GetCash_award(id)
+            if total and ids and total <= ids and not is then
+                flag = 1
+            end
+        end
+    end
+
+    return flag
+end
+
+function ActionKeynoteModel:AddRedCheckFunction(id)
+    local flag = true
+
+    if self:GetCurrentDay() < id then
+        flag = false
+        return
+    end
+    local data = _G.PlayerPrefsManager.GetTable("ActionKeynoteModelID")
+    if data ~= nil then
+        for key, value in pairs(data) do
+            if value == id then
+                flag = false
+            end
+        end
+        -- body
+    else
+        flag = false
+        data = { id }
+    end
+    if flag then
+        _G.table.insert(data, id)
+    end
+    _G.PlayerPrefsManager.SetTable("ActionKeynoteModelID", data)
+    self:RefRedPointActionDay()
+end
+
+---每一期充值统计
+function ActionKeynoteModel:GetIsGroup_cash(is)
+    -- local id = is
+    -- local is = 0
+    -- for key, value in pairs(self.group_cash) do
+    --     if value.k == id then
+    --         is = value.v
+    --     end
+    -- end
+    --判断新一期的时候手动清零点数
+    local alltask = self:GetAllDayTasks()
+    if #alltask[1] == 0 then 
+        self.group_cash = 0
+    end
+    return self.group_cash
+end
+
+---每一期充值统计
+function ActionKeynoteModel:GetGroup_cash()
+    -- local id = self:GetCurrentQiShu()
+    -- local is = 0
+    -- for key, value in pairs(self.group_cash) do
+    --     if value.k == id then
+    --         is = value.v
+    --     end
+    -- end
+    --判断新一期的时候手动清零点数
+    local alltask = self:GetAllDayTasks()
+    if #alltask[1] == 0 then 
+        self.group_cash = 0
+    end
+    return self.group_cash
+end
+
+---每一期充值统计
+function ActionKeynoteModel:AddGroup_cash(num)
+    -- local id = self:GetCurrentQiShu()
+    -- local v = true
+    -- for key, value in pairs(self.group_cash) do
+    --     if value.k == id then
+    --         v = false
+    --         value.v = value.v + num
+    --     end
+    -- end
+    -- if v then
+    --     _G.table.insert(self.group_cash, { k = id, v = num })
+    -- end
+    self.group_cash = self.group_cash + num
+    --return is
+end
+
+---判断是否领取的当前奖励
+function ActionKeynoteModel:GetCash_award(id)
+    local is = false
+    for key, value in pairs(self.cash_award) do
+        if value == id then
+            is = true
+        end
+    end
+    return is
+end
+
+---写入当前奖励
+function ActionKeynoteModel:AddCash_award(id)
+    local is = true
+    for key, value in pairs(self.cash_award) do
+        if value == id then
+            is = false
+        end
+    end
+    if is then
+        _G.table.insert(self.cash_award, id)
+    end
+end
+
+---倒计时 跨天刷新
+function ActionKeynoteModel:OnSixClockUpdate(endcall)
+    local day = self:GetCurrentDay()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(261) then
+        if endcall then
+            endcall()
+        end
+        if _G.AppSetting.DEBUG then
+            _G.LogError("功能没有开发返回了  ")
+        end
+        return
+    end
+    self:SixOnUpDate()
+    if endcall then
+        endcall()
+    end
+end
+
+--endregion
+
+--region
+--获得当前 期数相关数据 (1,2,3)
+--第二个返回值bol返回活动开没开
+function ActionKeynoteModel:GetCurrentQiShu()
+    local currentime = _G.TimeUtil.GetServerUnixTime()
+    local day = _G.TimeUtil.GetInterValDayByGame(_G.PlayerModel:GetInstance().open_time, currentime) + 1
+    for k, v in pairs(self.goalsCfg) do 
+        for i = 1, #v do 
+            if day == v[i].id then 
+                self.currentQishu = v[i].group
+                return self.currentQishu, true
+            end
+        end
+    end
+    return 1, false
+end
+
+---获得当前 活动时间
+function ActionKeynoteModel:GetCurrentTime()
+    local times_cu = 0
+    local cfg = self.goalsCfg[self:GetCurrentQiShu()]
+    times_cu = 86400 * cfg[#cfg].id
+    local curtime = _G.TimeUtil.GetServerUnixTime()
+    --与前后端时间统一
+    local curtime2 = _G.TimeUtil.GetDayBySix(self.roletime)
+    self.currentTime = curtime2 + times_cu - curtime
+    if self.currentTime <= 0 then
+        self.currentTime = 0
+    end
+    return self.currentTime
+end
+
+---获得 模型数据
+---@param periods number 周期数  1,2,3 (界面点击时 传入数值)
+function ActionKeynoteModel:GetCurrentModelCardid(periods)
+    local cfg = _G.ConfigManager.discrete_cfg[105201]
+    local cardid = cfg[periods]
+    return cardid
+end
+
+--endregin
+
+--region 对外接口 检测七日之誓入口
+---检测功能 主界面中  按钮默认是true 功能未开启 是 false
+---先检测功能是否开启
+function ActionKeynoteModel.CheckShowCwzl()
+    local _, bol = require("ActionKeynoteModel"):GetInstance():GetCurrentQiShu()
+    if not bol then 
+        return bol
+    end
+    if not require("ActionKeynoteModel"):GetInstance().isOpenFunction then
+        return true
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(261) then
+        return true
+    end
+
+    -- local endDay = _G.ConfigManager.discrete_cfg[105203][1][1]
+    -- local day = _G.TimeUtil.GetInterValDayByGame(
+    --     _G.PlayerModel:GetInstance().open_time,
+    --     _G.TimeUtil.GetServerUnixTime()
+    -- )
+    -- if day + 1 > _G.Mathf.Floor(endDay / 86400) then
+    --     return false
+    -- end
+end
+
+--endregin
+
+--region 初始化 动态 数z
+---6 点刷新 天数 和 接取任务
+function ActionKeynoteModel:CheckGoalsDay(day)
+    if day <= number_21 then
+        return true
+    end
+    return false
+end
+
+---期数修改
+function ActionKeynoteModel:SixOnUpDate()
+    self.currenDay = self:GetCurrentDay()
+    self:SendOtheJiequDay()
+    require("ActionKeynoteNet"):GetInstance():SendTaskGoalsGet(_G.handlerbind(self, self.ParseDataS))
+end
+
+---编辑 已完成的 任务
+function ActionKeynoteModel:AddTaskFinshToCurrentALLtaks(tasks)
+    if _G.table.isEmptyOrNil(tasks) then
+        return
+    end
+    for i = 1, #tasks do
+        local temp = {
+            sid = tasks[i],
+            state = _G.TaskEnum.ETaskState.Completed,
+            target = {
+                [1] = 0
+            }
+        }
+        local ta = ActionKeynoteData.New(temp, _G.handler(self, self.TaskCompletdRedPoint))
+        _G.table.insert(self.currentAlltasks, ta)
+    end
+end
+
+---编辑所有任务 增加 监听事件 检测 任务是否完成
+function ActionKeynoteModel:AddListenerTaskCheck(data)
+    local tasks = {}
+    if _G.table.isEmptyOrNil(data.task) then
+        return
+    end
+    for i = 1, #data.task do
+        local day_id = self:CheckTaskOfCfgDay(data.task[i].sid)
+        local task =
+            ActionKeynoteData.New(data.task[i], _G.handler(self, self.TaskCompletdRedPoint), nil, { dayid = day_id })
+        _G.table.insert(tasks, task)
+    end
+    return tasks
+end
+
+---检测任务 所有的 天数
+function ActionKeynoteModel:CheckTaskOfCfgDay(tasksid)
+    local cfg = self.goalsCfg[self:GetCurrentQiShu()]
+    for i = 1, #cfg do
+        local misscfg = cfg[i].mission_extra1 or {}
+        for j = 1, #misscfg do
+            if tasksid == misscfg[j] then
+                return cfg[i].id
+            end
+        end
+        misscfg = cfg[i].mission_extra2
+        for j = 1, #misscfg do
+            if tasksid == misscfg[j] then
+                return cfg[i].id
+            end
+        end
+    end
+    return cfg[1].id
+end
+
+---任务完成回调的 方法
+function ActionKeynoteModel:TaskCompletdRedPoint()
+    self:RefRedPointActionDay()
+end
+
+---设置创建角色的 时间
+function ActionKeynoteModel:SetCreateRoleTime()
+    --self.roletime = _G.PlayerModel:GetInstance().create_time
+    self:GetSevertimeToDay()
+end
+
+---时间转为天数(服务器时间： 转为 当前是第几天)
+function ActionKeynoteModel:GetSevertimeToDay()
+    local currentime = _G.TimeUtil.GetServerUnixTime()
+    local day = _G.TimeUtil.GetInterValDayByGame(self.roletime, currentime) + 1
+    for k, v in pairs(self.goalsCfg) do 
+        for i = 1, #v do 
+            for i = 1, #v do 
+                if day == v[i].id then 
+                    self.currenDay = i
+                    return 
+                end
+            end
+        end
+    end
+    self.currenDay = totalDays
+end
+
+function ActionKeynoteModel:GetRealDay(num)
+    local day 
+    if num then 
+        return self.goalsCfg[self:GetCurrentQiShu()][num].id
+    else
+        local currentime = _G.TimeUtil.GetServerUnixTime()
+        day = _G.TimeUtil.GetInterValDayByGame(self.roletime, currentime) + 1
+    end
+    
+    return day
+end
+
+--dayNum 给定一个天数，算出是该期的第几天
+function ActionKeynoteModel:GetCurrentDay(dayNum)
+    local currentime = _G.TimeUtil.GetServerUnixTime()
+    local day = dayNum or (_G.TimeUtil.GetInterValDayByGame(_G.PlayerModel:GetInstance().open_time, currentime) + 1)
+    for k, v in pairs(self.goalsCfg) do 
+        for i = 1, #v do 
+            if day == v[i].id then 
+                return i
+            end
+        end
+    end
+    return totalDays
+end
+
+---根据 天数获得 任务id
+function ActionKeynoteModel:GetCurrentDayTask(day)
+    local cfg = self.goalsCfg[self:GetCurrentQiShu()]
+    local task = cfg[day].mission_extra2
+    return task
+end
+
+---获取 所有天数的 所拥有的 任务 包括 完成 当前的
+function ActionKeynoteModel:GetAllDayTasks()
+    return self.AllDayTasks
+end
+
+---获取 所有天数的 所拥有的 任务 包括 完成 当前的
+function ActionKeynoteModel:GetDailyAlltasks()
+    return self.dailyAlltasks
+end
+
+---接取其他 天数的 任务
+function ActionKeynoteModel:SendOtheJiequDay()
+    --后端要求延迟两秒发送
+    self.timer = _G.TimerManager:GetInstance():GetTimer(2, self.SendAccept, self, true)
+    self.timer:Start()
+end
+
+---发送接取任务
+function ActionKeynoteModel:SendAccept()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    local _, bol = self:GetCurrentQiShu()
+    if not bol then 
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.Qirizhishi)
+    else
+        --self.currenDay = self:GetCurrentDay()
+        local data = self:CheckOtherDayTask()
+        if _G.table.isEmptyOrNil(data.accept) then
+            return
+        end
+        self:SendTaskJiequ(data)
+    end
+end
+
+---编辑 任务 匹配到每天 有什么任务
+function ActionKeynoteModel:GetOneDayAllTask()
+    if not _G.table.isEmptyOrNil(self.currentAlltasks) then
+        for i = 1, #self.currentAlltasks do
+            local temp, daily = self:ChenckCrruetTaskToDay(self.currentAlltasks[i].i_task.sid, self.currentAlltasks[i])
+            if temp then
+                self.currentAlltasks[i].dayid = temp.dayid
+                self.dailyAlltasks[self:GetCurrentDay(temp.dayid)] = daily
+                if _G.table.isEmptyOrNil(temp) then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("配置表中：未找到次任务..:" .. self.currentAlltasks[i].i_task.sid)
+                    end
+                else
+                    _G.table.insert(self.AllDayTasks[self:GetCurrentDay(temp.dayid)], temp)
+                end
+            end
+        end
+        
+    end
+    local qishu, bol = self:GetCurrentQiShu()
+    if bol then 
+        for i = 1, totalDays do 
+            self.dailyAlltasks[i] = self.goalsCfg[qishu][i]
+        end
+    end
+end
+
+---检测 某个任务所在的 天数
+function ActionKeynoteModel:ChenckCrruetTaskToDay(taskid, task)
+    local cfg = self.goalsCfg[self:GetCurrentQiShu()]
+    local DayAllTask = {}
+    local temp = {}
+    for i = 1, #cfg do 
+        if cfg[i].mission_extra1 then
+            for j = 1, #cfg[i].mission_extra1 do
+                if taskid == cfg[i].mission_extra1[j] then
+                    temp = {}
+                    temp.dayid = cfg[i].id
+                    temp.group = cfg[i].group
+                    temp.task = task
+                    _G.table.insert(DayAllTask, temp)
+                    return temp, cfg[i]
+                end
+            end
+        end
+        if cfg[i].mission_extra2 then
+            for j = 1, #cfg[i].mission_extra2 do
+                if taskid == cfg[i].mission_extra2[j] then
+                    temp = {}
+                    temp.dayid = cfg[i].id
+                    temp.group = cfg[i].group
+                    temp.task = task
+                    temp.value = cfg[i]
+                    _G.table.insert(DayAllTask, temp)
+                    return temp, cfg[i]
+                end
+            end
+        end
+    end
+end
+
+--endregion
+
+--region 初始化 静态数据 and 获取 配置表 信息
+---静态 配置表 数据
+function ActionKeynoteModel:initStaticData()
+    self.activeCfg = self:GetGoalsActiveCfg()
+    self.goalMissCfg = self:GetMissionExtraCfg()
+    self.goalsCfg = self:GetGoalsSevenCfg()
+end
+
+---获取 活动 7日、14日 目标奖励 配置表 goals_active_cfg
+---@return table 7日\14日 配置表信息
+function ActionKeynoteModel:GetGoalsActiveCfg()
+    local cfg =  _G.ConfigManager.keynote_active_cfg
+    local activeCfg = {}
+    if cfg then
+        for key, value in pairs(cfg) do
+            activeCfg[value.group] = activeCfg[value.group] or {}
+            _G.table.insert(activeCfg[value.group], value)
+        end
+    end
+    for k, v in pairs(activeCfg) do 
+        _G.table.sort(
+            v,
+            function(a, b)
+                return a.id < b.id
+            end
+        )
+    end
+    return activeCfg
+end
+
+---获取目标活动任务的 配置表 mission_extra_cfg
+function ActionKeynoteModel:GetMissionExtraCfg()
+    local cfg = _G.ConfigManager.mission_extra_cfg
+    self.goalMissCfg = {}
+    for key, value in pairs(cfg) do
+        if value.type_mission == 14 then
+            _G.table.insert(self.goalMissCfg, value)
+        end
+    end
+    return self.goalMissCfg
+end
+
+---获取目标活动配置表 goals_seven_cfg
+function ActionKeynoteModel:GetGoalsSevenCfg()
+    local cfg = _G.ConfigManager.keynote_seven_cfg
+    local goalsCfg = {}
+    for k, v in pairs(cfg) do 
+        goalsCfg[v.group] = goalsCfg[v.group] or {}
+        _G.table.insert(goalsCfg[v.group], v)
+    end
+    for k, v in pairs(goalsCfg) do 
+        _G.table.sort(
+            v,
+            function(a, b)
+                return a.id < b.id
+            end
+        )
+    end
+    return goalsCfg
+end
+
+--返回 某一天的 所有任务的
+function ActionKeynoteModel:GetAllTasksOneDay(day)
+    local cfg = self.goalsCfg[self:GetCurrentQiShu()]
+    local d_alltaks = {}
+    if not _G.table.isEmptyOrNil(cfg[day].mission_extra1) then
+        for i = 1, #cfg[day].mission_extra1 do
+            table.insert(d_alltaks, cfg[day].mission_extra1[i])
+        end
+    end
+    if not _G.table.isEmptyOrNil(cfg[day].mission_extra2) then
+        for j = 1, #cfg[day].mission_extra2 do
+            table.insert(d_alltaks, cfg[day].mission_extra2[j])
+        end
+    end
+    return d_alltaks
+end
+
+--任务的奖励 单条 任务奖励 从第个开始将测
+function ActionKeynoteModel:rewardOfTask(taskid)
+    local awards = {}
+    --_G.LogError("任务id ； " .. taskid)
+    local reward = self.Cfg[taskid].reward
+    for i = 2, #reward do
+        table.insert(awards, reward[i])
+    end
+    return awards
+end
+
+--一天所有的任务所有奖励（奖励物品，奖励物品数量）
+function ActionKeynoteModel:OndAwardAll(alltasks)
+    local a_awards = {}
+    for i = 1, #alltasks do
+        local awards = self:rewardOfTask(alltasks[i])
+        if _G.table.isEmptyOrNil(a_awards) then
+            for j = 1, #awards do
+                a_awards[awards[j][1]] = _G.GlobalInterface.GetNewArray(awards[j])
+            end
+        else
+            local flag = false
+            for j = 1, #awards do
+                flag = false
+                local val = 0
+                for key, value in pairs(a_awards) do
+                    if key == awards[j][1] then
+                        val = value[2] + awards[j][2]
+                        flag = true
+                        break
+                    end
+                end
+                if not flag then
+                    a_awards[awards[j][1]] = _G.GlobalInterface.GetNewArray(awards[j])
+                else
+                    a_awards[awards[j][1]][2] = val
+                end
+            end
+        end
+    end
+    local AllAwards = {}
+    if not _G.table.isEmptyOrNil(a_awards) then
+        local data = {}
+        for _, value in pairs(a_awards) do
+            data = {}
+            data = _G.StorageManager:GetInstance():GetItemDataClassByCfg(value)
+            _G.table.insert(AllAwards, data)
+        end
+    end
+    return AllAwards
+end
+
+--region 服务器 交互数据
+
+---领取 一天的 奖励
+function ActionKeynoteModel:SendDayAllCash_award(d, Call)
+    local pbData = {
+        index = d
+    }
+    require("ActionKeynoteNet"):GetInstance():SendDayAllCash_award(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            ---加入已经领取的 标记
+            _G.table.insert(self.cash_award, self:GetCurrentDay(d))
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                data,
+                function()
+                    _G.PlayerModel:GetInstance():ShowRoleLvUpAward()
+                end
+            )
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            self:RefRedPointActionDay()
+            if Call then
+                Call()
+            end
+        end
+    )
+end
+
+---标记任务 完成可以领取奖励(检测天数是否是过期了)
+---@param pbData table 要发送的数据
+---@field pbData.day number 要完成的任务所在的天数
+---@field pbData.sid number 任务的sid
+function ActionKeynoteModel:SendTaskFinshSign(pbData, task)
+    local day = pbData.day
+    if self:CheckGuoQi(day) then
+        if _G.AppSetting.DEBUG then
+            _G.Log("任务，检测时间，，已经过期了，，，，，，")
+        end
+        task.state = _G.TaskEnum.ETaskState.Claimed
+        return
+    end
+    if not self.finishTask then
+        self.finishTask = {}
+    end
+    if self.finishTask[pbData.sid] then
+        return
+    end
+    self.finishTask[pbData.sid] = true
+    require("ActionKeynoteNet"):GetInstance():SendTaskOneFinish(pbData)
+end
+
+function ActionKeynoteModel:SendTaskJiequ(dayData)
+    local pbData = dayData
+    require("ActionKeynoteNet"):GetInstance():SendJieQuTask(
+        pbData,
+        function(data)
+            if data.task ~= nil then
+                --_G.Events:GetInstance():Broadcast(_G.EvenActionKeynoteEnum.SixUpdate)
+                for key, value in pairs(data.task) do
+                    local day = 1
+                    for k, v in pairs(dayData.accept) do
+                        local data1 = v.sids
+                        local flag = false
+                        for i = 1, #data1 do
+                            if value.sid == data1[i] then
+                                day = v.day
+                                flag = true
+                                break
+                            end
+                        end
+                        if flag then
+                            break
+                        end
+                    end
+                    local temp = {}
+                    local taskt =
+                        ActionKeynoteData.New(value, _G.handler(self, self.TaskCompletdRedPoint), nil, { dayid = day })
+                    --_G.table.insert(self.currentAlltasks,taskt)
+                    temp.dayid = day
+                    temp.task = taskt
+                    --temp.task.state = _G.TaskEnum.ETaskState.Claimed
+                    _G.table.insert(self.AllDayTasks[self:GetCurrentDay(day)], temp)
+                end
+                _G.Events:GetInstance():Broadcast(_G.EvenActionKeynoteEnum.SixUpdate)
+                self:RefRedPointAll()
+            else
+                require("ActionKeynoteNet"):GetInstance():SendTaskGoalsGet(_G.handlerbind(self, self.ParseDataS))
+
+                --_G.FloatTipsModel:GetInstance():Show("七日目标接取任务 有错")
+                -- require("ActionGoalsNet"):GetInstance():SendTaskGoalsGet(_G.handler(self, self.ParseData))
+            end
+        end
+    )
+end
+
+function ActionKeynoteModel:ParseDataS(data)
+    self:ParseData(data)
+    self:InitFunction()
+    self:RefRedPointActionDay()
+end
+
+---单条 任务（完成)
+function ActionKeynoteModel:SendTaskOneFinish(da, task, Call)
+    local pbData = {
+        sid = task.task.i_task.sid,
+        day = task.task.dayid,
+        finish_type = 2
+    }
+    local d = task.task.dayid
+    require("ActionKeynoteNet"):GetInstance():SendTaskOneFinish(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+                -- elseif data.ack == "not_open" then --未开启
+                --     _G.FloatTipsModel:GetInstance():Show(data.ack)
+                --     return
+                -- elseif data.ack == "input_error" then
+                --     _G.FloatTipsModel:GetInstance():Show(data.ack)
+                --     return
+            end
+            if data then
+                local awardDatas = {
+                    award = {
+                        item = {},
+                        overflow = data.award.overflow
+                    }
+                }
+
+                for i = 1, #data.award.item do
+                    local sid = data.award.item[i].type[1]
+                    if  sid == _G.ResPropID.Active_keynote then
+                        self.goalsNum = self.goalsNum + data.award.item[i].type[2]
+                    else
+                        local temp = data.award.item[i]
+                        _G.table.insert(awardDatas.award.item, temp)
+                    end
+                end
+                --更新 资源背包
+                --_G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata,awardDatas.award.item)
+                _G.StorageManager:GetInstance():ReceiveAwardData(awardDatas)
+                --奖励
+                _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                    awardDatas,
+                    function()
+                        _G.PlayerModel:GetInstance():ShowRoleLvUpAward()
+                    end
+                )
+            end
+            local alltasks = self:GetAllDayTasks()
+            local onetaskData = alltasks[self.currenDay]
+            for i = 1, #onetaskData do
+                if data.new_task.sid == onetaskData[i].task.i_task.sid then
+                    onetaskData[i].task.i_task.state = data.new_task.state
+                    break
+                end
+            end
+            self:RefRedPointActionDay()
+            --刷新红点 GoalTarget
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.KeynoteTarget.id)
+            if Call then
+                Call()
+            end
+        end
+    )
+end
+
+---领取 一天的 奖励
+function ActionKeynoteModel:OneDayReward(d, Call)
+    local pbData = {
+        day = d
+    }
+    require("ActionKeynoteNet"):GetInstance():SendDayAllPassAward(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            ---加入已经领取的 标记
+            _G.table.insert(self.day_award, self:GetCurrentDay(d))
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                data,
+                function()
+                    _G.PlayerModel:GetInstance():ShowRoleLvUpAward()
+                end
+            )
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            self:RefRedPointActionDay()
+            if Call then
+                Call()
+            end
+        end
+    )
+end
+
+---目标点数 奖励
+---@param sid number 奖励id
+function ActionKeynoteModel:GoalsReward(sid, Call)
+    local pbData = {
+        index = sid
+    }
+    require("ActionKeynoteNet"):GetInstance():SendGoalsReward(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            ---加入已经领取的 标记
+            _G.table.insert(self.goals_award, sid)
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                data,
+                function()
+                    _G.PlayerModel:GetInstance():ShowRoleLvUpAward()
+                end
+            )
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            ---添加 累计点数数领取标记
+            --刷新红点 GoalTarget
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.KeynoteTarget.id)
+            if Call then
+                Call()
+            end
+        end
+    )
+end
+
+--endregion
+
+--region 服务推送来的消息
+function ActionKeynoteModel:UpdataTask(task)
+    ---检测功能有没有开启
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(261) then
+    else
+        return
+    end
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask.task:UpdataData(task)
+
+    return true
+end
+
+function ActionKeynoteModel:GetTaskByTaskid(taskid)
+    for i = 1, #self.AllDayTasks do
+        local tasksAll = self.AllDayTasks[i]
+        for j = 1, #tasksAll do
+            if tasksAll[j].task.i_task.sid == taskid then
+                return tasksAll[j]
+            end
+        end
+    end
+    return nil
+end
+
+--endregion
+--region 检测
+---检测任务是否已过期 (根据天数)
+function ActionKeynoteModel:CheckGuoQi(day)
+    -- if day == nil then
+    --     return
+    -- end
+    -- local qishu_n = 1
+    -- if day <= number_7 then
+    --     qishu_n = 1
+    -- elseif day <= number_14 and day > number_7 then
+    --     qishu_n = 2
+    -- else
+    --     qishu_n = 3
+    -- end
+    -- if qishu_n < self:GetCurrentQiShu() then
+    --     --
+    --     if _G.AppSetting.DEBUG then
+    --         _G.Log("任务，，，，已经过期了，，，，，，")
+    --     end
+    --     return true
+    -- else
+    --     --检测时间是否到期
+    --     if self:GetCurrentTime() == 0 then
+    --         return true
+    --     end
+    -- end
+    -- return false
+    return false
+end
+
+--region 其他检测
+---检测 其他天数是否接取了任务
+function ActionKeynoteModel:CheckOtherDayTask()
+    local alltask = self:GetAllDayTasks()
+    local cfg = self.goalsCfg[self:GetCurrentQiShu()]
+    local temp = {}
+    temp.accept = {}
+    for day = 1, self:GetCurrentDay() do
+        local count1 = 0
+        local count2 = #cfg[day].mission_extra2
+        local count3 = #alltask[day]
+        if count3 < (count1 + count2) then
+            local data = {
+                day = cfg[day].id,
+                sids = {}
+            }
+            local task = self:GetCurrentDayTask(day)
+            local t = {}
+            for i = 1, #task do
+                _G.table.insert(t, task[i])
+            end
+            data.sids = t
+            _G.table.insert(temp.accept, data)
+        end
+    end
+    --判断新一期接任务的时候手动清零点数
+    if not _G.table.isEmptyOrNil(temp.accept) then
+        if #alltask[1] == 0 then 
+            self.goalsNum = 0
+        end
+    end
+    return temp
+end
+
+--endregion
+--region 红点检测 有没有 可领取的奖励
+--无用代码 暂时留下
+-- function ActionKeynoteModel:CheckReward()
+--     local alltasks = self:CheckAlltasksState(_G.TaskEnum.ETaskState.Submited, true)
+--     if alltasks == 1 then
+--         return 1
+--     end
+--     --检测 目标奖励(7日目标，14日)
+--     if self:CheckGoals(false) == 1 then
+--         return 1
+--     end
+--     if self:CheckAllPss(false) == 1 then
+--         return 1
+--     end
+--     return 0
+-- end
+
+---检测 7日目标、14日目标
+---@param isEquality boolean 检测 任务是否已经 领取
+function ActionKeynoteModel:CheckGoals(isEquality)
+    for key, value in ipairs(self.activeCfg[self:GetCurrentQiShu()]) do
+        local flag = false
+        if not _G.table.isEmptyOrNil(self.goals_award) then
+            for i = 1, #self.goals_award do
+                if tonumber(value.id) == self.goals_award[i] then
+                    flag = true
+                    break
+                end
+            end
+        end
+        if not flag then
+            if isEquality then
+                if self:GetCurrentTime() == 0 then
+                else
+                    return 1
+                end
+                --return 1
+            end
+            --local flagAward = true
+            if  value.value_active <= self.goalsNum then
+                return 1
+            end
+            -- if not flagAward then
+            --     ---判断任务过期，全通的肯定是不能完成
+            --     if self:GetCurrentTime() == 0 then
+            --     else
+            --         return 1
+            --     end
+            -- else
+            --     return 1
+            -- end
+        end
+    end
+    return 0
+end
+
+---检测 全通的奖励
+---@param isEquality boolean 检测 任务是否已经 领取
+function ActionKeynoteModel:CheckAllPss(isEquality)
+    local cfg = self.goalsCfg
+    local alltasks = self:GetAllDayTasks()
+    local qishu = self:GetCurrentQiShu()
+    for key, value in ipairs(cfg[qishu]) do
+        local flag = false
+        if not _G.table.isEmptyOrNil(self.day_award) then
+            for i = 1, #self.day_award do
+                if key == self.day_award[i] then
+                    flag = true
+                    break
+                end
+            end
+        end
+        if not flag then
+            if isEquality then
+                ---判断任务过期，全通的肯定是不能完成
+                if self:CheckGuoQi(key) then
+                else
+                    return 1
+                end
+                --return 1
+            end
+            local flagAward = true
+            if not _G.table.isEmptyOrNil(alltasks[key]) then
+                local daytasks = alltasks[key]
+                for i = 1, #daytasks do
+                    local temp = daytasks[i]
+                    if
+                        temp.task.i_task.state ~= _G.TaskEnum.ETaskState.Submited and
+                        temp.task.i_task.state ~= _G.TaskEnum.ETaskState.Completed
+                    then
+                        flagAward = false
+                        break
+                    end
+                end
+                if flagAward then
+                    ---判断任务过期，全通的肯定是不能完成
+                    if self:CheckGuoQi(key) then
+                    else
+                        return 1
+                    end
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---检测 目标点数奖励
+function ActionKeynoteModel:CheckAllGoals()
+    if self:GetCurrentTime() == 0 then
+        return 0
+    end
+    if _G.table.isEmptyOrNil(self.goals_award) or self.goals_award == nil then
+        return 1
+    end
+    local cfg = self.activeCfg[self:GetCurrentQiShu()]
+    local count = table.count(cfg)
+
+    if count == #self.goals_award then
+        return 0
+    end
+    return 1
+end
+
+--endregion
+--检测 所有任务领取 完成关闭
+---@param taskstate number 任务的 状态
+---@param isEquality boolean 相等检测（领取） 不相等（完成）
+function ActionKeynoteModel:CheckAlltasksState(taskstate, isEquality)
+    local alltasks = self:GetAllDayTasks()
+    local curr_day = self:GetCurrentDay()
+    if curr_day > number_7 then
+        curr_day = number_7
+    end
+    --检测所有任务
+    for i = 1, number_7 do
+        local daytasks = self.AllDayTasks[i]
+        if not _G.table.isEmptyOrNil(daytasks) then
+            for j = 1, #daytasks do
+                local temp = daytasks[j]
+                if isEquality then
+                    if temp.task.i_task.state == taskstate and curr_day >= i then
+                        return 1
+                    end
+                else
+                    if temp.task.i_task.state == 1 then --过期的任务相等于 是完成的状态
+                        if self:CheckGuoQi(temp.dayid) then
+                        else
+                            return 1
+                        end
+                    elseif temp.task.i_task.state ~= taskstate then --任务都没有完成
+                        return 1
+                    end
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---@return 1 奖励都已经 领取完成
+function ActionKeynoteModel:CheckFunctionClose()
+    local taskstate = self:CheckAlltasksState(_G.TaskEnum.ETaskState.Completed)
+    local goalsstate = self:CheckGoals(true)
+    local allpassState = self:CheckAllPss(true)
+    --local goals_pass_state = self:CheckAllGoals(true) and goals_pass_state == 0
+    if taskstate == 0 and goalsstate == 0 and allpassState == 0 then
+        return 1
+    end
+    return 0
+end
+
+--endregion
+--region 红点
+---刷新红点
+---@param param number 天数
+function ActionKeynoteModel:RefRedPointActionDay(param)
+    --require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GoalPage.id, param)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.KeynotePage.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.KeynotePageone.id)
+end
+
+function ActionKeynoteModel:RefRedPointAll()
+    self:RefRedPointActionDay()
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.KeynoteTarget.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.KeynotePeriod.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MainKeynote.id)
+end
+
+---获得红点得个数 七日目标(成王之路) daybutton 页签上红点
+---@param param number 期数 + button 页签
+function ActionKeynoteModel:GetRedPointActionDayNum(param)
+    -- local qishu = math.modf(param / 100)
+    -- param = math.fmod(param, 100)
+    -- if qishu == 2 then
+    --     param = param + 7
+    -- elseif qishu == 3 then
+    --     param = param + 14
+    -- end
+    ---检测天数是否开启
+    local day = self:GetCurrentDay()
+    if param > day then
+        return 0
+    end
+    --检测 天数任务
+    local allTask = self:GetAllDayTasks()
+    local onePassTask = allTask[param]
+    if onePassTask == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("七日之誓 GM 直接设置放置关卡,第一次登录时,红点检测报错")
+        end
+        return 0 --GM 直接设置放置关卡,第一次登录时,红点检测报错
+    end
+    if self:RedCheckFunction(param) == 1 then
+        return 1
+    end
+    local flag = true
+    for key, value in pairs(onePassTask) do
+        if value.task.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            return 1
+        elseif value.task.i_task.state ~= _G.TaskEnum.ETaskState.Completed then
+            flag = false
+        end
+    end
+    --检测 全通奖励
+    if not _G.table.isEmptyOrNil(self.day_award) then
+        for key, value in pairs(self.day_award) do
+            if value == param then
+                return 0
+            end
+        end
+    end
+
+    if flag then
+        return 1
+    end
+    return 0
+end
+
+---获得红点得个数 七日目标(成王之路) daybutton 页签上红点
+---@param param number 期数 + button 页签
+function ActionKeynoteModel:GetRedPointActionDayNums(param)
+    -- local qishu = math.modf(param / 100)
+    -- param = math.fmod(param, 100)
+    -- if qishu == 2 then
+    --     param = param + 7
+    -- elseif qishu == 3 then
+    --     param = param + 14
+    -- end
+    ---检测天数是否开启
+    local day = self:GetCurrentDay()
+    if param > day then
+        return 0
+    end
+    --检测 天数任务
+    local allTask = self:GetAllDayTasks()
+    local onePassTask = allTask[param]
+    if onePassTask == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("七日目标 GM 直接设置放置关卡,第一次登录时,红点检测报错")
+        end
+        return 0 --GM 直接设置放置关卡,第一次登录时,红点检测报错
+    end
+
+    local flag = true
+    for key, value in pairs(onePassTask) do
+        if value.task.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            return 1
+        elseif value.task.i_task.state ~= _G.TaskEnum.ETaskState.Completed then
+            flag = false
+        end
+    end
+    --检测 全通奖励
+    if not _G.table.isEmptyOrNil(self.day_award) then
+        for key, value in pairs(self.day_award) do
+            if value == param then
+                return 0
+            end
+        end
+    end
+
+    if flag then
+        return 1
+    end
+    return 0
+end
+
+---七日目标 目标点 红点奖励
+function ActionKeynoteModel:CheckGoalsRedpoint(param)
+    --判断新一期的时候手动清零点数
+    local alltask = self:GetAllDayTasks()
+    if #alltask[1] == 0 then 
+        self.goalsNum = 0
+        return false
+    end
+    local qishu, bol = self:GetCurrentQiShu()
+    if bol then
+        param = qishu * 100 + param
+        local cfg = _G.ConfigManager.keynote_active_cfg[param]
+        local num = self.goalsNum
+        if num == nil then
+            return false
+        end
+        --检测目标点数
+        if num < cfg.value_active then
+            return false
+        end
+        --判断奖励是否已经领取过
+        if _G.table.isEmptyOrNil(self.goals_award) then
+            return true
+        end
+        for i = 1, #self.goals_award do
+            if self.goals_award[i] == param then
+                return false
+            end
+        end
+        return true
+    end
+    return false
+end
+
+-- function ActionKeynoteModel:IsConnect()
+--     local isOpen = _G.GameDataModelBase.GetFunctionOpen(self)
+--     if isOpen then
+--         ---ZHJ-22526 跨天断线没接到任务
+--         -- local currentDay = self:GetCurrentDay()
+--         -- if self.currenDay ~= currentDay then
+--         --     self.currenDay = currentDay
+--         --     self:CurrentDayJieQuTask(self.currenDay)
+--         -- end
+--         self.currenDay = self:GetCurrentDay()
+--         self:SendOtheJiequDay()
+--     end
+-- end
+
+---@private
+function ActionKeynoteModel:ReConnect(endcall)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        if endcall then
+            endcall()
+        end
+        return
+    end
+    -- local day = self:GetCurrentDay()
+    -- if day ~= self.currenDay then
+    --     self.currenDay = day
+    --     self:SendOtheJiequDay()
+    -- end
+    require("ActionKeynoteNet"):GetInstance():SendTaskGoalsGet(_G.handlerbind(self, self.ParseDataS))
+    --self:IsConnect()
+    -- local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActionGoalsView.Name)
+    -- if ctrl then
+    --     ctrl:DayButtonClick()
+    -- end
+    if endcall ~= nil then
+        endcall(self.__cname)
+    end
+end
+
+--获取进度条上面描述
+function ActionKeynoteModel:GetCurrentJinduDes(day)
+    local cfg = _G.ConfigManager.discrete_cfg[115401]
+    for i = 1, #cfg do 
+        if cfg[i][1] == self:GetCurrentQiShu() and cfg[i][2] == day then 
+            return cfg[i][3]
+        end
+    end
+    return nil
+end
+
+--获取奖励弹窗显示数据
+function ActionKeynoteModel:GetCurrentFinalBox()
+    return self.goalsCfg[self:GetCurrentQiShu()][1].show_rewards 
+end
+
+--获取箱子下面名字和描述
+function ActionKeynoteModel:GetCurrentFinalDes()
+    return self.goalsCfg[self:GetCurrentQiShu()][1].doc 
+end
+
+return ActionKeynoteModel

@@ -1,0 +1,531 @@
+-----------------------------------------------------------------------
+-- F:.SG.alpha.Client.Assets.Resources.LuaScripts.Game.HeroicIcon.View.Sg.HeroicMineViewSG	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2026/02/02
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+---@class HeroicMineViewSG : UIBaseView	中文描述
+---@field public go_table HeroicMineViewSG_GoTable GoTable
+---@field awardList table 领取奖励列表，每秒进行判断
+local HeroicMineViewSG = _G.BaseClass("HeroicMineViewSG", _G.UIBaseView)
+local RuinData = require("RuinData")
+local ruinEff = {
+    [1] = _G.ConfigManager.ui_effect_cfg.ef_Szhy_jin,
+    [2] = _G.ConfigManager.ui_effect_cfg.ef_Szhy_jin,
+    [3] = _G.ConfigManager.ui_effect_cfg.ef_Szhy_jin,
+    [4] = _G.ConfigManager.ui_effect_cfg.ef_Szhy_red,
+    [5] = _G.ConfigManager.ui_effect_cfg.ef_Szhy_cai,
+}
+
+function HeroicMineViewSG:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self:AddListener(_G.eSixUpdate.SixClockUpdate, self.UpdateView)
+    self:AddListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.UpdatePrivilege)
+end
+
+---界面的入口函数
+function HeroicMineViewSG:OnCreate()
+    self.updateCall = {}
+    self.awardList = {}
+    self.ruinTbList = {}
+    self.freeTeamNum = _G.ConfigManager.discrete_cfg[304005][1][1]
+    self.teamMaxNum = _G.ConfigManager.discrete_cfg[304004][1][1]
+    self.buyTeamNum = #_G.ConfigManager.discrete_cfg[304001]
+    self.maxRestore = _G.ConfigManager.discrete_cfg[304002][1][1]
+    local temp = require("PrivilegeManager"):GetInstance():GetPrivilegeDataNew({ _G.PrivilegeType.Heroic.restoreMax })
+    for _, v in pairs(temp) do
+        self.maxRestore = self.maxRestore + v[2]
+    end
+    self.privilegeTeamNum = 1
+    temp = require("PrivilegeManager"):GetInstance():GetPrivilegeDataNew({ _G.PrivilegeType.Heroic.ruinTime })
+    self.ruinTimePrivilege = 0
+    for _, v in pairs(temp) do
+        self.ruinTimePrivilege = self.ruinTimePrivilege + v[2]
+    end
+
+    ---@type HeroicMineModelSg
+    self.model = require("HeroicMineModelSg"):GetInstance()
+    self.ruins = self.model:GetRuinDataList()
+    self:UpdateView()
+    self.updateTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false, true)
+    self.updateTimer:Start()
+    _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.HeroicIconMineLogin,
+        _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime()))
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.HeroicIconMineLogin.id)
+    if _G.AppSetting.IsXzns then
+        local spinePaths = _G.ConfigManager.discrete_cfg[304010]
+        for _, v in pairs(spinePaths) do
+            local path = _G.ConfigManager.card_cfg[v[1]].spine[1]
+            _G.PoolsManager:GetInstance():Spawn(
+                path,
+                _G.ePoolType.Temporary,
+                self.go_table.obj_spineRoot,
+                function (obj)
+                    if self:IsNil() then
+                        _G.DestroyObject(obj)
+                        return
+                    end
+                    obj:SetLocalScaleXYZ(0.7)
+                    local num = _G.math.random(1,8)
+                    local x,y,z = self.go_table["obj_point" .. num]:GetLocalPosition()
+                    obj:SetLocalPosition(x,y,z)
+                    self:SpineMove(obj, num)
+                end
+            )
+        end
+    end
+end
+
+function HeroicMineViewSG:OnEnable()
+    for i = 1, 6 do
+        self.ruinTbList[i].obj_refreshEff:SetActiveE(0)
+    end
+end
+
+function HeroicMineViewSG:UpdateView()
+    self.restore = self.model:GetRestore()
+    self.go_table.aortext_per.text = self.restore .. "/" .. self.maxRestore
+    self.go_table.slider_teamEnergy.value = self.restore / self.maxRestore
+    local level = self.model:GetLevel()
+    self.go_table.aortext_teamLevel.text = level
+    if _G.AppSetting.IsXzns then
+        self.go_table.aorimage_teamLevel.SpriteName = "ui_szhy_xiaoduidengji".. level .. "_iocn"
+    end
+    local freeNum = self.model:GetFreeRefeashNum()
+    if freeNum > 0 then
+        if _G.AppSetting.IsXzns then
+            self.go_table.obj_prop:SetActiveE(0)
+        else
+            self.go_table.aorrawimage_PropLeft:SetActiveE(0)
+        end
+        self.go_table.aortext_PropLeftNum.text = _G.GetLangPackValue(90000011911, freeNum)
+    else
+        if _G.AppSetting.IsXzns then
+            self.go_table.obj_prop:SetActiveE(1)
+            self.go_table.aortext_PropLeftNum.text = _G.ConfigManager.discrete_cfg[304008][1][2] .. "/" .. _G.GameUtil.NumberWY(_G.StorageManager:GetInstance():GetItemCountBySid(12))
+        else
+            self.go_table.aorrawimage_PropLeft:SetActiveE(1)
+            self.go_table.aortext_PropLeftNum.text = _G.ConfigManager.discrete_cfg[304008][1][2]
+        end
+    end
+    self:UpdateRuin()
+    self:UpdateTeam()
+    self:UpdateTime(0)
+end
+
+function HeroicMineViewSG:UpdateRuin()
+    local index = 0
+    for _, ruin in pairs(self.ruins) do
+        index = index + 1
+        self:SetRuin(index, ruin)
+    end
+end
+
+function HeroicMineViewSG:UpdateTeam()
+    for i = 1, self.teamMaxNum do
+        for _, v in pairs(self.ruins) do
+            v:RemoveOverCall("team" .. i)
+        end
+    end
+    self.teamNum = self.model:GetTeamNum()
+    local runTeamList = self.model:GetStartRuinList()
+    local tb
+    for i = 1, self.teamMaxNum do
+        if i <= self.teamNum - #runTeamList then
+            tb = _G.GetAutoGoTable(self.go_table["obj_team" .. i])
+            tb.obj_uLock:SetActiveE(1)
+            tb.obj_lock:SetActiveE(0)
+            if not _G.AppSetting.IsXzns then
+                tb.aortext_state.color = _G.ColorTools.FormatColorByString("87f18a")
+            end
+            tb.aortext_state.text = _G.GetLangPackValue(90000010393)
+            tb.aorimage_per.fillAmount = 0
+        elseif i > self.teamNum - #runTeamList and i <= self.teamNum then
+            tb = _G.GetAutoGoTable(self.go_table["obj_team" .. i])
+            tb.obj_uLock:SetActiveE(1)
+            tb.obj_lock:SetActiveE(0)
+            if not _G.AppSetting.IsXzns then
+                tb.aortext_state.color = _G.ColorTools.FormatColorByString("E4E1D9")
+            end
+            local index = i - self.teamNum + #runTeamList
+            self:SetRunTeam(tb, index, runTeamList[index])
+        else
+            local maxNum = self.teamMaxNum
+            local isPri = false
+            -- 判断特权
+            if require("PrivilegeManager"):GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.Heroic.teamNum) then
+                isPri = true
+            end
+            -- 分开钻石和特权
+            if not isPri then
+                maxNum = maxNum - 2
+            end
+            tb = _G.GetAutoGoTable(self.go_table["obj_team" .. i],
+                _G.handlerbind(self, self.TeamClick, i <= maxNum and 1 or 2))
+            tb.obj_uLock:SetActiveE(0)
+            tb.obj_lock:SetActiveE(1)
+            if i <= maxNum then
+                -- 钻石购买
+                tb.obj_prop:SetActiveE(1)
+                tb.obj_info:SetActiveE(0)
+
+                local item = _G.ConfigManager.discrete_cfg[304001][(i - 1) % 2 + 1]
+                tb.aortext_PropLeftNum.text = item[2]
+            else
+                -- 特权购买
+                tb.obj_prop:SetActiveE(0)
+                tb.obj_info:SetActiveE(1)
+            end
+        end
+        tb.aortext_name.text = _G.GetLangPackValue(90031700126, i)
+    end
+end
+
+function HeroicMineViewSG:RefreashEnd()
+    _G.PopWindowManager:GetInstance():ShowAllTips(1250012)
+    self:UpdateView()
+    for i = 1, 6 do
+        if self.ruins[i].overTime == 0 then
+            self.ruinTbList[i].obj_refreshEff:SetActiveE(0)
+            self.ruinTbList[i].obj_refreshEff:SetActiveE(1)
+        end
+    end
+end
+
+--- 设置遗迹
+function HeroicMineViewSG:SetRuin(index, ruin)
+    local tb
+    tb = self.ruinTbList[index]
+    if not tb then
+        tb = _G.GetAutoGoTable(self.go_table["obj_platformRoot" .. index], _G.handlerbind(self, self.RuinClick, ruin))
+        self.ruinTbList[index] = tb
+    end
+    tb.aortext_num.text = ruin.level
+    if not _G.AppSetting.IsXzns then
+        tb.aorrawimage_bg:LoadImage(
+            ruin.level == 5 and "ImagesSg/HeroicIcon/ui_mqmzts_dz2" or "ImagesSg/HeroicIcon/ui_mqmzts_dz1",
+            function(tran)
+                if tran and not self:IsNil() then
+                    tran:SetNativeSize()
+                end
+            end
+        )
+    end
+    tb.aorrawimage_prop:LoadImage(_G.StorageManager:GetInstance():GetItemIcon(ruin.showAward.type[1]), function(tran)
+        if self:IsNil() or not tran then
+            return
+        end
+        tran:SetNativeSize()
+    end)
+    tb.obj_eff:ClearChildren()
+    _G.UIUtils.LoadEffectByCfg(
+        ruinEff[ruin.level],
+        tb.obj_eff,
+        function(obj)
+            if self:IsNil() then
+                _G.UIUtils.RemoveEffect(obj, 0)
+                return
+            end
+            if tb.obj_eff:GetChildCountE() > 1 then
+                _G.UIUtils.RemoveEffect(tb.eff, 0)
+            end
+            tb.eff = obj
+        end
+    )
+    if ruin.ruinState == RuinData.RuinState.Free then
+        tb.aorimage_state:SetActiveE(0)
+        tb.aorimage_time:SetActiveE(0)
+        tb.aorimage_time1:SetActiveE(0)
+    elseif ruin.ruinState == RuinData.RuinState.Start then
+        tb.aorimage_state:SetActiveE(1)
+        tb.aorimage_time1:SetActiveE(0)
+        tb.aorimage_time:SetActiveE(1)
+        ruin:AddOverCall("platform" .. ruin.sid, function()
+            ruin:RemoveOverCall("platform" .. ruin.sid)
+            if not _G.table.ContainsValue(self.awardList, ruin.sid) then
+                _G.table.insert(self.awardList, ruin.sid)
+            end
+        end)
+        tb.RST = ruin.overTime - _G.TimeUtil.GetServerUnixTime()
+        self.updateCall["platform" .. ruin.sid] = function(elapsed)
+            tb.RST = tb.RST - elapsed
+            if tb.RST <= 0 then
+                self.updateCall["platform" .. ruin.sid] = nil
+                return
+            end
+            tb.aortext_time.text = _G.TimeUtil.TimeToString(tb.RST, 1)
+            local time = _G.ConfigManager.heroic_icons_ruins_cfg[ruin.level].time * (1 - self.ruinTimePrivilege / 10000)
+            time = _G.math.floor(time)
+            if not _G.AppSetting.IsXzns then
+                tb.aorimage_per.fillAmount = 1 - tb.RST / time
+            end
+        end
+    elseif ruin.ruinState == RuinData.RuinState.Cd then
+        tb.aorimage_state:SetActiveE(1)
+        tb.aorimage_time1:SetActiveE(1)
+        tb.aorimage_time:SetActiveE(0)
+        ruin:AddCdOverCall("platform" .. ruin.sid, function()
+            ruin:RemoveCdOverCall("platform" .. ruin.sid)
+            self:SetRuin(index, ruin)
+        end)
+        tb.RST = ruin.cd - _G.TimeUtil.GetServerUnixTime()
+        self.updateCall["platform" .. ruin.sid] = function(elapsed)
+            tb.RST = tb.RST - elapsed
+            if tb.RST <= 0 then
+                self.updateCall["platform" .. ruin.sid] = nil
+                self:SetRuin(index, ruin)
+                return
+            end
+            tb.aortext_time1.text = _G.TimeUtil.TimeToString(tb.RST, 1)
+            local cd = _G.ConfigManager.heroic_icons_ruins_cfg[ruin.level].re_new_time
+            cd = _G.math.floor(cd)
+            if not _G.AppSetting.IsXzns then
+                tb.aorimage_per.fillAmount = 1 - tb.RST / cd
+            end
+        end
+    elseif ruin.ruinState == RuinData.RuinState.Get then
+        tb.aorimage_state:SetActiveE(0)
+        tb.aorimage_time:SetActiveE(0)
+        tb.aorimage_time1:SetActiveE(0)
+        if not _G.table.ContainsValue(self.awardList, ruin.sid) then
+            _G.table.insert(self.awardList, ruin.sid)
+        end
+    end
+end
+
+--- 设置派遣中小队
+function HeroicMineViewSG:SetRunTeam(tb, index, ruin)
+    tb.RST = ruin.overTime - _G.TimeUtil.GetServerUnixTime()
+    ruin:AddOverCall("team" .. index, function()
+        self.updateCall["team" .. index] = nil
+        ruin:RemoveOverCall("team" .. index)
+    end)
+    self.updateCall["team" .. index] = function(elapsed)
+        tb.RST = tb.RST - elapsed
+        if tb.RST <= 0 then
+            self.updateCall["team" .. index] = nil
+            return
+        end
+        local time = _G.ConfigManager.heroic_icons_ruins_cfg[ruin.level].time * (1 - self.ruinTimePrivilege / 10000)
+        time = _G.math.floor(time)
+        tb.aortext_state.text = _G.TimeUtil.TimeToString(tb.RST, 1)
+        tb.aorimage_per.fillAmount = 1 - tb.RST / time
+    end
+end
+
+--- 一个全局定时器，用来控制界面中所有刷新显示
+function HeroicMineViewSG:UpdateTime(elapsed)
+    for _, v in pairs(self.updateCall) do
+        v(elapsed)
+    end
+    if #self.awardList > 0 then
+        local awards = self.awardList
+        self.awardList = {}
+        self.model:GetRuinsAward(awards, _G.handler(self, self.GetAwardCall))
+    end
+end
+
+function HeroicMineViewSG:GetAwardCall(msg)
+    local temp = { award = { item = {} } }
+    for k, v in pairs(msg.award.item) do
+        if v.type[1] ~= 88 then
+            _G.table.insert(temp.award.item, v)
+        end
+    end
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, temp)
+    self:UpdateView()
+end
+
+--- 特权更新
+function HeroicMineViewSG:UpdatePrivilege(isInit)
+    if isInit then
+        if require("PrivilegeManager"):GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.Heroic.teamNum) then
+            self.model:PrivilegeUpdate()
+        end
+        if require("PrivilegeManager"):GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.Heroic.restoreMax) then
+            local data = require("PrivilegeManager"):GetInstance():GetPrivilegeDataNew({ _G.PrivilegeType.Heroic
+                .restoreMax })
+            for k, v in pairs(data) do
+                self.maxRestore = self.maxRestore + v[2]
+            end
+        end
+        local temp = require("PrivilegeManager"):GetInstance():GetPrivilegeDataNew({ _G.PrivilegeType.Heroic.ruinTime })
+        for _, v in pairs(temp) do
+            self.ruinTimePrivilege = self.ruinTimePrivilege + v[2]
+        end
+        self:UpdateView()
+    end
+end
+
+---界面的销毁函数
+function HeroicMineViewSG:OnDestroy()
+    if self.updateTimer then
+        self.updateTimer:Stop()
+        self.updateTimer = nil
+    end
+    for _, v in pairs(self.ruins) do
+        v:RemoveAllOverCall()
+        v:RemoveAllCdOverCall()
+    end
+    self.updateCall = nil
+    self:RemoveAllListener()
+end
+
+function HeroicMineViewSG:RuinClick(_, _, ruin)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.HeroicIconBuild.Name, ruin,
+        _G.handler(self, self.UpdateView))
+end
+
+function HeroicMineViewSG:TeamClick(_, _, type)
+    if type == 1 then
+        local num = self.teamNum % 2
+        local item = _G.ConfigManager.discrete_cfg[304001][num + 1]
+        -- 钻石购买
+        _G.PopWindowManager:GetInstance():ShowAllTips(1250001, _G.GetLangPackValue(92010700010, item[2]), function()
+            if _G.StorageManager:GetInstance():CheckItem(item[1], item[2]) then
+                self.model:UnlockTeam(num + 1, function()
+                _G.PopWindowManager:GetInstance():ShowAllTips(1250013)
+                self.teamNum = self.teamNum + 1
+                    self:UpdateView()
+                end)
+            else
+                _G.PopWindowManager:GetInstance():ShowAllTips(230303)
+            end
+        end)
+    elseif type == 2 then
+        -- 特权购买
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.HeroicIconPrivilegeView.Name, 405008)
+    end
+end
+
+---按钮点击事件在这里派发
+function HeroicMineViewSG:OnClickBtn(go)
+    if go == self.go_table.aorbtn_help then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 213)
+    elseif go == self.go_table.aorbtn_refresh then
+        local runRuins = self.model:GetStartRuinList()
+        if #runRuins == #self.ruins then
+            -- 没有刷新的遗迹
+            _G.PopWindowManager:GetInstance():ShowAllTips(1250005)
+            return
+        end
+        local savetime = _G.PlayerPrefsManager.GetInt("HeroicMineGoodRefreash")
+        local nowtime = _G.TimeUtil.GetServerUnixTime()
+        local todayTime = _G.TimeUtil.GetDayBySix(nowtime)
+        local isChoose = savetime ~= todayTime
+        local isRun
+        local isGrade = false
+        if isChoose then
+            for _, ruin in pairs(self.ruins) do
+                isRun = false
+                for _, run in pairs(runRuins) do
+                    if run.sid == ruin.sid then
+                        isRun = true
+                        break
+                    end
+                end
+                if not isRun then
+                    if ruin.level == 5 or ruin.level == 4 then
+                        isGrade = true
+                        break
+                    end
+                end
+            end
+        end
+        if isGrade then
+            -- 有高等级遗迹
+            _G.PopWindowManager:GetInstance():ShowAllTips(1250004, nil,
+                function(choose)
+                    if choose then
+                        _G.PlayerPrefsManager.SetInt("HeroicMineGoodRefreash", todayTime)
+                    end
+                    self.model:RefreashRuin(_G.handler(self, self.RefreashEnd))
+                end)
+        else
+            savetime = _G.PlayerPrefsManager.GetInt("HeroicMineDiamondRefreash")
+            nowtime = _G.TimeUtil.GetServerUnixTime()
+            todayTime = _G.TimeUtil.GetDayBySix(nowtime)
+            local isChoose = savetime ~= todayTime
+            if self.model:GetFreeRefeashNum() > 0 or not isChoose then
+                self.model:RefreashRuin(_G.handler(self, self.RefreashEnd))
+            else
+                _G.PopWindowManager:GetInstance():ShowAllTips(1250003,
+                    _G.GetLangPackValue(92010700012, _G.ConfigManager.discrete_cfg[304008][1][2]), function(choose)
+                        if choose then
+                            _G.PlayerPrefsManager.SetInt("HeroicMineDiamondRefreash", todayTime)
+                        end
+                        self.model:RefreashRuin(_G.handler(self, self.RefreashEnd))
+                    end)
+            end
+        end
+    elseif go == self.go_table.aorbtn_teamLevel then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.HeroicIconTeamLevel.Name)
+    elseif go == self.go_table.aorbtn_privilege then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.HeroicIconPrivilegeView.Name, 405008)
+    elseif go == self.go_table.aorbtn_preAward then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MineAwardView.Name)
+    elseif go == self.go_table.aorbtn_auto then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.HeroicMineAutoView.Name,_G.handler(self, self.UpdateView))        
+    end
+end
+
+function HeroicMineViewSG:SpineMove(spine, nowPoint, pointStack)
+    if self:IsNil() then
+        return
+    end
+    _G.GameUtil.SetCardUiSpineAnimation(spine,"stand_1")
+    _G.DelayDo(1,function()
+        if self:IsNil() then
+            return
+        end
+        if not pointStack or  #pointStack == 0 then
+            local stack = {}
+            local num = _G.math.random(1,8)
+            while(num == nowPoint) do
+                num = _G.math.random(1,8)
+            end
+            _G.table.insert(stack, num)
+            if num < 4 then
+                if nowPoint ~= 4 then
+                    _G.table.insert(stack, 4)
+                end
+                if nowPoint > 5 then
+                    _G.table.insert(stack, 5)
+                end
+            elseif num == 4 then
+                if nowPoint > 5 then
+                    _G.table.insert(stack, 5)
+                end
+            elseif num == 5 then
+                if nowPoint < 4 then
+                    _G.table.insert(stack, 4)
+                end
+            elseif num > 5 then
+                if nowPoint ~= 5 then
+                    _G.table.insert(stack, 5)
+                end
+                if nowPoint < 4 then
+                    _G.table.insert(stack, 4)
+                end
+            end
+            self:SpineMove(spine, nowPoint, stack)
+            return
+        end
+        local point = _G.table.remove(pointStack)
+        local x,y,z = self.go_table["obj_point" .. point]:GetPosition()
+        local nowX = self.go_table["obj_point" .. nowPoint]:GetPosition()
+        local _, scaleY, scaleZ = spine:GetLocalScale()
+        if nowX > x then
+            spine:SetLocalScale(-scaleY,scaleY,scaleZ)
+        else
+            spine:SetLocalScale(scaleY,scaleY,scaleZ)
+        end
+        _G.GameUtil.SetCardUiSpineAnimation(spine,"run_1")
+        spine:DoMove(x,y,z,function()
+            self:SpineMove(spine,point, pointStack)
+        end, 2)
+    end)
+end
+
+return HeroicMineViewSG

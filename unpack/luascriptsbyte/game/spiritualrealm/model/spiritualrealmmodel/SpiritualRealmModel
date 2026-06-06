@@ -1,0 +1,1324 @@
+-----------------------------------------------------------------------
+-- F:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.SpiritualRealm.Model.SpiritualRealmModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/03/28
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local SpiritualRealmTaskModel = require("SpiritualRealmTaskModel")
+
+local SpiritualRealmNet = require "SpiritualRealmNet"
+---@class SpiritualRealmModel :GameDataModelBase
+---@field Times SociatyBattleModel_Times 时间
+---@field state SociatyBattleState 当前公会战状态
+---@field normalCfg guild_battle_normal_cfg 公会战配置
+---@field curDay number 战斗阶段
+---@field sociatyUid number 公会uid
+---@field startTime number 当前阶段起始时间
+---@field endTime number 当前阶段终止时间
+---@field challengeNum number 挑战次数
+---@field score number 贡献积分
+---@field seasonCfg guild_battle_season_cfg 赛季配置
+local SpiritualRealmModel = _G.BaseClass("SpiritualRealmModel", _G.GameDataModelBase)
+
+---@return SpiritualRealmModel SpiritualRealmModel
+function SpiritualRealmModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SpiritualRealmModel:__init()
+    local arena_info_cfg = _G.ConfigManager.arena_info_cfg[7]
+    self.maxChallengeCount = arena_info_cfg.free_count
+    self.ticket = arena_info_cfg.ticket
+    self.ticketID = _G.ConfigManager.exchange_cfg[arena_info_cfg.ticket].get_item[1][1]
+    self.curFunctionOpenID = 152
+
+    self.OneKeyChangeScoreList = {}
+    self.OneKeyReportList = {}
+    self.OneKeyIsWinList = {}
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+end
+
+---销毁对象时,析构函数
+function SpiritualRealmModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.defendTimer then
+        self.defendTimer:Stop()
+        self.defendTimer = nil
+    end
+    if self.settleTimer then
+        self.settleTimer:Stop()
+        self.settleTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eCard.CardUpStar, self.RefreshDefendRed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eCard.CardDelCard, self.RefreshDefendRed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+end
+
+--region 子类重写
+---从服务器拉取数据
+function SpiritualRealmModel:GetDataFormServer()
+    self:GetInfo()
+    if not self.add then
+        self.add = true
+        _G.Events:GetInstance():AddListener(_G.eCard.CardUpStar, self.RefreshDefendRed, self)
+        _G.Events:GetInstance():AddListener(_G.eCard.CardDelCard, self.RefreshDefendRed, self)
+    end
+end
+
+---获取数据
+function SpiritualRealmModel:GetInfo(call)
+    SpiritualRealmNet:GetInstance():GetInfo(_G.handlerbind(self, self.GetInfoCall, call))
+end
+
+---获取信息回调
+---@param msg arena_layer.s2c_arena_layer_info
+function SpiritualRealmModel:GetInfoCall(msg, call)
+    self:ParseData(msg)
+    if call then
+        call()
+    end
+    _G.Events:GetInstance():Broadcast(_G.SpiritualRealmEvents.Refresh)
+end
+
+---解析数据
+function SpiritualRealmModel:ParseData(msg)
+    self:InitSeason(msg.pub_info)
+    self:InitRoleInfo(msg.self_info)
+    SpiritualRealmTaskModel:GetInstance():InitData(msg)
+    require "ShopModel":GetInstance():GetShopInServer(_G.ShopID.SpiritualRealm)
+    --self:InitLog()
+
+    --_G.Events:GetInstance():Broadcast(_G.eSociatyBattle.ScoiatyBattleChallengeNum)
+    --_G.Events:GetInstance():Broadcast(_G.eSociatyBattle.SociatyBattleState)
+    self.super.ParseData(self)
+
+    --刷新赛季红点
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayer.id)
+end
+
+---初始化功能逻辑
+
+function SpiritualRealmModel:InitFunction()
+end
+
+--region 赛季
+function SpiritualRealmModel:InitSeason(msg)
+    if self.seasonId and self.seasonId ~= msg.season_id and msg.state == 2 then
+        _G.DelayDo(
+            10,
+            function()
+                self:GetInfo(_G.handler(self, self.FreshViewCall))
+            end
+        )
+    end
+    self.seasonId = msg.season_id
+    self.seasonStartTime = msg.start_time
+    self.seasonEndTime = msg.end_time
+    self.seasonStopTime = msg.stop_time
+    self.seasonState = msg.state
+    local now = _G.TimeUtil.GetServerUnixTime()
+    if self.settleTimer then
+        self.settleTimer:Stop()
+        self.settleTimer = nil
+    end
+    if now < self.seasonStopTime then
+        self.settleTimer =
+            _G.TimerManager:GetInstance():GetTimer(
+                self.seasonStopTime - now,
+                self.OnSettleTimer,
+                self,
+                true,
+                false,
+                true
+            )
+        self.settleTimer:Start()
+    end
+end
+
+---初始化玩家信息
+function SpiritualRealmModel:InitRoleInfo(msg)
+    if not msg then
+        return
+    end
+    self.joinType = msg.join_type
+    self.score = msg.score
+    self.maxScore = msg.max_score
+    self.historyScores = {}
+    if msg.history_score then
+        for k, v in pairs(msg.history_score) do
+            self.historyScores[v.k] = v.v
+        end
+    end
+    self.fightTimes = msg.fight_times
+    self.stageAward = msg.stage_award or {}
+end
+
+---六点刷新更新红点
+function SpiritualRealmModel:OnSixClockUpdateCallback()
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.ArenaLayer.id)
+end
+
+function SpiritualRealmModel:FreshViewCall()
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ArenaPanelView.Name)
+    if ctrl then
+        ctrl:JieMianShuaXing()
+    end
+end
+
+--region 消息
+
+---报名
+---@param join_type number 类型
+function SpiritualRealmModel:Apply(join_type, call)
+    if self:CanApply(join_type) then
+        SpiritualRealmNet:GetInstance():Apply(
+            { join_type = join_type },
+            _G.handlerbind(self, self.ApplyCall, call, join_type)
+        )
+    end
+end
+
+---申请回调
+---@param join_type number 类型
+function SpiritualRealmModel:ApplyCall(msg, call, join_type)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.joinType = join_type
+    self.score = msg.score
+    SpiritualRealmTaskModel:GetInstance():InitTask()
+    if self.historyScores[join_type] == nil then
+        self.historyScores[join_type] = _G.ConfigManager.arena_layer_league_cfg[101].min_score
+        -- require "ShopModel":GetInstance():GetShopInServer(_G.ShopID.SpiritualRealm)
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayerRank.id)
+    if call then
+        call()
+    end
+end
+
+---获取排行榜
+---@param join_type number 类型
+function SpiritualRealmModel:GetRankList(join_type, call)
+    if join_type == 1 then
+        SpiritualRealmNet:GetInstance():GetFirstRankList(1, _G.handlerbind(self, self.GetRankCall, call))
+    elseif join_type == 2 then
+        SpiritualRealmNet:GetInstance():GetTwoRankList(1, _G.handlerbind(self, self.GetRankCall, call))
+    elseif join_type == 3 then
+        SpiritualRealmNet:GetInstance():GetThirdRankList(1, _G.handlerbind(self, self.GetRankCall, call))
+    elseif join_type == 4 then
+        SpiritualRealmNet:GetInstance():GetFourRankList(1, _G.handlerbind(self, self.GetRankCall, call))
+    end
+end
+
+---获取排行榜回调
+---@param msg rank.s2c_rank_arena_layer
+function SpiritualRealmModel:GetRankCall(msg, callback)
+    self.rankList = msg.ranks or {}
+    local count = #self.rankList
+    for i = 1, count do
+        self.rankList[i].rank = i
+        if self.rankList[i].type == 1 then
+            self.rankList[i].name = _G.LangUtil.GetLangPackValue(self.rankList[i].name)
+        end
+    end
+    if callback then
+        callback(self.rankList)
+    end
+end
+
+---匹配
+function SpiritualRealmModel:Match(call)
+    SpiritualRealmNet:GetInstance():Match(_G.handlerbind(self, self.MatchCall, call))
+end
+
+---匹配回调
+function SpiritualRealmModel:MatchCall(msg, callback)
+    if msg.ack == 1 then
+        self:GetEnemyGarray(
+            require "SpiritualRealmModel":GetInstance():GetJoinType(),
+            msg.role_info.uid,
+            msg.match_type,
+            msg,
+            callback
+        )
+    end
+end
+
+---获取对手的详细阵容信息
+---@param join_type number
+---@param player_uid number
+---@param player_type number
+---@param arena_layer_match arena_layer.s2c_arena_layer_match
+function SpiritualRealmModel:GetEnemyGarray(join_type, player_uid, player_type, arena_layer_match, call)
+    local pb = {
+        sid = join_type,
+        uid = player_uid,
+        type = player_type
+    }
+    SpiritualRealmNet:GetInstance():GetEnemyGarray(
+        pb,
+        _G.handlerbind(self, self.GetEnemyGarrayCall, call, arena_layer_match)
+    )
+end
+
+---获取对手的详细阵容信息回调
+---@param msg arena_layer.s2c_arena_layer_enemy_array
+---@param arena_layer_match arena_layer.s2c_arena_layer_match
+function SpiritualRealmModel:GetEnemyGarrayCall(msg, callback, arena_layer_match)
+    if msg.ack == 1 then
+        if callback then
+            callback(msg, arena_layer_match)
+        end
+    end
+end
+
+--endregion
+
+--region 判断和get接口函数
+
+---@param join_type number 类型
+---@return boolean 是否可以报名
+function SpiritualRealmModel:CanApply(join_type)
+    if self.joinType ~= 0 then
+        return false
+    end
+    local arena_layer_up_cfg = _G.ConfigManager.arena_layer_up_cfg[join_type]
+    for _, v in pairs(arena_layer_up_cfg.condition) do
+        if not self:CheckCondition(v) then
+            return false
+        end
+    end
+    return true
+end
+
+---@param condition table 条件
+---@return boolean, number, number 是否通过,当前进度,最大进度
+function SpiritualRealmModel:CheckCondition(condition)
+    if condition[1] == 1 then
+        local count = require "IllustrationModel":GetInstance():GetCardMaxStarCount(condition[2])
+        if count < condition[3] then
+            return false, count, condition[3]
+        else
+            return true, count, condition[3]
+        end
+    elseif condition[1] == 2 then
+        --把2转换成通关放置关卡4,再传入判断
+        local tmpCondition = _G.DeepCopyCfgTable(condition)
+        tmpCondition[1] = 4
+        local pass, tipSid, content = _G.GlobalConditionManager.CheckConditionArrays({ tmpCondition })
+        if not pass then
+            return false, 0, 1
+        else
+            return true, 1, 1
+        end
+    elseif condition[1] == 3 then
+        local historyScore = self.historyScores[1]
+        if historyScore ~= nil then
+            local arena_layer_league_cfg = _G.ConfigManager.arena_layer_league_cfg[condition[2]]
+            if historyScore < arena_layer_league_cfg.min_score then
+                return false, 0, 1
+            else
+                return true, 1, 1
+            end
+        else
+            return false, 0, 1
+        end
+    elseif condition[1] == 4 then
+        local historyScore = self.historyScores[2]
+        if historyScore ~= nil then
+            local arena_layer_league_cfg = _G.ConfigManager.arena_layer_league_cfg[condition[2]]
+            if historyScore < arena_layer_league_cfg.min_score then
+                return false, 0, 1
+            else
+                return true, 1, 1
+            end
+        else
+            return false, 0, 1
+        end
+    elseif condition[1] == 5 then
+        local historyScore = self.historyScores[3]
+        if historyScore ~= nil then
+            local arena_layer_league_cfg = _G.ConfigManager.arena_layer_league_cfg[condition[2]]
+            if historyScore < arena_layer_league_cfg.min_score then
+                return false, 0, 1
+            else
+                return true, 1, 1
+            end
+        else
+            return false, 0, 1
+        end
+    end
+    return false, 0, 1
+end
+
+---获取当前段位配置
+function SpiritualRealmModel:GetCurGradeCfg()
+    return self:GetGradeCfg(self.score)
+end
+
+---获取历史最高段位配置
+---@param type number 报名类型
+function SpiritualRealmModel:GetHistoryMaxGradeCfg(type)
+    type = type or self.joinType
+    if type == 0 then
+        return nil
+    end
+    local score
+    if type == self.joinType then
+        score = self.maxScore
+    else
+        score = self.historyScores[type]
+    end
+    if score == nil then
+        return nil
+    end
+    return self:GetGradeCfg(score)
+end
+
+---@param score number 积分
+---@return arena_layer_league_cfg 段位表
+function SpiritualRealmModel:GetGradeCfg(score)
+    local arena_layer_league_cfg = _G.ConfigManager.arena_layer_league_cfg
+    for _, v in pairs(arena_layer_league_cfg) do
+        if score >= v.min_score and score <= v.max_score then
+            return v
+        end
+    end
+    return nil
+end
+
+---@return number 赛季
+function SpiritualRealmModel:GetSeasonId()
+    return self.seasonId
+end
+
+---@return number 加入的竞技场类型
+function SpiritualRealmModel:GetJoinType()
+    return self.joinType
+end
+
+---获取挑战券数量
+---@return number 挑战券数量
+function SpiritualRealmModel:GetFightTicketNum()
+    return _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.Prop, self.ticketID)
+end
+
+---获取总的可挑战次数
+---@return number 可挑战次数
+function SpiritualRealmModel:GetAllRestFightTimes()
+    return self:GetRestFreeFightTimes() + self:GetFightTicketNum()
+end
+
+---@return number 每天最大免费挑战次数
+function SpiritualRealmModel:GetMaxFreeFightTimes()
+    return self.maxChallengeCount
+end
+
+---@return number 剩余的免费挑战次数
+function SpiritualRealmModel:GetRestFreeFightTimes()
+    local ret = self:GetMaxFreeFightTimes() - self:GetFightTimes()
+    if ret < 0 then
+        ret = 0
+    end
+    return ret
+end
+
+---@return number 已挑战次数(包含购买门票挑战的次数)
+function SpiritualRealmModel:GetFightTimes()
+    return self.fightTimes or 0
+end
+
+---@return number 赛季结束时间
+function SpiritualRealmModel:GetEndTime()
+    return self.seasonEndTime or 0
+end
+
+---@return number 结算开始时间
+function SpiritualRealmModel:GetStopTime()
+    return self.seasonStopTime or 0
+end
+
+---@return boolean 是否在结算期
+function SpiritualRealmModel:IsSettlementTime()
+    if self.seasonState == 2 then
+        return true
+    end
+    if self:GetStopTime() == nil or self:GetEndTime() == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("问鼎灵域：调整GM时间或导致赛季未正常结算，部分相关功能可能无法正常使用")
+        end
+        return false
+    end
+    local nowTime = _G.TimeUtil.GetServerUnixTime()
+    if nowTime >= self:GetStopTime() and nowTime <= self:GetEndTime() then
+        return true
+    end
+    return false
+end
+
+---@return number 获取当前积分
+function SpiritualRealmModel:GetScore()
+    return self.score
+end
+
+---@return number 获取当前赛季布阵队伍数
+function SpiritualRealmModel:GetCurTeamNum()
+    local cfg = _G.ConfigManager.arena_layer_up_cfg[self:GetJoinType()]
+    if cfg then
+        return cfg.number
+    elseif _G.AppSetting.DEBUG then
+        _G.LogError(self:GetJoinType(), "inviald arena_layer_up_cfg.id=")
+    end
+    return 1
+end
+
+--endregion
+
+--region 界面相关
+
+---打开防守布阵
+function SpiritualRealmModel:OpenEmbattleDefence(index)
+    --local embattleType = _G.EmbattleType
+    --local call = _G.handler(self, self.OnDefenceEmbattleClosed)
+    --_G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnDefenceEmbattleOpened, self)
+    --_G.UIManager:GetInstance():OpenWindow(
+    --        _G.ConfigManager.ui_cfg.SpiritualRealmEmbattleView.Name,
+    --        {
+    --            embattleType.arenaSeniorDefence1,
+    --            embattleType.arenaSeniorDefence2,
+    --            embattleType.arenaSeniorDefence3
+    --        },
+    --        _G.EmbattleControllerItemType.arenaSeniorDefence,
+    --        call,
+    --        call,
+    --        nil,
+    --        _G.ConfigManager.ui_cfg.ArenaChallengeTeamDefenceView.Name,
+    --        true
+    --)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened2, self)
+
+    ---@type EmbattleType[]
+    local tb, reserveEmbattleTypes = {}, {}
+    local teamNum = self:GetCurTeamNum()
+    for tnIndex = 1, teamNum do
+        table.insert(tb, _G.EmbattleType["SpiritualRealm" .. tnIndex])
+    end
+    for tnIndex = teamNum + 1, 5 do
+        table.insert(reserveEmbattleTypes, _G.EmbattleType["SpiritualRealm" .. tnIndex])
+    end
+
+    require("EmbattleController"):GetInstance():OpenEmbattle(
+        tb,
+        _G.EmbattleSaveType.server,
+        false,
+        _G.EmbattleControllerItemType.SpiritualRealmDefend,
+        _G.handler(self, self.ExitEmbattle2),
+        _G.handler(self, self.ExitEmbattleDefence),
+        500000001,
+        nil,
+        index,
+        nil,
+        reserveEmbattleTypes
+    )
+end
+
+---监听界面打开
+---@param name string 界面名称
+function SpiritualRealmModel:OnEmbattleViewOpened2(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        --ZHJ-35498【问鼎灵域】查看战报中的回放后，打开布阵界面显示重叠
+        --回放结束后ArenaPanelView页面意外的被显示出来
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ArenaPanelView.Name)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SpiritualRealmView.Name)
+        ---@type EmbattleNewView
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+        view:SetVsDescription(_G.PlayerModel:GetInstance():GetName(), "")
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened2, self)
+    end
+end
+
+---退出战斗
+function SpiritualRealmModel:ExitEmbattle2()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SpiritualRealmView.Name)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+    if not _G.ConfigManager.ui_cfg.SpiritualRealmView.HideWorld then
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+    end
+end
+
+---退出布阵（保存）
+function SpiritualRealmModel:ExitEmbattleDefence()
+    self:ExitEmbattle2()
+    self:RefreshDefendRed()
+end
+
+---当防守布阵界面打开
+function SpiritualRealmModel:OnDefenceEmbattleOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnDefenceEmbattleOpened, self)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SpiritualRealmView.Name)
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(false, true)
+    end
+end
+
+---匹配完成后直接开始战斗返回结果展示列表
+---@param arena_layer_enemy_array arena_layer.s2c_arena_layer_enemy_array
+---@param arena_layer_match arena_layer.s2c_arena_layer_match
+---@param skipBattle boolean 是否跳过战斗
+function SpiritualRealmModel:FightOneKey(arena_layer_enemy_array, arena_layer_match, skipBattle)
+    local tb, reserveEmbattleTypes = {}, {}
+    local teamNum = self:GetCurTeamNum()
+    --LogError(teamNum, "队伍数量")
+    if teamNum == 1 then
+        tb = {
+            _G.EmbattleType.SpiritualRealm1
+        }
+        reserveEmbattleTypes = {
+            _G.EmbattleType.SpiritualRealm2,
+            _G.EmbattleType.SpiritualRealm3,
+            _G.EmbattleType.SpiritualRealm4,
+            _G.EmbattleType.SpiritualRealm5
+        }
+
+        local datas = {}
+        local data = { false }
+        datas[1] = data
+        local emptyTag = true
+        if arena_layer_enemy_array.team_list ~= nil then
+            local teams = arena_layer_enemy_array.team_list[1]
+            if teams.team ~= nil then
+                for i = 1, #teams.team do
+                    data[i] = {
+                        uid = teams.team[i].sid,
+                        sid = teams.team[i].sid,
+                        level = teams.team[i].level or 0,
+                        star = teams.team[i].star or 0,
+                        power = teams.team[i].power,
+                        soulLink_lv = teams.team[i].soul_lv or 0,
+                        soulLink_IsActivate = teams.team[i].soul_state or 0,
+                        artifact = teams.team[i].artifact or {},
+                        open_inborn = teams.team[i].born_skill_num or 0
+                    }
+                    if emptyTag and teams.team[i].sid > 0 then
+                        emptyTag = false
+                    end
+                end
+            end
+            data.power = teams.power
+            data.combine = teams.combine
+            data.pet = teams.pet
+        else
+            data.power = 0
+        end
+
+        local joinType = self:GetJoinType()
+
+        if emptyTag then --挑战空阵容玩家
+            require("EmbattleController"):GetInstance():SaveByEnemyEmpty(
+                tb,
+                _G.EmbattleSaveType.server,
+                nil,
+                _G.EmbattleControllerItemType.SpiritualRealmAttack,
+                500000001,
+                datas
+            )
+            local msg = {}
+            msg.type = 2
+            SpiritualRealmNet:GetInstance():Fight(msg, _G.handlerbind(self, self.OnOneKeyFightCall, joinType, true, false))
+            return
+        end
+
+        self:EnterFightOneKey(joinType, skipBattle)
+    else
+        local joinType = self:GetJoinType()
+
+        self:EnterFightOneKey(joinType, skipBattle)
+    end
+end
+
+---进入战斗回调
+---@param msg arena_layer.s2c_arena_layer_fight
+---@param joinType number 加入的竞技场类型
+---@param isEmptyEnemy boolean 单场的战斗敌方阵容是否为空
+---@param skipBattle boolean 是否跳过战斗
+function SpiritualRealmModel:OnOneKeyFightCall(msg, joinType, isEmptyEnemy, skipBattle)
+    if msg.ack ~= 1 then
+        self:ExitEmbattle2()
+        return
+    end
+    local isWin = false
+
+    if msg.fight_result ~= nil then
+        _G.SortList(
+            msg.fight_result,
+            function(a)
+                return -a.index
+            end
+        )
+        local winnum = 0
+        for i = 1, #msg.fight_result do
+            if msg.fight_result[i].winner == 1 then
+                winnum = winnum + 1
+            end
+        end
+        if winnum > #msg.fight_result / 2 then
+            isWin = true
+        end
+    end
+
+    table.insert(self.OneKeyIsWinList, isWin)
+
+    if self:GetRestFreeFightTimes() <= 0 then
+        self:CastFightTicket()
+    end
+    self.fightTimes = self.fightTimes + 1
+    _G.Events:GetInstance():Broadcast(_G.SpiritualRealmEvents.FightTimeChange)
+    SpiritualRealmNet:GetInstance():FightResult(
+        _G.handlerbind(self, self.OnOneKeyFightResultCall, msg, joinType, isEmptyEnemy, skipBattle)
+    )
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayerFreeTime.id)
+end
+
+---进入战斗回调
+---@param msg arena_layer.s2c_arena_layer_result
+---@param arena_layer_fight arena_layer.s2c_arena_layer_fight
+---@param joinType number 加入的竞技场类型
+---@param isEmptyEnemy boolean 单场的战斗敌方阵容是否为空
+---@param skipBattle boolean 是否跳过战斗
+function SpiritualRealmModel:OnOneKeyFightResultCall(msg, arena_layer_fight, joinType, isEmptyEnemy, skipBattle)
+    if msg.ack ~= 1 then
+        self:ExitEmbattle2()
+        return
+    end
+    self:ScoreChange(msg.args[2] - msg.args[1])
+
+    table.insert(self.OneKeyChangeScoreList, msg.args[2] - msg.args[1])
+
+    table.insert(self.OneKeyReportList, msg.report)
+
+    _G.Events:GetInstance():Broadcast(_G.SpiritualRealmEvents.OneKeyFightEnd)
+end
+
+---匹配完成后进入进攻布阵或者调整界面
+---@param arena_layer_enemy_array arena_layer.s2c_arena_layer_enemy_array
+---@param arena_layer_match arena_layer.s2c_arena_layer_match
+---@param skipBattle boolean 是否跳过战斗
+function SpiritualRealmModel:Fight(arena_layer_enemy_array, arena_layer_match, skipBattle)
+    local tb, reserveEmbattleTypes = {}, {}
+    local teamNum = self:GetCurTeamNum()
+    if teamNum == 1 then
+        tb = {
+            _G.EmbattleType.SpiritualRealm1
+        }
+        reserveEmbattleTypes = {
+            _G.EmbattleType.SpiritualRealm2,
+            _G.EmbattleType.SpiritualRealm3,
+            _G.EmbattleType.SpiritualRealm4,
+            _G.EmbattleType.SpiritualRealm5
+        }
+
+        local datas = {}
+        local data = { false }
+        datas[1] = data
+        local emptyTag = true
+        if arena_layer_enemy_array.team_list ~= nil then
+            local teams = arena_layer_enemy_array.team_list[1]
+            if teams.team ~= nil then
+                for i = 1, #teams.team do
+                    data[i] = {
+                        uid = teams.team[i].sid,
+                        sid = teams.team[i].sid,
+                        level = teams.team[i].level or 0,
+                        star = teams.team[i].star or 0,
+                        power = teams.team[i].power,
+                        soulLink_lv = teams.team[i].soul_lv or 0,
+                        soulLink_IsActivate = teams.team[i].soul_state or 0,
+                        artifact = teams.team[i].artifact or {},
+                        open_inborn = teams.team[i].born_skill_num or 0
+                    }
+                    if emptyTag and teams.team[i].sid > 0 then
+                        emptyTag = false
+                    end
+                end
+            end
+            data.power = teams.power
+            data.combine = teams.combine
+            data.pet = teams.pet
+        else
+            data.power = 0
+        end
+
+        local joinType = self:GetJoinType()
+
+        if emptyTag then --挑战空阵容玩家
+            require("EmbattleController"):GetInstance():SaveByEnemyEmpty(
+                tb,
+                _G.EmbattleSaveType.server,
+                nil,
+                _G.EmbattleControllerItemType.SpiritualRealmAttack,
+                500000001,
+                datas
+            )
+            local msg = {}
+            msg.type = 1
+            SpiritualRealmNet:GetInstance():Fight(msg,_G.handlerbind(self, self.OnFightCall, joinType, true, false))
+            return
+        end
+        --跳过战斗(不进入布阵页面直接结算, 当前禁用)
+        if skipBattle and false then
+            local embattleItem =
+                require(_G.EmbattleControllerItemType.SpiritualRealmAttack).New(
+                    tb,
+                    _G.EmbattleSaveType.server,
+                    false,
+                    500000001,
+                    datas
+                )
+            embattleItem:SaveEmbattle(
+                function(result)
+                    if result ~= 0 then
+                        return
+                    end
+                    self:EnterFight(joinType, true)
+                end
+            )
+            return
+        end
+
+        --记录敌方信息, 用于布阵和战斗页面显示对方名称
+        self.enemyInfo = arena_layer_match
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        require("EmbattleController"):GetInstance():OpenEmbattle(
+            tb,
+            _G.EmbattleSaveType.server,
+            false,
+            _G.EmbattleControllerItemType.SpiritualRealmAttack,
+            _G.handler(self, self.ExitEmbattle),
+            --从布阵进入战斗(回调第一个参数为nil时, 无法正确传递参数, 因此此处无法使用_G.handlerbind)
+            function(_, _skipBattle)
+                self:EnterFight(joinType, _skipBattle)
+            end,
+            500000001,
+            datas,
+            nil,
+            skipBattle,
+            reserveEmbattleTypes
+        )
+    else
+        --打开调整界面
+        local embattleDatas = {}
+        for tnIndex = 1, teamNum do
+            ---@type EmbattleType
+            local embattleType = _G.EmbattleType["SpiritualRealm" .. tnIndex]
+            table.insert(embattleDatas, require("EmbattleModel"):GetInstance():GetEmbattleData(embattleType))
+        end
+
+        local attEquity = _G.ConfigManager.att_equity_cfg[8]
+        for i = 1, #embattleDatas do
+            for j = 1, #embattleDatas[i] do
+                if embattleDatas[i][j] > 0 then
+                    local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, embattleDatas[i][j])
+                    if card then
+                        local newCard = _G.CardData.New()
+                        local msg =
+                            require "CardInfoManager":GetInstance():GetNewCardDataByCfg(attEquity, card, newCard)
+                        newCard:Parse(msg)
+                        newCard:OnInitMutuallyData(true, nil, true)
+                        embattleDatas[i][j] = {
+                            uid = newCard.uid,
+                            sid = newCard.sid,
+                            star = newCard:GetStar(),
+                            level = newCard:GetLevel(),
+                            soulLink_lv = newCard.soulLink_lv,
+                            power = newCard:GetPower(),
+                            soulLink_IsActivate = newCard.soulLink_IsActivate,
+                            open_inborn = newCard.open_inborn,
+                            tag = 0,
+                            skin = newCard.skin
+                        }
+                    else
+                        embattleDatas[i][j] = {
+                            uid = 0,
+                            sid = 0,
+                            star = 0,
+                            level = 1,
+                            soulLink_lv = 0,
+                            power = 0,
+                            soulLink_IsActivate = 0,
+                            open_inborn = 0,
+                            tag = 0
+                        }
+                    end
+                else
+                    embattleDatas[i][j] = {
+                        uid = 0,
+                        sid = 0,
+                        star = 0,
+                        level = 1,
+                        soulLink_lv = 0,
+                        power = 0,
+                        soulLink_IsActivate = 0,
+                        open_inborn = 0,
+                        tag = 0
+                    }
+                end
+            end
+        end
+        local datas = {}
+        if arena_layer_enemy_array.team_list ~= nil then
+            for m = 1, #arena_layer_enemy_array.team_list do
+                local data = { false }
+                datas[m] = data
+                local emptyTag = true
+                local teams = arena_layer_enemy_array.team_list[m]
+                for i = 1, #teams.team do
+                    data[i] = {
+                        uid = teams.team[i].sid,
+                        sid = teams.team[i].sid,
+                        level = teams.team[i].level or 0,
+                        star = teams.team[i].star or 0,
+                        power = teams.team[i].power,
+                        soulLink_lv = teams.team[i].soul_lv or 0,
+                        soulLink_IsActivate = teams.team[i].soul_state or 0,
+                        artifact = teams.team[i].artifact or {},
+                        open_inborn = teams.team[i].born_skill_num or 0
+                    }
+                    if emptyTag and teams.team[i].sid > 0 then
+                        emptyTag = false
+                    end
+                end
+                if teams.power then
+                    data.power = teams.power
+                end
+            end
+        end
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.SpiritualRealmSettlementView.Name,
+            _G.handlerbind(self, self.TryShowGrade),
+            3,
+            arena_layer_match,
+            embattleDatas,
+            datas
+        )
+    end
+end
+
+---退出战斗
+function SpiritualRealmModel:ExitEmbattle()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SpiritualRealmView.Name)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+    if not _G.ConfigManager.ui_cfg.SpiritualRealmView.HideWorld then
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+    end
+end
+
+---监听界面打开
+---@param name string 界面名称
+function SpiritualRealmModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        --ZHJ-35498【问鼎灵域】查看战报中的回放后，打开布阵界面显示重叠
+        --回放结束后ArenaPanelView页面意外的被显示出来
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ArenaPanelView.Name)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SpiritualRealmView.Name)
+
+        local rightName = self.enemyInfo and self.enemyInfo.role_info.name or ""
+        if self.enemyInfo and self.enemyInfo.match_type == 1 then
+            rightName = _G.GetLangPackValue(rightName)
+        end
+
+        ---@type EmbattleNewView
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+        view:SetBattleStartCheckCall(
+            function()
+                --刚好到了下一个赛季则无法挑战
+                if self:GetJoinType() == 0 then
+                    return
+                end
+                return true
+            end
+        )
+        view:SetVsDescription(_G.PlayerModel:GetInstance():GetName(), rightName)
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    end
+end
+
+---进入战斗
+---@param joinType number 加入的竞技场类型
+---@param skipBattle boolean 是否跳过战斗
+function SpiritualRealmModel:EnterFightOneKey(joinType, skipBattle, AttackPowerType)
+    local msg = {}
+    msg.type = 2
+    SpiritualRealmNet:GetInstance():Fight(msg,_G.handlerbind(self, self.OnOneKeyFightCall, joinType, false, skipBattle))
+end
+
+---进入战斗
+---@param joinType number 加入的竞技场类型
+---@param skipBattle boolean 是否跳过战斗
+function SpiritualRealmModel:EnterFight(joinType, skipBattle)
+    --local skip =
+    --_G.PlayerPrefsManager.GetInt(
+    --        tostring(_G.PlayerModel:GetInstance().role_uid) .. "SkipBattle" .. 3
+    --) or 0
+    --if self:CheckEnemyEmpty() then
+    --    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+    --    skip = 1
+    --end
+    --if skip == 1 then
+    --    if call then
+    --        call()
+    --    end
+    --end
+    --local port =
+    local msg = {}
+    msg.type = 1
+    SpiritualRealmNet:GetInstance():Fight(msg,_G.handlerbind(self, self.OnFightCall, joinType, false, skipBattle))
+    --_G.BattleManager:GetInstance():AddLuaNetEvent(port)
+end
+
+---进入战斗回调
+---@param msg arena_layer.s2c_arena_layer_fight
+---@param joinType number 加入的竞技场类型
+---@param isEmptyEnemy boolean 单场的战斗敌方阵容是否为空
+---@param skipBattle boolean 是否跳过战斗
+function SpiritualRealmModel:OnFightCall(msg, joinType, isEmptyEnemy, skipBattle)
+    if msg.ack ~= 1 then
+        self:ExitEmbattle2()
+        return
+    end
+    if msg.fight_result ~= nil then
+        _G.SortList(
+            msg.fight_result,
+            function(a)
+                return -a.index
+            end
+        )
+    end
+    if self:GetRestFreeFightTimes() <= 0 then
+        self:CastFightTicket()
+    end
+    self.fightTimes = self.fightTimes + 1
+    _G.Events:GetInstance():Broadcast(_G.SpiritualRealmEvents.FightTimeChange)
+    SpiritualRealmNet:GetInstance():FightResult(
+        _G.handlerbind(self, self.OnFightResultCall, msg, joinType, isEmptyEnemy, skipBattle)
+    )
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayerFreeTime.id)
+end
+
+---进入战斗回调
+---@param msg arena_layer.s2c_arena_layer_result
+---@param arena_layer_fight arena_layer.s2c_arena_layer_fight
+---@param joinType number 加入的竞技场类型
+---@param isEmptyEnemy boolean 单场的战斗敌方阵容是否为空
+---@param skipBattle boolean 是否跳过战斗
+function SpiritualRealmModel:OnFightResultCall(msg, arena_layer_fight, joinType, isEmptyEnemy, skipBattle)
+    if msg.ack ~= 1 then
+        self:ExitEmbattle2()
+        return
+    end
+    self:ScoreChange(msg.args[2] - msg.args[1])
+    local cfg = _G.ConfigManager.arena_layer_up_cfg[joinType]
+    if cfg and cfg.number == 1 then
+        if not isEmptyEnemy then
+            _G.BattleManager:GetInstance():SetArgData(arena_layer_fight.fight_result[1].data)
+        end
+        local leftName, rightName =
+            _G.PlayerModel:GetInstance():GetName(),
+            self.enemyInfo and self.enemyInfo.role_info.name or ""
+        if self.enemyInfo and self.enemyInfo.match_type == 1 then
+            rightName = _G.GetLangPackValue(rightName)
+        end
+        if isEmptyEnemy or skipBattle then
+            self.curBattleController = _G.require(_G.BattleControllerType.SpiritualRealm).New()
+            self.curBattleController.leftName = leftName
+            self.curBattleController.rightName = rightName
+            self.curBattleController:StartSettlement(
+                _G.SettlementModel.SettlementType.SpiritualRealm,
+                arena_layer_fight.fight_result,
+                msg.report,
+                msg.args
+            )
+            --设置战斗控制器缓存
+            _G.BattleManager:GetInstance():SetBattleController(self.curBattleController)
+
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SpiritualRealmView.Name)
+            if view then
+                view:Close() --销毁主页面, 否则战斗回放时此页面将错误的activeSelf=true
+            end
+            _G.WorldManager:GetInstance():SetCurrentWorldVisible(false, true)
+        else
+            ---参考竞技场取战力最高角色
+            --local mvpData = require("EmbattleModel"):GetInstance():GetEmbattleMaxPowerData(_G.EmbattleType.SpiritualRealm1)
+            local mvpData = nil
+            _G.BattleManager:GetInstance():EnterFight(
+                _G.BattleControllerType.SpiritualRealm,
+                arena_layer_fight.fight_result,
+                msg.report,
+                msg.args,
+                mvpData,
+                leftName,
+                rightName
+            )
+        end
+    else
+        --结算
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SpiritualRealmSettlementView.Name)
+        if view then
+            view:AdjustToResult(arena_layer_fight.fight_result, msg.report, msg.args)
+        end
+    end
+    --- ZHJH5ZHJH-944 【7日版本】程序主单号ZHJH-4891
+    ---【客户端】H5任务类型移植镇魂街问鼎灵域任务
+    --- 后端把137 138两个任务改成通用类型了，会有推送，所以前端事件注释掉
+    -- ---进行x次问鼎灵域战斗
+    -- _G.Events:GetInstance():Broadcast(
+    --     _G.ePlayAactionEvent.PlayAaction,
+    --     {
+    --         _G.ActiveTaskEnum.ConditionEnum.SpiritualRealm.BattleTimes,
+    --         joinType
+    --     },
+    --     1
+    -- )
+    -- _G.Events:GetInstance():Broadcast(
+    --     _G.ePlayAactionEvent.PlayAaction,
+    --     {
+    --         _G.ActiveTaskEnum.ConditionEnum.SpiritualRealm.BattleTimes,
+    --         0
+    --     },
+    --     1
+    -- )
+    -- ---问鼎灵域胜利x场
+    -- if arena_layer_fight.fight_result[1].winner == 1 then
+    --     _G.Events:GetInstance():Broadcast(
+    --         _G.ePlayAactionEvent.PlayAaction,
+    --         {
+    --             _G.ActiveTaskEnum.ConditionEnum.SpiritualRealm.WinTimes,
+    --             joinType
+    --         },
+    --         1
+    --     )
+    --     _G.Events:GetInstance():Broadcast(
+    --         _G.ePlayAactionEvent.PlayAaction,
+    --         {
+    --             _G.ActiveTaskEnum.ConditionEnum.SpiritualRealm.WinTimes,
+    --             0
+    --         },
+    --         1
+    --     )
+    -- end
+end
+
+---检测能否进入匹配界面
+function SpiritualRealmModel:CheckEnterMatch()
+    ---@type EmbattleType[]
+    local tb = {}
+    local teamNum = self:GetCurTeamNum()
+    for tnIndex = 1, teamNum do
+        table.insert(tb, _G.EmbattleType["SpiritualRealm" .. tnIndex])
+    end
+    for i = 1, #tb do
+        local data = require("EmbattleModel"):GetInstance():GetEmbattleData(tb[i])
+        local canMatch = false
+        for j = 1, #data do
+            if data[j] > 0 then
+                canMatch = true
+                break
+            end
+        end
+        if not canMatch then
+            return false, i
+        end
+    end
+    return true
+end
+
+function SpiritualRealmModel:ScoreChange(changeScore)
+    if changeScore == 0 then
+        return
+    else
+        local last_league_cfg = self:GetGradeCfg(self.score)
+        self.score = self.score + changeScore
+        if self.score > self.maxScore then
+            self.maxScore = self.score
+        end
+        if self.score > self.historyScores[self.joinType] then
+            self.historyScores[self.joinType] = self.score
+        end
+        local now_league_cfg = self:GetGradeCfg(self.score)
+        if last_league_cfg.id ~= now_league_cfg.id then
+            if changeScore > 0 then
+                self.ShowScore = self.score
+            end
+            _G.Events:GetInstance():Broadcast(_G.SpiritualRealmEvents.GradeChange)
+        end
+        _G.Events:GetInstance():Broadcast(_G.SpiritualRealmEvents.ScoreChange)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayerRank.id)
+    end
+end
+
+function SpiritualRealmModel:TryShowGrade()
+    if self.ShowScore ~= nil and self.ShowScore > 0 then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SpiritualRealmPromotionView.Name, self.ShowScore)
+    end
+    self.ShowScore = 0
+end
+
+---获取商店商品列表(历史报名过的类型才会出现在商店中)
+---@return number[]
+function SpiritualRealmModel:GetShopItemList()
+    local cfg = self:GetCurrentShopCfg()
+    if cfg == nil then
+        return {}
+    end
+    local items = {}
+    for i = 1, 3 do
+        -- if self.historyScores[i] then
+        if cfg.shop[i] ~= nil then
+            for _, v in pairs(cfg.shop[i]) do
+                _G.table.insert(items, v)
+            end
+        end
+        -- end
+    end
+    return items
+end
+
+---获取商店跳转位置
+function SpiritualRealmModel:GetShopJumpIndex()
+    local cfg = self:GetCurrentShopCfg()
+    if cfg == nil then
+        return 1
+    end
+    local sum = 0
+    for i = 1, self.joinType - 1 do
+        sum = sum + #cfg.shop[i]
+    end
+    return sum + 1
+end
+
+---获取当前赛季商店配置(服务器ID顺序往后延, 但配置项可能没那么多, 此时取最后一个)
+---@如果配置表为空, 仍然可能返回nil
+---@private
+---@return arena_layer_season_cfg
+function SpiritualRealmModel:GetCurrentShopCfg()
+    local cfg = _G.ConfigManager.arena_layer_season_cfg[self.seasonId]
+    if cfg then
+        return cfg
+    end
+    --取序号最大的配置项(与服务器逻辑一致)
+    --下标不一定从1开始(非数组), 使用pairs遍历
+    local maxIndex = 0
+    for index, _cfg in pairs(_G.ConfigManager.arena_layer_season_cfg) do
+        if not cfg or index > maxIndex then
+            cfg = _cfg
+            maxIndex = index
+        end
+    end
+    return cfg
+end
+
+---检查历史最高段位是否满足
+---@param condition table 类型(4~6)#段位id
+function SpiritualRealmModel:CheckHistoryRank(condition)
+    local type = condition[1] - 3
+    local sid = condition[2]
+    local cfg = _G.ConfigManager.arena_layer_league_cfg[sid]
+    local achieve = self.historyScores[type] and self.historyScores[type] >= cfg.min_score
+    return achieve, cfg
+end
+
+---检查段位奖励是否已领取
+---@param sid number 段位sid
+---@return number 状态0可领取1未达标2已领取
+function SpiritualRealmModel:GetStageAwardState(sid)
+    local xx = _G.ConfigManager.arena_layer_league_cfg[sid]
+    if xx == nil then
+        _G.LogError("红点报错,段位id:" .. sid)
+    end
+    if self.maxScore == nil then
+        _G.LogError("红点报错maxScore为空,段位id:" .. sid)
+        return 1
+    end
+    if _G.table.ContainsValue(self.stageAward, sid) then
+        return 2
+    elseif self.maxScore >= _G.ConfigManager.arena_layer_league_cfg[sid].min_score then
+        return 0
+    end
+    return 1
+end
+
+---领取段位奖励
+---@param sids number[] 段位sid集合
+function SpiritualRealmModel:GetStageAward(sids, callback)
+    local pbData = { stage_sid = sids }
+    SpiritualRealmNet:GetInstance():GetStageAward(
+        pbData,
+        function(msg)
+            for _, sid in pairs(sids) do
+                _G.table.insert(self.stageAward, sid)
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayerRank.id)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---排行奖励红点
+function SpiritualRealmModel:CheckRedPointRankAward()
+    if self.joinType == 0 then
+        return false
+    end
+    if self:IsSettlementTime() then
+        return false
+    end
+    for _, v in pairs(_G.ConfigManager.arena_layer_league_cfg) do
+        if self:GetStageAwardState(v.id) == 0 then
+            return true
+        end
+    end
+    return false
+end
+
+---购买挑战券
+---@param 变量名 变量类型 中文描述
+function SpiritualRealmModel:BuyTicket(callback)
+    self.onBuyTicketCall = callback
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ItemBuyView.Name,
+        self.ticket,
+        _G.handler(self, self.OnBuyTicketCall)
+    )
+end
+
+function SpiritualRealmModel:OnBuyTicketCall(result)
+    if self.onBuyTicketCall then
+        self.onBuyTicketCall(result)
+    end
+    self.onBuyTicketCall = nil
+end
+
+---消耗挑战券，本地更新
+function SpiritualRealmModel:CastFightTicket()
+    _G.StorageManager:GetInstance():ConsumeItem(self.ticketID, 0, 1)
+end
+
+---开始结算时刷新红点
+function SpiritualRealmModel:OnSettleTimer(elapsed)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayerRank.id)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayerTask.id)
+end
+
+function SpiritualRealmModel:RefreshDefendRed()
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArenaLayerDefense.id)
+end
+
+--endregion
+return SpiritualRealmModel

@@ -1,0 +1,714 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie.alpha_0.0.8_FT.Client.Assets.Resources.LuaScripts.Game.SixVsSixPVP.Model.SixVsSixPVPModel	(修改路径必须修正此项!)
+-- Created by huangbaiying
+-- DateTime: 2023/08/15
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+---@class SixVsSixPVPModel:Singleton	中文描述
+---@field fightTimes number 剩余免费挑战次数
+---@field rank number 玩家排名
+---@field winRate number 玩家胜率
+---@field score number 玩家分数
+---@field defencePower number 防守阵容战力
+---@field lastRefreshTime number 上次刷新时间
+---@field refreshTimes number 今日刷新次数
+---@field attacked number 离线是否被攻击
+---@field winScore number 战斗获胜积分
+---@field loseScore number 战斗失败积分
+---@field ticketID number 挑战卷ID
+---@field freeCount number 每日最大刷新次数
+---@field freshCd number 刷新cd
+---@field haveNewReport boolean 是否有新战报
+local SixVsSixPVPModel = _G.BaseClass("SixVsSixPVPModel", _G.Singleton)
+local SixVsSixPVPNet = require "SixVsSixPVPNet":GetInstance()
+local ActivitySynManager = require "ActivitySynManager":GetInstance()
+---@return SixVsSixPVPModel SixVsSixPVPModel
+function SixVsSixPVPModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SixVsSixPVPModel:__init()
+    local arenaCfg = _G.ConfigManager.arena_info_cfg[6]
+    self.winScore = arenaCfg.vic_points
+    self.loseScore = arenaCfg.lose_points
+    self.freeCount = arenaCfg.renovate_time
+    self.freshCd = arenaCfg.refresh_cd
+    self.refreshTime = 0
+    self.haveNewReport = false
+    self.defenceEmabattle = {}
+    self.attackEmbattle = {}
+    self.ticketID = 203030103
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.season_duel_attacked.Cmd, self.UpdateMainView, self)
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.season_duel_award.Cmd, self.GetRankAward, self)
+end
+
+---销毁对象时,析构函数
+function SixVsSixPVPModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.season_duel_attacked.Cmd, self.UpdateMainView, self)
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.season_duel_award.Cmd, self.GetRankAward, self)
+end
+
+function SixVsSixPVPModel:GetDataFormServer()
+    --SixVsSixPVPNet:GetInfo(_G.handler(self, self.ParseData))
+end
+
+function SixVsSixPVPModel:ParseData(msg, typeClass)
+    self.curActivityClass = typeClass
+    self.curActivityClass.model = self
+    local data = msg.season_duel
+    if data.info then
+        local info = data.info
+        self.fightTimes = info.fight_num or 0
+        self.rank = info.rank or 0
+        self.winRate = info.win_rate or 0
+        self.defencePower = info.power or 0
+        self.score = info.score or 0
+        self.lastRefreshTime = info.last_refresh or 0
+        self.refreshTimes = info.refresh_times or 0
+        self.attacked = info.attacked or 0
+        require "SixVsSixCoinModel":GetInstance():SetCoin(info.coin)
+        self:InitMission(info)
+        self:InitRankAward(data)
+        self:UpdateView()
+    end
+    if self.curActivityClass:GetCurActivityState() == ActivitySynManager.State.Open then
+        self:GetReport()
+    end
+    --base.ParseData(self)
+end
+
+function SixVsSixPVPModel:InitSelfData(info)
+end
+
+---初始化任务进度
+function SixVsSixPVPModel:InitMission(info)
+    local table = _G.table
+    local insert = table.insert
+    self.missionList = {}
+    self.finishMissionList = {}
+    if info.task_info then
+        for k, v in pairs(info.task_info) do
+            local data = {}
+            data.language = v.language
+            data.order = v.order
+            data.sid = v.sid
+            data.type = v.type
+            local coin = {}
+            coin.type = {109, v.coin}
+            data.award = v.award
+            data.isFinish = false
+            data.coin = v.coin
+            insert(data.award, coin)
+            data.condition = {}
+            for i = 1, #v.condition - 1 do
+                data.condition[i] = v.condition[i]
+            end
+            if data.condition[1] == 5 then
+                data.need = 1
+                data.extra = v.condition[2]
+            else
+                data.need = v.condition[#v.condition]
+            end
+            insert(self.missionList, data)
+        end
+    end
+    if info.task_curr then
+        for k, v in pairs(info.task_curr) do
+            for k1, v1 in pairs(self.missionList) do
+                if table.same(v.type, v1.condition) then
+                    v1.curr = v.curr
+                    if v1.condition[1] == 5 then
+                        if v.curr > 0 and v.curr <= v1.extra then
+                            v1.curr = 1
+                        else
+                            v1.curr = 0
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if info.finish_task then
+        for k, v in pairs(info.finish_task) do
+            self.finishMissionList[v] = true
+        end
+    end
+    self.curActivityClass.typeClass:UpdateMission()
+end
+
+---初始化排行奖励
+function SixVsSixPVPModel:InitRankAward(info)
+    local insert = _G.table.insert
+    if info.day_rank then
+        self.DayRankAward = {}
+        for k, v in pairs(info.day_rank) do
+            local data = {}
+            data.max_rank = v.rank[1]
+            data.min_rank = v.rank[2]
+            local coin = {109, v.num[1]}
+            data.reward_daily = {}
+            insert(data.reward_daily, coin)
+            for k1, v1 in pairs(v.award) do
+                insert(data.reward_daily, v1.type)
+            end
+            data.sid = v.sid
+            insert(self.DayRankAward, data)
+        end
+    end
+    -- if info.final_rank then
+    --     self.FinalRankAward={}
+    --     for k,v in pairs(info.final_rank) do
+    --         local data = {}
+    --         data.max_rank = v.rank[1]
+    --         data.min_rank = v.rank[2]
+    --         local coin = {109,v.num[1]}
+    --         data.reward_daily = {}
+    --         insert(data.reward_daily,coin)
+    --         for k1,v1 in pairs(v.award) do
+    --             insert(data.reward_daily,v1.type)
+    --         end
+    --         data.sid = v.sid
+    --         insert(self.FinalRankAward,data)
+    --     end
+    -- end
+end
+
+---获取排行榜
+function SixVsSixPVPModel:GetRank(call)
+    SixVsSixPVPNet:GetRankInfo(
+        function(msg)
+            self.ranks = msg.ranks
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---更新自己的信息
+function SixVsSixPVPModel:UpdateRankSelf(data)
+    self.rank = data.rank or self.rank or 0
+    self.score = data.score or self.score or 0
+    self.winRate = data.rate or self.winRate or 100
+end
+
+---刷新红点显示
+function SixVsSixPVPModel:RefreshRedPoint()
+    if self.redPointId > 0 then
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(self.redPointId)
+    end
+end
+
+---退出功能
+function SixVsSixPVPModel:OnQuit()
+    self.curActivityClass:ChangeState(ActivitySynManager.State.Close)
+    if not _G.BattleManager:GetInstance():CheckInBattle() then
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SixVsSixChanllengeView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SixVsSixReportView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SixVsSixAwardView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SixVsSixMissionView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SixVsSixMainView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.OptionDialogView.Name)
+    end
+    local isExit, view = _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.SixVsSixEmbattleView.Name)
+    if isExit then
+        view.View:QuitEmbattle()
+    end
+end
+
+---打开活动主界面
+function SixVsSixPVPModel:OpenView()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SixVsSixMainView.Name)
+end
+
+---获取防守阵容
+function SixVsSixPVPModel:GetDefenceEmbattle()
+    return _G.DeepCopy(self.defenceEmabattle)
+end
+
+---获取进攻阵容
+function SixVsSixPVPModel:GetAttackEmbattle()
+    return _G.DeepCopy(self.attackEmbattle)
+end
+
+---防守布阵
+function SixVsSixPVPModel:OpenEmbattle()
+    if self.curActivityClass:GetCurActivityState() ~= ActivitySynManager.State.Open then
+        self:OnQuit()
+        return
+    end
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    self.openEmbattleState = true
+    self.curEmbattleAttackTag = false
+    require("EmbattleController"):GetInstance():OpenSixVsSixEmbattle(
+        _G.EmbattleType.SixVsSixPVPDefence,
+        _G.EmbattleSaveType.server,
+        nil,
+        _G.EmbattleControllerItemType.SixVsSixPVPDefence,
+        _G.handler(self, self.ExitEmbattle),
+        _G.handler(self, self.ExitEmbattle),
+        _G.ConfigManager.arena_info_cfg[6].battle_sences)
+end
+
+---退出布阵界面
+function SixVsSixPVPModel:ExitEmbattle()
+    if self.curActivityClass:GetCurActivityState() ~= ActivitySynManager.State.Open then
+        return
+    end
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SixVsSixMainView.Name, self.curActivityClass)
+    -- if self.curEmbattleAttackTag then
+    --     _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SixVsSixChanllengeView.Name)
+    -- end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+end
+
+---进入战斗
+function SixVsSixPVPModel:EnterFight()
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.SixVsSixPVP, self.enemyData)
+end
+
+function SixVsSixPVPModel:EnterFightEmpty()
+    SixVsSixPVPNet:Fight(
+                        self.curChallengeUid,
+                        self.curChallengeType,
+                        _G.handler(self, self.OnChallengeEmptyCall)
+                    )
+end
+
+function SixVsSixPVPModel:EnterFightEmptyCall(call)
+    SixVsSixPVPNet:Fight(
+                        self.curChallengeUid,
+                        self.curChallengeType,
+                        call
+                    )
+end
+
+function SixVsSixPVPModel:OnChallengeEmptyResult(call)
+    SixVsSixPVPNet:FightResult(
+        call
+        )
+end
+
+---检测进攻阵容是否为空
+function SixVsSixPVPModel:CheckAttackTeamIsEmpty()
+    if self.attackEmbattle == nil then
+        return true
+    end
+    -- 1位置为第一队，2,3 位置为第二队，456为第3对 有一队为空，战斗就直接算队伍为空
+    if self.attackEmbattle[1].sid == 0 or (self.attackEmbattle[2].sid == 0 and self.attackEmbattle[3].sid ==0) or (self.attackEmbattle[4].sid ==0 and self.attackEmbattle[5].sid ==0 and self.attackEmbattle[6].sid == 0)then
+        return true
+    end
+    return false
+end
+
+---挑战对手
+function SixVsSixPVPModel:Challenge(uid, type, enemy)
+    self.enemyData = enemy
+    self.curChallengeUid = uid
+    self.curChallengeType = type
+    if self.curActivityClass:GetCurActivityState() ~= ActivitySynManager.State.Open then
+        self:OnQuit()
+    end
+    self:GetEnemyEmbattleArray(
+        uid,type,
+        function(sids)
+            local data = {false, false, false, false, false, false}
+            local myteam = self:CheckEmbattleEmpty(self.attackEmbattle)
+            --如果我方进攻阵容不为空
+            if myteam ~= false then
+                --检测阵容是否为空 镇魂街ZHJ-27879 Alpha_JT BUG合集ZHJ-31375【灵弈对决】对面三支队伍中存在一支队伍为空时，进入战斗卡死
+                local teamEmpty = false
+                if not sids.team then
+                    teamEmpty = true
+                else
+                    -- 1位置为第一队，2,3 位置为第二队，456为第3对 有一队为空，战斗就直接算队伍为空
+                    if sids.team[1].sid == 0 or (sids.team[2].sid == 0 and sids.team[3].sid ==0) or (sids.team[4].sid ==0 and sids.team[5].sid ==0 and sids.team[6].sid == 0)then
+                        teamEmpty = true
+                    end
+                end
+                if teamEmpty then
+                    self:EnterFightEmpty()
+                    return
+                end
+            end
+            if sids.team == nil then
+                for i = 1, #data do
+                    data[i] = {
+                        uid = 0,
+                        sid = 0,
+                        level = 0,
+                        star = 0,
+                        soul_lv = 0
+                    }
+                end
+                self.enemyPower = {0, 0, 0}
+            else
+                for i = 1, #sids.team do
+                    data[i] = {
+                        uid = sids.team[i].sid,
+                        sid = sids.team[i].sid,
+                        level = sids.team[i].lv or 0,
+                        star = sids.team[i].star or 0,
+                        soul_lv = sids.team[i].soul_lv or 0
+                    }
+                end
+                self.enemyPower = sids.power
+            end
+
+            _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+            require("EmbattleController"):GetInstance():OpenSixVsSixEmbattle(
+                _G.EmbattleType.SixVsSixPVPAttack,
+                _G.EmbattleSaveType.server,
+                false,
+                _G.EmbattleControllerItemType.SixVsSixPVPAttack,
+                _G.handler(self, self.ExitEmbattle),
+                _G.handler(self, self.EnterFight),
+                _G.ConfigManager.arena_info_cfg[6].battle_sences,
+                data)
+            self.curEmbattleAttackTag = true
+        end
+    )
+end
+
+function SixVsSixPVPModel:OnChallengeEmptyCall(msg)
+    if msg.ack == 1 then
+        SixVsSixPVPNet:FightResult(
+            function(_data)
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                    300302,
+                    nil,
+                    function()
+                        self:UpdateData(_data)
+                    end
+                )
+            end
+        )
+    end
+end
+
+function SixVsSixPVPModel:UpdateData(data)
+    local UIManagerIns = _G.UIManager:GetInstance()
+    local ui_cfg = _G.ConfigManager.ui_cfg
+    self:ChangeScore(data.winner)
+    self:AddSingleReport(data.report)
+    if data.task_curr then
+        self:ChangeMission(data.task_curr)
+    end
+    if data.info then
+        self:ChangeSelfInfo(data.info)
+    end
+    self:UpdateView()
+
+    UIManagerIns:CloseWindow(ui_cfg.SixVsSixChanllengeView.Name)
+    UIManagerIns:OpenWindow(ui_cfg.SixVsSixChanllengeView.Name)
+end
+
+---更新主界面信息
+---@return void
+function SixVsSixPVPModel:UpdateView()
+    ---@type SixVsSixMainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SixVsSixMainView.Name)
+    if mainView then
+        mainView:UpdateView()
+    end
+end
+
+---监听界面打开
+---@param name string 界面名称
+function SixVsSixPVPModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.SixVsSixEmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SixVsSixMainView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SixVsSixChanllengeView.Name)
+    end
+end
+
+---退出战斗
+function SixVsSixPVPModel:OnExitFight(id)
+    if id ~= _G.SettlementModel.FunctionEnum.ReEmbattle and id ~= _G.SettlementModel.FunctionEnum.None then
+        return
+    end
+    if self:CheckIsOpen() then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SixVsSixMainView.Name)
+        if id == _G.SettlementModel.FunctionEnum.ReEmbattle then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SixVsSixChanllengeView.Name)
+        end
+    end
+end
+
+---进入战斗
+function SixVsSixPVPModel:OnFight()
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.SixVsSixPVP)
+end
+---检测是否当前阶段最后一关
+function SixVsSixPVPModel:ChekckStageEnd()
+    return self.curTowerId == self.stageEndTb[self.stage]
+end
+
+---获取结束时间
+function SixVsSixPVPModel:GetEndTime()
+    return self.curActivityClass:GetActivityDeadLineByCondition(ActivitySynManager.State.Settlement)
+end
+
+---设置防守阵容
+function SixVsSixPVPModel:SetDefence(team, callback)
+    self.defenceEmabattle = team
+    if self:CheckEmbattleEmpty(self.attackEmbattle) then
+        self.attackEmbattle = self.defenceEmabattle
+        SixVsSixPVPNet:SetArray(_G.EmbattleType.SixVsSixPVPAttack, team)
+    end
+    self.curActivityClass.typeClass:UpdateDefence()
+    SixVsSixPVPNet:SetArray(_G.EmbattleType.SixVsSixPVPDefence, team, callback)
+end
+
+---设置进攻阵容
+function SixVsSixPVPModel:SetAttack(team, callback)
+    self.attackEmbattle = team
+    if self:CheckEmbattleEmpty(self.defenceEmabattle) then
+        self.defenceEmabattle = self.attackEmbattle
+        SixVsSixPVPNet:SetArray(_G.EmbattleType.SixVsSixPVPDefence, team)
+        self.curActivityClass.typeClass:UpdateDefence()
+    end
+    SixVsSixPVPNet:SetArray(_G.EmbattleType.SixVsSixPVPAttack, team, callback)
+end
+
+---获取目标敌人阵容
+function SixVsSixPVPModel:GetEnemyEmbattleArray(uid, type, callback)
+    self.enemyUid = uid or self.enemyUid
+    self.enemyType = type or self.enemyType
+    SixVsSixPVPNet:GetEnemyEmbattle(self.enemyUid, self.enemyType, callback)
+end
+
+---获取免费挑战次数
+---@return number 挑战次数
+function SixVsSixPVPModel:GetFreeFightTimes()
+    return self.fightTimes
+end
+---获取挑战券数量
+---@return number 挑战券数量
+function SixVsSixPVPModel:GetFightTicketNum()
+    return _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.Prop, self.ticketID)
+end
+---获取总的挑战次数
+---@return number 挑战次数
+function SixVsSixPVPModel:GetAllFightTimes()
+    return self:GetFreeFightTimes() + self:GetFightTicketNum()
+end
+
+---战斗
+function SixVsSixPVPModel:Fight(callback)
+    return SixVsSixPVPNet:Fight(self.curChallengeUid, self.curChallengeType, callback)
+end
+
+---被攻击广播，刷新主界面
+function SixVsSixPVPModel:UpdateMainView(msg)
+    self.winRate = msg.rate
+    self.score = msg.score
+    self.rank = msg.rank
+    self.haveNewReport = true
+    local newReport = msg.report
+    self:AddSingleReport(newReport)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SixVsSixMainView.Name)
+    if view then
+        view:UpdateView()
+    end
+    --self:GetDataFormServer()
+end
+
+---变更分数
+function SixVsSixPVPModel:ChangeScore(win)
+    if win then
+        self.score = self.score + self.winScore
+        return self.score - self.winScore, self.winScore, self.loseScore
+    else
+        self.score = self.score - self.loseScore
+        return self.score, self.loseScore
+    end
+end
+
+---获得刷新次数
+function SixVsSixPVPModel:GetFreshEnemyTimes(isFresh)
+    if isFresh then
+        self.refreshTimes = self.refreshTimes + 1
+    end
+    return self.refreshTimes, self.freeCount
+end
+
+---获取任务列表
+function SixVsSixPVPModel:GetMissionData()
+    return self.missionList
+end
+
+---获取已完成任务
+function SixVsSixPVPModel:GetFinish()
+    return self.finishMissionList
+end
+
+---完成任务并领奖
+function SixVsSixPVPModel:GetMissionAward(data,callback)
+    SixVsSixPVPNet:GetMissionAward(data,function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        local coins = 0
+        for k,v in pairs(self.missionList) do
+            for k1,v1 in pairs(data) do
+                if v.sid == v1 then
+                    coins = coins + v.coin
+                    self.finishMissionList[v1] = true
+                end
+            end
+        end
+        local coinData = {[1] = 109,[2] = coins}
+        if coins > 0 then
+           table.insert(msg.award.item,{type = coinData})
+        end
+        _G.Events:GetInstance():Broadcast(_G.eArena.SetSixVsSix, coins)
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name,msg,callback)
+        self.curActivityClass.typeClass:UpdateMission()
+    end)
+end
+
+---变更任务进度
+function SixVsSixPVPModel:ChangeMission(data)
+    for k, v in pairs(data) do
+        for k1, v1 in pairs(self.missionList) do
+            if table.same(v.type, v1.condition) then
+                v1.curr = v.curr
+                if v1.condition[1] == 5 then
+                    if v.curr > 0 and v.curr <= v1.extra then
+                        v1.curr = 1
+                    else
+                        v1.curr = 0
+                    end
+                end
+            end
+        end
+    end
+    self.curActivityClass.typeClass:UpdateMission()
+end
+
+---检测活动是否开启
+function SixVsSixPVPModel:CheckIsOpen()
+    if self.curActivityClass:GetCurActivityState() ~= ActivitySynManager.State.Open then
+        self:OnQuit()
+        return false
+    end
+    return true
+end
+
+---跳转兑换商店
+function SixVsSixPVPModel:JumpExchange()
+    _G.GlobalInterface.JumpActivityByGM(10005, self.curActivityClass:GetJumpType())
+end
+
+---检测是否有已完成未领奖任务
+function SixVsSixPVPModel:CheckMission()
+    for k, v in pairs(self.missionList) do
+        if v.need <= v.curr and not self.finishMissionList[v.sid] then
+            return 1
+        end
+    end
+    return 0
+end
+
+---检测是否还有免费挑战次数，每次登入一次
+function SixVsSixPVPModel:CheckFirst()
+    if self.fightTimes > 0 and self.curActivityClass.typeClass.isFirst then
+        return 1
+    end
+    return 0
+end
+
+---检测防守阵容
+function SixVsSixPVPModel:CheckDefence()
+    if self.defencePower == 0 then
+        return 1
+    end
+    return 0
+end
+
+---修改自身数据
+function SixVsSixPVPModel:ChangeSelfInfo(data)
+    self.winRate = data[1]
+    self.rank = data[2]
+    if self.fightTimes == 0 then
+        _G.StorageManager:GetInstance():ConsumeItem(self.ticketID, 0, 1)
+    else
+        self.fightTimes = self.fightTimes == 0 and 0 or self.fightTimes - 1
+    end
+end
+
+---设置自身战力
+function SixVsSixPVPModel:SetSelfPower(power)
+    self.defencePower = power
+end
+
+---检测布阵是否为空
+function SixVsSixPVPModel:CheckEmbattleEmpty(data)
+    --数据一定有6个，没有6个就一定错误
+    if data == nil or data[1] == 0 or (data[2] == 0 and data[3] ==0) or (data[4] ==0 and data[5] ==0 and data[6] == 0) then
+        return false
+    end
+    return true
+    -- for k,v in pairs(data) do
+    --     if v ~= 0 then
+    --         return false
+    --     end
+    -- end
+    -- return true
+end
+
+---排名奖励发放
+function SixVsSixPVPModel:GetRankAward(msg)
+    if msg.id == self.curActivityClass:GetActivityID() then
+        _G.Events:GetInstance():Broadcast(_G.eArena.SetSixVsSix, msg.add_coin)
+    end
+end
+
+---检测是否有新战报
+function SixVsSixPVPModel:CheckReport()
+    return self.haveNewReport and 1 or 0
+end
+
+---获取战报
+function SixVsSixPVPModel:GetReport(callback, data)
+    if self.reportList then
+        if callback then
+            callback(self.reportList)
+        end
+    else
+        SixVsSixPVPNet:GetReport(function(data)
+            if data.ack == 1 then
+                self.reportList = data.reports
+                if callback then
+                    callback(self.reportList)
+                end
+            end
+        end)
+    end
+end
+
+---添加单条战报
+function SixVsSixPVPModel:AddSingleReport(data)
+    if not self.reportList then
+        self:GetReport(
+            function()
+                self.curActivityClass.typeClass:UpdateReport()
+            end
+        )
+    else
+        _G.table.insert(self.reportList, 1, data)
+        self.curActivityClass.typeClass:UpdateReport()
+    end
+end
+
+---获取排行榜数据
+function SixVsSixPVPModel:GetRanks()
+    return self.ranks
+end
+
+return SixVsSixPVPModel

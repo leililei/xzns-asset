@@ -1,0 +1,213 @@
+local base = require("AIHelperModuleBaseSelect")
+
+local FunctionIds = {
+    [_G.AdvertisementType.PlaneAD] = 0,
+    [_G.AdvertisementType.Draw] = _G.FunctionID.Draw,
+    [_G.AdvertisementType.SpiritualDraw] = _G.FunctionID.SpiritualDraw,
+    [_G.AdvertisementType.ArtifactDraw] = _G.FunctionID.ArtifactDraw,
+    [_G.AdvertisementType.PetDraw] = _G.FunctionID.Pet,
+    [_G.AdvertisementType.ExpAdd] = _G.FunctionID.UpMatSection,
+    [_G.AdvertisementType.CoinAdd] = _G.FunctionID.CoinSection,
+    [_G.AdvertisementType.StarAdd] = 49,
+    [_G.AdvertisementType.Equipment] = _G.FunctionID.EquipUpMatSection,
+    [_G.AdvertisementType.SecretRealm] = _G.FunctionID.Rune,
+    [_G.AdvertisementType.BuildDraw] = _G.FunctionID.Build,
+}
+
+local LangauageIds = {
+    [_G.AdvertisementType.PlaneAD] = 90000011737,       --地精飞艇
+    [_G.AdvertisementType.Draw] = 91111500101,          --普通招募
+    [_G.AdvertisementType.SpiritualDraw] = 90021000032, --饰品召唤
+    [_G.AdvertisementType.ArtifactDraw] = 91116900101,  --神器锻造
+    [_G.AdvertisementType.PetDraw] = 90031300059,       --魔兽召唤
+    -- [_G.AdvertisementType.ExpAdd] = 0,
+    -- [_G.AdvertisementType.CoinAdd] = 0,
+    -- [_G.AdvertisementType.StarAdd] = 0,
+    -- [_G.AdvertisementType.Equipment] = 0,
+    [_G.AdvertisementType.SecretRealm] = 90032800019, --大秘境
+}
+
+local SystemMaterialIds = {
+    [_G.AdvertisementType.ExpAdd] = 102,
+    [_G.AdvertisementType.CoinAdd] = 101,
+    [_G.AdvertisementType.StarAdd] = 105,
+    [_G.AdvertisementType.Equipment] = 103,
+}
+
+---@class AIHelperModuleADAward : AIHelperModuleBaseSelect	    @AI助手-广告奖励
+---@field model AdvertisementModel
+---@field list number[]                     @广告类型列表
+---@field count number                      @执行次数
+local AIHelperModuleADAward = _G.BaseClass("AIHelperModuleADAward", base)
+function AIHelperModuleADAward:__init()
+    self.model = require("AdvertisementModel"):GetInstance()
+    if _G.AppSetting.IsXzns then--星座宠物改成圣兽
+        FunctionIds[_G.AdvertisementType.PetDraw] = _G.FunctionID.Beast
+    end
+end
+
+---是否显示此模块(功能是否开启)
+function AIHelperModuleADAward:IsEnabled()
+    --是否开启广告
+    if not self.model:CheckADOPen() then
+        return false
+    end
+    --是否有月卡免广告
+    if not self.model:CheckFreeAD() then
+        return false
+    end
+    return true
+end
+
+---是否满足模块使用条件
+function AIHelperModuleADAward:IsActive()
+    return self.count > 0
+end
+
+---重置状态
+---@return void
+function AIHelperModuleADAward:Reset()
+    base.Reset(self)
+    self.list = nil
+    self.count = 1
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleADAward:Check(callback)
+    self.list = {}
+    for _, typeId in pairs(_G.AdvertisementType) do
+        local remainCount = self.model:GetADTimes(typeId) or 0
+        local functionId = FunctionIds[typeId]
+        if remainCount > 0 and (not functionId or functionId == 0 or _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(functionId)) then
+            table.insert(self.list, typeId)
+        end
+    end
+    table.sort(self.list, function(a, b)
+        return a < b
+    end)
+    self.count = #self.list
+    if self.count <= 0 then
+        self.count = 1
+    end
+
+    base.Check(self, callback)
+end
+
+---获取当前执行状态
+---@return any
+function AIHelperModuleADAward:GetExecuteState()
+    return self.list and self.list[1] or 0
+end
+
+---执行逻辑
+function AIHelperModuleADAward:Execute(callback)
+    if not self.list or #self.list == 0 then
+        self.count = 0
+        if callback then
+            callback(false, self:CreateFailureResults(self.cfg.fail_tip))
+        end
+        return
+    end
+    local typeId = self.list[1]
+
+    --检查剩余奖励次数(或者没有免广告特权)
+    local remainCount = self.model:GetADTimes(typeId) or 0
+    if remainCount <= 0 or not self.model:CheckFreeAD() then
+        self.count = self.count - 1
+        if callback then
+            callback(false, self:CreateFailureResults(self.cfg.fail_tip))
+        end
+        table.remove(self.list, 1)
+        return
+    end
+
+    local function response(msg)
+        local remainCount = self.model:GetADTimes(typeId) or 0
+        if remainCount <= 0 or not self.model:CheckFreeAD() then
+            table.remove(self.list, 1)
+            self.count = self.count - 1
+        end
+        if callback then
+            if not msg or msg.ack ~= 1 then
+                callback(false, self:CreateFailureResults(self.cfg.fail_tip))
+            else
+                msg.typeId = typeId
+                callback(true, msg)
+            end
+        end
+    end
+
+    if typeId == _G.AdvertisementType.SecretRealm then
+        self.model:PlaySecretRealmAd(response, true)
+    elseif SystemMaterialIds[typeId] then
+        self.model:PlaySystemMaterialAd(
+            typeId,
+            SystemMaterialIds[typeId],
+            response
+        )
+    else
+        self.model:VideoAD(typeId, response, true)
+    end
+end
+
+---获取当前执行标题
+function AIHelperModuleADAward:GetExecuteTitle(state)
+    local name = self:GetTypeIdName(state)
+    if not name or #name == 0 then
+        name = _G.GetLangPackValue(90022500411)
+    end
+    return _G.GetLangPackValue(self.cfg.title, name)
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleADAward:ShowExecuteResult(item, success, results)
+    base.ShowExecuteResult(self, item, success, results)
+    if not success then
+        return
+    end
+    if results.award then
+        self.Util.ShowAwardListOfMsg(item, results)
+    else
+        --显示奖励文本信息
+        item.scrollloophorizontal_award:SetActiveE(0)
+        item.aortext_failure:SetActiveE(1)
+
+        local typeId = results.typeId or 0
+        if typeId == _G.AdvertisementType.SecretRealm then
+            local award = self.model:GetAdAward(typeId)
+            local awardNum = award[1] and award[1][1] or 1
+            item.aortext_failure.text = _G.GetLangPackValue(90000011824, awardNum)
+        elseif SystemMaterialIds[typeId] then
+            local award = self.model:GetAdAward(typeId)
+            local awardNum = award[1] and award[1][1] or 1
+            item.aortext_failure.text = _G.GetLangPackValue(90000011825, self:GetTypeIdName(typeId), awardNum)
+        else
+            item.aortext_failure.text = ""
+        end
+    end
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleADAward:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+function AIHelperModuleADAward:GetTypeIdName(typeId)
+    local langauageId = LangauageIds[typeId]
+    if langauageId and langauageId > 0 then
+        return _G.GetLangPackValue(langauageId)
+    end
+
+    if SystemMaterialIds[typeId] then
+        local systemId = SystemMaterialIds[typeId]
+        local systemCfg = _G.ConfigManager.system_cfg[systemId]
+        local systemName = systemCfg and _G.GetLangPackValue(systemCfg.name) or ""
+        return systemName
+    end
+
+    return ""
+end
+
+return AIHelperModuleADAward

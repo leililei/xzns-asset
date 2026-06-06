@@ -1,0 +1,720 @@
+local ChallengeCounts = {
+    10,
+    5,
+    1,
+}
+local function getChallengeCount(own)
+    for _, v in ipairs(ChallengeCounts) do
+        if own >= v then
+            return v
+        end
+    end
+    return ChallengeCounts[#ChallengeCounts]
+end
+
+---创建事件触发条目
+---@param eventType UnityEngine.EventSystems.EventTriggerType @事件类型
+---@param callback fun(data:UnityEngine.EventSystems.PointerEventData):void @回调函数
+local function createTriggerEntry(eventType, callback)
+    local entry = _G.CS.UnityEngine.EventSystems.EventTrigger.Entry()
+    entry.eventID = eventType
+    entry.callback:AddListener(callback)
+    return entry
+end
+---求两点的距离
+---@param pos1 UnityEngine.Vector2 @点1
+---@param pos2 UnityEngine.Vector2 @点2
+local function magnitude(pos1, pos2)
+    return math.sqrt((pos1.x - pos2.x) ^ 2 + (pos1.y - pos2.y) ^ 2)
+end
+
+---@class FlowerCarParadeMainView : UIBaseView	赛车小游戏_入口选关页面
+---@field go_table FlowerCarParadeMainView_GoTable
+---@field activity ActivitySynGMActivity
+---@field model MiniFlowerCarParadeModel
+---@field stages activity_mini_game.activity_mini_game_fb_cfg[]     @关卡数据
+---@field stageIndex number                                         @当前关卡索引
+---@field stageItems FlowerCarParadeMainView._obj_stage1_GoTable[]      @关卡节点
+---@field stagePositions {pos:number[],scale:number[]}[]            @关卡节点位置信息
+---@field stageMove boolean                                         @关卡动画播放中
+---@field timeTimer Timer                                           @活动时间倒计时
+---@field unlockTimer Timer                                         @关卡解锁计时器
+local FlowerCarParadeMainView = _G.BaseClass("FlowerCarParadeMainView", _G.UIBaseView)
+
+function FlowerCarParadeMainView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+---界面的入口函数
+function FlowerCarParadeMainView:OnCreate(activity, model)
+    self.activity = activity
+    self.model = model
+    --获取关卡数据以及进行中的序号
+    self.stages = self.model:GetStages()
+    self.stageIndex = self.model:GetStageIndex()
+    if self.stageIndex > 1 and self.model:IsLock(self.stageIndex) then
+        --如果当前关卡未解锁，那么就退到上一个关卡
+        self.stageIndex = self.stageIndex - 1
+    end
+
+    self:InitView()
+    self:InitDragStages()
+    self:UpdateStages()
+    self:UpdateStagePositions()
+
+    self:UpdateView()
+
+    ---更新时间
+    self.remainTime = self.activity:GetActivityTypeCls():GetRemianDuration()
+    self:UpdateTime(0)
+    self.timeTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false, true)
+    self.timeTimer:Start()
+
+    --监听资源状态变化
+    self:AddListener(_G.eItemUpdata.Updata, self.UpdateStageButtons)
+
+    self.unlockTimer = _G.TimerManager:GetInstance():GetTimer(60, self.UpdateStageUnlock, self, false, false, true)
+    self.unlockTimer:Start()
+
+    --如果玩家是第一次进入, 弹出help面板
+    if _G.PlayerPrefsManager.GetInt("FlowerCarParadeMainView_FirstEnter", 0) == 0 then
+        _G.PlayerPrefsManager.SetInt("FlowerCarParadeMainView_FirstEnter", 1)
+        self:OnClickBtn(self.go_table.aorbtn_help)
+    end
+end
+
+function FlowerCarParadeMainView:OnDestroy()
+    self:RemoveAllListener()
+    if self.timeTimer then
+        self.timeTimer:Stop()
+        self.timeTimer = nil
+    end
+    if self.unlockTimer then
+        self.unlockTimer:Stop()
+        self.unlockTimer = nil
+    end
+end
+
+---初始化页面状态
+---@private
+function FlowerCarParadeMainView:InitView()
+    --关卡节点
+    self.stageItems = {}
+    self.stagePositions = {}
+    for i = 1, 3 do
+        local item = _G.GetAutoGoTable(self.go_table["obj_stage" .. i])
+        _G.AddViewBtnClick(item.gameObject, _G.handlerbind(self, self.OnClickStageBtn, item))
+        --节点初始缩放大小丶位置
+        local posX, posY, posZ = item.gameObject:GetLocalPosition()
+        local scaleX, scaleY, scaleZ = item.gameObject:GetLocalScale()
+        --local scaleX, scaleY, scaleZ = item.gameObject:GetWorldScale()
+        table.insert(self.stageItems, item)
+        table.insert(self.stagePositions, {
+            pos = { posX, posY, posZ },
+            scale = { scaleX, scaleY, scaleZ },
+        })
+    end
+
+    self.go_table.aortext_title.text = self.activity.cfg.info.name
+    local gsi = self.activity.cfg.info.front.gift_group_show
+    if gsi and gsi.images then
+        self.go_table.aorrawimage_awardicon:LoadImage(gsi.images[1].path)
+    end
+
+    --货币状态显示
+    local resources = _G.ConfigManager.ui_cfg.FlowerCarParadeMainView.resources
+    if self.model:GetCoinSid() and self.model:GetCoinSid() > 0 then
+        resources = { table.unpack(resources) }
+        table.insert(resources, self.model:GetCoinSid())
+    end
+    self:AddComponent(self.go_table.obj_goldInfo, require("ResourceCompont").New(self.go_table.obj_goldInfo, resources))
+
+    --门票货币图标
+    if self.model:GetCoinSid() and self.model:GetCoinSid() > 0 then
+        local itemIcon = _G.StorageManager:GetInstance():GetItemIcon(self.model:GetCoinSid())
+        self.go_table.aorrawimage_sweepIcon:LoadImage(itemIcon)
+        self.go_table.aorrawimage_challengeIcon:LoadImage(itemIcon)
+    end
+end
+
+---初始化拖动关卡
+function FlowerCarParadeMainView:InitDragStages()
+    local clickPosition, clickTime
+
+    local eventTriggers = self.go_table.obj_drag:GetComponentE(_G.typeof(_G.CS.UnityEngine.EventSystems.EventTrigger))
+    eventTriggers.triggers:Add(createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.PointerDown,
+        function(data)
+            if self.stageMove then
+                return
+            end
+            clickPosition = data.position
+            clickTime = _G.Time.time
+        end)
+    )
+    eventTriggers.triggers:Add(createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.Drag,
+        function(data)
+            if self.stageMove or not clickPosition then
+                return
+            end
+            if math.abs(clickPosition.y - data.position.y) < 50 and magnitude(clickPosition, data.position) >= 100 then
+                if clickPosition.x < data.position.x then
+                    --向右滑动
+                    if self.stageIndex > 1 then
+                        self:PlayStageMove(1)
+                        self.stageIndex = self.stageIndex - 1
+                    end
+                else
+                    --向左滑动
+                    if self.stageIndex < #self.stages then
+                        self:PlayStageMove(-1)
+                        self.stageIndex = self.stageIndex + 1
+                    end
+                end
+                clickPosition = nil
+            end
+        end)
+    )
+    eventTriggers.triggers:Add(createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.PointerUp,
+        function(data)
+            if self.stageMove or not clickPosition then
+                return
+            end
+            if _G.Time.time - clickTime <= 0.2 and magnitude(clickPosition, data.position) <= 10 then
+                --点击事件, 计算落点在哪个节点上
+                -- if containsScreenPoint(self.stageItems[1].transform, clickPosition) then
+                --     self:PlayStageMove(1)
+                --     self.stageIndex = self.stageIndex - 1
+                -- elseif containsScreenPoint(self.stageItems[3].transform, clickPosition) then
+                --     self:PlayStageMove(-1)
+                --     self.stageIndex = self.stageIndex + 1
+                -- end
+                --判断点击范围, 左边1/3则向右滑动, 右边1/3则向左滑动
+                local w = self.transform:GetRectTransformWidthHeight()
+                if clickPosition.x < w * 0.45 then
+                    if self.stageIndex > 1 then
+                        self:PlayStageMove(1)
+                        self.stageIndex = self.stageIndex - 1
+                    end
+                elseif clickPosition.x > w * 0.55 then
+                    if self.stageIndex < #self.stages then
+                        self:PlayStageMove(-1)
+                        self.stageIndex = self.stageIndex + 1
+                    end
+                end
+            end
+            clickPosition = nil
+        end)
+    )
+end
+
+---更新页面状态
+function FlowerCarParadeMainView:UpdateView()
+    local activityManager = require("ActivitySynManager"):GetInstance()
+    local jumpId = self.activity:GetJumpType()
+    local mainType = self.activity:GetMainType()
+
+    --战令
+    local battlePass = activityManager:GetChildAcitivity(10027, jumpId, mainType)
+    self.go_table.aorbtn_battlePass:SetActiveE(battlePass and 1 or 0)
+    if battlePass then
+        local tb = _G.GetAutoGoTable(self.go_table.aorbtn_battlePass)
+        tb.obj_redpoint:UpdateRedPointItemIDAndParam(
+            self.activity:GetActivityTypeCls():GetRedpointIDByIndex(2) --用于挂载战令丶战令任务
+        )
+    end
+
+    --额外奖励(需购买战令)
+    self.go_table.aorbtn_extraAward:SetActiveE(battlePass and 1 or 0)
+
+    --兑换
+    -- local exchange = activityManager:GetChildAcitivity(10048, jumpId, mainType)
+    -- self.go_table.aorbtn_exchange:SetActiveE(exchange and 1 or 0)
+    -- if exchange then
+    --     local tb = _G.GetAutoGoTable(self.go_table.aorbtn_exchange)
+    --     tb.obj_redpoint:UpdateRedPointItemIDAndParam(
+    --         exchange:GetActivityTypeCls():GetRedpointIDByIndex(1)
+    --     )
+    -- end
+
+    -- local selfRedpointId = self.activity:GetActivityTypeCls():GetRedpointIDByIndex(1)
+    local name = self.activity.cfg.info.name
+    local nameId = tonumber(name)
+    local gameTb = _G.GetAutoGoTable(self.go_table.aorbtn_game)
+    gameTb.aortext_text.text = nameId and _G.GetLangPackValue(nameId) or name
+
+    --额外奖励红点
+    local extraAwardRedpointId = self.activity:GetActivityTypeCls():GetRedpointIDByIndex(4)
+    self.go_table.obj_extraAwardRedpoint:UpdateRedPointItemIDAndParam(extraAwardRedpointId)
+end
+
+---更新当前关卡节点信息
+---@private
+function FlowerCarParadeMainView:UpdateStages()
+    --更新关卡状态
+    local offsetIndex = math.ceil(#self.stageItems / 2)
+    for index, item in ipairs(self.stageItems) do
+        local _index = self.stageIndex + index - offsetIndex
+        local d = self.stages[_index]
+        item.gameObject:SetActiveE(d and 1 or 0)
+        if d then
+            local name, surpassScore, icon = self:GetStageCfg(d.sid)
+            item.aortext_title.text = _G.GetLangPackValue(name)
+            local maxScore = self.model:GetHistoryScore(d.sid)
+            if maxScore > 0 then
+                item.aortext_score.text = _G.GetLangPackValue(90034511003, maxScore)
+            else
+                item.aortext_score.text = _G.GetLangPackValue(90034511002)
+            end
+            if maxScore > 0 and self.model:IsPass(_index) then
+                --超越xx%的玩家
+                item.aortext_condition.text = _G.GetLangPackValue(90034511014,
+                    string.format("%.2f%%", math.min(maxScore / surpassScore * 100, 99.99)))
+            else
+                item.aortext_condition.text = _G.GetLangPackValue(90034511004, d.pass)
+            end
+            if icon then
+                item.aorrawimage_role:LoadImage(icon, function()
+                    item.aorrawimage_role:SetNativeSize()
+                end)
+            end
+            --节点是否锁定
+            local isLock = self.model:IsLock(_index) or
+                _index > 1 and not self.model:IsPass(_index - 1)
+            item.isLock = isLock
+            _G.CS.GrayManager.SetGaryWithAllChildren(item.transform, isLock)
+            _G.CS.GrayManager.ProcessTextSetGray(item.aortext_title, isLock)
+            item.aorrawimage_role:SetGray(isLock)
+            item.aortext_title:GetComponentE(_G.typeof(_G.CS.UnityEngine.UI.Outline)).enabled = not isLock
+        end
+    end
+
+    --奖励信息
+    local curentStage = self.stages[self.stageIndex]
+    local award = curentStage.pass_award
+    if self.model:GetHistoryScore(curentStage.sid) > 0 and self.model:IsPass(self.stageIndex) then
+        self.go_table.aortext_awardTitle.text = _G.GetLangPackValue(90034511005)
+    else
+        self.go_table.aortext_awardTitle.text = _G.GetLangPackValue(90024300020)
+        --额外添加首通奖励
+        if not _G.table.isEmptyOrNil(curentStage.qualify_award) then
+            local function isSameAward(a1, a2)
+                if a1.type[1] == 0 and a2.type[1] == 0 then
+                    for i = 1, 4 do
+                        --0#活动type#活动subType#奖励id#奖励数量
+                        if not a1.type[i] or a1.type[i] ~= a2.type[i] then
+                            return false
+                        end
+                    end
+                    return true
+                end
+                return a1.type[1] == a2.type[1]
+            end
+            if _G.table.isEmptyOrNil(award) then
+                award = curentStage.qualify_award
+            else
+                award = _G.DeepCopy(award)
+                --合并奖励
+                for _, a1 in ipairs(curentStage.qualify_award) do
+                    local isAdd = true
+                    for _, a2 in ipairs(award) do
+                        if isSameAward(a1, a2) then
+                            isAdd = false
+                            if a2.type[1] == 0 then
+                                a2.type[5] = a2.type[5] + a1.type[5] --活动代币奖励
+                            else
+                                a2.type[2] = a2.type[2] + a1.type[2]
+                            end
+                            break
+                        end
+                    end
+                    if isAdd then
+                        table.insert(award, a1)
+                    end
+                end
+            end
+        end
+    end
+    self.go_table.obj_rewardParent:ClearChildren()
+    if award then
+        for _, v in ipairs(award) do
+            local parent = _G.InstantiateObject(self.go_table.obj_rewardItem, self.go_table.obj_rewardParent)
+            parent:SetActiveE(1)
+            _G.StorageManager:GetInstance():GetItemBaseViewNew(
+                v.type,
+                parent,
+                function(item)
+                    if not item or self:IsNil() then
+                        return
+                    end
+                    item.gameObject:SetLocalScale(0.8, 0.8, 0.8)
+                    item:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+                end
+            )
+        end
+    end
+
+    self:UpdateStageButtons()
+end
+
+---更新当前关卡节点位置丶缩放大小
+---@private
+function FlowerCarParadeMainView:UpdateStagePositions()
+    self.stageMove = false
+    for index, item in ipairs(self.stageItems) do
+        item.transform:DOKill()
+        item.gameObject:SetLocalPosition(table.unpack(self.stagePositions[index].pos))
+        item.gameObject:SetLocalScale(table.unpack(self.stagePositions[index].scale))
+        --item.gameObject:SetWorldScale(table.unpack(self.stagePositions[index].scale))
+    end
+end
+
+---更新下一个关卡解锁信息
+---@private
+function FlowerCarParadeMainView:UpdateStageUnlock()
+    if self.model:IsLock(self.stageIndex) then
+        --xx小时后开园
+        local time = _G.TimeUtil.TranslateSecond(self.model:GetUnlockTime(self.stageIndex))
+        local timeStr
+        if time.day > 0 then
+            timeStr = _G.GetLangPackValue(90022100001, time.day, time.hour) --%s天%s小时
+        else
+            timeStr = _G.GetLangPackValue(90022100002, time.hour, time.min) --%s小时%s分钟
+        end
+        self.go_table.aortext_waitTime.text = _G.GetLangPackValue(90034511012, timeStr)
+    elseif self.stageIndex > 1 and not self.model:IsPass(self.stageIndex - 1) then
+        --通关上一关后开放
+        self.go_table.aortext_waitTime.text = _G.GetLangPackValue(90034511013)
+    end
+end
+
+---更新当前按钮信息
+---@private
+function FlowerCarParadeMainView:UpdateStageButtons()
+    --更新当前关卡状态(按钮丶tip)
+    local curentStage = self.stages[self.stageIndex]
+    local isLock = self.model:IsLock(self.stageIndex) or
+        self.stageIndex > 1 and not self.model:IsPass(self.stageIndex - 1)
+    local isPass = not isLock and self.model:IsPass(self.stageIndex)
+    local maxScore = not isLock and self.model:GetHistoryScore(curentStage.sid) or 0
+    self.go_table.obj_tip1:SetActiveE((not isLock and not isPass) and 1 or 0) --提示: 首通无消耗
+    self.go_table.obj_tip2:SetActiveE((not isLock and isPass) and 1 or 0)     --提示: 不同区域的扫荡奖励均一致
+    self.go_table.aortext_waitTime:SetActiveE(isLock and 1 or 0)              --提示: xx小时后开园
+    self.go_table.aorbtn_challenge:SetActiveE(not isLock and 1 or 0)          --按钮: 挑战
+    self.go_table.aorbtn_sweep:SetActiveE(not isLock and isPass and 1 or 0)   --按钮: 扫荡
+    if isLock then
+        self:UpdateStageUnlock()
+    else
+        self.go_table.aortext_challengeConsume:SetActiveE(isPass and 1 or 0)
+        self.go_table.aorrawimage_challengeIcon:SetActiveE(isPass and 1 or 0)
+        self.go_table.aortext_challenge.text = _G.GetLangPackValue(isPass and 90034511010 or 90034511007)
+    end
+    --扫荡丶消耗信息
+    if isPass then
+        local coin = self.model:GetCoinNumber()
+        self.go_table.aortext_challengeConsume.text = string.format("<color=#e7cf61>%s</color>/1", coin)
+        self.go_table.aortext_sweepConsume.text = string.format(
+            "<color=#e7cf61>%s</color>/%s",
+            coin,
+            getChallengeCount(coin))
+
+        --挑战红点
+        local challengeRedpointId = self.activity:GetActivityTypeCls():GetRedpointIDByIndex(3)
+        self.go_table.obj_sweepRedpoint:UpdateRedPointItemIDAndParam(challengeRedpointId)
+        self.go_table.obj_challengeRedpoint:UpdateRedPointItemIDAndParam(challengeRedpointId)
+    else
+        --首通红点
+        local challengeRedpointId = self.activity:GetActivityTypeCls():GetRedpointIDByIndex(5)
+        self.go_table.obj_challengeRedpoint:UpdateRedPointItemIDAndParam(challengeRedpointId)
+    end
+end
+
+---更新时间字符串
+function FlowerCarParadeMainView:UpdateTime(deltaTime)
+    self.remainTime = self.remainTime - deltaTime
+    local time = _G.TimeUtil.TranslateSecond(math.max(0, math.floor(self.remainTime)))
+    local timeStr
+    if time.day > 0 then
+        timeStr = _G.GetLangPackValue(90022100001, time.day, time.hour) --%s天%s小时
+    else
+        timeStr = _G.GetLangPackValue(90022100002, time.hour, time.min) --%s小时%s分钟
+    end
+    self.go_table.aortext_time.text = _G.GetLangPackValue(90034511015, timeStr)
+end
+
+---播放关卡移动节点
+---@field forward number @移动方向, 1:向右, -1:向左
+---@private
+function FlowerCarParadeMainView:PlayStageMove(forward)
+    self.stageMove = true
+
+    local duration = 0.3
+    local maxIndex = #self.stageItems
+    for index, item in ipairs(self.stageItems) do
+        local nextIndex = index + forward
+        if nextIndex >= 1 and nextIndex <= maxIndex then
+            local next = self.stagePositions[nextIndex]
+            item.transform:DOLocalMove(next.pos[1], next.pos[2], next.pos[3], duration)
+                :SetEase(_G.CS.DG.Tweening.Ease.Linear)
+                :SetTarget(item.transform)
+            item.transform:DOScale(next.scale[1], next.scale[2], next.scale[3], duration)
+                :SetEase(_G.CS.DG.Tweening.Ease.Linear)
+                :SetTarget(item.transform)
+        end
+    end
+
+    local item
+    local selfInfo, nextInfo
+    --最左边的节点的动画
+    if forward < 0 then
+        item = self.stageItems[1]
+        selfInfo = self.stagePositions[1]
+        nextInfo = self.stagePositions[#self.stagePositions]
+    end
+    --最右边的节点的动画
+    if forward > 0 then
+        item = self.stageItems[#self.stageItems]
+        selfInfo = self.stagePositions[#self.stagePositions]
+        nextInfo = self.stagePositions[1]
+    end
+    if item then
+        local horDistance = math.abs(self.stagePositions[2].pos[1] - self.stagePositions[1].pos[1])
+        local beforeDuration = 0.5
+        local afterDuration = 1 - beforeDuration
+        local tweener = item.transform:DOLocalMove(
+            selfInfo.pos[1] + horDistance * beforeDuration * forward,
+            selfInfo.pos[2],
+            selfInfo.pos[3],
+            duration * beforeDuration,
+            function()
+                self:UpdateStages()
+                --接上另一半的动画
+                item.gameObject:SetLocalPosition(
+                    nextInfo.pos[1] - horDistance * afterDuration * forward,
+                    nextInfo.pos[2],
+                    nextInfo.pos[3])
+                item.transform:DOLocalMove(
+                    nextInfo.pos[1],
+                    nextInfo.pos[2],
+                    nextInfo.pos[3],
+                    duration * afterDuration,
+                    _G.handler(self, self.UpdateStagePositions))
+                    :SetEase(_G.CS.DG.Tweening.Ease.Linear)
+                    :SetTarget(item.transform)
+            end)
+        tweener:SetEase(_G.CS.DG.Tweening.Ease.Linear)
+        tweener:SetTarget(item.transform)
+    end
+
+    --交换节点状态
+    if forward < 0 then
+        self.stageItems = {
+            self.stageItems[2],
+            self.stageItems[3],
+            self.stageItems[1],
+        }
+    elseif forward > 0 then
+        self.stageItems = {
+            self.stageItems[3],
+            self.stageItems[1],
+            self.stageItems[2],
+        }
+    end
+end
+
+---发起挑战
+---@param stageIndex number 关卡索引
+function FlowerCarParadeMainView:Challenge(stageIndex)
+    if self.model:IsGaming() then
+        --先结算上一次游玩
+        self.model:FinishGame(self.model:GetLastStageIndex(), 0, function()
+            self:Challenge(stageIndex)
+            return
+        end)
+        return
+    end
+
+    local isPass = self.model:IsPass(stageIndex) --记录挑战前的通关状态
+    self.model:StartGame(stageIndex, function()
+        self:OpenGameView(stageIndex, function(score)
+            if self:IsNil() then
+                return
+            end
+            --结束挑战
+            self.model:FinishGame(stageIndex, math.max(0, score), function(msg)
+                --展示奖励信息
+                if msg and msg.ack == 1 and msg.award then
+                    _G.UIUtils.ShowCommonAward(msg)
+                end
+
+                --是否切换到下一个关卡
+                if not isPass and self.model:IsPass(stageIndex) and (stageIndex + 1) <= #self.stages then
+                    self:PlayStageMove(-1)
+                    self.stageIndex = stageIndex + 1
+                end
+                --刷新关卡信息
+                self:UpdateStages()
+            end)
+        end)
+    end)
+end
+
+---监听游戏打开事件
+---@param name string UI名称
+function FlowerCarParadeMainView:OnGameOpened(name)
+    if name ~= _G.ConfigManager.ui_cfg.FlowerCarParadeView.Name then
+        return
+    end
+    self:RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnGameOpened)
+
+    ---@type FlowerCarParadeView
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.FlowerCarParadeView.Name)
+    if view then
+        local stage = self.stages[self.stageIndex]
+        view:SetCloseButtonActive(true)
+        view:SetBackButtonActive(true)
+        view:SetScoreTip(_G.GetLangPackValue(90034511004, stage.pass))
+    end
+end
+
+---监听游戏结束事件
+function FlowerCarParadeMainView:OnGameEnded(score)
+    ---@type FlowerCarParadeView
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.FlowerCarParadeView.Name)
+    if view then
+        local stage = self.stages[self.stageIndex]
+        if score < stage.pass then
+            view:SetFinishTip(_G.GetLangPackValue(90034511004, stage.pass))
+        else
+            local cfg = _G.ConfigManager.min_parkour_cfg[stage.sid]
+            local surpassScore = cfg.fraction and cfg.fraction[1][1] or 9999 --超越xx%的玩家
+            view:SetFinishTip(_G.GetLangPackValue(90034511014,
+                string.format("%.2f%%", math.min(score / surpassScore * 100, 99.99))))
+        end
+    end
+end
+
+---打开游戏游玩页面
+---@param stageIndex number 关卡索引
+---@param callback fun(score:number):void
+function FlowerCarParadeMainView:OpenGameView(stageIndex, callback)
+    local stageCfg = _G.ConfigManager.min_parkour_cfg[self.stages[stageIndex].sid]
+
+    self:AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnGameOpened)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.FlowerCarParadeView.Name,
+        nil,
+        function(score)
+            if self:IsNil() then
+                return
+            end
+            if callback then
+                callback(score)
+            end
+        end,
+        _G.handler(self, self.OnGameEnded),
+        stageCfg
+    )
+end
+
+---获取关卡配置
+---@param sid number
+---@return number,number,string  @名称id,fraction分数,icon路径
+function FlowerCarParadeMainView:GetStageCfg(sid)
+    local cfg = _G.ConfigManager.min_parkour_cfg[sid]
+    return cfg.name,
+        (cfg.fraction and cfg.fraction[1][1] or 9999), --超越xx%的玩家
+        cfg.icon
+end
+
+---点击关卡信息
+---@private
+function FlowerCarParadeMainView:OnClickStageBtn(_, _, item)
+    if self.stageMove then
+        return
+    end
+    if item == self.stageItems[1] then
+        self:PlayStageMove(1)
+        self.stageIndex = self.stageIndex - 1
+    elseif item == self.stageItems[3] then
+        self:PlayStageMove(-1)
+        self.stageIndex = self.stageIndex + 1
+    end
+end
+
+---按钮点击事件在这里派发
+---@protected
+function FlowerCarParadeMainView:OnClickBtn(go)
+    if self.stageMove then
+        return
+    end
+    if go == self.go_table.aorbtn_close then
+        self:Close()
+    elseif go == self.go_table.aorbtn_sweep then
+        --扫荡
+        local coin = self.model:GetCoinNumber()
+        if coin <= 0 then
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.GetItemWayView.Name,
+                self.model:GetCoinSid()
+            )
+            return
+        end
+        if self.model:IsGaming() then
+         --先结算上一次游玩
+            self.model:FinishGame(self.model:GetLastStageIndex(), 0, function()
+                self.model:Sweep(self.stageIndex, getChallengeCount(coin), function(msg)
+                    --展示奖励信息
+                    if msg and msg.ack == 1 and msg.award then
+                        _G.UIUtils.ShowCommonAward(msg)
+                    end
+
+                    --刷新关卡信息
+                    self:UpdateStages()
+                end)
+            end)
+            return 
+        end
+        self.model:Sweep(self.stageIndex, getChallengeCount(coin), function(msg)
+            --展示奖励信息
+            if msg and msg.ack == 1 and msg.award then
+                _G.UIUtils.ShowCommonAward(msg)
+            end
+
+            --刷新关卡信息
+            self:UpdateStages()
+        end)
+    elseif go == self.go_table.aorbtn_challenge then
+        --发起挑战
+        local stageSid = self.stages[self.stageIndex].sid
+        if self.model:GetHistoryScore(stageSid) > 0 and self.model:IsPass(self.stageIndex) and self.model:GetCoinNumber() <= 0 then
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.GetItemWayView.Name,
+                self.model:GetCoinSid()
+            )
+            return
+        end
+        self:Challenge(self.stageIndex)
+    elseif go == self.go_table.aorbtn_battlePass then
+        --战令
+        _G.GlobalInterface.JumpActivityByGM(10027, self.activity:GetJumpType(), nil, self.activity:GetMainType())
+    elseif go == self.go_table.aorbtn_exchange then
+        --兑换
+        _G.GlobalInterface.JumpActivityByGM(10048, self.activity:GetJumpType(), nil, self.activity:GetMainType())
+    elseif go == self.go_table.aorbtn_extraAward then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.FlowerCarParadeMainExtraAwardView.Name,
+            self.activity,
+            self.model
+        )
+    elseif go == self.go_table.aorbtn_help then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.GamePlayDescribeView.Name,
+            221
+        )
+    end
+end
+
+return FlowerCarParadeMainView

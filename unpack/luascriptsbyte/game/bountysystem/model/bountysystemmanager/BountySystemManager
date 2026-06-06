@@ -1,0 +1,917 @@
+-------------------------------------------------------
+-- Description:     贪字营管理器
+-- Author:          wyx
+-- Create Date:     2021/03/10
+-------------------------------------------------------
+
+local QuestData = require "BountyQuestData"
+
+---@class BountySystemManager : GameDataModelBase 贪字营管理器
+---@field GetInstance fun():BountySystemManager
+---@field Level number 等级
+---@field RefreshTime number 重置任务时间戳
+---@field FinishedBossCnt number 完成的Boss完成数
+---@field AllQuest BountyQuestData[] 所有的任务
+---@field BountyData dispatch.s2c_dispatch_info 贪字营数据
+---@field QuestDataPool BountyQuestData[] 任务数据池
+---@field Cards CardData[] 空闲的卡牌 0-全部卡牌 1-5代表对应元素的卡牌
+---@field timer Timer 刷新任务倒计时
+---@field taskDatas BountyTaskData[]
+local base = _G.GameDataModelBase
+local BountySystemManager = _G.BaseClass("BountySystemManager", base)
+
+local StarIndexDic = {
+    --ZHJH-3361 最低紫色
+    --绿   index>=2 显示index-1星星数量  （框算一星）
+    [1] = "ui_js_zise_icon",
+    --蓝
+    [2] = "ui_js_zise_icon",
+    --紫
+    [3] = "ui_js_zise_icon",
+    --橙
+    [4] = "ui_js_chengse_icon",
+    --红
+    [5] = "ui_js_hongse_icon",
+    --金
+    [6] = "ui_js_chengse_icon",
+    --彩
+    [7] = "ui_js_caise_icon"
+}
+
+local ElementSps = {
+    [1] = "ui_js_renlei_icon",
+    [2] = "ui_js_shouren_icon",
+    [3] = "ui_js_jingling_icon",
+    [4] = "ui_js_wangling_icon",
+    [5] = "ui_js_renlei_icon",
+    [6] = "ui_js_chuanqi_icon",
+    [16] = "ui_js_multi16",   --人神
+    [26] = "ui_js_multi26",   --兽神
+    [36] = "ui_js_multi36",    --精神
+    [46] = "ui_js_multi46"     --亡神
+}
+---创建对象时,入口构造函数
+function BountySystemManager:__init()
+    self.getSids = {}
+    self.QuestDataPool = {}
+    self.curFunctionOpenID = 12
+    _G.Events:GetInstance():AddListener(_G.eLimitePrivilege.LimitePrivilegeChange, self.GetDataFormServer, self)
+end
+
+function BountySystemManager:GetDataFormServer()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return
+    end
+    self:GetBountyData(_G.handler(self, self.ParseData))
+end
+
+function BountySystemManager:ParseData(data)
+    if self.endCallback then
+        self.endCallback()
+    end
+    self.endCallback = nil
+end
+
+---销毁对象时,析构函数
+function BountySystemManager:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.AllQuest = nil
+    self.QuestDataPool = nil
+    _G.Events:GetInstance():RemoveListener(_G.eLimitePrivilege.LimitePrivilegeChange, self.GetDataFormServer, self)
+end
+
+---获取空闲卡牌包括已经派遣的
+function BountySystemManager:GetIdleCardsNoLimit()
+    local card = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    card = _G.table.toArray(card)
+    _G.table.sort(
+        card,
+        function(a, b)
+            if a.power == b.power then
+                if a.star == b.star then
+                    if a.lv == b.lv then
+                        return a.uid > b.uid
+                    else
+                        return a.lv > b.lv
+                    end
+                else
+                    return a.star > b.star
+                end
+            else
+                return a.power > b.power
+            end
+        end
+    )
+    return card
+end
+
+---取得空闲的卡牌
+---@return CardData[]
+function BountySystemManager:GetIdleCards()
+    local card = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    card = _G.table.toArray(card)
+    _G.table.sort(
+        card,
+        function(a, b)
+            if
+            (self:ChekcIsDispath(a.uid) and self:ChekcIsDispath(b.uid)) or
+                (not self:ChekcIsDispath(a.uid) and not self:ChekcIsDispath(b.uid))
+            then
+                if a.star == b.star then
+                    if a.lv == b.lv then
+                        return a.uid > b.uid
+                    else
+                        return a.lv > b.lv
+                    end
+                else
+                    return a.star > b.star
+                end
+            else
+                if self:ChekcIsDispath(a.uid) then
+                    return false
+                else
+                    return true
+                end
+            end
+        end
+    )
+
+    return card
+end
+
+---取得空闲的卡牌,key为uid的
+---@return CardData[]
+function BountySystemManager:GetIdleCardofKey()
+    local card = _G.DeepCopy(_G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal))
+    for i, v in pairs(self.AllQuest) do
+        if v.mission and v.mission.card then
+            for i = 1, #v.mission.card do
+                card[v.mission.card[i].uid] = nil
+            end
+        end
+    end
+    local compare = function(a, b)
+        if a.star == b.star then
+            if a.lv == b.lv then
+                return a.uid > b.uid
+            else
+                return a.lv > b.lv
+            end
+        else
+            return a.star > b.star
+        end
+    end
+
+    local keys = _G.table.keys(card)
+    for i = 1, #keys - 1 do
+        for j = 1, #keys - i do
+            if compare(card[keys[j]], card[keys[j + 1]]) then
+                local temp = keys[j]
+                keys[j] = keys[j + 1]
+                keys[j + 1] = temp
+            end
+        end
+    end
+    local tb = {}
+    for i = 1, #keys do
+        tb[keys[i]] = card[keys[i]]
+    end
+
+    return tb
+end
+
+---获取一键派遣的卡牌
+function BountySystemManager:GetDispathAll()
+    local CardDatas = self:GetIdleCardofKey()
+    local AllCards = {}
+    local data = _G.DeepCopy(self.AllQuest)
+    for i = 1, #data do
+        if data[i].mission.time == 0 then
+            local cards = self:GetSimpleDispath(CardDatas, data[i].mission)
+            if cards then
+                cards.Count = nil
+                if self:CheckCards(cards, data[i].mission) then
+                    AllCards[data[i].mission.sid] = data[i]
+                    data[i].mission.card = {}
+                    for k, v in pairs(cards) do
+                        data[i].mission.card[#data[i].mission.card + 1] = { sid = v.sid, uid = v.uid, star = v.star }
+                        CardDatas[v.uid] = nil
+                    end
+                end
+            end
+        end
+    end
+    return AllCards
+end
+
+---获取适合单个任务卡牌组合
+---@param CardData CardData[]
+---@param EvilData dispatch.i_evil_spirit_mission
+function BountySystemManager:GetSimpleDispath(CardData, EvilData)
+    local data = EvilData
+    local cfg = _G.ConfigManager.bounty_quest_cfg[data.sid]
+    if not cfg then
+        return nil
+    end
+
+    if _G.table.count(CardData) < cfg.condition_num then
+        return nil
+    end
+    local allCards = CardData
+    local cards = {}
+    local requiredCards = {}
+
+    for key, v in pairs(allCards) do
+        if not self:ChekcIsDispath(v.uid) then
+            if not cards[v.star] then
+                cards[v.star] = {}
+            end
+            cards[v.star][v.uid] = v
+        end
+    end
+
+    local prop = _G.DeepCopy(data.five_elements)
+
+    for k, v in pairs(cards) do
+        if k >= cfg.condition_attribute[2] then
+            for _2, v2 in pairs(v) do
+                if self:CheckIsFiveElement(prop, v2.cfg.Elements_new, true) then
+                    _G.table.insert(requiredCards, v2)
+                    v[v2.uid] = nil
+                    if #requiredCards >= cfg.condition_attribute[1] or #prop <= 0 then
+                        break
+                    end
+                end
+            end
+            if #requiredCards >= cfg.condition_attribute[1] or #prop <= 0 then
+                break
+            end
+        end
+    end
+
+    if cfg.condition_attribute[1] + #data.five_elements - cfg.condition_num > #requiredCards then
+        return nil
+    end
+
+    if #requiredCards < cfg.condition_attribute[1] then
+        for k, v in pairs(cards) do
+            if k >= cfg.condition_attribute[2] then
+                for _2, v2 in pairs(v) do
+                    _G.table.insert(requiredCards, v2)
+                    v[v2.uid] = nil
+                    if #requiredCards >= cfg.condition_attribute[1] then
+                        break
+                    end
+                end
+            end
+            if #requiredCards >= cfg.condition_attribute[1] then
+                break
+            end
+        end
+    end
+
+    if #requiredCards < cfg.condition_attribute[1] then
+        return nil
+    end
+
+    if #prop > 0 then
+        for _, v in pairs(cards) do
+            for _2, v2 in pairs(v) do
+                if self:CheckIsFiveElement(prop, v2.cfg.Elements_new, true) then
+                    _G.table.insert(requiredCards, v2)
+                    v[v2.uid] = nil
+                    if #prop <= 0 then
+                        break
+                    end
+                end
+            end
+            if #prop <= 0 then
+                break
+            end
+        end
+    end
+
+    if #prop > 0 then
+        return nil
+    end
+
+    if #requiredCards < cfg.condition_num then
+        for _, v in pairs(cards) do
+            for _2, v2 in pairs(v) do
+                _G.table.insert(requiredCards, v2)
+                v[v2.uid] = nil
+                if #requiredCards >= cfg.condition_num then
+                    break
+                end
+            end
+            if #requiredCards >= cfg.condition_num then
+                break
+            end
+        end
+    end
+
+    if #requiredCards < cfg.condition_num then
+        return nil
+    end
+
+    return requiredCards
+end
+
+---检测卡牌组合是否符合所需要的卡牌
+function BountySystemManager:CheckCards(cards, EvilData)
+    local cfg = _G.ConfigManager.bounty_quest_cfg[EvilData.sid]
+    if cards == nil or _G.table.count(cards) < cfg.condition_num then
+        return false
+    end
+
+    local prop = _G.DeepCopy(EvilData.five_elements)
+    local limitCardNum = 0
+    for k, v in pairs(cards) do
+        if v.star >= cfg.condition_attribute[2] then
+            limitCardNum = limitCardNum + 1
+        end
+        if #prop > 0 then
+            self:CheckIsFiveElement(prop, v.cfg.Elements_new, true)
+        end
+    end
+
+    if #prop == 0 and limitCardNum >= cfg.condition_attribute[1] then
+        return true
+    else
+        return false
+    end
+end
+
+---检测是否为当前所需要的五行元素
+---@param table  table<number>
+---@param Elements_new number 元素
+---@param isRemove boolean 是否移除元素
+---@return boolean
+function BountySystemManager:CheckIsFiveElement(table, Elements_new, isRemove)
+    for _, v in pairs(table) do
+        if require "CardInfoManager":GetInstance():CheckMultiMatch(v, Elements_new) then
+            if isRemove then
+                _G.table.remove(table, _)
+            end
+            return true
+        end
+    end
+    return false
+end
+
+---解析奖励并展示
+---@param data award.i_award_item
+---@return BountyAward[]
+function BountySystemManager:ParaseAward(data)
+    local tb = {}
+    for _, value in ipairs(data) do
+        self:ParseSimpleAward(tb, value)
+    end
+
+    -- self:ParseSimpleAward(tb, data)
+    return tb
+end
+---解析单个奖励
+---@return BountyAward
+function BountySystemManager:ParseSimpleAward(tb, data)
+    ---@class BountyAward 奖励数据
+    ---@field sid number
+    ---@field uid number
+    ---@field star number 卡牌初始星级
+    ---@field number number
+
+    ---@type BountyAward
+    local award = {}
+    local itemType = data.type == nil and data or data.type
+    if itemType[1] ~= nil then
+        local type = _G.StorageManager:GetInstance():CheckSidType(itemType[1])
+        if type == _G.StorageType.Card then
+            award.sid = itemType[1]
+            award.uid = itemType[2]
+            award.star = itemType[3]
+            award.number = 1
+            table.insert(tb, award)
+        elseif type == _G.StorageType.Equipment then
+            award.sid = itemType[1]
+            award.uid = itemType[2]
+            award.number = 1
+            table.insert(tb, award)
+        else
+            local addNum = itemType[2] or itemType[3]
+            award.sid = itemType[1]
+            award.number = addNum
+            table.insert(tb, award)
+        end
+    end
+end
+
+---#region  与服务器的交互
+---获取贪字营数据
+function BountySystemManager:GetBountyData(callback)
+    require("BountyNet"):GetInstance():GetBountyData(_G.handlerbind(self, self.GetBountyDataSuc, callback))
+end
+
+---获取贪字营数据回调
+---@param data dispatch.s2c_dispatch_info 贪字营数据
+function BountySystemManager:GetBountyDataSuc(data, callback)
+    local isSetCount = false
+    if self.BountyData then
+        if self.BountyData.missions and data.missions then
+            isSetCount = #self.BountyData.missions ~= #data.missions
+        else
+            isSetCount = true
+        end
+    end
+    self.BountyData = data
+    if not self.BountyData.missions then
+        self.BountyData.missions = {}
+    end
+    self:InitTaskData()
+    self:InitBossTimer()
+    if self.callback then
+        self.callback(self.BountyData, isSetCount)
+    end
+    if callback then
+        callback()
+    end
+    if self.BountyData ~= nil then
+        --成就任务登录判断
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            { _G.ActiveTaskEnum.ConditionEnum.Section.TzyLevel },
+        -- 贪字营等级达到X级
+        --- #等级
+            self.BountyData.level
+        )
+    end
+    self.isHaveDispath = nil
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.BountyLobby.id)
+end
+---初始化任务数据
+function BountySystemManager:InitTaskData()
+    self.DispathCards = {}
+    if self.taskDatas then
+        for _, v in pairs(self.taskDatas) do
+            v:Dispose()
+        end
+        self.taskDatas = {}
+        for _, v in pairs(self.BountyData.missions) do
+            self.taskDatas[v.sid] = require "BountyTaskData".New(v)
+            if v.card then
+                for i = 1, #v.card do
+                    self.DispathCards[v.card[i].uid] = true
+                end
+            end
+            require "RedPointManager":GetInstance():AddRedPointParam(
+                _G.ConfigManager.redpoint_cfg.BountyLobby.id,
+                v.sid
+            )
+        end
+    else
+        self.taskDatas = {}
+        for _, v in pairs(self.BountyData.missions) do
+            self.taskDatas[v.sid] = require "BountyTaskData".New(v)
+            if v.card then
+                for i = 1, #v.card do
+                    self.DispathCards[v.card[i].uid] = true
+                end
+            end
+        end
+    end
+end
+
+---绑定更新时间，与回调
+function BountySystemManager:BindUpdateTime(updateTime, callback)
+    self.updateTime = updateTime
+    self.callback = callback
+end
+
+function BountySystemManager:UnBindUpdateTime()
+    self.updateTime = nil
+    self.callback = nil
+end
+
+---初始化任务数据
+function BountySystemManager:InitAllQuset()
+    if self.BountyData.missions == nil then
+        self.BountyData.missions = {}
+    end
+    self.AllQuest = {}
+    for i = 1, #self.BountyData.missions do
+        self.AllQuest[i] = self:GetQuestData()
+        self.AllQuest[i]:InitData(self.BountyData.missions[i])
+    end
+    self:SortEvilTask()
+    self:UpdateCards()
+end
+
+function BountySystemManager:UpdateCards()
+    self.Cards = {}
+    self.Cards[0] = self:GetIdleCards()
+    for k, v in pairs(_G.ConfigManager.type_elements_cfg) do
+        self.Cards[v.id] = _G.table.chooseToArray(
+            self.Cards[0],
+            function(k, v2)
+                if require "CardInfoManager":GetInstance():CheckMultiMatch(v.id, v2.cfg.Elements_new) then
+                    return true
+                end
+                return false
+            end
+        )
+    end
+end
+
+---移除已完成的任务
+function BountySystemManager:RemoveQuest(sid, cards)
+    local uids = {}
+    for i = 1, #self.BountyData.missions do
+        if self.BountyData.missions[i].sid == sid then
+            self:RemoveCardDispatch(cards, self.BountyData.missions[i].card)
+            _G.table.remove(self.BountyData.missions, i)
+            break
+        end
+    end
+
+    for i = 1, #self.AllQuest do
+        if self.AllQuest[i].mission.sid == sid then
+            self:RespawnQuestData(self.AllQuest[i])
+            _G.table.remove(self.AllQuest, i)
+            break
+        end
+    end
+    if self.taskDatas[sid] then
+        self.taskDatas[sid]:Dispose()
+        self.taskDatas[sid] = nil
+    end
+end
+
+---移除已经派遣卡牌的派遣标志
+---@param uids dispatch.i_card
+---@param cards CardData[]
+function BountySystemManager:RemoveCardDispatch(cards, card)
+    for i = 1, #card do
+        self.DispathCards[card[i].uid] = nil
+    end
+end
+
+---转换所有空闲卡牌
+function BountySystemManager:ChangeCards()
+    return self:ChangeCardUids(self.Cards[0])
+end
+
+---将卡牌由数组转成以uid为key的table
+---@param cards CardData[]
+---@return cards CardData[]
+function BountySystemManager:ChangeCardUids(card)
+    local table = {}
+    for _, v in pairs(card) do
+        table[v.uid] = v
+    end
+    return table
+end
+
+---刷新恶灵任务
+function BountySystemManager:RefreshEvilTask(callback)
+    require("BountyNet"):GetInstance():RefreshEvilTask(_G.handlerbind(self, self.RefreshEvilTaskCall, callback))
+end
+---@param msg dispatch.s2c_dispatch_refresh
+function BountySystemManager:RefreshEvilTaskCall(msg, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.BountyData.missions = msg.missions
+    self:InitTaskData()
+    if callback then
+        callback(msg)
+    end
+end
+
+---接取恶灵任务
+---@param list dispatch.s2c_dispatch_accept 恶灵任务sid
+---@param callback function 完成回调
+function BountySystemManager:AcceptEvilTask(list, callback)
+    local msg = {}
+    msg.list = list
+    require("BountyNet"):GetInstance():AcceptEvilTask(
+        msg,
+        _G.handlerbind(self, self.AcceptEvilTaskCall, list, callback)
+    )
+end
+---领取任务回调
+function BountySystemManager:AcceptEvilTaskCall(msg, list, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    if callback then
+        callback(msg)
+    end
+    --require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.BountyLobby.id, 1)
+end
+---更改任务状态
+function BountySystemManager:ChangeTaskData(id)
+    local taskData = self.taskDatas[id]
+    if taskData then
+        taskData:InitTimer()
+    end
+end
+
+---完成恶灵任务
+---@param sids table<number> 所有恶灵任务sid
+------@param callback function 完成回调
+function BountySystemManager:FinshEvilTask(sids, callback)
+    local msg = {}
+    msg.sid = sids
+    require("BountyNet"):GetInstance():FinishEvilTask(msg, callback)
+end
+
+---接取boss任务
+---@param cards table 出战卡牌的uid
+---@param callback function 完成回调
+function BountySystemManager:AcceptBossTask(cards, callback, power)
+    local msg = {}
+    msg.cards = cards
+    require("BountyNet"):GetInstance():AcceptBossTask(
+        msg,
+        _G.handlerbind(self, self.AcceptBossTaskCall, callback, power)
+    )
+end
+---接受boss任务回调
+function BountySystemManager:AcceptBossTaskCall(msg, callback, power)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.BountyData.boss.power = power
+    self.BountyData.boss.boss_start_time = msg.start_time
+    self:InitBossTimer()
+    if callback then
+        callback(msg)
+    end
+end
+---初始化Boss
+function BountySystemManager:InitBossTimer()
+    if self.bossTimer then
+        self.bossTimer:Stop()
+        self.bossTimer = nil
+    end
+    if self.BountyData.boss.boss_start_time <= 0 then
+        self.BossRTS = 0
+        return
+    end
+    self.BossRTS = _G.ConfigManager.bounty_level_cfg[self.BountyData.level].duration + self.BountyData.boss.boss_start_time -
+        _G.TimeUtil.GetServerUnixTime()
+    if self.BossRTS > 0 then
+        self.bossTimer = _G.TimerManager:GetInstance():GetTimer(self.BossRTS, self.BossTimerOver, self, true, false, true)
+        self.bossTimer:Start()
+    else
+        self.BossRTS = 0
+    end
+end
+
+function BountySystemManager:OnSixClockUpdate(endcall)
+    local call = endcall
+    _G.DelayDo(
+        3,
+        function()
+            base.OnSixClockUpdate(self, call)
+        end
+    )
+end
+
+function BountySystemManager:BossTimerOver()
+    if self.bossTimer then
+        self.bossTimer:Stop()
+        self.bossTimer = nil
+    end
+    self.BossRTS = 0
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.BountyLobby.id, 0)
+end
+
+---完成boss任务
+------@param callback function 完成回调
+function BountySystemManager:FinshBossTask(callback)
+    require("BountyNet"):GetInstance():FinishBossTask(_G.handlerbind(self, self.FinishBossTaskCall, callback))
+end
+---完成Boss任务回调
+function BountySystemManager:FinishBossTaskCall(msg, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.BountyData.boss.boss_start_time = 0
+    if callback then
+        callback(msg)
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.BountyLobby.id, 0)
+end
+
+---检测是否为初始任务
+function BountySystemManager:ChekDefultId(id)
+    if not self.defultTb then
+        self.defultTb = {}
+        for _, v in pairs(_G.ConfigManager.discrete_cfg[101502][1]) do
+            self.defultTb[v] = true
+        end
+    end
+    return self.defultTb[id]
+end
+
+---任务排列
+---@param data BountyQuestData[]
+function BountySystemManager:SortEvilTask(data)
+    if data == nil then
+        data = self.AllQuest
+    end
+    self.isDefult = false
+    local time = _G.TimeUtil.GetServerUnixTime()
+    _G.table.sort(
+        data,
+        function(data1, data2)
+            local a = data1.mission
+            local b = data2.mission
+            local isDefultA = self:ChekDefultId(a.sid)
+            local isDefultB = self:ChekDefultId(b.sid)
+            if (isDefultA and isDefultB) or (not isDefultA and not isDefultB) then
+                local cfg1 = _G.ConfigManager.bounty_quest_cfg[a.sid]
+                local cfg2 = _G.ConfigManager.bounty_quest_cfg[b.sid]
+                if a.time > 0 and b.time > 0 then
+                    if
+                    (cfg1.duration - (time - a.time) <= 0 and cfg2.duration - (time - b.time) <= 0) or
+                        (cfg1.duration - (time - a.time) > 0 and cfg2.duration - (time - b.time) > 0)
+                    then
+                        if cfg1.grade ~= cfg2.grade then
+                            return cfg1.grade > cfg2.grade
+                        else
+                            return a.sid > b.sid
+                        end
+                    else
+                        if cfg1.duration - (time - a.time) <= 0 then
+                            return true
+                        else
+                            return false
+                        end
+                    end
+                elseif a.time == 0 and b.time == 0 then
+                    if cfg1.grade ~= cfg2.grade then
+                        return cfg1.grade > cfg2.grade
+                    else
+                        if cfg1.duration ~= cfg2.duration then
+                            return cfg1.duration > cfg2.duration
+                        else
+                            return a.sid > b.sid
+                        end
+                    end
+                else
+                    if a.time > 0 and cfg1.duration - (time - a.time) <= 0 then
+                        return true
+                    elseif b.time > 0 and cfg2.duration - (time - b.time) <= 0 then
+                        return false
+                    else
+                        return a.time == 0
+                    end
+                end
+            else
+                if not self.isDefult then
+                    self.isDefult = true
+                end
+                return isDefultA
+            end
+        end
+    )
+end
+function BountySystemManager:RefreshAllQuest(msg,card)
+    for i = 1, #self.AllQuest do
+        if self.AllQuest[i].mission.sid==msg.success_sid[1] then
+            self.AllQuest[i]:StartTask(msg.start_time, card)
+        end
+    end
+end
+
+---添加卡牌派遣
+function BountySystemManager:AddDispath(card)
+    for i = 1, #card do
+        self.DispathCards[card[i].uid] = true
+    end
+end
+
+---更新任务数据
+function BountySystemManager:UpdateAllQuest()
+    if #self.AllQuest < #self.BountyData.missions then
+        for i = 1, #self.BountyData.missions - #self.AllQuest do
+            self.AllQuest[#self.AllQuest + 1] = self:GetQuestData()
+        end
+    end
+    for i = 1, #self.BountyData.missions do
+        self.AllQuest[i]:InitData(self.BountyData.missions[i])
+    end
+end
+
+---添加新的任务
+function BountySystemManager:AddQuest(datas)
+    for i = 1, #datas do
+        self.AllQuest[#self.AllQuest + 1] = self:GetQuestData()
+        self.AllQuest[#self.AllQuest]:InitData(datas[i])
+    end
+end
+
+---获取任务数据
+---@return BountyQuestData
+function BountySystemManager:GetQuestData()
+    if #self.QuestDataPool > 0 then
+        return _G.table.remove(self.QuestDataPool, 1)
+    end
+    return QuestData.New()
+end
+
+---归还任务数据
+---@param data BountyQuestData
+function BountySystemManager:RespawnQuestData(data)
+    data:Dispose()
+    self.QuestDataPool[#self.QuestDataPool + 1] = data
+end
+---获取任务数据
+function BountySystemManager:GetQuestDataWithIndex(index)
+    if not self.AllQuest then
+        return nil
+    end
+    return self.AllQuest[index]
+end
+
+---检测是否挑战(红点)
+function BountySystemManager:CheckIsChallenge()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return true
+    end
+    if not self.BountyData then
+        return false
+    end
+    return not (self.BountyData.level == 1 and self.BountyData.boss_kill_num == 0 and self.BountyData.boss_progress == 0)
+end
+
+---获取卡牌限制图
+function BountySystemManager:GetLimitSp(star)
+    local order = require "CardInfoManager":GetInstance():GetOrderStarCount(star)
+    return StarIndexDic[order]
+end
+
+---获取属性图
+function BountySystemManager:GetElementSp(element)
+    return ElementSps[element]
+end
+
+---检测是否可领取
+function BountySystemManager:CheckIsCanTask(id)
+    if not self.BountyData then
+        return false
+    end
+    if id == 0 then
+        return self.BountyData.boss.boss_start_time > 0 and self.BossRTS <= 0
+    elseif id == 1 then
+        for k, v in pairs(self.taskDatas) do
+            if v.mission.time > 0 and v.RTS <= 0 then
+                return true
+            end
+        end
+        return self:CheckHaveDispath()
+    else
+        local taskData = self.taskDatas[id]
+        if not taskData then
+            return false
+        end
+        return taskData.mission.time > 0 and taskData.RTS <= 0
+    end
+end
+---检测是否有可派遣任务
+function BountySystemManager:CheckHaveDispath()
+    if not self.BountyData then
+        return false
+    end
+    if self.isHaveDispath == nil or self.isHaveDispath then
+        self.isHaveDispath = false
+        local card = self:GetIdleCards()
+        for _, v in pairs(self.BountyData.missions) do
+            if v.time == 0 then
+                local tb = self:GetSimpleDispath(card, v)
+                if not _G.table.isEmptyOrNil(tb) then
+                    self.isHaveDispath = true
+                    break
+                end
+            end
+        end
+        return self.isHaveDispath
+    end
+    return self.isHaveDispath
+end
+---获取boss战斗力
+function BountySystemManager:GetBossPower()
+    return self.BountyData.boss.power or 0
+end
+---检测卡牌是否被派遣
+function BountySystemManager:ChekcIsDispath(uid)
+    return self.DispathCards[uid]
+end
+
+---#endregion
+---@return BountySystemManager
+return BountySystemManager

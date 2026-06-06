@@ -1,0 +1,291 @@
+-----------------------------------------------------------------------
+-- F:.H5.Client.Assets.Resources.LuaScripts.Game.RechargeDraw.Model.RechargeDrawModel	(修改路径必须修正此项!)
+-- Created by ldc
+-- DateTime: 2025/07/11
+-- Description: 充值抽奖
+-----------------------------------------------------------------------
+
+------
+---selectList  {{type,index1,index2},...}
+---type: 为配置表中activity_raffle_cfg的reward*
+---index1: 为奖励库中的第几个多奖励
+---index2: 为多奖励中的第几个奖励
+
+local base = require "ActivitySynTypeBase"
+local MallManager = require("MallManager")
+---@class RechargeDrawModel	: ActivitySynTypeBase
+---@field todayTime boolean 当日是否已经获得抽奖次数
+---@field Recharge number 当日的充值金额
+---@field drawTime number 可抽奖次数
+---@field selectList table 抽奖选择的奖励列表
+---@field gotAward {type,index} 已经抽取的奖励
+---@field gotCount number 当前已经抽到的奖励数量，用于判断是否去刷新奖池
+---@field awardCount number 配置中奖励的数量
+local RechargeDrawModel = _G.BaseClass("RechargeDrawModel", base)
+
+local RechargeDrawNet = require("RechargeDrawNet"):GetInstance()
+
+---类的构造函数
+function RechargeDrawModel:__init()
+    self.id = 1
+    self.recharge = 0
+    self.gotCount = 0
+    self.drawTime = 0
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallRechargeListener, self)
+end
+
+function RechargeDrawModel:GetDataFormServer()
+    RechargeDrawNet:GetInfo(_G.handler(self, self.ParseData))
+end
+
+function RechargeDrawModel:ReConnect(endcall)
+    self:UpdateInfo(endcall)
+end
+
+function RechargeDrawModel:ParseData(data)
+    self.id = data.pool_sid
+    self.recharge = data.day_cash
+    self.todayTime = data.is_add == 1
+    self.drawTime = data.times
+    self.gotCount = data.award and _G.table.count(data.award) or 0
+
+    self.selectList = {
+        [1] = {},
+        [2] = {},
+        [3] = {}
+    }
+    if data.choose_list then
+        for _, v in pairs(data.choose_list) do
+            self.selectList[v.type][v.index1] = v.index2
+        end
+    end
+
+    self.gotAward = {
+        [1] = {},
+        [2] = {},
+        [3] = {}
+    }
+    if data.award then
+        for _, v in pairs(data.award) do
+            if not self.gotAward[v.key] then
+                self.gotAward[v.key] = {}
+            end
+            self.gotAward[v.key][v.value] = true
+        end
+    end
+
+    self.awardCfg = {
+        [1] = {},
+        [2] = {},
+        [3] = {}
+    }
+    local cfg = _G.ConfigManager.activity_raffle_cfg[self.id]
+    self.awardCount = 0
+
+    for i = 1, 3 do
+        if not cfg["reward" .. i] then
+            break
+        end
+        for k, v in pairs(cfg["reward" .. i]) do
+            self.awardCount = self.awardCount + 1
+            self.awardCfg[i][k] = v
+            if #v > 2 and not self.selectList[i][k] then
+                self.selectList[i][k] = false
+            end
+        end
+    end
+
+    base.ParseData(self)
+end
+
+--- 更新信息
+function RechargeDrawModel:UpdateInfo(callback)
+    RechargeDrawNet:GetInfo(function(data)
+        self:ParseData(data)
+        if callback then
+            callback()
+        end
+    end)
+end
+
+---充值事件订阅方法
+function RechargeDrawModel:OnMallRechargeListener(data)
+    if not data.cash_rmb or data.cash_rmb <= 0 then
+        return
+    end
+
+    if not data.activity_id or data.activity_id == 0 then
+        ---如果是从当前活动充值的，就不用判断是否是代金券充值
+        local cfg = _G.ConfigManager.store_recharge_cfg
+        if not data.sid or (cfg[data.sid] and cfg[data.sid].type1 == 2) then
+            -- 充值代金券
+            return
+        end
+    end
+
+    self.recharge = self.recharge + data.cash_rmb
+    if not self.todayTime then
+        -- 如果今天还有抽奖次数，则更新抽奖次数
+        local activitycfg = _G.ConfigManager.activity_raffle_cfg[self.id]
+        local finalPrice = MallManager:GetInstance():GetFinalPrice(activitycfg.price_id)
+        if self.recharge >= finalPrice then
+            self.drawTime = self.drawTime + 1
+            self.todayTime = true
+        end
+    end
+    self:RefreshRedPointRecordRecharge()
+end
+
+function RechargeDrawModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RechargeDrawView.Name, self)
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+
+function RechargeDrawModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.RechargeDrawView.Name
+end
+
+function RechargeDrawModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckDrawTime }
+    self.redpointTree = { { 2 }, false }
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function RechargeDrawModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---刷新奖励红点
+function RechargeDrawModel:RefreshRedPointRecordRecharge()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+function RechargeDrawModel:CheckDrawTime()
+    return self.drawTime > 0 and 1 or 0
+end
+
+--region 对外接口
+
+---获取奖励个数
+function RechargeDrawModel:GetAwardCount()
+    return self.awardCount
+end
+
+---获取配置id
+function RechargeDrawModel:Getid()
+    return self.id
+end
+
+---获取今日是否还有抽奖次数
+---@return boolean
+function RechargeDrawModel:GetTodayTime()
+    return self.todayTime
+end
+
+---获取充值金额和抽奖条件
+function RechargeDrawModel:GetRechargeAndCondition()
+    local recharge = self.recharge or 0
+    local cfg = _G.ConfigManager.activity_raffle_cfg[self.id]
+    local finalPrice = MallManager:GetInstance():GetFinalPrice(cfg.price_id)
+    return recharge, finalPrice
+end
+
+--- 获取抽奖次数
+function RechargeDrawModel:GetDrawTime()
+    return self.drawTime
+end
+
+---获取选择的奖励信息（配置奖励只有一个时，这里面没有）
+function RechargeDrawModel:GetSelectList()
+    return self.selectList
+end
+
+function RechargeDrawModel:GetAwardCfg()
+    return self.awardCfg
+end
+
+---检查奖励是否被领取
+function RechargeDrawModel:CheckAward(type, index1)
+    return self.gotAward[type] and self.gotAward[type][index1] or false
+end
+
+function RechargeDrawModel:AddDrawTime(num)
+    self.drawTime = self.drawTime + num
+    self:RefreshRedPointRecordRecharge()
+end
+
+---抽奖
+function RechargeDrawModel:Draw(callback)
+    if self.drawTime <= 0 then
+        -- 没有抽奖次数
+        return
+    end
+    RechargeDrawNet:Draw(function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.drawTime = self.drawTime - 1
+        local type = msg.args[1]
+        local index = msg.args[2]
+        local sid = msg.args[3]
+        -- 记录抽到的奖励
+        if not self.gotAward[type] then
+            self.gotAward[type] = {}
+        end
+        self.gotAward[type][index] = true
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        -- 判断当前的奖池的id是否发生改变
+        if sid or self.gotCount == self.awardCount then
+            self:UpdateInfo(function()
+                local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.RechargeDrawView.Name)
+                if view then
+                    view:PlayResetAwardAni()
+                end
+                if callback then
+                    callback()
+                end
+            end)
+        else
+            if callback then
+                callback()
+            end
+        end
+        self:RefreshRedPointRecordRecharge()
+    end)
+end
+
+---选择奖励
+function RechargeDrawModel:SelectAward(type, index1, index2, callback)
+    RechargeDrawNet:ChooseAward({ choose = { type = type, index1 = index1, index2 = index2 } }, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        if not self.selectList[type] then
+            self.selectList[type] = {}
+        end
+        self.selectList[type][index1] = index2
+        if callback then
+            callback()
+        end
+    end
+    )
+end
+
+--endregion
+
+---类的析构函数
+function RechargeDrawModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallRechargeListener, self)
+end
+
+return RechargeDrawModel

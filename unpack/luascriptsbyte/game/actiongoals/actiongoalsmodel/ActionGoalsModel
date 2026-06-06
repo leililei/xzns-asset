@@ -1,0 +1,1436 @@
+--------------------------------------------------------------------------
+-- E:.Game.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.ActionGoals.ActionGoalsModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/10/13
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ActionGoalsData = require("ActionGoalsData")
+---@class ActionGoalsModel : GameDataModelBase    中文描述
+local ActionGoalsModel = _G.BaseClass("ActionGoalsModel", _G.GameDataModelBase)
+
+---@return ActionGoalsModel
+function ActionGoalsModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function ActionGoalsModel:__init()
+    self.endCallback = nil
+    self.curFunctionOpenID = 42
+    self.Cfg = _G.ConfigManager.mission_extra_cfg
+    self.data = {}
+    self.day_award = {}
+    self:initStaticData()
+    self.currentAlltasks = {}
+    self.dailyAlltasks = {}
+    self.currenDay = 0 --界面点击的天数（当前点击的天数，获取任务）
+    self.currendDay_qishu = 1 --期数
+    self.goals_award = {}
+    self.isOpenFunction = false
+    self.AllDayTasks = {}
+    self.singleDays = 7 --单期天数
+    self.totalQiShu = #_G.ConfigManager.discrete_cfg[105202][1]
+    self.totalDays = self.singleDays * self.totalQiShu
+    self.cycleDays = self.singleDays * 3 --循环天数，用于pb里的任务点数，后端循环利用那三个字段active_seven/ctive_fourteen/active_twenty_one
+end
+
+function ActionGoalsModel:Dispose()
+    self.data = nil
+    if not _G.table.isEmptyOrNil(self.currentAlltasks) then
+        for k, v in pairs(self.currentAlltasks) do
+            v:Dispose()
+        end
+    end
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.currentAlltasks = nil
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+---@return ActionGoalsModel ActionGoalsModel
+--- 网络请求初始化
+function ActionGoalsModel:GetDataFormServer()
+    require("ActionGoalsNet"):GetInstance():SendTaskGoalsGet(_G.handler(self, self.ParseData))
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+function ActionGoalsModel:OnMallCashListener(data)
+    local time = self:GetCurrentTime()
+    if time <= 0 then
+        return
+    end
+    -- local cfg = _G.ConfigManager.store_battle_pass_cfg[data.sid]
+    if data.total_cash_bool and data.cash_rmb and data.cash_rmb > 0 then
+        self:AddGroup_cash(data.cash_rmb)
+
+        local store_extra_cfg = _G.ConfigManager.store_extra_cfg[data.sid]
+        if store_extra_cfg and data.sid == self.store_extra_cfgData then
+            local MallManager = require("MallManager"):GetInstance()
+            MallManager:SetItemBuyTimes(store_extra_cfg.id, store_extra_cfg.type_reset, 1)
+            self.store_extra_cfgData = nil
+        end
+        self:RefRedPointActionDay()
+        local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActionGoalsView.Name)
+        if ctrl then
+            ctrl:DayButtonClick()
+            -- ctrl:Support()
+        end
+    end
+end
+
+---数据解析完成
+function ActionGoalsModel:ParseData(data)
+    self.data = {}
+    self.data = data
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActionGoalsView.Name)
+    if ctrl then
+        ctrl:DayButtonClick()
+    end
+
+    -- self:IsConnect()
+    self.super.ParseData(self)
+end
+
+---@field currentQishu number 当前的期数
+---@field currentTime number 当前期数的时间
+function ActionGoalsModel:InitFunction()
+    if _G.table.isEmptyOrNil(self.data) then
+        return
+    end
+    self.isOpenFunction = true
+    self.AllDayTasks = {}
+    for i = 1, self.totalDays do
+        self.AllDayTasks[i] = {}
+    end
+    if not _G.table.isEmptyOrNil(self.currentAlltasks) then
+        for k, v in pairs(self.currentAlltasks) do
+            v:Dispose()
+        end
+    end
+    self.currenDay = 0
+    self.currentQishu = 1
+    self.goalsNum = self.data.active_seven or 0
+    self.day_award = self.data.day_award or {}
+    self.goals_award = self.data.goals_award or {}
+    self.taskfinsh_task = self.data.finish_task or {}
+    self.roletime = _G.PlayerModel:GetInstance().create_time or 0
+    self.currendDay_qishu = self:GetCurrentDay()
+    self.currentAlltasks = self:AddListenerTaskCheck(self.data) or {}
+    self.active_fourteen = self.data.active_fourteen or 0
+    self.active_twentyone = self.data.active_twenty_one or 0
+    --每一期充值统计
+    self.group_cash = self.data.group_cash or {}
+    --已领取充值奖励
+    self.cash_award = self.data.cash_award or {}
+    self.jiequ_day = self.data.jiequ_day or { [1] = 1 }
+    self:AddTaskFinshToCurrentALLtaks(self.data.finish_task)
+    self:SetCreateRoleTime()
+    self:GetOneDayAllTask()
+    self:SendOtheJiequDay()
+    ---给任务 添加 完成事件
+    --self:SixUpdata()
+    if self.CheckShowCwzl() == false then
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.Qirimubiao)
+    end
+end
+
+function ActionGoalsModel:RedCheckFunction(id)
+    local flag = 1
+
+    if self:GetCurrentDay() < id then
+        return 0
+    end
+    local data = _G.PlayerPrefsManager.GetTable("ActionGoalsModelID")
+    if data ~= nil then
+        for key, value in pairs(data) do
+            if value == id then
+                flag = 0
+            end
+        end
+    end
+    
+    return flag
+end
+
+function ActionGoalsModel:AddRedCheckFunction(id)
+    local flag = true
+
+    if self:GetCurrentDay() < id then
+        flag = false
+        return
+    end
+    local data = _G.PlayerPrefsManager.GetTable("ActionGoalsModelID")
+    if data ~= nil then
+        -- body
+        for key, value in pairs(data) do
+            if value == id then
+                flag = false
+            end
+        end
+    else
+        flag = false
+        data = { id }
+    end
+    if flag then
+        _G.table.insert(data, id)
+    end
+    _G.PlayerPrefsManager.SetTable("ActionGoalsModelID", data)
+    self:RefRedPointActionDay()
+end
+
+---每一期充值统计
+function ActionGoalsModel:GetIsGroup_cash(is)
+    local id = is
+    local is = 0
+    for key, value in pairs(self.group_cash) do
+        if value.k == id then
+            is = value.v
+        end
+    end
+    return is
+end
+
+---每一期充值统计
+function ActionGoalsModel:GetGroup_cash()
+    local id = self:GetCurrentQiShu()
+    local is = 0
+    for key, value in pairs(self.group_cash) do
+        if value.k == id then
+            is = value.v
+        end
+    end
+    return is
+end
+
+---每一期充值统计
+function ActionGoalsModel:AddGroup_cash(num)
+    local id = self:GetCurrentQiShu()
+    local v = true
+    for key, value in pairs(self.group_cash) do
+        if value.k == id then
+            v = false
+        end
+        value.v = value.v + num
+    end
+    if v then
+        _G.table.insert(self.group_cash, { k = id, v = num })
+    end
+    --return is
+end
+
+---判断是否领取的当前奖励
+function ActionGoalsModel:GetCash_award(id)
+    local is = false
+    for key, value in pairs(self.cash_award) do
+        if value == id then
+            is = true
+        end
+    end
+    return is
+end
+
+---写入当前奖励
+function ActionGoalsModel:AddCash_award(id)
+    local is = true
+    for key, value in pairs(self.cash_award) do
+        if value == id then
+            is = false
+        end
+    end
+    if is then
+        _G.table.insert(self.cash_award, id)
+    end
+end
+
+---倒计时 跨天刷新
+function ActionGoalsModel:OnSixClockUpdate(endcall)
+    local day = self:GetCurrentDay()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(42) then
+        if endcall then
+            endcall()
+        end
+        _G.LogError("功能没有开发返回了  ")
+        return
+    end
+    self:SixOnUpDate()
+    if endcall then
+        endcall()
+    end
+end
+
+--endregion
+
+--region
+--获得当前 期数相关数据 (1,2,3)
+function ActionGoalsModel:GetCurrentQiShu()
+    for i = 1, self.totalQiShu do
+        if self.currendDay_qishu > (i - 1) * 7 and self.currendDay_qishu <= i * 7 then
+            self.currentQishu = i
+            return self.currentQishu
+        end
+    end
+    self.currentQishu = 1
+    return self.currentQishu
+end
+
+function ActionGoalsModel:GetCurrentTime()
+    return self:GetTimeByQiShu(self:GetCurrentQiShu())
+end
+
+function ActionGoalsModel:GetTimeByQiShu(qishu)
+    local disCfg = _G.ConfigManager.discrete_cfg[105202][1]
+    local now = _G.TimeUtil.GetServerUnixTime()
+    local lastTime = _G.TimeUtil.GetDayBySix(self.roletime) + disCfg[qishu] * 86400 - now
+    if lastTime < 0 then
+        lastTime = 0
+    end
+    return lastTime
+end
+
+function ActionGoalsModel:GetTimeByDay(day)
+    local qishu = self:GetQiShuByDay(day)
+    return self:GetTimeByQiShu(qishu)
+end
+
+function ActionGoalsModel:GetQiShuByDay(day)
+    return _G.Mathf.Ceil(day / self.singleDays)
+end
+
+---获得 模型数据
+---@param periods number 周期数  1,2,3 (界面点击时 传入数值)
+function ActionGoalsModel:GetCurrentModelCardid(periods)
+    local cfg = _G.ConfigManager.discrete_cfg[105201]
+    local cardid = cfg[periods]
+    return cardid
+end
+
+--endregin
+
+--region 对外接口 检测七日目标口
+---检测功能 主界面中  按钮默认是true 功能未开启 是 false
+---先检测功能是否开启
+function ActionGoalsModel.CheckShowCwzl()
+    if not require("ActionGoalsModel"):GetInstance().isOpenFunction then
+        return true
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(42) then
+        return true
+    end
+    if require("ActionGoalsModel"):GetInstance():GetCurrentDay() < require("ActionGoalsModel"):GetInstance().totalDays then
+        return true
+    end
+    local endDay = _G.ConfigManager.discrete_cfg[105203][1][1]
+    local day = _G.TimeUtil.GetInterValDayByGame(_G.PlayerModel:GetInstance().create_time, _G.TimeUtil.GetServerUnixTime())
+    if day + 1 > _G.Mathf.Floor(endDay / 86400) then
+        return false
+    end
+
+    return true
+end
+
+--endregin
+
+--region 初始化 动态 数z
+---6 点刷新 天数 和 接取任务
+function ActionGoalsModel:CheckGoalsDay(day)
+    if day <= self.totalDays then
+        return true
+    end
+    return false
+end
+
+---期数修改
+function ActionGoalsModel:SixOnUpDate()
+    self.currenDay = self:GetCurrentDay()
+    self:SendOtheJiequDay()
+end
+
+---编辑 已完成的 任务
+function ActionGoalsModel:AddTaskFinshToCurrentALLtaks(tasks)
+    if _G.table.isEmptyOrNil(tasks) then
+        return
+    end
+    for i = 1, #tasks do
+        local temp = {
+            sid = tasks[i],
+            state = _G.TaskEnum.ETaskState.Completed,
+            target = {
+                [1] = 0
+            }
+        }
+        local ta = ActionGoalsData.New(temp, _G.handler(self, self.TaskCompletdRedPoint))
+        _G.table.insert(self.currentAlltasks, ta)
+    end
+end
+
+---编辑所有任务 增加 监听事件 检测 任务是否完成
+function ActionGoalsModel:AddListenerTaskCheck(data)
+    local tasks = {}
+    if _G.table.isEmptyOrNil(data.task) then
+        return
+    end
+    for i = 1, #data.task do
+        local day_id = self:CheckTaskOfCfgDay(data.task[i].sid)
+        local task = ActionGoalsData.New(data.task[i], _G.handler(self, self.TaskCompletdRedPoint), nil, { dayid = day_id })
+        _G.table.insert(tasks, task)
+    end
+    return tasks
+end
+
+---检测任务 所有的 天数
+function ActionGoalsModel:CheckTaskOfCfgDay(tasksid)
+    local cfg = _G.ConfigManager.goals_seven_cfg
+    for i = 1, #cfg do
+        local misscfg = cfg[i].mission_extra1
+        for j = 1, #misscfg do
+            if tasksid == misscfg[j] then
+                return i
+            end
+        end
+        misscfg = cfg[i].mission_extra2
+        for j = 1, #misscfg do
+            if tasksid == misscfg[j] then
+                return i
+            end
+        end
+    end
+    return 1
+end
+
+---任务完成回调的 方法
+function ActionGoalsModel:TaskCompletdRedPoint()
+    self:RefRedPointActionDay()
+end
+
+---设置创建角色的 时间
+function ActionGoalsModel:SetCreateRoleTime()
+    --self.roletime = _G.PlayerModel:GetInstance().create_time
+    self:GetSevertimeToDay()
+end
+
+---时间转为天数(服务器时间： 转为 当前是第几天)
+function ActionGoalsModel:GetSevertimeToDay()
+    local currentime = _G.TimeUtil.GetServerUnixTime()
+    local day = _G.TimeUtil.GetInterValDayByGame(self.roletime, currentime)
+    if (day + 1) <= self.totalDays then
+        --self:CurrentDayJieQuTask(self.currenDay)
+        self.currenDay = day + 1
+    else
+        self.currenDay = self.totalDays
+    end
+end
+
+function ActionGoalsModel:GetCurrentDay()
+    local currentime = _G.TimeUtil.GetServerUnixTime()
+    local day = _G.TimeUtil.GetInterValDayByGame(_G.PlayerModel:GetInstance().create_time, currentime)
+    if (day + 1) <= self.totalDays then
+        return day + 1
+    else
+        return self.totalDays
+    end
+end
+
+---根据 天数获得 任务id
+function ActionGoalsModel:GetCurrentDayTask(day)
+    local cfg = _G.ConfigManager.goals_seven_cfg
+    local task = cfg[day].mission_extra2
+    return task
+end
+
+---获取 所有天数的 所拥有的 任务 包括 完成 当前的
+function ActionGoalsModel:GetAllDayTasks()
+    return self.AllDayTasks
+end
+
+---获取 所有天数的 所拥有的 任务 包括 完成 当前的
+function ActionGoalsModel:GetDailyAlltasks()
+    return self.dailyAlltasks
+end
+
+---接取其他 天数的 任务
+function ActionGoalsModel:SendOtheJiequDay()
+    --后端要求延迟两秒发送
+    self.timer = _G.TimerManager:GetInstance():GetTimer(2, self.SendAccept, self, false)
+    self.timer:Start()
+end
+
+---发送接取任务
+function ActionGoalsModel:SendAccept()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    local data = self:CheckOtherDayTask()
+    local day = self:GetCurrentDay()
+    if _G.table.isEmptyOrNil(data.accept) then
+        return
+    end
+    --限制失败次数(仅DEBUG模式下有效)
+    if _G.AppSetting.DEBUG then
+        ---@type table<number,number>
+        local requestTasks = self.requestTasks
+        if not requestTasks then
+            requestTasks = {}
+            self.requestTasks = requestTasks
+        end
+        for i = #data.accept, 1, -1 do
+            local sids = data.accept[i].sids
+            for j = #sids, 1, -1 do
+                local count = requestTasks[sids[j]] or 0
+                if count < 3 then
+                    --最大重试次数: 3次
+                    requestTasks[sids[j]] = count + 1
+                else
+                    _G.LogError("ActionGoals任务接取失败次数过多: " .. sids[j])
+                    table.remove(sids, j)
+                end
+            end
+            if #sids <= 0 then
+                table.remove(data.accept, i)
+            end
+        end
+        if _G.table.isEmptyOrNil(data.accept) then
+            return
+        end
+    end
+    self:SendTaskJiequ(data)
+end
+
+---编辑 任务 匹配到每天 有什么任务
+function ActionGoalsModel:GetOneDayAllTask()
+    if not _G.table.isEmptyOrNil(self.currentAlltasks) then
+        for i = 1, #self.currentAlltasks do
+            local temp, daily = self:ChenckCrruetTaskToDay(self.currentAlltasks[i].i_task.sid, self.currentAlltasks[i])
+            if temp then
+                self.currentAlltasks[i].dayid = temp.dayid
+                self.dailyAlltasks[temp.dayid] = daily
+                if _G.table.isEmptyOrNil(temp) then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("配置表中：未找到次任务..:" .. self.currentAlltasks[i].i_task.sid)
+                    end
+                else
+                    _G.table.insert(self.AllDayTasks[temp.dayid], temp)
+                end
+            end
+        end
+    end
+end
+
+---检测 某个任务所在的 天数
+function ActionGoalsModel:ChenckCrruetTaskToDay(taskid, task)
+    local cfg = _G.ConfigManager.goals_seven_cfg
+    local DayAllTask = {}
+    local temp = {}
+    for key, value in pairs(cfg) do
+        if not _G.table.isEmptyOrNil(value.mission_extra1) then
+            for i = 1, #value.mission_extra1 do
+                if taskid == value.mission_extra1[i] then
+                    temp = {}
+                    temp.dayid = key
+                    temp.group = value.group
+                    temp.task = task
+                    _G.table.insert(DayAllTask, temp)
+                    return temp, value
+                end
+            end
+        end
+        if not _G.table.isEmptyOrNil(value.mission_extra2) then
+            for j = 1, #value.mission_extra2 do
+                if taskid == value.mission_extra2[j] then
+                    temp = {}
+                    temp.dayid = key
+                    temp.group = value.group
+                    temp.task = task
+                    temp.value = value
+                    _G.table.insert(DayAllTask, temp)
+                    return temp, value
+                end
+            end
+        end
+    end
+end
+
+--endregion
+
+--region 初始化 静态数据 and 获取 配置表 信息
+---静态 配置表 数据
+function ActionGoalsModel:initStaticData()
+    self:InitGoalsActiveCfg()
+    self.goalMissCfg = self:GetMissionExtraCfg()
+    self:InitGoalsSevenCfg()
+end
+
+---获取 活动 7日、14日 目标奖励 配置表 goals_active_cfg
+---@return table 7日\14日 配置表信息
+function ActionGoalsModel:InitGoalsActiveCfg()
+    local cfg = _G.ConfigManager.goals_active_cfg
+    self.activeCfgs = {}
+    for key, value in pairs(cfg) do
+        if self.activeCfgs[value.group] == nil then
+            self.activeCfgs[value.group] = {}
+        end
+        _G.table.insert(self.activeCfgs[value.group], value)
+    end
+    for _, v in pairs(self.activeCfgs) do
+        _G.table.sort(
+            v,
+            function(a, b)
+                return a.id < b.id
+            end
+        )
+    end
+end
+
+---获取目标活动任务的 配置表 mission_extra_cfg
+function ActionGoalsModel:GetMissionExtraCfg()
+    local cfg = _G.ConfigManager.mission_extra_cfg
+    local goalsMissionCfg = {}
+    if not _G.table.isEmptyOrNil(cfg) then
+        for key, value in pairs(cfg) do
+            if value.type_mission == 2 then
+                _G.table.insert(goalsMissionCfg, value)
+            end
+        end
+    end
+    return goalsMissionCfg
+end
+
+---获取目标活动配置表 goals_seven_cfg
+function ActionGoalsModel:InitGoalsSevenCfg()
+    local cfg = _G.ConfigManager.goals_seven_cfg
+    self.goalsCfgs = {}
+    for _, value in pairs(cfg) do
+        if self.goalsCfgs[value.group] == nil then
+            self.goalsCfgs[value.group] = {}
+        end
+        _G.table.insert(self.goalsCfgs[value.group], value)
+    end
+end
+
+--返回 某一天的 所有任务的
+function ActionGoalsModel:GetAllTasksOneDay(day)
+    local cfg = _G.ConfigManager.goals_seven_cfg
+    local d_alltaks = {}
+    if not _G.table.isEmptyOrNil(cfg[day].mission_extra1) then
+        for i = 1, #cfg[day].mission_extra1 do
+            table.insert(d_alltaks, cfg[day].mission_extra1[i])
+        end
+    end
+    if not _G.table.isEmptyOrNil(cfg[day].mission_extra2) then
+        for j = 1, #cfg[day].mission_extra2 do
+            table.insert(d_alltaks, cfg[day].mission_extra2[j])
+        end
+    end
+    return d_alltaks
+end
+
+--任务的奖励 单条 任务奖励 从第个开始将测
+function ActionGoalsModel:rewardOfTask(taskid)
+    local awards = {}
+    --_G.LogError("任务id ； " .. taskid)
+    local reward = self.Cfg[taskid].reward
+    for i = 2, #reward do
+        table.insert(awards, reward[i])
+    end
+    return awards
+end
+
+--一天所有的任务所有奖励（奖励物品，奖励物品数量）
+function ActionGoalsModel:OndAwardAll(alltasks)
+    local a_awards = {}
+    for i = 1, #alltasks do
+        local awards = self:rewardOfTask(alltasks[i])
+        if _G.table.isEmptyOrNil(a_awards) then
+            for j = 1, #awards do
+                a_awards[awards[j][1]] = _G.GlobalInterface.GetNewArray(awards[j])
+            end
+        else
+            local flag = false
+            for j = 1, #awards do
+                flag = false
+                local val = 0
+                for key, value in pairs(a_awards) do
+                    if key == awards[j][1] then
+                        val = value[2] + awards[j][2]
+                        flag = true
+                        break
+                    end
+                end
+                if not flag then
+                    a_awards[awards[j][1]] = _G.GlobalInterface.GetNewArray(awards[j])
+                else
+                    a_awards[awards[j][1]][2] = val
+                end
+            end
+        end
+    end
+    local AllAwards = {}
+    if not _G.table.isEmptyOrNil(a_awards) then
+        local data = {}
+        for _, value in pairs(a_awards) do
+            data = {}
+            data = _G.StorageManager:GetInstance():GetItemDataClassByCfg(value)
+            _G.table.insert(AllAwards, data)
+        end
+    end
+    return AllAwards
+end
+
+--region 服务器 交互数据
+
+---领取 一天的 奖励
+function ActionGoalsModel:SendDayAllCash_award(d, Call)
+    local pbData = {
+        index = d
+    }
+    require("ActionGoalsNet"):GetInstance():SendDayAllCash_award(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            ---加入已经领取的 标记
+            _G.table.insert(self.cash_award, d)
+            local awardDatas = self:ParseScoreAward(d, data)
+            _G.StorageManager:GetInstance():ReceiveAwardData(awardDatas)
+            _G.PopWindowManager:GetInstance():AddAwardPopQuene(
+                data,
+                function()
+                    _G.PlayerModel:GetInstance():ShowRoleLvUpAward()
+                end
+            )
+            self:RefRedPointActionDay()
+            --require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GoalTarget.id)
+            if Call then
+                Call()
+            end
+        end
+    )
+end
+
+---标记任务 完成可以领取奖励(检测天数是否是过期了)
+---@param pbData table 要发送的数据
+---@field pbData.day number 要完成的任务所在的天数
+---@field pbData.sid number 任务的sid
+function ActionGoalsModel:SendTaskFinshSign(pbData, task)
+    local day = pbData.task[1].day
+    if self:CheckGuoQi(day) then
+        if _G.AppSetting.DEBUG then
+            _G.Log("任务，检测时间，，已经过期了，，，，，，")
+        end
+        task.state = _G.TaskEnum.ETaskState.Claimed
+        return
+    end
+    if not self.finishTask then
+        self.finishTask = {}
+    end
+    if self.finishTask[pbData.task[1].sid[1]] then
+        return
+    end
+    self.finishTask[pbData.task[1].sid[1]] = true
+    require("ActionGoalsNet"):GetInstance():SendTaskOneFinish(pbData)
+end
+
+function ActionGoalsModel:SendTaskJiequ(dayData)
+    local pbData = dayData
+    require("ActionGoalsNet"):GetInstance():SendJieQuTask(
+        pbData,
+        function(data)
+            if data.task ~= nil then
+                --_G.Events:GetInstance():Broadcast(_G.EvenActionGoalsEnum.SixUpdate)
+                for key, value in pairs(data.task) do
+                    local day = 1
+                    for k, v in pairs(dayData.accept) do
+                        local data1 = v.sids
+                        local flag = false
+                        for i = 1, #data1 do
+                            if value.sid == data1[i] then
+                                day = v.day
+                                flag = true
+                                break
+                            end
+                        end
+                        if flag then
+                            break
+                        end
+                    end
+                    local temp = {}
+                    local taskt = ActionGoalsData.New(value, _G.handler(self, self.TaskCompletdRedPoint), nil, { dayid = day })
+                    --_G.table.insert(self.currentAlltasks,taskt)
+                    temp.dayid = day
+                    temp.task = taskt
+                    --temp.task.state = _G.TaskEnum.ETaskState.Claimed
+                    _G.table.insert(self.AllDayTasks[day], temp)
+                end
+                self:RefRedPointActionDay()
+            else
+                --_G.FloatTipsModel:GetInstance():Show("七日目标接取任务 有错")
+                -- require("ActionGoalsNet"):GetInstance():SendTaskGoalsGet(_G.handler(self, self.ParseData))
+                require("ActionGoalsNet"):GetInstance():SendTaskGoalsGet(_G.handlerbind(self, self.ParseDataS))
+            end
+        end
+    )
+end
+
+function ActionGoalsModel:ParseDataS(data)
+    self:ParseData(data)
+    self:InitFunction()
+    self:RefRedPointActionDay()
+end
+
+---单条 任务（完成)
+function ActionGoalsModel:SendTaskOneFinish(da, taskList, Call)
+    local T = {}
+    for i = 1, #taskList do
+        T[i] = taskList[i].task.i_task.sid
+    end
+    local pbData = {
+        task = { { day = taskList[1].task.dayid, sid = T } },
+        finish_type = 2
+    }
+    local d = taskList[1].task.dayid
+    require("ActionGoalsNet"):GetInstance():SendTaskOneFinish(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+                -- elseif data.ack == "not_open" then --未开启
+                --     _G.FloatTipsModel:GetInstance():Show(data.ack)
+                --     return
+                -- elseif data.ack == "input_error" then
+                --     _G.FloatTipsModel:GetInstance():Show(data.ack)
+                --     return
+            end
+            if data then
+                local awardDatas = self:ParseScoreAward(d, data)
+                _G.StorageManager:GetInstance():ReceiveAwardData(awardDatas)
+                --更新 资源背包
+                --_G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata,awardDatas.award.item)
+                --奖励
+                _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                    awardDatas,
+                    function()
+                        _G.PlayerModel:GetInstance():ShowRoleLvUpAward()
+                    end
+                )
+            end
+            local alltasks = self:GetAllDayTasks()
+            local onetaskData = alltasks[self.currenDay]
+            for k, v in pairs(data.new_task) do
+                for i = 1, #onetaskData do
+                    if v.sid == onetaskData[i].task.i_task.sid then
+                        onetaskData[i].task.i_task.state = v.state
+                        break
+                    end
+                end
+            end
+            self:RefRedPointActionDay()
+            --刷新红点 GoalTarget
+            --require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GoalTarget.id)
+            if Call then
+                Call()
+            end
+        end
+    )
+end
+
+function ActionGoalsModel:ParseScoreAward(day, data)
+    local awardDatas = {
+        award = {
+            item = {},
+            overflow = data.award.overflow
+        }
+    }
+    local cycleRemainder = (day - 1) % self.cycleDays + 1 --3期一循环，取余
+    for i = 1, #data.award.item do
+        local sid = data.award.item[i].type[1]
+        if sid == _G.ResPropID.Active_seven or sid == _G.ResPropID.Active_forten or sid == _G.ResPropID.Active_twentyone then
+            if cycleRemainder <= self.singleDays then
+                self.goalsNum = self.goalsNum + data.award.item[i].type[2]
+            elseif cycleRemainder > self.singleDays and cycleRemainder <= self.singleDays * 2 then
+                self.active_fourteen = self.active_fourteen + data.award.item[i].type[2]
+            else
+                self.active_twentyone = self.active_twentyone + data.award.item[i].type[2]
+            end
+        else
+            local temp = data.award.item[i]
+            _G.table.insert(awardDatas.award.item, temp)
+        end
+    end
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GoalTarget.id)
+    return awardDatas
+end
+
+---领取 一天的 奖励
+function ActionGoalsModel:OneDayReward(d, Call)
+    local pbData = {
+        day = d
+    }
+    require("ActionGoalsNet"):GetInstance():SendDayAllPassAward(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            ---加入已经领取的 标记
+            _G.table.insert(self.day_award, d)
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                data,
+                function()
+                    _G.PlayerModel:GetInstance():ShowRoleLvUpAward()
+                end
+            )
+            self:RefRedPointActionDay()
+            if Call then
+                Call()
+            end
+        end
+    )
+end
+
+---目标点数 奖励
+---@param sid number 奖励id
+function ActionGoalsModel:GoalsReward(sid, Call)
+    local pbData = {
+        index = sid
+    }
+    require("ActionGoalsNet"):GetInstance():SendGoalsReward(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            ---加入已经领取的 标记
+            _G.table.insert(self.goals_award, sid)
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                data,
+                function()
+                    _G.PlayerModel:GetInstance():ShowRoleLvUpAward()
+                end
+            )
+            ---添加 累计点数数领取标记
+            --刷新红点 GoalTarget
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GoalTarget.id)
+            if Call then
+                Call()
+            end
+        end
+    )
+end
+
+--endregion
+
+--region 服务推送来的消息
+function ActionGoalsModel:UpdataTask(task)
+    ---检测功能有没有开启
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(42) then
+    else
+        return
+    end
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask.task:UpdataData(task)
+
+    return true
+end
+
+function ActionGoalsModel:GetTaskByTaskid(taskid)
+    for i = 1, #self.AllDayTasks do
+        local tasksAll = self.AllDayTasks[i]
+        for j = 1, #tasksAll do
+            if tasksAll[j].task.i_task.sid == taskid then
+                return tasksAll[j]
+            end
+        end
+    end
+    return nil
+end
+
+--endregion
+--region 检测
+---检测任务是否已过期 (根据天数)
+function ActionGoalsModel:CheckGuoQi(day)
+    if day == nil then
+        return
+    end
+    local curNum = self:GetCurrentQiShu()
+    if curNum == 1 then
+        return false
+    end
+
+    if day <= (curNum - 2) * 7 then
+        return true
+    end
+    if (curNum - 1) * 7 < day and day <= curNum * 7 then
+        return false
+    end
+    if (curNum - 2) * 7 < day and day <= (curNum - 1) * 7 then
+        --上一期
+        local disCfg = _G.ConfigManager.discrete_cfg[105202][1]
+        return self:GetCurrentDay() > disCfg[curNum - 1]
+    end
+
+    if self:GetCurrentTime() == 0 then
+        return true
+    end
+
+    return false
+end
+
+--region 其他检测
+---检测 其他天数是否接取了任务
+function ActionGoalsModel:CheckOtherDayTask()
+    local alltask = self:GetAllDayTasks()
+    local cfg = _G.ConfigManager.goals_seven_cfg
+    local temp = {}
+    temp.accept = {}
+    for day = 1, self.currenDay do
+        local count1 = #cfg[day].mission_extra1
+        local count2 = #cfg[day].mission_extra2
+        local count3 = #alltask[day]
+        if count3 < (count1 + count2) then
+            local data = {
+                day = day,
+                sids = {}
+            }
+            local task = self:GetCurrentDayTask(day)
+            local t = {}
+            for i = 1, #task do
+                _G.table.insert(t, task[i])
+            end
+            data.sids = t
+            _G.table.insert(temp.accept, data)
+        end
+    end
+    return temp
+end
+
+--endregion
+--region 红点检测 有没有 可领取的奖励
+--无用代码 暂时留下
+-- function ActionGoalsModel:CheckReward()
+--     local alltasks = self:CheckAlltasksState(_G.TaskEnum.ETaskState.Submited, true)
+--     if alltasks == 1 then
+--         return 1
+--     end
+--     --检测 目标奖励(7日目标，14日)
+--     if self:CheckGoals(false) == 1 then
+--         return 1
+--     end
+--     if self:CheckAllPss(false) == 1 then
+--         return 1
+--     end
+--     return 0
+-- end
+
+---检测 7日目标、14日目标
+---@param isEquality boolean 检测 任务是否已经 领取
+function ActionGoalsModel:CheckGoals(isEquality)
+    local cfg = _G.ConfigManager.goals_active_cfg
+    local temp = {}
+    for key, value in pairs(cfg) do
+        _G.table.insert(temp, value)
+    end
+    _G.table.sort(
+        temp,
+        function(a, b)
+            return a.id < b.id
+        end
+    )
+    for key, value in ipairs(temp) do
+        local flag = false
+        if not _G.table.isEmptyOrNil(self.goals_award) then
+            for i = 1, #self.goals_award do
+                if tonumber(value.id) == self.goals_award[i] then
+                    flag = true
+                    break
+                end
+            end
+        end
+        if not flag then
+            if isEquality then
+                if self:GetCurrentTime() == 0 then
+                else
+                    return 1
+                end
+                --return 1
+            end
+            --local flagAward = true
+            if
+            value.group % 3 == 1 and value.value_active[2] <= self.goalsNum or
+                value.group % 3 == 2 and value.value_active[2] <= self.active_fourteen or
+                value.group % 3 == 0 and value.value_active[2] <= self.active_twentyone
+            then
+                return 1
+            end
+            -- if not flagAward then
+            --     ---判断任务过期，全通的肯定是不能完成
+            --     if self:GetCurrentTime() == 0 then
+            --     else
+            --         return 1
+            --     end
+            -- else
+            --     return 1
+            -- end
+        end
+    end
+    return 0
+end
+
+---检测 全通的奖励
+---@param isEquality boolean 检测 任务是否已经 领取
+function ActionGoalsModel:CheckAllPss(isEquality)
+    local cfg = _G.ConfigManager.goals_seven_cfg
+    local alltasks = self:GetAllDayTasks()
+    for key, value in ipairs(cfg) do
+        if value.id <= self.totalDays then
+            local flag = false
+            if not _G.table.isEmptyOrNil(self.day_award) then
+                for i = 1, #self.day_award do
+                    if key == self.day_award[i] then
+                        flag = true
+                        break
+                    end
+                end
+            end
+            if not flag then
+                if isEquality then
+                    ---判断任务过期，全通的肯定是不能完成
+                    if self:CheckGuoQi(key) then
+                    else
+                        return 1
+                    end
+                    --return 1
+                end
+                local flagAward = true
+                if not _G.table.isEmptyOrNil(alltasks[key]) then
+                    local daytasks = alltasks[key]
+                    for i = 1, #daytasks do
+                        local temp = daytasks[i]
+                        if
+                        temp.task.i_task.state ~= _G.TaskEnum.ETaskState.Submited and
+                            temp.task.i_task.state ~= _G.TaskEnum.ETaskState.Completed
+                        then
+                            flagAward = false
+                            break
+                        end
+                    end
+                    if flagAward then
+                        ---判断任务过期，全通的肯定是不能完成
+                        if self:CheckGuoQi(key) then
+                        else
+                            return 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---检测 目标点数奖励
+function ActionGoalsModel:CheckAllGoals()
+    if self:GetCurrentTime() == 0 then
+        return 0
+    end
+    if _G.table.isEmptyOrNil(self.goals_award) or self.goals_award == nil then
+        return 1
+    end
+    local cfg = _G.ConfigManager.goals_active_cfg
+    local count = table.count(cfg)
+
+    if count == #self.goals_award then
+        return 0
+    end
+    return 1
+end
+
+--endregion
+--检测 所有任务领取 完成关闭
+---@param taskstate number 任务的 状态
+---@param isEquality boolean 相等检测（领取） 不相等（完成）
+function ActionGoalsModel:CheckAlltasksState(taskstate, isEquality)
+    local alltasks = self:GetAllDayTasks()
+    local curr_day = self:GetCurrentDay()
+    if curr_day > self.totalDays then
+        curr_day = self.totalDays
+    end
+    --检测所有任务
+    for i = 1, self.totalDays do
+        local daytasks = self.AllDayTasks[i]
+        if not _G.table.isEmptyOrNil(daytasks) then
+            for j = 1, #daytasks do
+                local temp = daytasks[j]
+                if isEquality then
+                    if temp.task.i_task.state == taskstate and curr_day >= i then
+                        return 1
+                    end
+                else
+                    if temp.task.i_task.state == 1 then
+                        --过期的任务相等于 是完成的状态
+                        if self:CheckGuoQi(temp.dayid) then
+                        else
+                            return 1
+                        end
+                    elseif temp.task.i_task.state ~= taskstate then
+                        --任务都没有完成
+                        return 1
+                    end
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---@return 1 奖励都已经 领取完成
+function ActionGoalsModel:CheckFunctionClose()
+    local taskstate = self:CheckAlltasksState(_G.TaskEnum.ETaskState.Completed)
+    local goalsstate = self:CheckGoals(true)
+    local allpassState = self:CheckAllPss(true)
+    --local goals_pass_state = self:CheckAllGoals(true) and goals_pass_state == 0
+    if taskstate == 0 and goalsstate == 0 and allpassState == 0 then
+        return 1
+    end
+    return 0
+end
+
+--endregion
+--region 红点
+---刷新红点
+---@param param number 天数
+function ActionGoalsModel:RefRedPointActionDay(param)
+    --require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GoalPage.id, param)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GoalPage.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GoalPageone.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GoalPageoneRecharge.id)
+end
+
+---获得红点得个数 七日目标(成王之路) daybutton 页签上红点
+---@param param number 期数 + button 页签
+function ActionGoalsModel:GetRedPointActionDayNum(param)
+    local qishu = math.modf(param / 100)
+    local getRecharge=self:GetRedPointActionDayRecharge(param)
+    param = math.fmod(param, 100)
+    param = param + (qishu - 1) * 7
+    ---检测天数是否开启
+    local day = self:GetCurrentDay()
+    if param > day then
+        return 0
+    end
+    if self:CheckGuoQi(param) then
+        return 0
+    end
+    --检测 天数任务
+    local allTask = self:GetAllDayTasks()
+    local onePassTask = allTask[param]
+    if onePassTask == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("七日目标 GM 直接设置放置关卡,第一次登录时,红点检测报错")
+        end
+        return 0 --GM 直接设置放置关卡,第一次登录时,红点检测报错
+    end
+    -- if self:RedCheckFunction(param) == 1 then
+    --     return 1
+    -- end
+    local flag = true
+    for key, value in pairs(onePassTask) do
+        if value.task.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            return 1
+        elseif value.task.i_task.state ~= _G.TaskEnum.ETaskState.Completed then
+            flag = false
+        end
+    end
+    --检测 全通奖励
+    if not _G.table.isEmptyOrNil(self.day_award) then
+        for key, value in pairs(self.day_award) do
+            if value == param then
+                return 0
+            end
+        end
+    end
+
+    if flag then
+        return 1
+    end
+    return getRecharge
+end
+
+---获得红点得个数 七日目标(成王之路) daybutton 页签上红点
+---@param param number 期数 + button 页签
+function ActionGoalsModel:GetRedPointActionDayNums(param)
+    local qishu = math.modf(param / 100)
+    param = math.fmod(param, 100)
+    param = param + (qishu - 1) * 7
+    ---检测天数是否开启
+    local day = self:GetCurrentDay()
+    if param > day then
+        return 0
+    end
+    if self:CheckGuoQi(param) then
+        return 0
+    end
+    --检测 天数任务
+    local allTask = self:GetAllDayTasks()
+    local onePassTask = allTask[param]
+    if onePassTask == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("七日目标 GM 直接设置放置关卡,第一次登录时,红点检测报错")
+        end
+        return 0 --GM 直接设置放置关卡,第一次登录时,红点检测报错
+    end
+
+    local flag = true
+    for key, value in pairs(onePassTask) do
+        if value.task.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            return 1
+        elseif value.task.i_task.state ~= _G.TaskEnum.ETaskState.Completed then
+            flag = false
+        end
+    end
+    --检测 全通奖励
+    if not _G.table.isEmptyOrNil(self.day_award) then
+        for key, value in pairs(self.day_award) do
+            if value == param then
+                return 0
+            end
+        end
+    end
+
+    if flag then
+        return 1
+    end
+    return 0
+end
+
+---获得红点得个数 七日目标(成王之路) 累充页签上红点
+---@param param number 期数 + button 页签
+function ActionGoalsModel:GetRedPointActionDayRecharge(param)
+    local qishu = math.modf(param / 100)
+    param = math.fmod(param, 100)
+    param = param + (qishu - 1) * 7
+    ---检测天数是否开启
+    local day = self:GetCurrentDay()
+    if param > day then
+        return 0
+    end
+    if self:CheckGuoQi(param) then
+        return 0
+    end
+    --检测 天数任务
+    local onePassTask = self.dailyAlltasks[param]
+    if onePassTask == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("七日目标 GM 直接设置放置关卡,第一次登录时,红点检测报错")
+        end
+        return 0 --GM 直接设置放置关卡,第一次登录时,红点检测报错
+    end
+    local finalPrice = require("MallManager"):GetInstance():GetFinalPrice(onePassTask.total_recharge)
+
+    if finalPrice <= self:GetIsGroup_cash(onePassTask.group) and not self:GetCash_award(onePassTask.id)  then
+        return 1
+    end
+    return 0
+end
+
+
+---七日目标 目标点 红点奖励
+function ActionGoalsModel:CheckGoalsRedpoint(param)
+    local qishu=self:GetCurrentQiShu()
+    local pam=math.modf(param / 100)
+    if qishu>1 and pam<qishu-1  then
+        return false
+    end
+    local cfg = _G.ConfigManager.goals_active_cfg[param]
+    local num = self.goalsNum
+    if cfg.group % 3 == 2 then
+        num = self.active_fourteen
+    elseif cfg.group % 3 == 0 then
+        num = self.active_twentyone
+    end
+    if num == nil then
+        return false
+    end
+    --检测目标点数
+    if num < cfg.value_active[2] then
+        return false
+    end
+    if cfg.group > self:GetCurrentQiShu() then
+        return false
+    end
+    local qishu = math.modf(param / 100)
+    local param1 = math.fmod(param, 100)
+    param1 = param1 + (qishu - 1) * 7
+    if self:CheckGuoQi(param1) then
+        return false
+    end
+    --判断奖励是否已经领取过
+    if _G.table.isEmptyOrNil(self.goals_award) then
+        return true
+    end
+    for i = 1, #self.goals_award do
+        if self.goals_award[i] == param then
+            return false
+        end
+    end
+    return true
+end
+
+-- function ActionGoalsModel:IsConnect()
+--     local isOpen = _G.GameDataModelBase.GetFunctionOpen(self)
+--     if isOpen then
+--         ---ZHJ-22526 跨天断线没接到任务
+--         -- local currentDay = self:GetCurrentDay()
+--         -- if self.currenDay ~= currentDay then
+--         --     self.currenDay = currentDay
+--         --     self:CurrentDayJieQuTask(self.currenDay)
+--         -- end
+--         self.currenDay = self:GetCurrentDay()
+--         self:SendOtheJiequDay()
+--     end
+-- end
+
+---@private
+function ActionGoalsModel:ReConnect(endcall)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        if endcall then
+            endcall()
+        end
+        return
+    end
+    local day = self:GetCurrentDay()
+    if day ~= self.currenDay then
+        self.currenDay = day
+        self:SendOtheJiequDay()
+    end
+    require("ActionGoalsNet"):GetInstance():SendTaskGoalsGet(_G.handlerbind(self, self.ParseData))
+    --self:IsConnect()
+    -- local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActionGoalsView.Name)
+    -- if ctrl then
+    --     ctrl:DayButtonClick()
+    -- end
+    if endcall ~= nil then
+        endcall(self.__cname)
+    end
+end
+
+---@param index number 期数
+function ActionGoalsModel:GetActiveCfg(index)
+    return self.activeCfgs[index]
+end
+
+return ActionGoalsModel

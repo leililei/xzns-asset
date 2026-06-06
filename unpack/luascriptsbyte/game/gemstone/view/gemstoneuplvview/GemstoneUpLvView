@@ -1,0 +1,589 @@
+-----------------------------------------------------------------------
+-- F:.H5.Client.Assets.Resources.LuaScripts.Game.Gemstone.View.GemstoneUpLvView	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2026/03/27
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+---@class GemstoneUpLvView : UIBaseView	中文描述
+---@field public go_table GemstoneUpLvView_GoTable GoTable
+local GemstoneUpLvView = _G.BaseClass("GemstoneUpLvView", _G.UIBaseView)
+
+function GemstoneUpLvView:Awake()
+    self.minLvMax = 999999
+    self.valueColor = {
+        has = _G.ColorTools.FormatColorByString("ffffff"),
+        noHas = _G.ColorTools.FormatColorByString("AA3932")
+    }
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.UpdateView, self)
+end
+
+function GemstoneUpLvView:OnDestroy()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.UpdateView, self)
+end
+
+---界面的入口函数
+function GemstoneUpLvView:OnCreate()
+    self:InitData()
+
+    local resources = _G.ConfigManager.ui_cfg.GemstoneUpLvView.resources
+    self:AddComponent(
+        self.go_table.obj_gold,
+        require("ResourceCompont").New(self.go_table.obj_gold, resources)
+    )
+end
+
+function GemstoneUpLvView:InitData()
+    self.model = require("GemstoneModel"):GetInstance()
+    self.selectItemIndex = 1
+    self.itemTable = {}
+    self.attrItem = {}
+    self.cardUidList = require("CardResonanceModel"):GetInstance():GetAllPosCardsUids()
+    for i = 1, 5 do
+        local cardUid = self.cardUidList[i]
+        local index = i
+        if cardUid and cardUid ~= 0 then
+            local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, cardUid)
+            _G.ItemCardFactory:GetInstance():GetItemCard(
+                _G.ItemCardFactory.itemCardType.CardAllItem,
+                self.go_table["obj_head" .. i],
+                function(item)
+                    if self:IsNil() then
+                        return
+                    end
+                    item.gameObject:SetLocalScaleXYZ(0.85)
+                    item:ShowCardData(cardData, function()
+                        self.selectItemIndex = index
+                        self:UpdateSelectItem()
+                        self:UpdateGem()
+                    end)
+                end
+            )
+        end
+    end
+    self:UpdateView()
+end
+
+function GemstoneUpLvView:UpdateView()
+    for i = 1, 5 do
+        local cardUid = self.cardUidList[i]
+        if cardUid and cardUid ~= 1 then
+            local count = self:CalculateUpgradeMaterials(cardUid, 50)
+            self.go_table["obj_redpoint" .. i]:SetActiveE(count >= 10 and 1 or 0)
+        else
+            self.go_table["obj_redpoint" .. i]:SetActiveE(0)
+        end
+    end
+    self:UpdateGem()
+    self:UpdateAttrPanel()
+    local gemList = self.model:GetGemListByCardUid(self.cardUidList[self.selectItemIndex])
+    self.go_table.aorbtn_reset:SetActiveE(0)
+    for _, v in pairs(gemList) do
+        if v.level > 0 then
+            self.go_table.aorbtn_reset:SetActiveE(1)
+            break
+        end
+    end
+end
+function GemstoneUpLvView:ShowPowerChange(lastPower, newPower)
+    if lastPower == newPower then
+        return
+    end
+    require "CommonTipManager".OpenPowerUpView(newPower, newPower - lastPower, true)
+end
+--- 计算卡片上所有宝石的总属性
+---@param cardUid number 卡片UID
+---@return table<string, number> attr 基础属性表
+---@return table<string, number> randomAttr 随机属性表
+function GemstoneUpLvView:CalculateTotalAttributes(cardUid)
+    local data = self.model:GetGemListByCardUid(cardUid)
+    local attr = {}
+    local randomAttr = {}
+    local cfg = _G.ConfigManager.gem_add_att_cfg
+
+    for _, gemData in pairs(data) do
+        -- 累加基础属性
+        for key, att in pairs(gemData:GetAttr()) do
+            if not attr[key] then
+                attr[key] = {}
+            end
+            for k, v in pairs(att) do
+                attr[key][k] = v[3] + (attr[key][k] or 0)
+            end
+        end
+
+        -- 累加随机属性
+        for _, randomAtt in pairs(gemData:GetRandomAttr()) do
+            local key = cfg[randomAtt.sid].type_attribute
+            local value = randomAtt.value
+            if not randomAttr[key] then
+                randomAttr[key] = 0
+            end
+            randomAttr[key] = randomAttr[key] + value
+        end
+    end
+
+    return attr, randomAttr
+end
+
+--- 显示属性项
+---@param index number 属性索引
+---@param key string 属性键名
+---@param value any 属性值
+function GemstoneUpLvView:ShowAttributeItem(index, key, value)
+    local tb = self.attrItem[index]
+    if not tb then
+        tb = _G.GetAutoGoTable(_G.InstantiateObject(self.go_table.obj_attr, self.go_table.obj_content), nil)
+        self.attrItem[index] = tb
+    end
+    tb.aortext_name.text = _G.AttrType[key].des
+    tb.aortext_value.text =  value
+    return tb
+end
+
+--- 获取所有卡片宝石的最小等级
+---@param lvList table 等级列表
+---@return number 最小等级
+function GemstoneUpLvView:GetMinGemLevel(lvList)
+    local minLv = self.minLvMax
+    for _, gemLevels in pairs(lvList) do
+        for i = 1, 4 do
+            local level = gemLevels[i] or 0
+            minLv = _G.math.min(minLv, level)
+        end
+    end
+    return minLv
+end
+
+--- 计算升级所需的材料和可升级次数
+---@param cardUid number 卡片UID
+---@param maxLv number 最大升级次数
+---@return number count 可升级次数
+---@return table material 材料消耗表
+---@return table lvList 升级后的等级列表
+---@return number minLv 最小等级限制
+function GemstoneUpLvView:CalculateUpgradeMaterials(cardUid, maxLv)
+    local count = 0
+    local material = {}
+    local lvList = {}
+    local minLv = self.minLvMax
+    local model = self.model
+    local level_cfg = _G.ConfigManager.gem_level_cfg
+
+    -- 初始化所有卡片的宝石等级列表
+    for _, v in pairs(self.cardUidList) do
+        local gemDataList = model:GetGemListByCardUid(v)
+        lvList[v] = {}
+        for i, gem in pairs(gemDataList) do
+            lvList[v][i] = gem.level
+        end
+    end
+
+    if not cardUid or cardUid == 0 then
+        return count, material, lvList, minLv
+    end
+
+    local gemDataList = model:GetGemListByCardUid(cardUid)
+    local currentLvList = lvList[cardUid]
+
+    for _ = 1, maxLv do
+        local upLv = 0x0
+        local minAllLevel = self:GetMinGemLevel(lvList)
+
+        for gemIndex, currentLevel in pairs(currentLvList) do
+            local gem = gemDataList[gemIndex]
+            if not gem then
+            elseif currentLevel >= gem.cfg.strengthen_level then
+                -- 检查是否已达到最大等级
+            else
+                local nextLevelCfg = level_cfg[currentLevel + 1]
+                -- 检查其他宝石等级限制
+                if nextLevelCfg.min_level > minAllLevel or not _G.GlobalConditionManager.CheckConditionArrays(nextLevelCfg.condition) then
+                    minLv = _G.math.min(minLv, nextLevelCfg.min_level)
+                    break
+                else
+                    -- 计算本次升级所需材料
+                    local canUpgrade, addMaterials = self:CheckUpgradeMaterials(currentLevel, material, level_cfg)
+                    if canUpgrade then
+                        -- 添加材料消耗
+                        for sid, num in pairs(addMaterials) do
+                            if not material[sid] then
+                                material[sid] = 0
+                            end
+                            material[sid] = material[sid] + num
+                        end
+                        currentLvList[gemIndex] = currentLevel + 1
+                        upLv = upLv | 2^(gemIndex - 1)
+                        -- upLv = true
+                    end
+                end
+            end
+        end
+
+        if upLv ~= 0xf then
+            local index = 0
+            -- 一轮强化没有进行完，需要回退
+            while(upLv ~= 0) do
+                index = index + 1
+                if upLv % 2 == 1 then
+                    local rollbackFromLevel = currentLvList[index]
+                    currentLvList[index] = rollbackFromLevel - 1
+                    -- 回退材料消耗：减去升级时增加的材料
+                    for _, mater in pairs(level_cfg[rollbackFromLevel].material_1) do
+                        material[mater[1]] = material[mater[1]] - mater[2]
+                    end
+                    if rollbackFromLevel - 1 > 0 then
+                        for _, mater in pairs(level_cfg[rollbackFromLevel - 1].material_1) do
+                            material[mater[1]] = material[mater[1]] + mater[2]
+                        end
+                    end
+                end
+                upLv = upLv >> 1
+            end
+            break
+        end
+        count = count + 1
+    end
+
+    return count, material, lvList, minLv
+end
+
+--- 检查升级材料是否足够并计算所需材料
+---@param currentLevel number 当前等级
+---@param currentMaterial table 当前已消耗材料
+---@param level_cfg table 等级配置
+---@return boolean canUpgrade 是否可以升级
+---@return table addMaterials 需要添加的材料
+function GemstoneUpLvView:CheckUpgradeMaterials(currentLevel, currentMaterial, level_cfg)
+    local addMaterials = {}
+
+    -- 计算从当前等级升到下一级需要的材料（增量）
+    for _, mater in pairs(level_cfg[currentLevel + 1].material_1) do
+        addMaterials[mater[1]] = mater[2]
+    end
+
+    if currentLevel > 0 then
+        for _, mater in pairs(level_cfg[currentLevel].material_1) do
+            local sid = mater[1]
+            if addMaterials[sid] then
+                addMaterials[sid] = addMaterials[sid] - mater[2]
+            end
+        end
+    end
+
+    -- 检查材料是否足够
+    for sid, num in pairs(addMaterials) do
+        local totalNeeded = (currentMaterial[sid] or 0) + num
+        if not _G.StorageManager:GetInstance():CheckItem(sid, totalNeeded) then
+            return false, {}
+        end
+    end
+
+    return true, addMaterials
+end
+
+--- 更新属性面板显示
+function GemstoneUpLvView:UpdateAttrPanel()
+    local cardUid = self.cardUidList[self.selectItemIndex]
+    if not cardUid or cardUid == 0 then
+        return
+    end
+
+    -- 计算并显示属性
+    local attr, randomAttr = self:CalculateTotalAttributes(cardUid)
+    if _G.table.count(attr) == 0 then
+        self.go_table.obj_empty:SetActiveE(1)
+    else
+        self.go_table.obj_empty:SetActiveE(0)
+    end
+    self:DisplayAttributes(attr, randomAttr)
+
+    -- 计算升级材料和显示结果
+    local maxLv = 50
+    local count, material, lvList, minLv = self:CalculateUpgradeMaterials(cardUid, maxLv)
+
+    self:DisplayUpgradeResult(count, material, lvList[cardUid], minLv)
+end
+
+--- 显示升级结果
+---@param count number 可升级次数
+---@param material table 材料消耗
+---@param upgradedLevels table 升级后的等级列表
+---@param minLv number 最小等级限制
+function GemstoneUpLvView:DisplayUpgradeResult(count, material, upgradedLevels, minLv)
+    if count == 0 then
+        self.go_table.obj_allUpLv:SetActiveE(0)
+        if minLv == self.minLvMax then
+            self.go_table.obj_allUpLv:SetActiveE(0)
+            self.go_table.aortext_state:SetActiveE(0)
+        else
+            self.go_table.aortext_state:SetActiveE(1)
+            self.go_table.aortext_state.text = _G.GetLangPackValue(93010010010, minLv)
+        end
+    else
+        self.go_table.obj_allUpLv:SetActiveE(1)
+        self.go_table.aortext_state:SetActiveE(0)
+
+        self.go_table.obj_consume:ClearChildren()
+        for k, v in pairs(material) do
+            local consumeTb = _G.GetAutoGoTable(_G.InstantiateObject(self.go_table.obj_consumeItem, self.go_table.obj_consume))
+            consumeTb.gameObject:SetLocalPositionToZero()
+            consumeTb.aorrawimage_icon:LoadImage(_G.StorageManager:GetInstance():GetItemIcon(k))
+            consumeTb.aortext_value.text = _G.GameUtil.NumberWY(_G.Mathf.RoundToInt(v))
+            if _G.StorageManager:GetInstance():CheckItem(k, v) then
+                consumeTb.aortext_value.color = self.valueColor.has
+            else
+                consumeTb.aortext_value.color = self.valueColor.noHas
+            end
+        end
+
+        self.go_table.aortext_lv.text = _G.GetLangPackValue(91307420705, count)
+        self.AllUpLvList = upgradedLevels
+        self.AllUpLvMaterial = material 
+    end
+
+    self.go_table.obj_redpoint:SetActiveE(count >= 10 and 1 or 0)
+end
+
+--- 显示属性列表
+---@param attr table 基础属性
+---@param randomAttr table 随机属性
+function GemstoneUpLvView:DisplayAttributes(attr, randomAttr)
+    local index = 0
+
+    -- 显示基础属性
+    for key, att in pairs(attr) do
+        for type, value in pairs(att) do
+            index = index + 1
+            if type == 1 then
+                self:ShowAttributeItem(index, key, _G.GameUtil.NumberWY(_G.Mathf.RoundToInt(value)))
+            else
+                self:ShowAttributeItem(index, key, value / 100 .. "%")
+            end
+        end
+    end
+
+    -- 显示随机属性
+    for key, value in pairs(randomAttr) do
+        index = index + 1
+        self:ShowAttributeItem(index, key, value / 100 .. "%")
+    end
+
+    -- 隐藏多余的属性项
+    for k, v in pairs(self.attrItem) do
+        v.gameObject:SetActiveE(k <= index and 1 or 0)
+    end
+end
+
+
+function GemstoneUpLvView:UpdateSelectItem()
+    self.go_table.aorimage_select:SetParentE(self.go_table["obj_head" .. self.selectItemIndex])
+    self.go_table.aorimage_select:SetLocalPositionToZero()
+    self:UpdateAttrPanel()
+end
+
+function GemstoneUpLvView:UpdateGem()
+    local cardUid = self.cardUidList[self.selectItemIndex]
+    if cardUid and cardUid ~= 0 then
+        local gemDataList = self.model:GetGemListByCardUid(cardUid)
+        local useGems = self.model:GetAllUseGemData()
+        local minGemLv = 999
+        for _, gem in pairs(useGems) do
+            minGemLv = _G.math.min(minGemLv, gem and gem.level or 0)
+        end
+        for i = 1, 4 do
+            local gem = gemDataList[i]
+            local tb = _G.GetAutoGoTable(self.go_table["obj_gem" .. i], _G.handlerbind(self, self.UpGemLv, gem))
+            if not gem then
+                tb.obj_root:SetActiveE(0)
+                tb.aortext_name:SetActiveE(0)
+                tb.obj_upLv:SetActiveE(0)
+                tb.obj_state:SetActiveE(1)
+                tb.aortext_state.text = _G.GetLangPackValue(93010010014)
+                tb.aortext_state.color = _G.ColorTools.FormatColorByString("cccfdc")
+            else
+                tb.obj_root:SetActiveE(1)
+                tb.aortext_name:SetActiveE(1)
+                tb.obj_upLv:SetActiveE(0)
+
+                local nextLevelCfg = _G.ConfigManager.gem_level_cfg[gem.level + 1]
+                tb.aortext_name.text = gem:GetName()
+                if gem.level >= gem.cfg.strengthen_level then
+                    -- 最大等级
+                    tb.obj_state:SetActiveE(1)
+                    tb.aortext_state.text = _G.GetLangPackValue(9002050021)
+                    tb.aortext_state.color = _G.ColorTools.FormatColorByString("f1eed7")
+                elseif nextLevelCfg.min_level > minGemLv or not _G.GlobalConditionManager.CheckConditionArrays(nextLevelCfg.condition)  then
+                    -- 其余宝石等级低于最低等级
+                    tb.obj_state:SetActiveE(0)
+                    -- tb.aortext_state.text = _G.GetLangPackValue(93010010010, nextLevelCfg.min_level)
+                    -- tb.aortext_state.color = _G.ColorTools.FormatColorByString("eec398")
+                else
+                    tb.obj_state:SetActiveE(0)
+                    tb.obj_upLv:SetActiveE(1)
+                    local levelCfg = _G.ConfigManager.gem_level_cfg[gem.level]
+                    tb.obj_consume:ClearChildren()
+                    for _, v in pairs(nextLevelCfg.material_1) do
+                        local consumeTb = _G.GetAutoGoTable(_G.InstantiateObject(self.go_table.obj_consumeItem, tb.obj_consume))
+                        consumeTb.gameObject:SetLocalPositionToZero()
+                        local key = v[1]
+                        consumeTb.aorrawimage_icon:LoadImage(_G.StorageManager:GetInstance():GetItemIcon(key))
+                        local sum = 0
+                        for _, material in pairs(levelCfg.material_1) do
+                            if material[1] == v[1] then
+                                sum = material[2]
+                                break
+                            end
+                        end
+                        consumeTb.aortext_value.text = _G.GameUtil.NumberWY(_G.Mathf.RoundToInt(v[2] - sum))
+                        if _G.StorageManager:GetInstance():CheckItem(key, v[2] - sum) then
+                            consumeTb.aortext_value.color = self.valueColor.has
+                        else
+                            consumeTb.aortext_value.color = self.valueColor.noHas
+                        end
+                    end
+                    tb.aortext_lv.text = _G.GetLangPackValue(91307420705, 1)
+                end
+                if not tb.item then
+                    _G.ItemFactory:GetInstance():GetItemCard(
+                        _G.ItemFactory.itemType.ItemGemstoneBase,
+                        tb.obj_root,
+                        function(trans)
+                            if self:IsNil() then
+                                return
+                            end
+                            tb.item = trans
+                            trans:ShowData(gem, function()
+                            end)
+                        end
+                    )
+                else
+                    tb.item:ShowData(gem, function()
+                    end)
+                end
+            end
+        end
+    end
+end
+
+function GemstoneUpLvView:UpGemLv(_, _, gem)
+    local nextLevelCfg = _G.ConfigManager.gem_level_cfg[gem.level + 1]
+    local levelCfg = _G.ConfigManager.gem_level_cfg[gem.level]
+    for k, v in pairs(nextLevelCfg.material_1) do
+        local sum = 0
+        for _, material in pairs(levelCfg.material_1) do
+            if material[1] == v[1] then
+                sum = material[2]
+                break
+            end
+        end
+        if not _G.StorageManager:GetInstance():CheckItemNew(v[1], v[2] - sum) then
+            return
+        end
+    end
+    local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, gem.cardUid)
+    local lastPower = cardData:GetPower()
+    self.model:LevelUp(
+        gem.cardUid,
+        {
+            { key = gem.professional, value = gem.level + 1 }
+        },
+        function()
+            local cfg = _G.ConfigManager.gem_level_cfg[gem.level]
+            local nextCfg = _G.ConfigManager.gem_level_cfg[gem.level + 1]
+            local consume = {}
+            for _, v in pairs(nextCfg.material_1) do
+                consume[v[1]] = v[2]
+            end
+            for _, v in pairs(cfg.material_1) do
+                if consume[v[1]] then
+                    consume[v[1]] = consume[v[1]] - v[2]
+                end
+            end
+            for k, v in pairs(consume) do
+                _G.StorageManager:GetInstance():ConsumeItem(k, 0, v)
+            end
+            self:UpdateView()
+            local newPower = cardData:GetPower()
+            self:ShowPowerChange(lastPower, newPower)
+        end
+    )
+end
+
+function GemstoneUpLvView:AllUpLv()
+    local cardUid = self.cardUidList[self.selectItemIndex]
+    local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid)
+    local lastPower = cardData:GetPower()
+    if cardUid and cardUid ~= 0 then
+        local info = {}
+        for k, v in pairs(self.AllUpLvList) do
+            _G.table.insert(info,{key = k, value = v})
+        end
+        self.model:LevelUp(
+            cardUid,
+            info,
+            function()
+                for k, v in pairs(self.AllUpLvMaterial) do
+                    _G.StorageManager:GetInstance():ConsumeItem(k, 0, v)
+                end
+                self:UpdateView()
+                local newPower = cardData:GetPower()
+                self:ShowPowerChange(lastPower, newPower)
+            end
+        )
+    end
+end
+
+function GemstoneUpLvView:RebornCall(index, dataList, award)
+    if index > 4 then
+        self:RebornEndCall(award)
+        return
+    end
+    if dataList[index] and dataList[index].level > 0 then
+        dataList[index]:Reborn(
+            function(msg)
+                if msg.award then
+                    _G.table.insertto(award.award.item, msg.award.item)
+                end
+                self:RebornCall(index + 1, dataList, award)
+            end
+        )
+    else
+        self:RebornCall(index + 1, dataList, award)
+    end
+end
+
+function GemstoneUpLvView:RebornEndCall(msg)
+    if #msg.award.item ~= 0 then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+    end
+    self:UpdateView()
+    local cardUid = self.cardUidList[self.selectItemIndex]
+    local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid)
+    cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+    local newPower = cardData:GetPower()
+    self:ShowPowerChange(self.lastPower, newPower)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpLv.id)
+end
+
+---按钮点击事件在这里派发
+function GemstoneUpLvView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_tip then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 235)
+    elseif go == self.go_table.aorbtn_up then
+        self:AllUpLv()
+    elseif go == self.go_table.aorbtn_reset then
+        _G.PopWindowManager:GetInstance():ShowAllTips(2720104,nil,function()
+            local cardUid = self.cardUidList[self.selectItemIndex]
+            local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid)
+            self.lastPower = cardData:GetPower()
+            local uid = self.cardUidList[self.selectItemIndex]
+            local gemDataList = self.model:GetGemListByCardUid(uid)
+            self:RebornCall(1, gemDataList, { award = { item = {} } })
+        end)
+    end
+end
+
+return GemstoneUpLvView

@@ -1,0 +1,629 @@
+local ArenaNet = require("ArenaNet")
+local ArenaPeakNet = require("ArenaPeakNet")
+local SpiritualRealmNet = require("SpiritualRealmNet")
+local ArenaPeakModel = require("ArenaPeakModel")
+local SociatyBattleModel = require("SociatyBattleModel")
+local SpiritualRealmModel = require("SpiritualRealmModel")
+
+---TODO: debug模式
+local DEBUG_MODE = false
+
+--region 工具类方法
+
+---从table中寻找值
+---@generic T
+---@param tbl table<any, T>
+---@param expr fun(v:T):boolean
+local function findInTable(tbl, expr)
+    if not tbl then
+        return nil
+    end
+    for _, v in pairs(tbl) do
+        if expr(v) then
+            return v
+        end
+    end
+    return nil
+end
+---从table中寻找值
+---@generic T
+---@param tbl T[]
+---@param expr fun(v:T):boolean
+local function findInArray(tbl, expr)
+    if not tbl then
+        return nil
+    end
+    for _, v in ipairs(tbl) do
+        if expr(v) then
+            return v
+        end
+    end
+    return nil
+end
+---转为数组
+---@generic T
+---@param tbl table<any, T>
+local function toArray(tbl)
+    local results = {}
+    for _, v in pairs(tbl) do
+        table.insert(results, v)
+    end
+    return results
+end
+---从table中寻找值
+---@generic T
+---@param target T[]
+---@param source T[]
+local function insertMany(target, source)
+    if not target or not source then
+        return
+    end
+    for _, v in ipairs(source) do
+        table.insert(target, v)
+    end
+end
+---数组转换
+---@generic T
+---@generic R
+---@param tbl T[]
+---@param expr fun(v:T):T
+---@return R[]
+local function map(tbl, expr)
+    if not tbl then
+        return nil
+    end
+    local results = {}
+    for _, v in ipairs(tbl) do
+        table.insert(results, expr(v))
+    end
+    return results
+end
+
+--endregion
+
+---Pvp推送目标类型
+---@class ePvpPublicityType
+---@field Arena number                  竞技场
+---@field SpiritualRealm number         问鼎灵域
+---@field SociatyBattle number          公会战(争霸天下)
+---@field ArenaPeak number              巅峰演武
+---@type ePvpPublicityType
+local ePvpPublicityType = {
+    Arena = 1,
+    SpiritualRealm = 2,
+    SociatyBattle = 3,
+    ArenaPeak = 4
+}
+
+---Pvp功能开启ID
+---@class ePvpFunctionEnableType
+---@field Arena number[]                竞技场
+---@field SpiritualRealm number[]       问鼎灵域
+---@field SociatyBattle number[]        公会战(争霸天下)
+---@field ArenaPeak number[]            巅峰演武
+---@type ePvpFunctionEnableType
+local ePvpFunctionEnableType = {
+    Arena = {2},
+    SpiritualRealm = {152},
+    SociatyBattle = {147},
+    ArenaPeak = {138}
+}
+
+---@class PvpPublicityModel : GameDataModelBase
+---@field ePvpPublicityType ePvpPublicityType
+local PvpPublicityModel = _G.BaseClass("PvpPublicityModel", _G.GameDataModelBase)
+PvpPublicityModel.ePvpPublicityType = ePvpPublicityType
+
+---@return PvpPublicityModel
+function PvpPublicityModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---获取功能配置
+---@return PvpPublicityData[]
+function PvpPublicityModel:GetConfigure()
+    ---@type number[][]
+    local duartions, descs = _G.ConfigManager.discrete_cfg[100131], _G.ConfigManager.discrete_cfg[100132]
+    if not duartions then
+        return nil
+    end
+
+    ---活动持续时间
+    ---@type table<any,PvpPublicityData>
+    local results = {}
+    for _, v in pairs(duartions) do
+        if v and #v >= 2 then
+            local id, start, finish = table.unpack(v)
+            results[id] = {id = id, start = start, finish = finish or 0}
+        end
+    end
+    --界面描述
+    if descs then
+        for _, v in pairs(descs) do
+            if v and #v >= 2 then
+                local id, desc = table.unpack(v)
+                if results[id] then
+                    results[id].desc = desc
+                end
+            end
+        end
+    end
+    return toArray(results)
+end
+---功能是否满足开启条件
+---@param data PvpPublicityData
+---@return boolean
+function PvpPublicityModel:IsOpening(data)
+    if DEBUG_MODE then
+        return true
+    end
+
+    --检查时间范围
+    local duration = self:GetServerOpenDuration()
+    if duration < 0 then
+        return false
+    end
+    local start, finish = self:GetPeriod(data)
+    if duration < start or finish > 0 and duration > finish then
+        return false
+    end
+
+    --检查功能是否已开启(额外附加条件检查)
+    ---@type number[]
+    local funcIds
+    local type = data.id
+    if type == ePvpPublicityType.Arena then
+        funcIds = ePvpFunctionEnableType.Arena
+    elseif type == ePvpPublicityType.SpiritualRealm then
+        --额外的条件判断
+        if require("SpiritualRealmModel"):GetInstance():IsSettlementTime() then
+            return false
+        end
+        funcIds = ePvpFunctionEnableType.SpiritualRealm
+    elseif type == ePvpPublicityType.SociatyBattle then
+        --额外的条件判断(是否需要判断加入公会???)
+        if not require("SociatyManager"):GetInstance():HasSociaty() then
+            return false
+        end
+        funcIds = ePvpFunctionEnableType.SociatyBattle
+    elseif type == ePvpPublicityType.ArenaPeak then
+        --额外的条件判断
+        if not ArenaPeakModel:GetInstance():CheckIsOpen(false) then
+            return false
+        end
+        funcIds = ePvpFunctionEnableType.ArenaPeak
+    end
+    if funcIds then
+        for _, sid in ipairs(funcIds) do
+            if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(sid) then
+                return false
+            end
+        end
+    end
+
+    return true
+end
+---功能是否已过期
+---@param data PvpPublicityData
+---@return boolean
+function PvpPublicityModel:IsExpired(data)
+    if DEBUG_MODE then
+        return false
+    end
+
+    --检查时间范围
+    local duration = self:GetServerOpenDuration()
+    if duration < 0 then
+        return false
+    end
+    local _, finish = self:GetPeriod(data)
+    if finish > 0 and duration > finish then
+        return true
+    end
+    return false
+end
+---获取面板剩余时间
+---@param data PvpPublicityData
+---@return number 单位: 秒, 如返回-1表示活动已过期
+function PvpPublicityModel:GetRemainTime(data)
+    if DEBUG_MODE then
+        return 100
+    end
+
+    local duration = self:GetServerOpenDuration()
+    local _, finish = self:GetPeriod(data)
+
+    local remain = finish - duration
+    if remain < 0 then
+        remain = -1
+    end
+    return remain
+end
+---获取已开服时长(-1表示尚未初始化)
+---@private
+---@return number 秒
+function PvpPublicityModel:GetServerOpenDuration()
+    if not _G.PlayerModel or not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        --角色尚未创建, _G.PlayerModel为空
+        return -1
+    end
+    return _G.TimeUtil.GetServerUnixTime() - _G.PlayerModel:GetInstance():GetServerOpenTime()
+end
+---获取活动时期(时间段
+---@private
+---@param data PvpPublicityData
+---@return number,number 开始时间, 结束时间
+function PvpPublicityModel:GetPeriod(data)
+    return (data.start - 1) * 86400, data.finish * 86400
+end
+---获取赛季结算剩余时间
+---@param type number 请求类型: 竞技场/问鼎灵域/公会战/巅峰演武
+---@return number
+function PvpPublicityModel:GetSeasonRemainTime(type)
+    if not _G.PlayerModel or not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        --角色尚未创建, _G.PlayerModel为空
+        return -1
+    end
+
+    ---@type number 剩余时间(秒)
+    local remain
+    if type == ePvpPublicityType.Arena then
+        ---@type ArenaSingleClassNormal
+        local normalModel = require("ArenaManager"):GetInstance():GetArenaClass(1)
+        if normalModel and normalModel.endTimeSec then
+            remain = normalModel.endTimeSec
+        end
+    elseif type == ePvpPublicityType.SpiritualRealm then
+        remain = require("SpiritualRealmModel"):GetInstance():GetStopTime()
+        if remain then
+            remain = remain - _G.TimeUtil.GetServerUnixTime()
+        end
+    elseif type == ePvpPublicityType.SociatyBattle then
+        remain = SociatyBattleModel:GetInstance():GetEndTime()
+        if remain then
+            remain = remain - _G.TimeUtil.GetServerUnixTime()
+        end
+    elseif type == ePvpPublicityType.ArenaPeak then
+        remain = ArenaPeakModel:GetInstance():GetStartSettlementTime()
+    end
+
+    return remain or 0
+end
+
+---获取积分对应的段位
+---@param type number 请求类型: 竞技场/问鼎灵域/公会战/巅峰演武
+---@param score number 积分
+---@return string
+function PvpPublicityModel:GetScoreBadgeIcon(type, score)
+    ---@type table<any, arena_league_cfg>| table<any, arena_layer_league_cfg> | table<any, arena_peak_league_cfg>
+    local list
+
+    if type == ePvpPublicityType.Arena then
+        --list = _G.ConfigManager.arena_league_cfg          --竞技场无需段位显示
+    elseif type == ePvpPublicityType.SpiritualRealm then
+        list = _G.ConfigManager.arena_layer_league_cfg
+    elseif type == ePvpPublicityType.ArenaPeak then
+        --elseif type == ePvpPublicitytype.Pvp2 then        --公会战没有段位
+        list = _G.ConfigManager.arena_peak_league_cfg
+    end
+
+    local target =
+        list and
+        findInTable(
+            list,
+            function(v)
+                return score >= v.min_score and score <= v.max_score
+            end
+        )
+    if target then
+        return target.icon
+    end
+    return nil
+end
+---获取积分会排名对应的奖励
+---@param type number 请求类型: 竞技场/问鼎灵域/公会战/巅峰演武
+---@param index number  排行名次
+---@param score number  积分
+function PvpPublicityModel:GetAward(type, index, score)
+    ---@type number[][]
+    local results
+    if type == ePvpPublicityType.Arena then
+        ---@type arena_info_cfg
+        local target = _G.ConfigManager.arena_info_cfg[1]
+        if target then
+            for _, id in ipairs(target.rank_league) do
+                ---@type arena_rank_cfg
+                local cfg = _G.ConfigManager.arena_rank_cfg[id]
+                if cfg and index >= cfg.min_rank and index <= cfg.max_rank then
+                    results = {}
+                    insertMany(results, self:FindManyItemByType(cfg.reward_appearance))
+                    insertMany(results, cfg.reward_daily)
+                    break
+                end
+            end
+        end
+    elseif type == ePvpPublicityType.SpiritualRealm then
+        ---@type arena_layer_up_cfg
+        local target = _G.ConfigManager.arena_layer_up_cfg[1]
+        if target then
+            for _, id in ipairs(target.rank_season) do
+                ---@type arena_rank_cfg
+                local cfg = _G.ConfigManager.arena_rank_cfg[id]
+                if cfg and index >= cfg.min_rank and index <= cfg.max_rank then
+                    results = {}
+                    insertMany(results, self:FindManyItemByType(cfg.reward_appearance))
+                    insertMany(results, cfg.reward_daily)
+                    break
+                end
+            end
+        end
+    elseif type == ePvpPublicityType.SociatyBattle then
+        ---@type guild_entrance_cfg
+        local target = _G.ConfigManager.guild_entrance_cfg[_G.ScoaityActivityType.SociatyBattle]
+        if target then
+            for _, id in ipairs(target.rank) do
+                ---@type arena_rank_cfg
+                local cfg = _G.ConfigManager.arena_rank_cfg[id]
+                if cfg and index >= cfg.min_rank and index <= cfg.max_rank then
+                    results = {}
+                    insertMany(results, self:FindManyItemByType(cfg.reward_appearance))
+                    insertMany(results, cfg.reward_daily)
+                    break
+                end
+            end
+        end
+    elseif type == ePvpPublicityType.ArenaPeak then
+        if not self._cacheArenaPeakReward then
+            ---@type {rank_con:number,min_score:number,max_score:number,reward_season:number[][]}[] 缓存巅峰演武奖励
+            self._cacheArenaPeakReward = {}
+
+            local cfg = ArenaPeakModel:GetInstance():GetCfg()
+            for _, v in ipairs(cfg and cfg.reward_season or {}) do
+                if v and #v >= 2 then
+                    local idx, id = table.unpack(v)
+                    ---@type arena_peak_league_cfg
+                    local _rankCfg = _G.ConfigManager.arena_peak_league_cfg[idx]
+                    ---@type arena_peak_tier_cfg
+                    local _awardCfg = _G.ConfigManager.arena_peak_tier_cfg[id]
+                    if _rankCfg and _awardCfg then
+                        table.insert(
+                            self._cacheArenaPeakReward,
+                            {
+                                rank_con = _rankCfg.rank_con,
+                                min_score = _rankCfg.min_score,
+                                max_score = _rankCfg.max_score,
+                                reward_season = _awardCfg.reward_season
+                            }
+                        )
+                    end
+                end
+            end
+        end
+        local target =
+            index ~= nil and
+            findInArray(
+                self._cacheArenaPeakReward,
+                function(v)
+                    return (v.rank_con <= 0 or index <= v.rank_con) and score >= v.min_score and score <= v.max_score
+                end
+            )
+        if target then
+            results = {}
+            insertMany(results, target.reward_season)
+        end
+    end
+
+    return results
+end
+---通过类型查找物品
+---@param list number[][]
+---@return number[][]
+function PvpPublicityModel:FindManyItemByType(list)
+    if not list or #list == 0 then
+        return nil
+    end
+    --TODO: 循环查找效率太慢, 考虑字典缓存!!!
+    local results = {}
+    for _, v in pairs(list) do
+        local type, sid = table.unpack(v)
+        sid = tostring(sid)
+        for _, item in pairs(_G.ConfigManager.item_cfg) do
+            if item.UseType == type and item.UseParameter[1][1] == sid then
+                _G.table.insert(results, {item.ID, 1})
+                break
+            end
+        end
+    end
+    return results
+end
+
+---获取排行榜数据
+---@param type number   请求类型: 竞技场/问鼎灵域/公会战/巅峰演武
+---@param callback fun(resp: RankListData):void 回调函数
+function PvpPublicityModel:GetRankList(type, callback)
+    if type == ePvpPublicityType.Arena then
+        ---TODO: sid是什么, 先按照其他地方传1???
+        ArenaNet:GetInstance():GetRankList(
+            1,
+            1,
+            function(resp)
+                if not resp or not resp.arenas then
+                    callback(nil)
+                    return
+                end
+                for _, v in ipairs(resp.arenas) do
+                    if v.type == 1 then
+                        v.name = _G.GetLangPackValue(v.name)
+                    end
+                end
+                callback({ack = 1, list = resp.arenas})
+            end
+        )
+    elseif type == ePvpPublicityType.SpiritualRealm then
+        local function onResponse(resp)
+            if not resp or not resp.ranks then
+                callback(nil)
+                return
+            end
+            ---@type RankListData.Player[]
+            local list = {}
+            for _, v in ipairs(resp.ranks) do
+                table.insert(
+                    list,
+                    {
+                        uid = v.role_info.uid,
+                        score = v.score,
+                        name = v.role_info.name,
+                        frame = v.role_info.frame,
+                        level = v.role_info.level,
+                        power = v.role_info.power,
+                        style = v.role_info.style,
+                        type = 0
+                    }
+                )
+            end
+            callback({ack = 1, list = list})
+        end
+
+        --获取当前加入类型
+        local joinType = SpiritualRealmModel:GetInstance():GetJoinType() or 1
+        if joinType == 2 then
+            SpiritualRealmNet:GetInstance():GetTwoRankList(1, onResponse)
+        elseif joinType == 3 then
+            SpiritualRealmNet:GetInstance():GetThirdRankList(1, onResponse)
+        else
+            SpiritualRealmNet:GetInstance():GetFirstRankList(1, onResponse)
+        end
+    elseif type == ePvpPublicityType.SociatyBattle then
+        --获取当前赛季ID
+        local seasonId = SociatyBattleModel:GetInstance():GetSeasonId()
+        SociatyBattleModel:GetInstance():GetRank(
+            function(resp)
+                if not resp or not resp.ranks then
+                    callback(nil)
+                    return
+                end
+                ---@type RankListData.Player[]
+                local list = {}
+                for _, v in ipairs(resp.ranks) do
+                    table.insert(
+                        list,
+                        {
+                            score = v.guild_score,
+                            name = v.guild_name,
+                            banner = v.banner,
+                            frame = 0,
+                            level = 0,
+                            power = 0,
+                            style = 0,
+                            type = 0
+                        }
+                    )
+                end
+                callback({ack = 1, list = list})
+            end,
+            seasonId
+        )
+    elseif type == ePvpPublicityType.ArenaPeak then
+        ArenaPeakNet:GetInstance():GetRank(
+            function(resp)
+                if not resp or not resp.rank_list then
+                    callback(nil)
+                    return
+                end
+                ---@type RankListData.Player[]
+                local list = {}
+                for _, v in ipairs(resp.rank_list) do
+                    table.insert(
+                        list,
+                        {
+                            uid = v.role_info.uid,
+                            score = v.score,
+                            name = v.role_info.name,
+                            frame = v.role_info.frame,
+                            level = v.role_info.level or 1,
+                            power = v.role_info.power,
+                            style = v.role_info.style,
+                            type = 0
+                        }
+                    )
+                end
+                callback({ack = 1, list = list})
+            end
+        )
+    else
+        callback(nil)
+    end
+end
+---获取自身排行数据
+---@param type number   请求类型: 竞技场/问鼎灵域/公会战/巅峰演武
+---@param callback fun(resp: SelfData):void 回调函数
+function PvpPublicityModel:GetSelfRank(type, callback)
+    if type == ePvpPublicityType.Arena then
+        ---TODO: sid是什么, 先按照其他地方传1???
+        ArenaNet:GetInstance():GetArenaData(1, callback)
+    elseif type == ePvpPublicityType.SpiritualRealm then
+        local function onResponse(resp)
+            if not resp or resp.ack ~= 1 then
+                callback(resp)
+                return
+            end
+            callback({ack = 1, rank = resp.index, score = resp.value})
+        end
+        --获取当前加入类型
+        local joinType = SpiritualRealmModel:GetInstance():GetJoinType() or 1
+        if joinType == 2 then
+            SpiritualRealmNet:GetInstance():SelfRank(84, onResponse)
+        elseif joinType == 3 then
+            SpiritualRealmNet:GetInstance():SelfRank(85, onResponse)
+        else
+            SpiritualRealmNet:GetInstance():SelfRank(83, onResponse)
+        end
+    elseif type == ePvpPublicityType.SociatyBattle then
+        callback(nil)
+    elseif type == ePvpPublicityType.ArenaPeak then
+        ArenaPeakNet:GetInstance():GetInfo(
+            function(resp)
+                if not resp or resp.ack ~= 1 then
+                    callback(resp)
+                    return
+                end
+                callback({ack = 1, rank = resp.role_info.rank_num, score = resp.role_info.score})
+            end
+        )
+    else
+        callback(nil)
+    end
+end
+
+--region 类型定义
+
+---@class PvpPublicityData Pvp推送类型定义
+---@field id number
+---@field start number          开始时间, 服务器开启后多少天
+---@field finish number         结束时间, 服务器开启后多少天
+---@field desc number|string    界面文本描述
+
+---@class SelfData              自身排名状态
+---@field ack number                请求状态: 1表示成功
+---@field rank number               排名
+---@field score number              积分
+
+---@class RankListData          其他玩家排名状态
+---@field ack number                请求状态: 1表示成功
+---@field list RankListData.Player[]数据列表
+---
+---@class RankListData.Player   玩家状态
+---@field uid number                玩家id
+---@field score number              积分
+---@field name string               玩家名称
+---@field frame number              头像框
+---@field level number              等级
+---@field power number              战力
+---@field style number
+---@field type number               角色类型(1机器人)
+---@field banner number             公会图标?
+
+--endregion
+
+return PvpPublicityModel

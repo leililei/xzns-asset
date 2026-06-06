@@ -1,0 +1,802 @@
+-----------------------------------------------------------------------
+-- E:01.zhj.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.PowerToTheTop.Model.PowerToTheTopModel
+--	(修改路径必须修正此项!)
+-- Created by 刘畅
+-- DateTime: 2021/09/15
+-- Description 管理器
+-----------------------------------------------------------------------
+local PowerToTheTopNet = require "PowerToTheTopNet"
+local base = require "GameDataModelBase"
+local PowerToTheTopModel = _G.BaseClass("PowerToTheTopModel", _G.GameDataModelBase)
+local Top_RankList = {
+    --放置阵容历史最强战力
+    power = 1,
+    --放置通关进度
+    afk = 2,
+    --死魂塔挑战进度
+    dead = 4,
+    --力拔头筹-竞技场积分
+    arena = 3,
+    --力拔头筹-五行竞技场积分
+    ele_arena = 6,
+    --力拔头筹-高阶竞技场段位
+    high_arena = 5,
+    --力拔头筹-神器积分
+    artifact = 7
+}
+local ConvertSysType = {
+    [_G.PowerToTheTopType.power] = Top_RankList.power,
+    [_G.PowerToTheTopType.afk] = Top_RankList.afk,
+    [_G.PowerToTheTopType.dead] = Top_RankList.dead,
+    [_G.PowerToTheTopType.arena] = Top_RankList.arena,
+    [_G.PowerToTheTopType.ele_arena] = Top_RankList.ele_arena,
+    [_G.PowerToTheTopType.high_arena] = Top_RankList.high_arena,
+    [_G.PowerToTheTopType.artifact] = Top_RankList.artifact
+}
+local SelfRankLanId = {
+    [_G.PowerToTheTopType.afk] = 91307420706,
+    [_G.PowerToTheTopType.dead] = 91307420708,
+    [_G.PowerToTheTopType.arena] = 91307420707,
+    [_G.PowerToTheTopType.artifact] = 91307420709
+}
+local rank_top_cfg = _G.ConfigManager.rank_top_cfg
+local rank_list_cfg = _G.ConfigManager.rank_list_cfg
+local artifact_cfg = _G.ConfigManager.artifact_cfg
+---创建对象时,入口构造函数
+function PowerToTheTopModel:__init()
+    self.curFunctionOpenID = 146
+    self.cackeRankData = {}
+    self.cacheSelfRankValue = {}
+    self.cacheInitRank = {}
+    -- _G.Events:GetInstance():AddListener(_G.eAFKAactionEnum.AfkSectionPass, self.RedView, self, Top_Rank.afk)
+    _G.Events:GetInstance():AddListener(_G.eAFKAactionEnum.AfkSectionPass, self.Top_Rank, self)
+    _G.Events:GetInstance():AddListener(_G.GlobalEvents.PlayerPowerChange, self.Top_Rank, self)
+    _G.Events:GetInstance():AddListener(_G.eArena.RefreshSeniorView, self.Top_Rank, self)
+    _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.PlayAaction, self.Top_Rank, self)
+end
+
+function PowerToTheTopModel:GetDataFormServer(call)
+    self.valueNum = 0
+    self.PanDuan = false
+    self:AccessRankInfo()
+    -- self:AccessAfkPowerpList()
+
+    if call ~= nil then
+        call()
+    end
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.PowerToTheTopView.Name)
+    if view then
+        view:InitPowerToTheTopItem(1)
+    end
+end
+
+--region
+function PowerToTheTopModel:Top_Rank()
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RankList.id)
+end
+
+--获取放置通关进度
+function PowerToTheTopModel:AccessRankInfo(call)
+    local time = _G.TimeUtil.TranslateTimeForStamp({ year = 2026, month = 3, day = 18 })--2026年3月18日之前的服读旧配置，之后的服读新配置
+    self.isNew = _G.PlayerModel:GetInstance():GetServerOpenTime() >= time
+    --self.isNew = false
+    if self.isNew then
+        rank_list_cfg = _G.ConfigManager.rank_list2_cfg
+        self.curFunctionOpenID = 1010
+    end
+    if self:PowerToTheTopBoll() then
+        -- body
+        PowerToTheTopNet:GetInstance():GetPlayerRankInfo(
+            function(mag)
+                self:TopRankData(mag.top_rank)
+                if call then
+                    call()
+                end
+            end
+        )
+    end
+    base.ParseData(self)
+end
+
+function PowerToTheTopModel:TopRankData(data)
+    self.RankData = {}
+    if data then
+        -- body
+        for _, value in pairs(data) do
+            self.RankData[value.sys_type] = value
+        end
+        --强制使用本地战力数据(不等待服务器战力同步)
+        --但实际领取奖励时需等待同步完成
+        self:MaxZhanLi(true)
+        self:Top_Rank()
+        self:InitAllRank()
+    else
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.PowerToTheTop)
+    end
+end
+
+function PowerToTheTopModel:InitAllRank()
+    if self.RankData then
+        local selfRankType = {}
+        for sysType, v in pairs(self.RankData) do
+            if v.state == 1 then
+                if self.cacheInitRank[sysType] == nil then --首次开启或登录时拉一次
+                    self.cacheInitRank[sysType] = true
+                    if sysType == Top_RankList.afk then
+                        self:AccessTopAfkList()
+                        _G.table.insert(selfRankType, _G.PowerToTheTopType.afk)
+                    elseif sysType == Top_RankList.arena then
+                        self:AccessArena()
+                        _G.table.insert(selfRankType, _G.PowerToTheTopType.arena)
+                    elseif sysType == Top_RankList.dead then
+                        self:AccessTopDeadList()
+                        _G.table.insert(selfRankType, _G.PowerToTheTopType.dead)
+                    elseif sysType == Top_RankList.artifact then
+                        self:AccessTop_artifact()
+                        _G.table.insert(selfRankType, _G.PowerToTheTopType.artifact)
+                    end
+                end
+            end
+        end
+        self:GetNextPlayerRank(selfRankType)
+    end
+end
+
+function PowerToTheTopModel:GetNextPlayerRank(typeLis)
+    local num = _G.table.remove(typeLis, 1)
+    if num == nil then
+        return
+    end
+    self:GetPlayerRank(num, function()
+        self:GetNextPlayerRank(typeLis)
+    end)
+end
+
+--放置阵容历史最强战力
+function PowerToTheTopModel:AccessAfkList(call)
+    PowerToTheTopNet:GetInstance():AccessAfk(call)
+end
+
+--放置通关进度
+function PowerToTheTopModel:AccessTopAfkList(call)
+    PowerToTheTopNet:GetInstance():AccessTopAfk(
+        function(msg)
+            self.cackeRankData[_G.PowerToTheTopType.afk] = msg.ranker or {}
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+--死魂塔挑战进度
+function PowerToTheTopModel:AccessTopDeadList(call)
+    PowerToTheTopNet:GetInstance():AccessTopDead(
+        function(msg)
+            self.cackeRankData[_G.PowerToTheTopType.dead] = msg.ranker or {}
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+--力拔头筹-竞技场积分
+function PowerToTheTopModel:AccessArena(call)
+    PowerToTheTopNet:GetInstance():AccessArena(
+        function(msg)
+            self.cackeRankData[_G.PowerToTheTopType.arena] = msg.ranker or {}
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+--力拔头筹-五行竞技场积分
+function PowerToTheTopModel:AccessEle_arena(call)
+    PowerToTheTopNet:GetInstance():AccessEle_arena(call)
+end
+
+--力拔头筹-高阶竞技场段位
+function PowerToTheTopModel:AccessHigh_arena(call)
+    PowerToTheTopNet:GetInstance():AccessHigh_arena(call)
+end
+
+--力拔头筹-神器积分
+function PowerToTheTopModel:AccessTop_artifact(call)
+    PowerToTheTopNet:GetInstance():AccessTop_artifact(
+        function(msg)
+            self.cackeRankData[_G.PowerToTheTopType.artifact] = msg.ranker or {}
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+--获取历史最高记录
+function PowerToTheTopModel:GetHis_max_value(index)
+    return self.RankData[index] and self.RankData[index].his_max_value or 0
+end
+
+--设置历史最高记录
+function PowerToTheTopModel:SetHis_max_value(index, value)
+    self.RankData[index].his_max_value = value or 0
+end
+
+--设置历史最高记录
+function PowerToTheTopModel:AddHis_max_value(index, num)
+    if self.RankData[index].his_max_value == nil then
+        self.RankData[index].his_max_value = 0
+    end
+    if index == Top_RankList.artifact then
+        self.RankData[index].his_max_value = self.RankData[index].his_max_value + num
+    elseif index == Top_RankList.high_arena then
+        if self.RankData[index].his_max_value == 0 or self.RankData[index].his_max_value > num then
+            self.RankData[index].his_max_value = num
+        end
+    else
+        if self.RankData[index].his_max_value < num then
+            self.RankData[index].his_max_value = num
+        end
+    end
+end
+
+---奖励判断是否以领取
+function PowerToTheTopModel:ISaward_index(index, id)
+    if self.RankData[index].award_index == nil then
+        self.RankData[index].award_index = {}
+    end
+    for _, value in pairs(self.RankData[index].award_index) do
+        if value == id then
+            return true
+        end
+    end
+    return false
+end
+
+--获取是否是新表
+function PowerToTheTopModel:CheckIsNew()
+    return self.isNew
+end
+
+--领取进度奖励
+function PowerToTheTopModel:GetAward(pb, call)
+    PowerToTheTopNet:GetInstance():GetAward(pb, call)
+end
+
+--增加已领取进度奖励
+function PowerToTheTopModel:AddAward(index, data)
+    if self.RankData[index].award_index == nil then
+        self.RankData[index].award_index = {}
+    end
+    _G.table.insert(self.RankData[index].award_index, data)
+    self:RedView(index)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RankList.id)
+end
+
+--获取玩家是否点赞
+function PowerToTheTopModel:GetRole_infoUid(index)
+    if self.RankData == nil or self.RankData[index].point_role == nil then
+        return
+    end
+    return self.RankData[index].point_role
+end
+
+--获取玩家是否点赞
+function PowerToTheTopModel:AddRole_infoUid(index, uid)
+    if self.RankData == nil or self.RankData[index].point_role == nil then
+        self.RankData[index].point_role = {uid}
+    else
+        _G.table.insert(self.RankData[index].point_role, uid)
+    end
+    self:RedView(index)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RankList.id)
+end
+
+--获取历史最高记录
+function PowerToTheTopModel:GetRole_info(index, num)
+    if self.RankData == nil or self.RankData[index].role_info == nil then
+        return
+    end
+    for key, value in pairs(self.RankData[index].role_info) do
+        if num == value.index then
+            return value
+        end
+    end
+    return
+end
+
+--添加历史最高记录
+function PowerToTheTopModel:AddRole_info(index, num)
+    if self.RankData[index].role_info == nil then
+        return
+    end
+    for key, value in pairs(self.RankData[index].role_info) do
+        if value.role_info.uid == num then
+            value.role_info.point = value.role_info.point + 1
+            self:AddRole_infoUid(index, value.role_info.uid)
+            return
+        end
+    end
+end
+
+--领取进度奖励
+function PowerToTheTopModel:GetPoint(pb, call)
+    PowerToTheTopNet:GetInstance():GetPoint(pb, call)
+end
+
+--endregion
+
+--获取放置阵容历史最高战力
+function PowerToTheTopModel:AccessAfkPowerpList(call)
+    PowerToTheTopNet:GetInstance():AccessAfkPowerp(
+        function(mag)
+            ---最高战斗力计算
+            if self.valueNum < mag.value then
+                self.valueNum = mag.value
+            end
+
+            if call ~= nil then
+                call(mag)
+            end
+        end
+    )
+end
+
+--获取单卡历史最高战力
+function PowerToTheTopModel:AccessCardPowerList(call)
+    PowerToTheTopNet:GetInstance():AccessCardPower(call)
+end
+
+--获取玩家在排行榜上的名次
+function PowerToTheTopModel:GetPlayerRank(num, call)
+    local pbData = {type = num}
+    PowerToTheTopNet:GetInstance():GetPlayerRank(pbData, function(msg)
+        if msg.ack == 1 then
+            self.cacheSelfRankValue[num] = {rank = msg.index or 999999, value = msg.value or 0}
+        end
+        if call then
+            call(msg)
+        end
+    end)
+end
+
+--获取放置通关进度
+function PowerToTheTopModel:AccessTopAfkPowerList()
+    local cfg = require "AfkModel":GetInstance():GetPreviousSectionCfg()
+    if cfg then
+        self:AddHis_max_value(Top_RankList.afk, cfg.id)
+    end
+    return cfg
+end
+
+--死魂塔挑战进度
+function PowerToTheTopModel:AccessTopDeadPowerList()
+    self:AddHis_max_value(Top_RankList.dead, require "DeadsoulTowerModel":GetInstance().LandFloor)
+    return require "DeadsoulTowerModel":GetInstance().LandFloor
+end
+
+--竞技场积分
+function PowerToTheTopModel:GetArena()
+    local normal = require "ArenaManager":GetInstance():GetArenaClass(require "ArenaManager".arenaType.normal)
+    if normal == nil then
+        return 0
+    end
+    self:AddHis_max_value(Top_RankList.arena, normal:GetScore())
+    return normal:GetScore()
+end
+
+-- 五行竞技场积分
+function PowerToTheTopModel:GetAwardCount()
+    local normal = require "ArenaManager":GetInstance():GetArenaClass(require "ArenaManager".arenaType.element)
+    if normal == nil then
+        return 0
+    end
+    self:AddHis_max_value(Top_RankList.ele_arena, normal:GetScore())
+    return normal:GetScore()
+end
+
+--高阶竞技场段位
+function PowerToTheTopModel:GetAwardElement()
+    local normal = require "ArenaManager":GetInstance():GetArenaClass(require "ArenaManager".arenaType.senior)
+    local cfg = require "ArenaController":GetInstance():CalculateSeniorLeagueByRank(normal:GetCurRank())
+    if cfg == nil then
+        return 155
+    end
+    self:AddHis_max_value(Top_RankList.high_arena, cfg.id)
+    return cfg.id
+end
+
+--神器积分
+function PowerToTheTopModel:GetArtifact(sid)
+    if self.RankData and self.RankData[Top_RankList.artifact] and self.RankData[Top_RankList.artifact].state == 1 then
+        local cardList = artifact_cfg[sid]
+
+        if cardList == nil then
+            return 0
+        end
+
+        local num = artifact_cfg[sid].count
+        -- for _, value in pairs(cardList) do
+        --     num = num + artifact_cfg[value].count
+        -- end
+        
+        self:AddHis_max_value(Top_RankList.artifact, num)
+        _G.DelayDo(1, function()
+            self:CheckSelfRank(_G.PowerToTheTopType.artifact, self:GetHis_max_value(Top_RankList.artifact))
+        end)
+        return num
+    end
+end
+
+---当前奖励
+function PowerToTheTopModel:CheckIsOpen()
+    if
+        _G.PlayerModel:GetInstance().open_time + (86400 * _G.ConfigManager.discrete_cfg[105301][1][1]) >=
+            _G.TimeUtil.GetServerUnixTime()
+     then
+        return true
+    else
+        return false
+    end
+end
+
+---红点刷新
+function PowerToTheTopModel:hongDianNew()
+    if self.typeCls ~= nil and not self.co then
+        self.co =
+            _G.DelayFrameDo(
+            function()
+                if self.typeCls ~= nil then
+                    self.typeCls:RefreshRedPoint()
+                end
+                self.co = nil
+            end
+        )
+    end
+end
+
+function PowerToTheTopModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eAFKAactionEnum.AfkSectionPass, self.Top_Rank, self)
+    _G.Events:GetInstance():RemoveListener(_G.GlobalEvents.PlayerPowerChange, self.Top_Rank, self)
+    _G.Events:GetInstance():RemoveListener(_G.GlobalEvents.RefreshSeniorView, self.Top_Rank, self)
+    _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.PlayAaction, self.Top_Rank, self)
+
+    if self.co then
+        _G.coroutine.stopwaiting(self.co)
+        self.co = nil
+    end
+end
+
+function PowerToTheTopModel:RedView(id)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.PowerToTheTopView.Name)
+    if view then
+        view:InitRedPoint(id)
+    else
+        self:InitRedPoint(id)
+    end
+end
+
+function PowerToTheTopModel:InitRedPoint(id)
+    local is = 0
+    local CheckFunctionIsUnlock = 0
+    if self.RankData == nil or self.RankData[Top_RankList.artifact] == nil then
+        return is
+    end
+    if rank_list_cfg[id] == nil or rank_list_cfg[id].reveal then
+        return is
+    end
+    if id == Top_RankList.power then
+        if self:ValueNum() == 1 then
+            is = 1
+        end
+    elseif id == Top_RankList.afk then
+        if self:AfkPowerList() == 1 then
+            is = 1
+        end
+    elseif id == Top_RankList.dead then
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.DeadsoulMain) then
+            is = 0
+            CheckFunctionIsUnlock = 1
+        elseif self:DeadPowerList() == 1 then
+            is = 1
+        end
+    elseif id == Top_RankList.arena then
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.PVP) then
+            is = 0
+            CheckFunctionIsUnlock = 1
+        elseif self:GetArenaList() == 1 then
+            is = 1
+        end
+    elseif id == Top_RankList.ele_arena then
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(79) then
+            is = 0
+            CheckFunctionIsUnlock = 1
+        elseif self:GetAwardCountList() == 1 then
+            is = 1
+        end
+    elseif id == Top_RankList.high_arena then
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(51) then
+            is = 0
+            CheckFunctionIsUnlock = 1
+        elseif self:GetHigh_arenaList() == 1 then
+            is = 1
+        end
+    elseif id == Top_RankList.artifact then
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(145) then
+            is = 0
+            CheckFunctionIsUnlock = 1
+        elseif self:GetAwardArtifact() == 1 then
+            is = 1
+        end
+    end
+    --if is == 0 and self.RankData[id].state == 2 and CheckFunctionIsUnlock == 0 then
+    --    local GetRole_infoUid = self:GetRole_infoUid(id)
+    --    if GetRole_infoUid then
+    --        if #GetRole_infoUid < rank_list_cfg[id].praise_num and self.RankData[id].role_info and
+    --            #self.RankData[id].role_info >= rank_list_cfg[id].praise_num then
+    --            is = 1
+    --        end
+    --    else
+    --        if self.RankData[id].role_info and #self.RankData[id].role_info > 0 and
+    --            #self.RankData[id].role_info >= rank_list_cfg[id].praise_num then
+    --            is = 1
+    --        end
+    --    end
+    --end
+    return is
+end
+
+---@param force boolean @是否强制更新数据
+function PowerToTheTopModel:MaxZhanLi(force)
+    local power = _G.PlayerModel:GetInstance():GetCorePower()
+    if power == nil or power == 0 then
+        power = _G.StorageManager:GetInstance():GetPlayerPower()
+    end
+
+    if self.valueNum < power or force then
+        self.PanDuan = true
+        _G.StorageManager:GetInstance():GetServerCardPower(
+            function()
+                self.PanDuan = false
+            end
+        )
+        self.valueNum = power
+        self:AddHis_max_value(Top_RankList.power, self.valueNum)
+        return true
+    end
+    return false
+end
+
+---战斗力红点判断
+function PowerToTheTopModel:ValueNum()
+    if self.RankData[Top_RankList.power].state == 0 or self.RankData[Top_RankList.power].state == 2 then
+        return 0
+    end
+    self:MaxZhanLi()
+    for key, value in pairs(rank_list_cfg[Top_RankList.power].goal) do
+        if self.RankData[Top_RankList.power].his_max_value >= rank_top_cfg[value].min_rank then
+            if self:ISaward_index(Top_RankList.power, key) == false then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---刷图红点判断
+function PowerToTheTopModel:AfkPowerList()
+    if self.RankData[Top_RankList.afk].state == 0 or self.RankData[Top_RankList.afk].state == 2 then
+        return 0
+    end
+    for key, value in pairs(rank_list_cfg[Top_RankList.afk].goal) do
+        local cfg = self:AccessTopAfkPowerList()
+        if cfg == nil then
+            return 0
+        end
+        if cfg.id >= rank_top_cfg[value].min_rank then
+            if self:ISaward_index(Top_RankList.afk, key) == false then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---死魂塔红点判断
+function PowerToTheTopModel:DeadPowerList()
+    if not self.RankData[Top_RankList.dead] then
+        return 0
+    end
+    if self.RankData[Top_RankList.dead].state == 0 or self.RankData[Top_RankList.dead].state == 2 then
+        return 0
+    end
+    for key, value in pairs(rank_list_cfg[Top_RankList.dead].goal) do
+        if self:AccessTopDeadPowerList() >= rank_top_cfg[value].min_rank then
+            if self:ISaward_index(Top_RankList.dead, key) == false then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---竞技场红点判断
+function PowerToTheTopModel:GetArenaList()
+    if self.RankData[Top_RankList.arena].state == 0 or self.RankData[Top_RankList.arena].state == 2 then
+        return 0
+    end
+    for key, value in pairs(rank_list_cfg[Top_RankList.arena].goal) do
+        if self:GetArena() >= rank_top_cfg[value].min_rank then
+            if self:ISaward_index(Top_RankList.arena, key) == false then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---五行竞技场积分
+function PowerToTheTopModel:GetAwardCountList()
+    if self.RankData[Top_RankList.ele_arena].state == 0 or self.RankData[Top_RankList.ele_arena].state == 2 then
+        return 0
+    end
+    for key, value in pairs(rank_list_cfg[Top_RankList.ele_arena].goal) do
+        if self:GetAwardCount() >= rank_top_cfg[value].min_rank then
+            if self:ISaward_index(Top_RankList.ele_arena, key) == false then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---高阶竞技场段位
+function PowerToTheTopModel:GetHigh_arenaList()
+    if self.RankData[Top_RankList.high_arena].state == 0 or self.RankData[Top_RankList.high_arena].state == 2 then
+        return 0
+    end
+    for key, value in pairs(rank_list_cfg[Top_RankList.high_arena].goal) do
+        if self:GetAwardElement() <= rank_top_cfg[value].min_rank then
+            if self:ISaward_index(Top_RankList.high_arena, key) == false then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---神器积分
+function PowerToTheTopModel:GetAwardArtifact()
+    if self.RankData[Top_RankList.artifact].state == 0 or self.RankData[Top_RankList.artifact].state == 2 then
+        return 0
+    end
+    for key, value in pairs(rank_list_cfg[Top_RankList.artifact].goal) do
+        if self:GetHis_max_value(Top_RankList.artifact) >= rank_top_cfg[value].min_rank then
+            if self:ISaward_index(Top_RankList.artifact, key) == false then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+function PowerToTheTopModel:HongDianNew(go, tab)
+    -- self:MaxZhanLi()
+    -- local rank_top_cfg = _G.ConfigManager.rank_top_cfg
+    -- for key, value in pairs(rank_top_cfg) do
+    --     if value.type_rank == 4 then
+    --         if self.valueNum >= value.min_rank then
+    --             if self:JiangLiPanDuan(value.id) == false then
+    --                 return true
+    --             end
+    --         end
+    --     elseif value.type_rank == 5 then
+    --         if self:AccessTopAfkPowerList().id >= value.min_rank then
+    --             if self:JiangLiPanDuan(value.id) == false then
+    --                 return true
+    --             end
+    --         end
+    --     elseif value.type_rank == 6 then
+    --         if self:AccessTopDeadPowerList() >= value.min_rank then
+    --             if self:JiangLiPanDuan(value.id) == false then
+    --                 return true
+    --             end
+    --         end
+    --     end
+    -- end
+    return false
+end
+
+function PowerToTheTopModel:GetFreeTimes()
+    local num = 0
+    for key, value in pairs(Top_RankList) do
+        if self:InitRedPoint(value) == 1 and num == 0 then
+            num = 1
+        end
+    end
+    return num
+end
+
+--是否显示
+function PowerToTheTopModel.PowerToTheTopPanDuan()
+    return require("PowerToTheTopModel"):GetInstance():PowerToTheTopBoll()
+end
+
+function PowerToTheTopModel:PowerToTheTopBoll()
+    local isAllOver = false
+    if self:CheckIsNew() then
+        isAllOver = true
+        for _, v in pairs(_G.ConfigManager.rank_list2_cfg) do
+            local endTime = _G.PlayerModel:GetInstance().open_time + v.end_time * 3600
+            if _G.TimeUtil.GetServerUnixTime() < endTime then
+                isAllOver = false
+            end
+        end
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) or isAllOver then
+        if self.PowerToTheTop == nil then
+            self.PowerToTheTop = true
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.PowerToTheTopView.Name)
+            if view then
+                _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.PowerToTheTopView.Name)
+            end
+            _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.PowerToTheTop)
+        end
+        return false
+    end
+
+    if
+        _G.PlayerModel:GetInstance().open_time + _G.ConfigManager.activity_info_cfg[1000002].time_duration >=
+            _G.TimeUtil.GetServerUnixTime()
+     then
+        self.PowerToTheTop = nil
+        return true
+    end
+    if self.PowerToTheTop == nil then
+        self.PowerToTheTop = true
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.PowerToTheTopView.Name)
+        if view then
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.PowerToTheTopView.Name)
+        end
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.PowerToTheTop)
+    end
+    return false
+end
+
+function PowerToTheTopModel:CheckSelfRank(type, value)
+    local sysType = ConvertSysType[type]
+    if self.RankData == nil or self.RankData[sysType] == nil or self.RankData[sysType].state ~= 1 then
+        return
+    end
+    local oldRank = self.cacheSelfRankValue[type]
+    if oldRank == nil then
+        return
+    end
+    if value < oldRank.value then
+        return
+    end
+    oldRank.value = value
+    if self.cackeRankData[type] == nil then
+        return
+    end
+    local newRank
+    for i, v in pairs(self.cackeRankData[type]) do
+        if value > v.value then
+            newRank = i
+            break
+        end
+    end
+    if newRank then
+        if newRank < oldRank.rank or oldRank.rank == 0 then
+            oldRank.rank = newRank
+            local lanID = SelfRankLanId[type] or 0
+            local content = _G.GetLangPackValue(lanID, newRank)
+            require("CommonTipManager").OpenRankUpView(content)
+        end
+    end
+end
+
+return PowerToTheTopModel

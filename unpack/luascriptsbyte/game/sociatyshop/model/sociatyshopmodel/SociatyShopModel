@@ -1,0 +1,295 @@
+-----------------------------------------------------------------------
+-- E:.H5_Client.H5_AlphaJt.Client.Assets.Resources.LuaScripts.Game.SociatyShop.Model.SociatyShopModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2025/06/26
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+---@class SociatyShopModel : Singleton	中文描述
+local SociatyShopModel = _G.BaseClass("SociatyShopModel", _G.GameDataModelBase)
+
+---@return SociatyShopModel SociatyShopModel
+function SociatyShopModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SociatyShopModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.SociatyShop
+    ---当前商品状态
+    self.GoodsStatusEnum = {
+        CanBargain = 0,
+        CanPurchase = 1,
+        Purchased = 2
+    }
+    self.goods = {}
+end
+
+function SociatyShopModel:ReConnect(endcall)
+    self:InitData(endcall)
+end
+
+function SociatyShopModel:GetDataFormServer()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        self.super.ParseData(self)
+        return
+    end
+
+    --local serverTime = _G.TimeUtil.GetServerUnixTime()
+    --local shopStartTime, shopEndTime = require("SociatyShopModel"):GetInstance():GetTime()
+    ----结束时间提前5秒，防止踩点拉数据
+    --if _G.AppSetting.IsXzns then
+    --    shopEndTime = shopEndTime - 5
+    --end
+    --if serverTime >= shopStartTime and serverTime < shopEndTime then
+    --else
+    --    self.super.ParseData(self)
+    --end
+    require("SociatyShopNet"):GetInstance():GetInfo(_G.handler(self, self.ParseData))
+    self:SetShopTimer()
+end
+
+function SociatyShopModel:ParseData(msg)
+    if msg.ack ~= 1 then
+        self.super.ParseData(self)
+        return
+    end
+
+    ---砍价次数
+    self.count = msg.count or 0
+    ---购买次数
+    self.buyCount = msg.buy_count or 0
+    ---商人商品信息,price:价格放大十倍,最后一位代表正负(0-负, 1-正)
+    self.goods = msg.goods or {}
+    self.super.ParseData(self)
+
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyShopBargain.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyShopBuy.id)
+end
+
+function SociatyShopModel:SetShopTimer()
+    if self.shopTimer then
+        self.shopTimer:Stop()
+        self.shopTimer = nil
+    end
+
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local shopStartTime, shopEndTime = self:GetTime()
+
+    local delay = 0
+    if serverTime < shopStartTime then
+        delay = shopStartTime - serverTime
+    else
+        delay = shopEndTime - serverTime
+    end
+    self.shopTimer = _G.TimerManager:GetInstance():GetTimer(delay, self.RefreshShopTime, self, true, false)
+    self.shopTimer:Start()
+end
+
+function SociatyShopModel:RefreshShopTime()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local shopStartTime, shopEndTime = self:GetTime()
+    --结束时间提前5秒，防止踩点拉数据
+    if _G.AppSetting.IsXzns then
+        shopEndTime = shopEndTime - 5
+    end
+    if serverTime >= shopStartTime and serverTime < shopEndTime then
+        require("SociatyShopNet"):GetInstance():GetInfo(_G.handler(self, self.ParseData))
+    else
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyShopBargain.id)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyShopBuy.id)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefreshSociatyShop)
+    self:SetShopTimer()
+end
+
+---当前商品对应的工会等级
+function SociatyShopModel:GetSociatyLevel()
+    return self.goods.lv or 1
+end
+
+---获取当前商品的实际价格
+function SociatyShopModel:GetPrice()
+    if self.goods.price then
+        local flag = self.goods.price % 10
+        if flag == 0 then
+            return self.goods.price // -10
+        else
+            return self.goods.price // 10
+        end
+    end
+    return nil
+end
+
+---获取公会砍价人数
+function SociatyShopModel:GetBargainNum()
+    return self.goods.guild_num or 0
+end
+
+---砍价详细信息
+function SociatyShopModel:GetBargainList()
+    return self.goods.list or {}
+end
+
+---砍价详细信息
+function SociatyShopModel:GetBuyList()
+    return self.goods.buy_list or {}
+end
+
+---当前状态0-砍价 1-可购买 2-已购买
+function SociatyShopModel:GetGoodsStatus()
+    local cfg = _G.ConfigManager.discrete_cfg[124301]
+    ---是否砍价(达到最大砍价人数后就不能砍价了)
+    local isBargain = self.count >= cfg[3][1] or self:MaxBargain()
+
+    if isBargain then
+        if self.buyCount >= cfg[4][1] then
+            return self.GoodsStatusEnum.Purchased
+        end
+
+        return self.GoodsStatusEnum.CanPurchase
+    end
+    return self.GoodsStatusEnum.CanBargain
+end
+
+function SociatyShopModel:CheckBargain()
+    return self:GetGoodsStatus() == self.GoodsStatusEnum.CanBargain
+end
+
+function SociatyShopModel:MaxBargain()
+    local memberCount = require("SociatyModel"):GetInstance().SociatySelf.SociatyMemberModule:GetMaxMemberNum()
+    return self:GetBargainNum() >= memberCount
+end
+
+---是否购买商品
+function SociatyShopModel:CheckBuy(uid)
+    return _G.table.indexof(self:GetBuyList(), uid)
+end
+
+---获取开始时间和结束时间
+function SociatyShopModel:GetTime(serverTime)
+    if not serverTime then
+        serverTime = _G.TimeUtil.GetServerUnixTime()
+    end
+    local cfg = _G.ConfigManager.discrete_cfg[124301]
+    local begin = _G.TimeUtil.GetDayBegin(serverTime)
+    return begin + cfg[1][1] * 3600, begin + cfg[2][1] * 3600
+end
+
+---公会旅行商人-砍价
+function SociatyShopModel:SendBargain(callback)
+    require("SociatyShopNet"):GetInstance():SendBargain(_G.handlerbind(self, self.OnBargainSuc, callback))
+end
+
+function SociatyShopModel:OnBargainSuc(msg, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+
+    self.count = self.count + 1
+    self.goods = msg.goods
+
+    ---砍价成功的提示
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    for _, v in pairs(self:GetBargainList()) do
+        if v.uid == uid then
+            _G.PopWindowManager:GetInstance():ShowAllTips(825, nil, nil, nil, nil, nil, v.price)
+            break
+        end
+    end
+
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyShopBargain.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyShopBuy.id)
+    if callback then
+        callback()
+    end
+end
+
+---公会旅行商人-购买
+function SociatyShopModel:SendBuy(sid, callback)
+    require("SociatyShopNet"):GetInstance():SendBuy(_G.handlerbind(self, self.OnBuySuc, sid, callback))
+end
+
+function SociatyShopModel:OnBuySuc(msg, sid, callback)
+    if msg.ack ~= 1 then
+        if msg.ack == 2 then
+            ---获取不足弹获取路径
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, sid)
+        end
+        return
+    end
+
+    if msg.award then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+    end
+    if msg.consume then
+        for _, v in pairs(msg.consume) do
+            _G.StorageManager:GetInstance():ConsumeItem(v.k, v.k, v.v)
+        end
+    end
+
+    self.buyCount = self.buyCount + 1
+    self.goods = msg.goods
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyShopBuy.id)
+    if callback then
+        callback()
+    end
+end
+
+---红点
+---砍价红点
+function SociatyShopModel:CheckBargainRedPoint()
+    if not self.count then
+        return 0
+    end
+
+    if self:MaxBargain() then
+        return 0
+    end
+
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local shopStartTime, shopEndTime = require("SociatyShopModel"):GetInstance():GetTime()
+    if serverTime >= shopStartTime and serverTime < shopEndTime then
+        local cfg = _G.ConfigManager.discrete_cfg[124301]
+        return self.count < cfg[3][1] and 1 or 0
+    end
+
+    return 0
+end
+
+---购买红点
+function SociatyShopModel:CheckBuyRedPoint()
+    local price = self:GetPrice()
+    if not price then
+        return 0
+    end
+
+    local cfg = _G.ConfigManager.discrete_cfg[124301]
+    if self.buyCount and self.buyCount >= cfg[4][1] then
+        return 0
+    end
+
+    local cfg = _G.ConfigManager.guild_level_cfg[self:GetSociatyLevel()]
+    if not cfg or not cfg.recommend then
+        return 0
+    end
+
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local shopStartTime, shopEndTime = require("SociatyShopModel"):GetInstance():GetTime()
+    if (self:MaxBargain() or not self:CheckBargain()) and serverTime >= shopStartTime and serverTime < shopEndTime then
+        return price <= cfg.recommend and 1 or 0
+    end
+    return 0
+end
+
+---销毁对象时,析构函数
+function SociatyShopModel:Dispose()
+    self.goods = {}
+    if self.shopTimer then
+        self.shopTimer:Stop()
+        self.shopTimer = nil
+    end
+end
+
+return SociatyShopModel

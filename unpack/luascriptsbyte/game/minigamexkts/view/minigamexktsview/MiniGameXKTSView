@@ -1,0 +1,488 @@
+local SwordCasual_MapControll = require("SwordCasual_MapControll")
+local SwordCasual_Utils = require("SwordCasual_Utils")
+
+local NumberImages = {
+    "ui_hbdj_djs_1",
+    "ui_hbdj_djs_2",
+    "ui_hbdj_djs_3",
+}
+
+---@class MiniGameXKTSView : UIBaseView	虚空吞噬_战斗页面
+---@field go_table MiniGameXKTSView_GoTable
+-----------------------------------------------------------------------
+---@field cfg xkts_stage_cfg
+---@field stageIndex number
+---@field callback fun(win:boolean,time:number):void
+---@field time number                               @剩余时间
+---@field initTime number                           @初始化时间
+-----------------------------------------------------------------------
+---@field mapControll SwordCasual_MapControll       @地图控制器, 直接使用剑之修行的类
+---@field rolePosition {x:number,y:number}          @主角当前位置
+---@field roleExp number                            @主角经验
+---@field roleLv number                             @主角等级
+---@field roleLevels number[]                       @主角升级所需经验
+---@field roleAttackRange number                    @主角攻击范围
+-----------------------------------------------------------------------
+---@field monsterRow number                         @一行多少个
+---@field monsterRemain number                      @剩余怪物数量
+---@field monsterDatas xkts_role_cfg[]
+---@field monsterItems MiniGameXKTSView_MonsterItem[]
+---@field monsterSpecial table<number,number>       @特殊怪物索引
+-----------------------------------------------------------------------
+---@field mainLoop Timer                            @主循环定时器
+---@field pause boolean                             @是否暂停游戏
+---@field joystick ETCJoystick                      @移动摇杆组件
+---@field direction {x:number,y:number}             @摇杆方向
+local MiniGameXKTSView = _G.BaseClass("MiniGameXKTSView", _G.UIBaseView)
+
+function MiniGameXKTSView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+function MiniGameXKTSView:OnDestroy()
+    --移除摇杆事件
+    if self.joystick then
+        self.joystick.onMove:RemoveAllListeners()
+        self.joystick.onMoveEnd:RemoveAllListeners()
+        self.joystick = nil
+    end
+    --移除定时器
+    if self.mainLoop then
+        self.mainLoop:Stop()
+        self.mainLoop = nil
+    end
+
+    --清理怪物资源
+    self:ClearMonsterItems(false)
+end
+
+---界面的入口函数
+---@param stageIndex number @关卡序号
+---@param cfg xkts_stage_cfg
+---@param callback fun(win:boolean,time:number):void     @是否胜利/击杀数量/总耗时时间
+function MiniGameXKTSView:OnCreate(stageIndex, cfg, callback)
+    self.stageIndex = stageIndex
+    self.cfg = cfg
+    self.callback = callback
+    self.time = cfg.time_limit
+    self.initTime = 3
+
+    --初始化地图
+    self.mapControll =
+        self:AddComponent(self.go_table.obj_mapRoot, SwordCasual_MapControll.New(self.go_table.obj_mapRoot))
+
+    --初始化怪物数据
+    ---@type table<number,number>
+    local monsterLevels = {}
+    local row, column = cfg.num[1], cfg.num[2]
+    self.monsterRow = row
+    self.monsterDatas = {}
+    self.monsterItems = {}
+    self.monsterRemain = row * column
+    for c = 1, column do
+        for r = 1, row do
+            local _index = cfg.monster_position_type == 0 and r or c
+            local ids = cfg.monster_type[_index] or cfg.monster_type[# cfg.monster_type]
+            local cfg = _G.ConfigManager.xkts_role_cfg[ids[math.random(1, #ids)]]
+            table.insert(self.monsterDatas, cfg)
+            if cfg then
+                monsterLevels[cfg.lv] = (monsterLevels[cfg.lv] or 0) + 1
+            end
+        end
+    end
+    -- 特殊怪物
+    self.monsterSpecial = {}
+    for i = 1, cfg.special_monster_num do
+        local index = math.random(1, #self.monsterDatas)
+        if not self.monsterSpecial[index] then
+            self.monsterSpecial[index] = true
+        end
+    end
+
+    --初始化角色数据
+    local x, y = self.go_table.trans_master:GetLocalPosition()
+    self.roleExp = 0
+    self.roleLv = 1
+    self.roleLevels = {}
+    self.rolePosition = { x = x, y = y }
+    self.roleAttackRange = 100
+    for lv, count in ipairs(monsterLevels) do
+        local everyExp = lv == 1 and 6 or lv == 2 and 16 or 32
+        self.roleLevels[lv] = count * everyExp
+    end
+
+    self:InitView()
+    --初始化摇杆
+    self:InitJoystick()
+
+    --初始化主循环
+    self.mainLoop = _G.TimerManager:GetInstance():GetTimer(1, self.Update, self, false, true)
+    self.mainLoop:Start()
+
+    --直接初始化所有节点状态
+    if not self.initTime or self.initTime < 0 then
+        self:InitMonsterItems(9999)
+        self:ShowMonsterItems()
+        self.go_table.obj_countdown:SetActiveE(0)
+    else
+        self.go_table.obj_countdown:SetActiveE(1)
+        self:UpdateCountDownTime()
+    end
+
+    self:UpdateTime()
+    self:UpdateRoleExp()
+    self:UpdateMonsterNumber()
+end
+
+---主循环事件
+function MiniGameXKTSView:Update()
+    --暂停游戏逻辑更新
+    if self.pause then
+        return
+    end
+
+    local dt = _G.Time.deltaTime
+
+    --初始化时间
+    if self.initTime >= 0 then
+        self.initTime = self.initTime - dt
+        --初始化怪物模型, 每次一个
+        self:InitMonsterItems(1)
+        self:UpdateCountDownTime()
+        --如果到最后一秒仍没有初始化完成, 则初始化剩余全部节点
+        if self.initTime < 0 then
+            self:InitMonsterItems(9999)
+            self:ShowMonsterItems()
+            self.go_table.obj_countdown:SetActiveE(0)
+        end
+        return
+    end
+
+    --时间计数
+    self.time = self.time - dt
+    self:UpdateTime()
+
+    if self.time <= 0 then
+        --时间耗尽, 游戏结束
+        self:Finish()
+        return
+    end
+
+    --主角移动(实际相对移动地图)
+    if self.direction.x ~= 0 or self.direction.y ~= 0 then
+        local delta = 300 * dt
+        self.mapControll:SetDirection(self.direction)
+        self.mapControll:UpdatePosition(delta)
+    end
+
+    --计算吞噬规则
+    for i, monsterItem in pairs(self.monsterItems) do
+        if monsterItem and monsterItem.cfg then
+            if monsterItem.cfg.lv <= self.roleLv or self.monsterSpecial[i] then
+                --判断距离
+                local x, y = self.mapControll:GetPosition()
+                x = x + monsterItem.position.x
+                y = y + monsterItem.position.y
+                local magnitude = SwordCasual_Utils.Physics:magnitude(self.rolePosition, { x = x, y = y })
+                if magnitude <= self.roleAttackRange then
+                    if monsterItem.cfg.lv <= self.roleLv then
+                        --吞噬
+                        self.roleExp = self.roleExp + monsterItem.cfg.exp
+                        self:UpdateRoleExp()
+                        self:ReleaseMonsterItem(monsterItem)
+                        self.monsterRemain = self.monsterRemain - 1
+                        self:UpdateMonsterNumber()
+
+                        if self.monsterRemain <= 0 then
+                            self:Finish()
+                        end
+                    else
+                        --遇到特殊敌人(直接失败)
+                        self:Finish()
+                    end
+                end
+            end
+        end
+    end
+end
+
+--region ===================初始化/清理===================
+
+--初始化页面信息
+function MiniGameXKTSView:InitView()
+    self.go_table.aortext_name.text = _G.GetLangPackValue(90049100011, self.stageIndex)
+end
+
+---初始化摇杆组件
+function MiniGameXKTSView:InitJoystick()
+    local joystick = self.go_table.obj_move:GetComponentE(_G.typeof(_G.CS.ETCJoystick))
+    self.direction = { x = 0, y = 0 }
+    self.joystick = joystick
+
+    joystick.onMove:AddListener(
+        function(vec2)
+            self.direction.x = vec2.x
+            self.direction.y = vec2.y
+            --归一化处理
+            local len = math.sqrt(self.direction.x ^ 2 + self.direction.y ^ 2)
+            if len > 0.0001 then
+                self.direction.x = self.direction.x / len
+                self.direction.y = self.direction.y / len
+            else
+                self.direction.x = 0
+                self.direction.y = 0
+            end
+            --_G.LogError("onMove: " .. self.direction.x .. ", " .. self.direction.y)
+        end
+    )
+    joystick.onMoveEnd:AddListener(
+        function()
+            self.direction.x = 0
+            self.direction.y = 0
+            --_G.LogError("onMoveEnd: ")
+        end
+    )
+end
+
+---初始化怪物Item
+---@param count number @此次处理怪物数量, 默认9999
+---@return boolean      @是否有剩余待处理节点
+function MiniGameXKTSView:InitMonsterItems(count)
+    count = math.max(count or 9999, 1)
+
+    for i = 1, #self.monsterDatas do
+        local item = self.monsterItems[i]
+        if not item then
+            item = {
+                go_table = _G.GetAutoGoTable(_G.InstantiateObject(
+                    self.go_table.trans_role,
+                    self.mapControll:GetRoleParent()
+                ))
+            }
+            self.monsterItems[i] = item
+            item.go_table.gameObject:SetActiveE(0) --默认隐藏
+            --设置节点位置
+            local x, y = self:GetMonsterPosition(i)
+            item.position = { x = x, y = y }
+            item.go_table.gameObject:SetLocalPosition(x, y, 0)
+            --设置数据并加载模型
+            local cfg = self.monsterDatas[i]
+            item.cfg = cfg
+            item.model = nil
+            self:UpdateMonsterItem(item, self.monsterSpecial[i])
+
+            if _G.AppSetting.DEBUG then
+                item.go_table.gameObject:SetName(tostring(i))
+            end
+
+            count = count - 1
+            if count <= 0 then
+                break
+            end
+        end
+    end
+    return count <= 0
+end
+
+---清理怪物Item
+---@param destroyed boolean 是否销毁Item节点, 默认(false)
+function MiniGameXKTSView:ClearMonsterItems(destroyed)
+    for i = 1, #self.monsterDatas do
+        local item = self.monsterItems[i]
+        if item then
+            self.monsterItems[i] = nil
+            self:ReleaseMonsterItem(item)
+            if destroyed then
+                _G.DestroyObject(item.gameObject)
+            end
+        end
+    end
+end
+
+---显示所有怪物Item
+function MiniGameXKTSView:ShowMonsterItems()
+    for i = 1, #self.monsterDatas do
+        local item = self.monsterItems[i]
+        if item then
+            item.go_table.gameObject:SetActiveE(1)
+        end
+    end
+end
+
+---释放怪物Item
+---@param monsterItem MiniGameXKTSView_MonsterItem
+function MiniGameXKTSView:ReleaseMonsterItem(monsterItem)
+    monsterItem.go_table.aortext_level.text = nil
+    monsterItem.cfg = nil
+    if monsterItem.model then
+        _G.PoolsManager:GetInstance():Despawn(monsterItem.model, _G.ePoolType.Temporary)
+        monsterItem.model = nil
+    end
+end
+
+---更新怪物Item
+---@param monsterItem MiniGameXKTSView_MonsterItem
+---@param isSpecial boolean      @是否为特殊怪物
+function MiniGameXKTSView:UpdateMonsterItem(monsterItem, isSpecial)
+    local cfg = monsterItem.cfg
+    --怪物信息
+    monsterItem.go_table.aortext_level.text = _G.GetLangPackValue(90031900006, cfg.lv)
+
+    ---加载模型
+    if not monsterItem.model and monsterItem.model ~= false then
+        monsterItem.model = false
+        _G.PoolsManager:GetInstance():Spawn(
+            cfg.spine_path,
+            _G.ePoolType.Temporary,
+            monsterItem.go_table.trans_model,
+            function(trans)
+                if not monsterItem.go_table or monsterItem.cfg ~= cfg or monsterItem.model then
+                    _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.Temporary)
+                    return
+                end
+                trans:SetLocalScaleXYZ(cfg.role_scale or 1)
+                trans:SetLocalPositionToZero()
+                monsterItem.model = trans
+            end
+        )
+    end
+end
+
+--endregion
+
+--region ===================逻辑处理===================
+
+---设置是否暂停游戏
+---@param pause boolean
+function MiniGameXKTSView:SetPause(pause)
+    self.pause = pause
+end
+
+---游戏结束
+function MiniGameXKTSView:Finish()
+    self:SetPause(true)
+
+    if self.callback then
+        self.callback(self.monsterRemain <= 0, self.time)
+    end
+end
+
+---获取怪物位置
+---@param index number @怪物索引
+---@return number,number @怪物位置x,y
+function MiniGameXKTSView:GetMonsterPosition(index)
+    local row, column = self.cfg.num[1], self.cfg.num[2]
+    local centerX, centerY = self.cfg.position[1] or 0, self.cfg.position[2] or 0 --center是中心方块的坐标
+    local spacingX, spacingY = self.cfg.gap[1] or 100, self.cfg.gap[2] or 100
+
+    --TODO: 测试用代码
+    --centerX = 0
+    --centerY = 500
+
+    local x = centerX + ((index - 1) % column - math.floor(column * 0.5)) * spacingX
+    local y = centerY + (math.floor((index - 1) / column) - math.floor(row * 0.5)) * spacingY
+    return x, y
+end
+
+---更新角色经验ui
+function MiniGameXKTSView:UpdateRoleExp()
+    local isUpgrade = false
+
+    local nextExp = self.roleLevels[self.roleLv] or 0
+    while nextExp > 0 and self.roleExp > nextExp do
+        isUpgrade = true
+        self.roleExp = self.roleExp - nextExp
+        self.roleLv = self.roleLv + 1
+        --攻击距离和渲染块大小: 升级
+        self.roleAttackRange = self.roleAttackRange * self.cfg.scale
+        local sx, sy = self.go_table.trans_master:GetLocalScale()
+        self.go_table.trans_master:SetLocalScale(
+            sx * self.cfg.scale,
+            sy * self.cfg.scale,
+            0
+        )
+
+        --下一级所需经验值
+        nextExp = self.roleLevels[self.roleLv] or 0
+    end
+
+    --播放升级特效
+    if isUpgrade then
+    end
+
+    --ui信息
+    self.go_table.aorimage_lvProgress:SetLocalScale(nextExp > 0 and (self.roleExp / nextExp) or 1, 1, 1)
+    self.go_table.aortext_exp.text = string.format("%d/%d", self.roleExp, nextExp)
+    self.go_table.aortext_lv.text = _G.GetLangPackValue(9002010022, self.roleLv)
+end
+
+---更新显示剩余怪物数量
+function MiniGameXKTSView:UpdateMonsterNumber()
+    self.go_table.aortext_remainMonster.text = _G.GetLangPackValue(90022900073) .. tostring(self.monsterRemain)
+end
+
+--endregion
+
+---更新显示时间UI
+function MiniGameXKTSView:UpdateTime()
+    self.go_table.aortext_time.text = _G.TimeUtil.TimeToString(math.ceil(self.time), 2)
+end
+
+---更新倒计时文本
+function MiniGameXKTSView:UpdateCountDownTime()
+    local index = math.ceil(self.initTime)
+    if index < 1 then
+        index = 1
+    elseif index > #NumberImages then
+        index = #NumberImages
+    end
+    self.go_table.aorimage_countdown.SpriteName = NumberImages[index]
+end
+
+---帮助按钮是否显示
+---@param isActive boolean @是否显示
+function MiniGameXKTSView:SetHelpButtonActive(isActive)
+    self.go_table.aorbtn_help:SetActiveE(isActive and 1 or 0)
+end
+
+---设置按钮是否显示
+---@param isActive boolean @是否显示
+function MiniGameXKTSView:SetSettingsButtonActive(isActive)
+    self.go_table.aorbtn_settings:SetActiveE(isActive and 1 or 0)
+end
+
+---关闭按钮是否显示
+---@param isActive boolean @是否显示
+function MiniGameXKTSView:SetCloseButtonActive(isActive)
+    self.go_table.aorbtn_CloseView:SetActiveE(isActive and 1 or 0)
+end
+
+---按钮点击事件在这里派发
+function MiniGameXKTSView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_CloseView or go == self.go_table.aorbtn_settings then
+        --弹窗确认
+        self:SetPause(true)
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            1140004,
+            nil,
+            _G.handler(self, self.Close),
+            function()
+                self:SetPause(false)
+            end
+        )
+    elseif go == self.go_table.aorbtn_help then
+        self:SetPause(true)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 187, function()
+            self:SetPause(false)
+        end)
+    end
+end
+
+---类型提示
+---@class MiniGameXKTSView_MonsterItem
+---@field go_table MiniGameXKTSView._trans_role_GoTable @节点表
+---@field cfg xkts_role_cfg @角色配置
+---@field model UnityEngine.Transform @模型节点
+---@field position {x:number,y:number} @模型节点位置
+
+return MiniGameXKTSView

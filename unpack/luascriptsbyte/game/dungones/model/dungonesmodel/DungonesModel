@@ -1,0 +1,1198 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Dungones.Model.DungonesModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/01/05
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local RankItemData = require("LingRankItemData")
+---@class DungonesModel : GameDataModelBase	中文描述
+---@field DungonesInfo roguelike.s2c_roguelike_info
+local DungonesModel = _G.BaseClass("DungonesModel", _G.GameDataModelBase)
+local rankMax = 100
+---创建对象时,入口构造函数
+---@param bossSkillRandom table boss 随机 技能
+function DungonesModel:__init()
+    self.isTime = false -- 在千机 界面中 使用 （战斗中，点击其他的）
+    self.endCallback = nil
+    self.curFunctionOpenID = 41
+    self.hit_rate_question = 0
+    self.hit_cuowu_question = 0
+    self.awardData = {}
+    self.rank_all_player = {}
+    self.rankpage = 1
+    self.rankTotalPage = 5
+    self.isInitPrivilege = false
+    self.rebirth = 0
+    self.maxCount = 0
+    self.bossSkillRandom = {}
+    self.isRedHint = false
+    ---遗物列表
+    self.MementosList = {}
+    self:SetBossRandomSkill()
+    _G.Events:GetInstance():AddListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.UpdateRebirth, self)
+end
+
+---@return DungonesModel DungonesModel
+function DungonesModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+function DungonesModel:Dispose()
+    self.hit_rate_question = nil
+    self.awardData = nil
+    self.rank_all_player = nil
+    self.rankpage = nil
+    self._sid = nil
+    self.rankTotalPage = nil
+    self.isRedHint = nil
+end
+
+function DungonesModel:GetDataFormServer()
+    self:GetDungonesInfo()
+end
+
+function DungonesModel:InitFunction()
+    self.isTime = false --活动倒计时 重置 （战斗中，选择光卡界面）
+    --登录游戏时会，获得援助卡牌， 援助卡牌身上有装备时，会算入仓库中
+    self:ClealAidCardEquip()
+    --刷新红点
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Dungones.id)
+end
+
+---boss 随机 技能
+function DungonesModel:SetBossRandomSkill()
+    local bossid = _G.ConfigManager.discrete_cfg[103404][1][1]
+    local cfg = _G.ConfigManager.adventure_cfg
+    local num = cfg[bossid].event_params[1][1] -- 技能个数
+    local skills = cfg[bossid].event_params[2]
+    for i = 1, #skills do
+        local random = math.random(1, #skills)
+        if _G.table.isEmptyOrNil(self.bossSkillRandom) then
+            _G.table.insert(self.bossSkillRandom, random)
+        else
+            if random ~= self.bossSkillRandom[1] then
+                _G.table.insert(self.bossSkillRandom, random)
+            end
+        end
+        if #self.bossSkillRandom >= num then
+            break
+        end
+    end
+end
+
+---拿千机数据
+function DungonesModel:GetDungonesInfo(call)
+    if require("DungonesManager"):GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Dungones) then
+        local DungonesNet = require("DungonesNet")
+        DungonesNet:GetInstance():GetInfo(_G.handlerbind(self, self.ParseData, call))
+    else
+        self:ParseData()
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=#ff0000>不满足公会开放等级，拿到不公会数据</color>")
+        end
+    end
+end
+
+function DungonesModel:GetServerData(call)
+    if require("DungonesManager"):GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Dungones) then
+        local DungonesNet = require("DungonesNet")
+        DungonesNet:GetInstance():GetInfo(_G.handlerbind(self, self.ParseData, call))
+    end
+end
+
+function DungonesModel:UpdateRebirth()
+    local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({_G.PrivilegeType.Dungones.Rebirth})
+    if data[1] then
+        self.rebirth = data[1] - self.DungonesInfo.rebirth
+    else
+        self.rebirth = 0
+    end
+end
+
+---初始化遗物数据，用于战力数据加成显示
+function DungonesModel:InitMementos(mementos)
+    self.MementosList = {}
+    for key, value in pairs(mementos) do
+        _G.table.insert(self.MementosList, value)
+    end
+end
+
+---外部调用方法,遗物战力加成
+---@return num  number 遗物战力加持百分比
+function DungonesModel:AddPower()
+    if _G.table.isEmptyOrNil(self.MementosList) then
+        return 0
+    end
+    local num = 0
+    local cfg = _G.ConfigManager.mementos_cfg
+    for key, value in pairs(self.MementosList) do
+        --占据百分比计算
+        local precent = tonumber(cfg[value].power_mul / 10000)
+        num = num + precent
+    end
+    return num
+end
+
+---数据回调
+---@param msg roguelike.s2c_roguelike_info 千机相关数据
+function DungonesModel:ParseData(msg, call)
+    if msg then
+        if msg.status == 1 then
+            self.isTime = false
+        end
+        if not _G.table.isEmptyOrNil(msg.mementos) then
+            self:InitMementos(msg.mementos)
+        end
+        self.DungonesInfo = msg
+
+        if _G.AppSetting.DEBUG then
+            _G.Log(msg.status, "当前千机黑刹的开启状态是>>>>>>>")
+        end
+        if not self.DungonesInfo.is_top then
+            self.DungonesInfo.is_top = -1
+        end
+        if self.DungonesInfo.adventures then
+            _G.SortList(
+                self.DungonesInfo.adventures,
+                function(item)
+                    return -item.section_sid
+                end
+            )
+        else
+            self.DungonesInfo.adventures = {}
+        end
+        --self:InitCollect()
+        self:UpdateRebirth()
+        self:InitHyAward()
+        if self.DungonesInfo.adventures then
+            for i = 1, #self.DungonesInfo.adventures do
+                if _G.AppSetting.DEBUG then
+                    _G.Log(self.DungonesInfo.adventures[i], "事件单条信息")
+                end
+            end
+        end
+
+        ---由引导配置触发式来完成调用，暂无需手动调用
+        --镇魂街ZHJ-29489 【主任务】【0202】涉及程序单号ZHJ-29355
+        --【客户端】千机黑刹阵亡条件
+        -- local ishpz = self:CheckHpZero()
+        -- if ishpz then
+        --     _G.GuideManager:GetInstance():DoExternalPlay(guideId)
+        -- end
+
+        if _G.AppSetting.DEBUG then
+            local main = _G.DeepCopy(msg)
+            main.adventures = nil
+
+            if _G.AppSetting.DEBUG then
+                _G.Log(main, "主要信息")
+            end
+        end
+    end
+    self:InitPassCount()
+    self:InitDungonesAidCards()
+    self:InitDungonesCardBag()
+    self.maxCount = 0
+    if self.DungonesInfo.difficulty and self.DungonesInfo.difficulty > 0 and self.DungonesInfo.section > 0 then
+        local cfg = _G.ConfigManager.dungeons_cfg[self.DungonesInfo.section]
+        for _, v in pairs(_G.ConfigManager.dungeons_cfg) do
+            if v.difficulty == self.DungonesInfo.difficulty and v.layer == cfg.layer and v.group > self.maxCount then
+                self.maxCount = v.group
+            end
+        end
+    else
+        self.maxCount = #self.DungonesInfo.adventures
+    end
+
+    self.super.ParseData(self)
+    if call then
+        call()
+    end
+end
+
+function DungonesModel:InitPassCount()
+    self.passCountList = {}
+    if self.DungonesInfo.pass_section then
+        for _, v in pairs(self.DungonesInfo.pass_section) do
+            self.passCountList[v] = true
+        end
+    end
+end
+
+---初始化援助的卡牌信息
+function DungonesModel:InitDungonesAidCards()
+    self.dungones_aid_cards = {}
+    if self.DungonesInfo.aid_cards == nil then
+        return
+    end
+    for i = 1, #self.DungonesInfo.aid_cards do
+        local data = self.DungonesInfo.aid_cards[i]
+        local card = _G.CardData.New()
+        card:Parse(data)
+        card:OnInitMutuallyData(true)
+        _G.table.insert(self.dungones_aid_cards, card)
+    end
+end
+
+---清理援助卡牌身上的装备（从 equipmodel.PartsList 中删除）
+function DungonesModel:ClealAidCardEquip()
+    if self.dungones_aid_cards then
+        for i = 1, #self.dungones_aid_cards do
+            local card = self.dungones_aid_cards[i]
+            for key, equip in pairs(card.EquipBar) do
+                if not table.isEmptyOrNil(equip) then
+                    --("清楚助战的卡牌的装备")
+                    require("EquipmentModel"):GetInstance():SubPartsList(equip, card.uid)
+                end
+            end
+        end
+    end
+end
+
+---是否在结算中或者没开
+function DungonesModel:IsSettle()
+    if nil == self.DungonesInfo then
+        return true
+    end
+    return self.DungonesInfo.next_reset_time <= _G.TimeUtil.GetServerUnixTime() and
+        _G.TimeUtil.GetServerUnixTime() <=
+            self.DungonesInfo.next_reset_time + _G.ConfigManager.discrete_cfg[103402][1][1]
+end
+
+function DungonesModel:InitDungonesCardBag()
+    self.dungones_card_bag = {}
+    for i = 1, #self.dungones_aid_cards do
+        _G.table.insert(self.dungones_card_bag, self.dungones_aid_cards[i])
+    end
+    local cardslist = _G.StorageManager:GetInstance():GetCardDataSortList()
+    for i = 1, #cardslist do
+        _G.table.insert(self.dungones_card_bag, cardslist[i])
+    end
+end
+
+function DungonesModel:GetDungonesCardBag()
+    return self.dungones_card_bag
+end
+
+---初始化藏品
+function DungonesModel:InitCollect()
+    self.CollectList = {}
+    if self.DungonesInfo.item then
+        local count = #self.DungonesInfo.item
+        for i, v in ipairs(self.DungonesInfo.item) do
+            self.CollectList[v] = true
+            if not self.isInitPrivilege then
+                if i == count then
+                    self:AddPrivilege(v)
+                else
+                    self:AddPrivilege(v, false)
+                end
+            end
+        end
+    end
+    self.isInitPrivilege = true
+end
+
+---初始化千机黑煞特权
+---@param id number 藏品id
+function DungonesModel:AddPrivilege(id, isNotDispath)
+    local cfg = _G.ConfigManager.dungeons_item_cfg[id]
+    if cfg then
+        require "PrivilegeManager":GetInstance():AddPrivilege(cfg.privilege[1], isNotDispath, true)
+    end
+end
+
+--region 千机布阵界面调用 (怪物检测血量)
+---设置当前点击的事件
+function DungonesModel:SetSectionIDEmbattleInfo(eventinfo)
+    self.embattle_sectioninfo = eventinfo
+end
+
+---获得当前点击事件
+function DungonesModel:GetSectionIDEmbattleInfo()
+    return self.embattle_sectioninfo
+end
+
+function DungonesModel:GetHPMPEmbattleEnemy(uid)
+    local isHas = false
+    local data
+    if self.embattle_sectioninfo.defender_cards then
+        local cards = self.embattle_sectioninfo.defender_cards
+        for i = 1, #cards do
+            if cards[i].uid == uid then
+                data = cards[i]
+                isHas = true
+                break
+            end
+        end
+        --没有找到卡牌 代表死亡
+        if not isHas then
+            data = {
+                uid = uid,
+                hp = 0,
+                mp = 0
+            }
+            return data
+        end
+    else
+        data = {
+            uid = uid,
+            hp = 10000,
+            mp = 0
+        }
+    end
+    if not isHas then
+        data = {
+            uid = uid,
+            hp = 10000,
+            mp = 0
+        }
+    end
+    return data
+end
+
+--endregion
+
+---用关卡id查找事件
+---@param  adventure i_adventure 事件信息 section_sid ==  关卡id sid == 事件id
+function DungonesModel:GetAdventureByLevel(sid)
+    for i = 1, #self.DungonesInfo.adventures do
+        if sid == self.DungonesInfo.adventures[i].section_sid then
+            return self.DungonesInfo.adventures[i], i
+        end
+    end
+end
+
+---怪物的 动态数据 进行整理
+---@param adventures table 动态怪物数据（战斗）
+---@field  adventure i_adventure 事件信息 section_sid ==  关卡id sid == 事件id
+function DungonesModel:DisposalDateAdventure(adventures)
+    if _G.table.isEmptyOrNil(adventures) then
+        --
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=#ff0000>千机黑煞动态怪物数据是个  空 </color>")
+        end
+    end
+    if self.DungonesInfo.adventures then
+        for i = 1, #adventures do
+            local adve, index = self:GetAdventureByLevel(adventures[i].section_sid)
+            if adve then
+                self.DungonesInfo.adventures[index] = adventures[i]
+            end
+        end
+    else
+        self.DungonesInfo.adventures = {}
+        self.DungonesInfo.adventures = adventures
+    end
+end
+
+---根据事件 得到地方的 阵容
+function DungonesModel:GetEnmeyTeam(info)
+    local team = {}
+    local team_e = info.defender_team
+    local fighter = {}
+    if team_e then
+        fighter = team_e[1].fights
+    end
+    _G.SortList(
+        fighter,
+        function(a)
+            return a.star
+        end
+    )
+    team = fighter
+    return team
+end
+
+---是否通关关卡
+function DungonesModel:IsPassLevelByEventId(sid)
+    ---@type dungeons_cfg
+    local cfg = _G.ConfigManager.dungeons_cfg[sid]
+    ---如果是起点就默认通过了
+    if #cfg.event <= 0 then
+        return true
+    end
+    if self:CheckUnselectedMementoIsLastSectionByLayer() then
+        if sid == self.DungonesInfo.unselected_mementos_section then
+            return true
+        end
+    end
+    return self.passCountList[sid]
+end
+
+---获取HP信息
+function DungonesModel:GetHPMP(uid)
+    local isHas = false
+    local data
+    if self.DungonesInfo.cards then
+        local cards = self.DungonesInfo.cards
+        for i = 1, #cards do
+            if cards[i].uid == uid then
+                data = cards[i]
+                isHas = true
+                break
+            end
+        end
+    else
+        data = {
+            uid = uid,
+            hp = 10000,
+            mp = 0
+        }
+    end
+    if not isHas then
+        data = {
+            uid = uid,
+            hp = 10000,
+            mp = 0
+        }
+    end
+    return data
+end
+
+---检测千机是否有阵亡角色
+function DungonesModel:CheckHpZero()
+    local isHpZero = false
+    if self.DungonesInfo and self.DungonesInfo.cards then
+        local cards = self.DungonesInfo.cards
+        for i = 1, #cards do
+            local data = cards[i]
+            if data and data.hp and data.hp <= 0 then
+                isHpZero = true
+            end
+        end
+    end
+
+    return isHpZero
+end
+
+---检测藏品是否解锁
+function DungonesModel:CheckCollectionIsUnLock(sid)
+    if not self.CollectList then
+        return false
+    end
+    return self.CollectList[sid]
+end
+
+function DungonesModel:UnLockCollection(tb, callback)
+    require "DungonesNet":GetInstance():UnLockCollection(
+        {
+            dungeons_item = tb
+        },
+        _G.handlerbind(self, self.UnLockCollectionCall, tb, callback)
+    )
+end
+
+function DungonesModel:UnLockCollectionCall(data, tb, callback)
+    if data.ack ~= 1 then
+        if callback then
+            callback()
+        end
+        return
+    end
+    local count = #tb
+    for i, v in ipairs(tb) do
+        self.CollectList[v] = true
+        if i == count then
+            self:AddPrivilege(v)
+        else
+            self:AddPrivilege(v, false)
+        end
+    end
+    if callback then
+        callback()
+    end
+end
+
+--region 对外接口 2023/2/21弃用
+---放置挂机通过 检测藏品是否可以激活
+function DungonesModel:AfkPassLockCollecion()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(41) then
+        return
+    end
+    if not self.CollectList then
+        return
+    end
+    if self.DungonesInfo then
+        if self.DungonesInfo.status == 2 then
+            return
+        end
+    end
+    local cfgs = _G.ConfigManager.dungeons_item_cfg
+    local keys = _G.table.keys(cfgs)
+    _G.table.sort(
+        keys,
+        function(a, b)
+            return a < b
+        end
+    )
+    local count = #keys
+    local sidQue = {}
+    for i = 1, count do
+        local cfg = _G.ConfigManager.dungeons_item_cfg[keys[i]]
+        if
+            not DungonesModel:CheckCollectionIsUnLock(keys[i]) and not _G.table.isEmptyOrNil(cfg.mission_extra) and
+                _G.GlobalConditionManager.CheckCondition(cfg.mission_extra[1], cfg.mission_extra[2])
+         then
+            _G.table.insert(sidQue, keys[i])
+        end
+    end
+    if #sidQue > 0 then
+        self:UnLockCollection(sidQue)
+    end
+end
+
+--endregion
+
+---触发的奇遇事件
+function DungonesModel:Adventure(pbData, callback)
+    require "DungonesNet":GetInstance():Adventure(pbData, _G.handlerbind(self, self.AdventrueCall, callback))
+end
+
+function DungonesModel:AdventrueCall(data, callback)
+    if data.ack ~= 1 then
+        return
+    end
+    self:SetAwardData(data)
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    if callback then
+        callback()
+    end
+    -- 派发出事件 通知 已经结束
+end
+
+---触发的奇遇事件
+function DungonesModel:AdventureTop(pbData, callback)
+    require "DungonesNet":GetInstance():AdventureTop(pbData, _G.handlerbind(self, self.AdventrueTopCall, callback))
+end
+
+function DungonesModel:AdventrueTopCall(data, callback)
+    if data.ack ~= 1 then
+        return
+    end
+    self:SetAwardData(data)
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    if callback then
+        callback(data)
+    end
+    -- 派发出事件 通知 已经结束
+end
+
+function DungonesModel:GetRanKInfo(msg, callback)
+    self.rankpage = 8 --榜单类型
+    self.rank_all_player = {}
+    require("LingRankNet"):GetInstance():GetRankAllInfos(
+        msg,
+        function(data)
+            self.rank_all_player = {}
+            local rankIndex = self.myselfRank and self.myselfRank.player_mingci
+            if not rankIndex or rankIndex == 0 then
+                self:SetMySelfRank(nil)
+            end
+            self:SetRankAllPlayer(data.rank, self.rankpage)
+            if callback then
+                callback(data)
+            end
+        end
+    )
+end
+
+---获取自己的排名信息
+---@param callback function 回调函数
+function DungonesModel:GetSelfRankInfo(callback)
+    require("LingRankNet"):GetInstance():GetSelfRankInfo({ type = 8 }, function(msg)
+        if msg and msg.ack == 1 then
+            self:SetMySelfRank(nil)
+            local self = self:GetMySelfRank()
+            self:SetPlayerMingCi(msg.index or 0)
+            self:SetDamage(msg.value or 0)
+        end
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+-- region 设置、获得
+function DungonesModel:SetMySelfRank(itemData)
+    self.myselfRank = itemData
+end
+
+function DungonesModel:GetMySelfRank()
+    if not _G.table.isEmptyOrNil(self.myselfRank) then
+        return self.myselfRank
+    end
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    local frame = _G.PlayerModel:GetInstance():GetCurFrame()
+    local level = _G.PlayerModel:GetInstance():GetLevel()
+    local name = _G.PlayerModel:GetInstance():GetName()
+    local portrait = _G.PlayerModel:GetInstance():GetRoleStyle()
+    local title = _G.PlayerModel:GetInstance():GetTitle()
+    local itemData = RankItemData.New()
+    itemData:Parse()
+    itemData:SetPlayerName(name)
+    itemData:SetPlayerFrame(frame)
+    itemData:SetSign(title)
+    itemData:Setplaye_level(level)
+    itemData:SetPlayerHead(portrait)
+    local damage = self:GetPlayerDamage()
+    itemData:SetDamage(damage)
+    itemData:SetisRank(false)
+    itemData:SetPlayerUid(uid)
+    itemData:SetIsMySelf(true)
+    itemData:SetPlayerMingCi(0)
+    self.myselfRank = itemData
+    return self.myselfRank
+end
+
+---设置排行榜数据
+---@field i_rank_report i_rank_report 排行人员的信息
+function DungonesModel:SetRankAllPlayer(data, rankID)
+    local temp = data or {}
+    if _G.table.isEmptyOrNil(temp) then
+        return
+    end
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    local count = #data
+    for i = 1, #temp do
+        local itemData = RankItemData.New()
+        itemData:Parse()
+        itemData:SetTypeRankID(rankID) --榜单类型
+        itemData:SetPlayerName(temp[i].name)
+        itemData:SetPlayerFrame(temp[i].frame)
+        itemData:Setplaye_level(temp[i].lv)
+        itemData:SetPlayerHead(temp[i].portrait)
+        itemData:SetPlayerUid(temp[i].uid)
+        itemData:SetDamage(temp[i].value)
+        itemData:SetSign(temp[i].title)
+        itemData:SetisRank(true)
+        itemData:SetPlayerMingCi(i)
+        itemData:SetTeamCard(temp[i].sids[1].sids)
+        itemData:SetParams(temp[i].params)
+        itemData:SetSnapShotTitle(temp[i].snapshot_title)
+        itemData:SetSnapShotHalo(temp[i].snapshot_halo)
+        itemData:SetValues(temp[i].values)
+        itemData:SetArtifactskin(temp[i].artifact_skin)
+        if uid == temp[i].uid then
+            -- body
+            itemData:SetIsMySelf(true)
+            self:SetMySelfRank(itemData)
+        else
+            itemData:SetIsMySelf(false)
+        end
+        _G.table.insert(self.rank_all_player, itemData)
+    end
+    -- if count >= rankMax then
+    --     self.rankpage = self.rankpage + 1
+    --     if self.rankpage <= self.rankTotalPage then
+    --         local msg = {
+    --             page = self.rankpage
+    --         }
+    --         require("DungonesNet"):GetInstance():GetRanKInfo(
+    --             msg,
+    --             function(data)
+    --                 self:SetRankAllPlayer(data)
+    --             end
+    --         )
+    --         return
+    --     end
+    -- end
+end
+
+--region 对外接口 点击排行回放
+---@param playerName? string 左侧显示的玩家名称(如不传则取战报中名称)
+---@param monsterName? string 右侧显示的名称
+function DungonesModel:PlayRankHuiFang(rankid, playeruid, call, playerName, monsterName)
+    local msg = {}
+    msg.type = rankid
+    msg.uid = playeruid
+    require "LingRankNet":GetInstance():GetRankReport(
+        msg,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            --左边显示的名称
+            local leftName, rightName = "", ""
+            if playerName and #playerName > 0 then
+                leftName = playerName
+            elseif msg and msg.arg then
+                leftName = msg.arg.attacker_team[1].name
+            end
+
+            --右边显示的名称
+            if monsterName and #monsterName > 0 then
+                rightName = monsterName
+            elseif rankid == 8 then
+                --千机黑煞
+                local bossEventIdCfg = _G.ConfigManager.discrete_cfg[103404]
+                local bossEventCfg = bossEventIdCfg and _G.ConfigManager.adventure_cfg[bossEventIdCfg[1][1]] or nil
+                if bossEventCfg then
+                    rightName = _G.GetLangPackValue(bossEventCfg.name)
+                else
+                    rightName = _G.GetLangPackValue(90024500010) --策划说boss名字写死语言表id
+                end
+            elseif rankid == 18 then
+                --赛季boss
+                local rightNameId = require("FirstTestBossModel"):GetInstance():GetSeasonBossName()
+                rightName = rightNameId and rightNameId > 0 and _G.GetLangPackValue(rightNameId) or ""
+            elseif rankid == 4 then
+                --龙之试炼(右边为多个boss的名称)
+                rightName = require("WorldBossManager"):GetInstance():GetBossName()
+            end
+
+            self.fight_arg = msg.arg
+            self:UpdateData1(_G.BattleManager:GetInstance():GetStatisticsRecord(msg.arg), leftName, rightName)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+function DungonesModel:UpdateData1(data, leftName, rightName)
+    if not data then
+        _G.PopWindowManager:GetInstance():ShowAllTips(540302)
+        return
+    end
+
+    self.maxCountRank = _G.table.count(data.FighterInfo)
+    self.PveData = {}
+    local damage, win = _G.GameUtil.ShowStatisticsView(data)
+    self.PveData = damage
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name,
+        self.PveData,
+        win,
+        function()
+            local DungonesView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DungonesView.Name)
+            if DungonesView then
+                DungonesView.View:Show()
+            end
+            local DungonesRuningView =
+                _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DungonesRuningView.Name)
+            if DungonesRuningView then
+                DungonesRuningView.View:Show()
+            end
+        end,
+        nil,
+        self.otherPlayer,
+        1,
+        true,
+        self.fight_arg,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        { leftName, rightName } --reportParams
+    )
+end
+
+--endregion
+
+---获得挑战次数 (剩余次数) 废弃，改为无限挑战次数
+function DungonesModel:GetChallengeBossNum()
+    local cfg = _G.ConfigManager.discrete_cfg
+    local discrete = cfg[103401]
+    local total = discrete[1][1]
+    local num = self.DungonesInfo.fight_num or 0
+    if num < 0 then
+        num = 0
+    end
+    return num, total
+end
+
+---获得玩家的伤害信息
+function DungonesModel:GetPlayerDamage()
+    return self.DungonesInfo.damage
+end
+
+---重置答对题的数量
+function DungonesModel:ResetHitRate_question()
+    self.hit_rate_question = 0
+end
+
+---重置答错题的数量
+function DungonesModel:ResetHitCuowu_question()
+    self.hit_rate_question = 0
+end
+
+-- 设置 答题 命中率
+function DungonesModel:SetHitRate_question(hitrate)
+    self.hit_rate_question = self.hit_rate_question + hitrate
+end
+
+-- 设置答题 错误数量
+function DungonesModel:SetHitCuo_question(hitrate)
+    self.hit_cuowu_question = self.hit_cuowu_question + hitrate
+end
+
+---获得 正确答题的数量
+function DungonesModel:GetHitRate_question()
+    return self.hit_rate_question
+end
+
+---获得错误答题数量
+function DungonesModel:GetHitCuowu_question()
+    return self.hit_cuowu_question
+end
+
+-- 设置获得奖励
+function DungonesModel:SetAwardData(data)
+    self.awardData = {}
+    self.awardData = data
+end
+
+function DungonesModel:GetAwardData()
+    return self.awardData
+end
+
+---复活角色
+---@param type1 number 1 = 使用特权  2 = 使用道具
+function DungonesModel:Rebirth(type1, callback)
+    local msg = {
+        type = type1
+    }
+    require "DungonesNet":GetInstance():Rebirth(
+        msg,
+        function(data)
+            self:GetDungonesInfo(
+                function()
+                    if callback then
+                        callback(data)
+                    end
+                end
+            )
+        end
+    )
+end
+
+---重置卡牌状态
+function DungonesModel:ResetCard()
+    if self.DungonesInfo and self.DungonesInfo.cards then
+        for _, v in pairs(self.DungonesInfo.cards) do
+            v.hp = 10000
+            v.mp = 10000
+        end
+    end
+end
+
+-- endregin
+---进入战斗
+---@param type number 挑战的id
+---@param sid number tower_cfg.tower 所属塔
+---@field CurEventType number 点击的模型
+---@field CurEventId number 房间id
+---@param skipBattle boolean    @是否显示跳过战斗按钮
+function DungonesModel:EnterSection(type, sid, info, isBoss, skipBattle)
+    self.CurEventType = type
+    self.CurEventId = sid
+    self.CurEventInfo = info
+    self.CurIsBoss = isBoss
+
+    require("DungonesManager"):GetInstance():EnterEmbattle(skipBattle)
+end
+
+---检测挑战事件 是否可以碾压
+function DungonesModel:CheckFastPass(CurEventId, defender_team)
+    local eventtype = _G.ConfigManager.adventure_cfg[CurEventId].event_type
+    if eventtype == _G.DungonesEventType.boss then
+        return true
+    end
+    local EmbattleModelIns = require("EmbattleModel"):GetInstance()
+    local EmbattleData = EmbattleModelIns:GetEmbattleData(_G.EmbattleType.dungones) or {}
+    local mpower = 0
+    local isEmptyOrNil = _G.table.isEmptyOrNil
+    if not _G.table.isEmptyOrNil(EmbattleData) then
+        local itemType = require(_G.EmbattleControllerItemType.dungones)
+        local item = itemType.New(_G.EmbattleType.dungones)
+        mpower = item:GetMyEmbattlePower(1)
+        ---检测任务阵容是否需要改变
+        local StorageManager = _G.StorageManager:GetInstance()
+        local data
+        for i, v in pairs(EmbattleData) do
+            if v > 0 then
+                data = StorageManager:GetDatasByUid(_G.StorageID.Card, v)
+                if isEmptyOrNil(data) and not self:CheckIsDungonesCard(v) then
+                    EmbattleData[i] = 0
+                end
+            end
+        end
+    end
+    local epower = defender_team[1].power or 0
+    if mpower < epower then
+        EmbattleModelIns:SaveEmbattleDataNew(
+            _G.EmbattleType.dungones,
+            function()
+                return false
+            end,
+            0,
+            false,
+            EmbattleData
+        )
+        return true
+    else
+        local StorageManager = _G.StorageManager:GetInstance()
+        local isChange = false
+        if EmbattleModelIns:CheckEmbattleData(_G.EmbattleType.dungones) then
+            --问题：第一次进入千机黑煞，服务器没有布阵数据，需要发送布阵数据
+            --当玩家战斗力超过当前守卫时，按钮变成碾压，点击碾压则直接获取该关卡奖励 ZHJ-14342【客户端】千机黑刹系统优化
+
+            local data
+            for i, v in pairs(EmbattleData) do
+                if v > 0 then
+                    data = StorageManager:GetDatasByUid(_G.StorageID.Card, v)
+                    if isEmptyOrNil(data) and not self:CheckIsDungonesCard(v) then
+                        EmbattleData[i] = 0
+                        isChange = true
+                    end
+                end
+            end
+        else
+            EmbattleData = EmbattleModelIns:GetEmbattleData(_G.EmbattleType.AFKOnly)
+            local data
+            for i, v in pairs(EmbattleData) do
+                if v > 0 then
+                    data = StorageManager:GetDatasByUid(_G.StorageID.Card, v)
+                    if isEmptyOrNil(data) then
+                        EmbattleData[i] = 0
+                        isChange = true
+                    end
+                end
+            end
+        end
+        EmbattleModelIns:SaveEmbattleDataNew(
+            _G.EmbattleType.dungones,
+            function()
+                return false
+            end,
+            0,
+            false,
+            EmbattleData
+        )
+    end
+end
+
+---战斗 碾压
+---@param type number 挑战的id
+---@param sid number  奇遇事件id
+---@field CurEventType number 点击的模型
+---@field CurEventId number 房间id
+function DungonesModel:EnterYanYa(type, sid, info, call)
+    self.CurEventType = type
+    self.CurEventId = sid
+    self.CurEventInfo = info
+    self.CurIsBoss = isBoss or false
+    require("DungonesManager"):GetInstance():EnterYanYa(sid, call)
+end
+
+function DungonesModel:OnChallenge(id, callback)
+    require "DungonesNet":GetInstance():Challenge(
+        {sid = id},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.DungonesInfo.difficulty = id
+            for i = 1, #msg.adventures do
+                if _G.AppSetting.DEBUG then
+                    _G.Log(msg.adventures[i], "事件单条信息")
+                end
+            end
+            self.DungonesInfo.adventures = msg.adventures
+            self.DungonesInfo.open_mementos = msg.open_mementos
+            self.maxCount = #self.DungonesInfo.adventures
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---@return boolean 是否有未领取的遗物
+---@return table {遗物关卡id,遗物table}
+function DungonesModel:HaveUnselectedMementos()
+    if not self.DungonesInfo then
+        return false, nil
+    end
+    if self.DungonesInfo.unselected_mementos_section > 0 then
+        return true, {self.DungonesInfo.unselected_mementos_section, self:GetUnselectedMementos()}
+    end
+    return false, nil
+end
+
+---获得当前关卡是否领取遗物 先判断是否存在有未领取 IsUnselectedMementos
+function DungonesModel:GetUnselectedMementos()
+    if not self.DungonesInfo then
+        return nil
+    end
+    return self.DungonesInfo.unselected_mementos
+end
+
+---判断当前未领取遗物的点是不是每层最后一关 如果是需要在领取遗物后重新绘制地图 进千机判断
+function DungonesModel:CheckUnselectedMementoIsLastSectionByLayer()
+    local haveUnselectedMementon, unselectedInfo = self:HaveUnselectedMementos()
+    if haveUnselectedMementon then
+        local after_section = _G.ConfigManager.dungeons_cfg[self.DungonesInfo.section].after_section
+        if _G.table.isEmptyOrNil(after_section) then
+            return true
+        else
+            return false
+        end
+    end
+    return false
+end
+
+---添加一个遗物
+function DungonesModel:AddMementos(id)
+    if nil == self.DungonesInfo.mementos then
+        self.DungonesInfo.mementos = {}
+    end
+    if id then
+        table.insert(self.DungonesInfo.mementos, id)
+    end
+end
+
+--region 魂玉甲虫
+---初始化已领取的魂玉
+function DungonesModel:InitHyAward()
+    self.hy = {}
+    if self.DungonesInfo.pass_award then
+        for _, v in pairs(self.DungonesInfo.pass_award) do
+            self.hy[v] = true
+        end
+    end
+end
+
+---检测魂玉甲虫奖励是否领取
+function DungonesModel:CheckHyIsGet(index)
+    return self.hy[index]
+end
+
+---领取魂玉
+function DungonesModel:GetHy(index, callback)
+    require "DungonesNet":GetInstance():GetHy({layer = index}, _G.handlerbind(self, self.GetHyCall, index, callback))
+end
+
+---领取魂玉回调
+function DungonesModel:GetHyCall(msg, index, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.hy[index] = true
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DungonesAward.id)
+    if callback then
+        callback(msg)
+    end
+end
+
+--endregion
+
+--region 开局选择遗物
+function DungonesModel:OpenChooseMementos(id, callback)
+    require "DungonesNet":GetInstance():OpenChooseMementos(
+        {mementos = id},
+        _G.handlerbind(self, self.OpenChooseMementosCall, callback)
+    )
+end
+
+---选择遗物回调
+function DungonesModel:OpenChooseMementosCall(msg, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.DungonesInfo.open_mementos = nil
+    if callback then
+        callback()
+    end
+end
+
+--endregion
+
+--region
+function DungonesModel:NotificationChangePointHint()
+    self.isRedHint = true
+    --刷新红点
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Dungones.id)
+end
+
+---当千机黑刹可以挑战时，增加提示红点 玩家只需要进入千机黑刹活动主界面一次，则本次登录不再提示
+function DungonesModel:CheckRedPointHint()
+    --检测千机是否开启
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(41) then
+        return 0
+    end
+    --GM 创建号 检测下 关卡是否 达到
+    local cfg = _G.ConfigManager.function_open_cfg[41]
+    if not _G.GlobalConditionManager.CheckConditionByArray(cfg.condition_type) then
+        return 0.
+    end
+    -- 检测本次登录是不是 进入了千机黑煞界面
+    if self.isRedHint then
+        return 0
+    end
+    --无数据
+    if nil == self.DungonesInfo then
+        return 0
+    end
+    --检测是否千机黑煞结算中
+    if self.DungonesInfo.status then
+    else
+        return 0
+    end
+    if self.DungonesInfo.status == 2 then
+        return 0
+    end
+    -- --检测未选择关卡
+    if self.DungonesInfo.section == 0 then
+        return 1
+    end
+    -- -- 千机黑煞 boss 是否挑战过
+    -- local boss_num = _G.ConfigManager.discrete_cfg[103401][1][1]
+    -- if self.DungonesInfo.fight_num < boss_num then
+    --     return 0
+    -- end
+    --检测 选择了关卡
+    local ShowList = {}
+    ShowList = require "DungonesManager":GetInstance():GetShowList(self.DungonesInfo.difficulty)
+    local section_max_id = ShowList[#ShowList]
+    if self.DungonesInfo.section == section_max_id.id then
+        return 0
+    end
+    if self.DungonesInfo.damage > 0 then
+        return 0
+    end
+    return 1
+end
+
+---检测是否是千机黑刹助战卡牌
+function DungonesModel:CheckIsDungonesCard(uid)
+    for i = 1, #self.dungones_aid_cards do
+        if uid == self.dungones_aid_cards[i].uid then
+            return true
+        end
+    end
+    return false
+end
+
+---检测跳过开启的通关次数条件是否达成
+function DungonesModel:CheckEndBossCanSkip()
+    local passNumCon = _G.ConfigManager.discrete_cfg[120015][1][1]
+    if self.DungonesInfo.pass_times < passNumCon then
+        return false, _G.GetLangPackValue(90024500016, passNumCon)
+    end
+    local params = _G.ConfigManager.discrete_cfg[115604]
+    local unlock, content = _G.GlobalConditionManager.CheckConditionArraysCustomUnlockTip(params)
+    return unlock, content
+end
+
+--endregion
+return DungonesModel

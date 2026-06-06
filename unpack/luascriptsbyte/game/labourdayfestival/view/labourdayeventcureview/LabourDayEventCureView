@@ -1,0 +1,1070 @@
+--region 数据定义
+---圈类型
+---GameType 游戏类型 1为剧情 2为庙会
+local GameType = 2
+local itemtype = {
+    ---点击
+    click = 1,
+    ---拖动
+    drag = 2,
+    ---拖动点击
+    dragClick = 3
+}
+---圈被点击后的停留时间
+local stayTime = 0.5
+---每轮开始等待时间
+local gameStartTime = 1.5
+---每个圈出现的时间间隔
+local intervalTime = 2
+---拖拽圈出现的间隔时间
+local dragItervalTime = 0.5
+---缩圈时间
+local liveTime = 2
+---时间比例
+local timeRatio = 0.333
+---表现数据(配置)
+--[[
+    {
+        story = 0,--当前伦次完了播放的剧情ID
+        game={ --本轮游戏数据 同一组顺序执行 不同组并行
+            {1，0，0}，--第一位 玩法类型 1 点击 后面每两位就是坐标， (原点在屏幕中间)
+            {2，0，0，50，50，100，100}--玩法类型2 拖动，后面每两位就是坐标，
+        }
+    }
+]]
+local ListenerEnum = "EventCure"
+local GameDied = "TempleGameDied"
+
+local gameData
+---游戏每轮时间参数
+local MinBtnData = {}
+---当前游戏轮数
+local CurGameIndex = 1
+local BgContentEffPath = {_G.ConfigManager.ui_effect_cfg.ef_xindiantu2, _G.ConfigManager.ui_effect_cfg.ef_xindiantu}
+local LevelImage = {
+    "ui_jhb_b_icon",
+    "ui_jhb_a_icon",
+    "ui_jhb_s_icon",
+    "ui_jhb_s+_icon"
+}
+local numImage = "mh_img_"
+---分数
+local MScore = 0
+---连击次数
+local LianjiCount = 0
+local levelInfo = _G.ConfigManager.discrete_cfg[105601][1]
+local MaxScore = 0
+local CurLevelImage = LevelImage[1]
+local LianjiInfo = _G.ConfigManager.discrete_cfg[105602][1]
+local ComputeMaxScore = function(cfg)
+    local mbtCfg
+    local lianjiCount = 0
+    local extra = 0
+    for i = 1, #cfg.EventID do
+        mbtCfg = _G.ConfigManager.min_button_event_cfg[cfg.EventID[i]]
+        if mbtCfg then
+            local click = not _G.table.isEmptyOrNil(mbtCfg.fraction) and mbtCfg.fraction[1] or 0
+            local drag = not _G.table.isEmptyOrNil(mbtCfg.fraction) and mbtCfg.fraction[2] or 0
+            for k, v in pairs(mbtCfg.IntervalPos) do
+                lianjiCount = lianjiCount + (#v - 1) / 2
+                if v[1] == 1 then
+                    MaxScore = MaxScore + click * ((#v - 1) / 2)
+                elseif v[1] == 2 then
+                    MaxScore = MaxScore + drag * ((#v - 1) / 2)
+                end
+            end
+        end
+    end
+    for i = 1, lianjiCount / 3 do
+        extra = extra + LianjiInfo[2] * i
+    end
+    MaxScore = math.floor(extra + MaxScore)
+end
+local SetLevelByScore = function()
+    for i = #levelInfo, 1, -1 do
+        if MScore >= levelInfo[i] then
+            CurLevelImage = LevelImage[i]
+            return
+        end
+    end
+end
+---type true click false drag
+local SetTotalScore = function(type)
+    local extra = 0
+    local click =
+        not _G.table.isEmptyOrNil(MinBtnData[CurGameIndex].fraction) and MinBtnData[CurGameIndex].fraction[1] or 0
+    local drag =
+        not _G.table.isEmptyOrNil(MinBtnData[CurGameIndex].fraction) and MinBtnData[CurGameIndex].fraction[2] or 0
+    if LianjiCount % LianjiInfo[1] == 0 then
+        extra = LianjiInfo[2] * (LianjiCount / LianjiInfo[1])
+    end
+    if type then
+        MScore = click + MScore
+    else
+        MScore = drag + MScore
+    end
+    MScore = math.floor(extra + MScore)
+end
+--endregion
+local remove = _G.table.remove
+--region 玩法节点类
+local EventCureItemPoolInstance
+local scaleTime = 0.04
+local scaleValue = 0.5
+local resultTag = {
+    {perfect = "ui_jqwf_icon_youxiaozhiliao_01", normal = "ui_jqwf_icon_jiandanbaoza_01"},
+    {
+        perfect = "mh_img_wanmei_01",
+        normal = "mh_img_shiwu_01"
+    }
+}
+--region 点击item
+local AudioManager = _G.AudioManager
+local EventCureClickItem = _G.BaseClass("EventCureClickItem")
+function EventCureClickItem:__init(obj)
+    _G.Events:GetInstance():AddListener(GameDied, self.TimerClose, self)
+    self.gameObject = obj
+    self.go_table = _G.GetAutoGoTable(obj, _G.handler(self, self.OnClickBtn))
+end
+function EventCureClickItem:TimerClose()
+    if self.scaleTimer then
+        self.scaleTimer:Stop()
+    end
+    if self.temp_co ~= nil then
+        _G.coroutine.stopwaiting(self.temp_co)
+        self.temp_co = nil
+    end
+    self.scaleTimer = nil
+    _G.Events:GetInstance():RemoveListener(GameDied, self.TimerClose, self)
+end
+function EventCureClickItem:Dispose()
+    self.go_table = nil
+    self.gameObject = nil
+    self.onDoneCall = nil
+    self.onCloseCall = nil
+    self.time = nil
+    self.curScale = nil
+    if self.scaleTimer then
+        self.scaleTimer:Stop()
+        self.scaleTimer = nil
+    end
+    if self.scaleTimer1 then
+        self.scaleTimer1:Stop()
+        self.scaleTimer1 = nil
+    end
+    if self.temp_co ~= nil then
+        _G.coroutine.stopwaiting(self.temp_co)
+        self.temp_co = nil
+    end
+    self.scaleTimer = nil
+    _G.Events:GetInstance():RemoveListener(GameDied, self.TimerClose, self)
+end
+function EventCureClickItem:loadBombEff(perfect)
+    if not self.clickDone then
+        if perfect then
+            LianjiCount = LianjiCount + 1
+        else
+            LianjiCount = 0
+        end
+        self.clickDone = true
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_Eff, true)
+        if perfect then
+            SetTotalScore(true)
+            SetLevelByScore()
+        end
+    end
+end
+function EventCureClickItem:OnClickBtn(go)
+    if go == self.go_table.aorbtn_click then
+        AudioManager.PlayAudio(_G.AudioType.PlaySound, 2037)
+        self:SetResult(nil, true)
+        self.go_table.aorbtn_click:SetActiveE(0)
+    end
+end
+---展示
+function EventCureClickItem:Show(doneCall, closeCall)
+    if self.go_table == nil or self.go_table.gameObject==nil then
+        return
+    end
+    if not self.anim then
+        self.anim = self.go_table.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+    else
+        self.go_table.aorimage_tag:SetActiveE(0)
+        self.anim.enabled = false
+    end
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_Eff, false)
+    self.clickDone = false
+    self.onDoneCall = doneCall
+    self.onCloseCall = closeCall
+    self.time = MinBtnData[CurGameIndex].LiveTime
+    self.curScale = 1
+    self.go_table.trans_scale:SetLocalScale(self.curScale, self.curScale, 1)
+    self.scaleTimer = _G.TimerManager:GetInstance():GetTimer(scaleTime, self.OnScaleUpdateCall, self)
+    self.scaleTimer:Start()
+end
+---缩放
+function EventCureClickItem:OnScaleUpdateCall(elapsed)
+    if MinBtnData[CurGameIndex] == nil then
+        return
+    end
+    self.time = self.time - elapsed
+    self.curScale = scaleValue + (1 - scaleValue) * (Mathf.RoundToInt(self.time) / MinBtnData[CurGameIndex].LiveTime)
+    -- self.go_table.trans_scale:SetLocalScale(self.curScale, self.curScale, 1)
+    if self.time <= 0 then
+        self:SetResult(false)
+    end
+end
+---设置结果
+---@param perfect boolean 是否完美
+function EventCureClickItem:SetResult(perfect, isClick)
+    if self.IsSet then
+        return
+    end
+    self.IsSet = true
+    if perfect == nil then
+        perfect = false
+        if self.time <= MinBtnData[CurGameIndex].LiveTime * MinBtnData[CurGameIndex].TimeRatio then
+            perfect = true
+        end
+    end
+    if self.scaleTimer ~= nil then
+        self.scaleTimer:Stop()
+        self.scaleTimer = nil
+    end
+    if isClick then
+        self:loadBombEff(perfect)
+    else
+        LianjiCount = 0
+    end
+    if GameType == 2 then
+        _G.Events:GetInstance():Broadcast(ListenerEnum, LianjiCount, perfect)
+    end
+    -- self.go_table.aorimage_tag.SpriteName = perfect and resultTag[GameType].perfect or resultTag[GameType].normal
+    self.go_table.aorimage_tag:SetNativeSize()
+    -- self.go_table.aorimage_tag:SetActiveE(1)
+    if not self.anim then
+        self.anim = self.go_table.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+    else
+        self.anim.enabled = true
+    end
+    if self.onDoneCall then
+        self.onDoneCall(self)
+    end
+    self.scaleTimer1 = _G.TimerManager:GetInstance():GetTimer(MinBtnData[CurGameIndex].StayTime, self.Close, self, true)
+    self.scaleTimer1:Start()
+end
+---结束消失
+function EventCureClickItem:Close()
+    self.IsSet = false
+    if self.go_table.aorbtn_click then
+        self.go_table.aorbtn_click:SetActiveE(1)
+    end
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_Eff, false)
+    self:OnPutItem()
+    if self.onCloseCall then
+        self.onCloseCall(self)
+    end
+    if self.scaleTimer1 then
+        self.scaleTimer1:Stop()
+        self.scaleTimer1 = nil
+    end
+end
+function EventCureClickItem:OnPutItem()
+    EventCureItemPoolInstance:PutItem(itemtype.click, self)
+end
+--endregion
+
+--region 拖拽item
+local EventCureDragItem = _G.BaseClass("EventCureDragItem", EventCureClickItem)
+---展示
+---@param x number 下一个节点的x坐标
+---@param y number 下一个节点的y坐标
+function EventCureDragItem:Show(doneCall, closeCall, index, x, y)
+    if not self.anim then
+        self.anim = self.go_table.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+    else
+        self.go_table.aorimage_tag:SetActiveE(0)
+        self.anim.enabled = false
+    end
+    EventCureClickItem.Show(self, doneCall, closeCall)
+    self.curIndex = index
+    _G.GameUtil.SetActiveByCondition(self.go_table.trans_arrow, x ~= nil)
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_point, x == nil)
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_line, x ~= nil)
+    --计算箭头朝向
+    if x == nil then
+        return
+    end
+    local angle, dis = self:ComputePointAngleAndDistance(x, y)
+    if angle then
+        self.go_table.obj_Line:SetLocalEulerAngles(0, 0, angle)
+    end
+    if dis then
+        self.temp_co = _G.coroutine.start(_G.handlerbind(self, self.SetLinePos, dis))
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_line, true)
+    end
+end
+function EventCureDragItem:SetLinePos(dis)
+    local add = dis / (MinBtnData[CurGameIndex].IntervalTime * 30)
+    local _dis = dis
+    local realDis = 0
+    while realDis < _dis do
+        realDis = realDis + add
+        self.go_table.obj_line:SetRectTransformSize(realDis, 60)
+        _G.coroutine.waitforendofframe()
+    end
+    _G.coroutine.waitforendofframe()
+end
+function EventCureDragItem:Close()
+    self.go_table.obj_Line:SetLocalEulerAngles(0, 0, 0)
+    self.super.Close(self)
+end
+---@param x 下个点的x坐标
+---@param y 下个点的y坐标
+---@return angle dis 角度和长度
+function EventCureDragItem:ComputePointAngleAndDistance(x, y)
+    if x == nil then
+        return
+    end
+    local myX, myY, myZ = self.gameObject:GetLocalPosition()
+    local offX, offY
+    local angle = 0
+    local dis = 0
+    offX = myX - x
+    offY = myY - y
+    dis = math.sqrt((offX) * (offX) + (offY) * (offY))
+    angle = math.atan((offY / offX)) * 180 / math.pi
+    if offX >= 0 then
+        if angle >= 0 then
+            angle = math.abs(angle) - 180
+        else
+            angle = 180 - math.abs(angle)
+        end
+    end
+    return angle, dis
+end
+function EventCureDragItem:loadBombEff(perfect)
+    if perfect then
+        LianjiCount = LianjiCount + 1
+    else
+        LianjiCount = 0
+    end
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_Eff, true)
+    if perfect then
+        SetTotalScore(false)
+        SetLevelByScore()
+    end
+end
+function EventCureDragItem:OnPutItem()
+    EventCureItemPoolInstance:PutItem(itemtype.drag, self)
+end
+--endregion
+
+--region 拖拽点击item
+local EventCureDragClickItem = _G.BaseClass("EventCureDragClickItem")
+function EventCureDragClickItem:__init(go)
+    self.gameObject = go
+    self.go_table = _G.GetAutoGoTable(go)
+    _G.SetEventTrigger(self.go_table.aorbtn_dragClick, "onDown", _G.handler(self, self.OnDown))
+    _G.SetEventTrigger(self.go_table.aorbtn_dragClick, "onDragBegin", _G.handler(self, self.OnDragBegin))
+    _G.SetEventTrigger(self.go_table.aorbtn_dragClick, "onDrag", _G.handler(self, self.OnDrag))
+    _G.SetEventTrigger(self.go_table.aorbtn_dragClick, "onDragEnd", _G.handler(self, self.OnDragEnd))
+end
+function EventCureDragClickItem:Dispose()
+    self.gameObject = nil
+    self.go_table = nil
+    self.onClick = nil
+    self.dragBegin = nil
+    self.drag = nil
+    self.dragEnd = nil
+end
+function EventCureDragClickItem:OnDown()
+    if self.onDown then
+        self.onDown()
+    end
+end
+function EventCureDragClickItem:OnDragBegin(go, ed)
+    if self.dragBegin then
+        self.dragBegin(ed)
+    end
+end
+function EventCureDragClickItem:OnDrag(go, ed)
+    if self.drag then
+        self.drag(ed)
+    end
+end
+function EventCureDragClickItem:OnDragEnd(go, ed)
+    if self.dragEnd then
+        self.dragEnd(ed)
+    end
+end
+---设置拖动回调方法
+---@param begin function 开始
+---@param drag function 拖动
+---@param over function 结束
+function EventCureDragClickItem:SetDragCall(begin, drag, over, down)
+    self.dragBegin = begin
+    self.drag = drag
+    self.dragEnd = over
+    self.onDown = down
+end
+function EventCureDragClickItem:OnPutItem()
+    EventCureItemPoolInstance:PutItem(itemtype.dragClick, self)
+end
+--endregion
+
+--region 圈池
+local EventCureItemPool = _G.BaseClass("EventCureItemPool")
+function EventCureItemPool:__init()
+    self.itemPool = {{}, {}, {}}
+    self.nowShow = {{},{},{}}
+    self.itemCls = {EventCureClickItem, EventCureDragItem, EventCureDragClickItem}
+end
+function EventCureItemPool:Dispose()
+    for i = 1, #self.itemPool do
+        if self.itemPool[i] then
+            for j = 1, #self.itemPool[i] do
+                self.itemPool[i][j]:Dispose()
+            end
+        end
+    end
+    for i = 1, #self.nowShow do
+        if self.nowShow[i] then
+            for j = 1, #self.nowShow[i] do
+                self.nowShow[i][j]:Dispose()
+            end
+        end
+    end
+    self.itemPool = nil
+    self.itemObj = nil
+    self.itemCls = nil
+    self.getRoot = nil
+    self.putRoot = nil
+    self.nowShow = nil
+end
+function EventCureItemPool:SetObj(obj1, obj2, obj3)
+    self.itemObj = {obj1, obj2, obj3}
+end
+function EventCureItemPool:GetItem(t)
+    local item
+    if #self.itemPool[t] > 0 then
+        item = remove(self.itemPool[t])
+        item.gameObject:SetParentE(self.getRoot)
+    else
+        item = self.itemCls[t].New(_G.InstantiateObject(self.itemObj[t], self.getRoot))
+    end
+    _G.table.insert(self.nowShow[t], item)
+    return item
+end
+function EventCureItemPool:PutItem(t, item)
+    if self.nowShow and self.nowShow[t] then
+        _G.table.removebyvalue(self.nowShow[t],item)
+    end
+    _G.table.insert(self.itemPool[t], item)
+    item.gameObject:SetParentE(self.putRoot)
+end
+function EventCureItemPool:SetParent(getRT, putRT)
+    self.getRoot = getRT
+    self.putRoot = putRT
+end
+--endregion
+--endregion
+
+--region 玩法类
+--region 玩法基类
+local EventCureGameBase = _G.BaseClass("EventCureGameBase")
+function EventCureGameBase:__init(endCall)
+    _G.Events:GetInstance():AddListener(GameDied, self.TimerClose, self)
+    self.endCall = endCall
+    self.onItemDoneCall = _G.handler(self, self.ItemDoneCall)
+    self.onItemCloseCall = _G.handler(self, self.ItemCloseCall)
+end
+function EventCureGameBase:TimerClose()
+    if self.showTimer ~= nil then
+        self.showTimer:Stop()
+        self.showTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(GameDied, self.TimerClose, self)
+end
+function EventCureGameBase:Dispose()
+    self.endCall = nil
+    self.playData = nil
+    self.itemCount = nil
+    self.curPosIndex = nil
+    if self.showTimer ~= nil then
+        self.showTimer:Stop()
+        self.showTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(GameDied, self.TimerClose, self)
+end
+---开始
+---@param data table 圈数据
+function EventCureGameBase:Play(data)
+    self.playData = data
+    self.itemCount = #data * 0.5
+    self.curPosIndex = 1
+    if self.showTimer then
+        self.showTimer:Stop()
+        self.showTimer = nil
+    end
+    self.showTimer =
+        _G.TimerManager:GetInstance():GetTimer(MinBtnData[CurGameIndex].GameStartTime, self.OnPlayCall, self, true)
+    self.showTimer:Start()
+end
+function EventCureGameBase:OnPlayCall()
+    if self.showTimer then
+        self.showTimer:Stop()
+        self.showTimer = nil
+    end
+    if table.isEmptyOrNil(MinBtnData) then
+        return
+    end
+    self.showTimer = _G.TimerManager:GetInstance():GetTimer(MinBtnData[CurGameIndex].IntervalTime, self.ShowItem, self)
+    self.showTimer:Start()
+    self:ShowItem()
+end
+---展示圈 间隔时间调用
+function EventCureGameBase:ShowItem()
+    if self.curPosIndex > #self.playData then
+        if self.showTimer then
+            self.showTimer:Stop()
+            self.showTimer = nil
+        end
+        return
+    end
+    self:OnShowItem()
+    self.curPosIndex = self.curPosIndex + 2
+end
+--region 子类重写
+function EventCureGameBase:GetIntervalTime()
+    return 0
+end
+---展示圈
+function EventCureGameBase:OnShowItem()
+end
+---圈被操作之后得回调
+function EventCureGameBase:ItemDoneCall(item)
+end
+function EventCureGameBase:OnGameEnd()
+end
+---圈被回收之后得回调
+function EventCureGameBase:ItemCloseCall(item)
+    self.itemCount = self.itemCount - 1
+    if self.itemCount <= 0 then
+        self:OnGameEnd(item)
+        if self.endCall then
+            self.endCall()
+        end
+    end
+end
+--endregion
+--endregion
+--region 点击
+local EventCureClickClass = _G.BaseClass("EventCureClickClass", EventCureGameBase)
+
+function EventCureClickClass:GetIntervalTime()
+    return intervalTime
+end
+
+function EventCureClickClass:OnShowItem()
+    local item = EventCureItemPoolInstance:GetItem(itemtype.click)
+    item.gameObject:SetLocalPosition(self.playData[self.curPosIndex], self.playData[self.curPosIndex + 1], 0)
+    item:Show(self.onItemDoneCall, self.onItemCloseCall)
+end
+--endregion
+--region 拖拽
+local EventCureDragClass = _G.BaseClass("EventCureDragClass", EventCureGameBase)
+
+function EventCureDragClass:__init(endCall, root)
+    self.onDragBegin = _G.handler(self, self.OnItemDragBegin)
+    self.onDrag = _G.handler(self, self.OnItemDrag)
+    self.onDragEnd = _G.handler(self, self.OnItemDragEnd)
+    self.onDown = _G.handler(self, self.OnItemPressDown)
+    self.rectRoot = root
+    self.dragItemList = {}
+end
+
+function EventCureDragClass:Dispose()
+    self.onDragBegin = nil
+    self.onDrag = nil
+    self.onDragEnd = nil
+    self.curMousePos = nil
+    self.dragItemList = nil
+    self.dragItem = nil
+end
+--region 重写方法
+function EventCureDragClass:GetIntervalTime()
+    return dragItervalTime
+end
+
+function EventCureDragClass:OnShowItem()
+    if self.curPosIndex == 1 then
+        self.dragItem = EventCureItemPoolInstance:GetItem(itemtype.dragClick)
+        self.dragItem.gameObject:SetLocalPosition(
+            self.playData[self.curPosIndex],
+            self.playData[self.curPosIndex + 1],
+            0
+        )
+        self.dragItem:SetDragCall(self.onDragBegin, self.onDrag, self.onDragEnd, self.onDown)
+    end
+    local item = EventCureItemPoolInstance:GetItem(itemtype.drag)
+    item.gameObject:SetLocalPosition(self.playData[self.curPosIndex], self.playData[self.curPosIndex + 1], 0)
+    item:Show(
+        self.onItemDoneCall,
+        self.onItemCloseCall,
+        (self.curPosIndex + 1) * 0.5,
+        self.playData[self.curPosIndex + 2],
+        self.playData[self.curPosIndex + 3]
+    )
+    self.dragItemList[(self.curPosIndex + 1) * 0.5] = item
+end
+---圈被操作之后得回调
+function EventCureDragClass:ItemDoneCall(item)
+    self.dragItemList[item.curIndex] = nil
+end
+---圈被回收之后得回调
+function EventCureDragClass:ItemCloseCall(item)
+    self.dragItemList[item.curIndex] = nil
+    EventCureGameBase.ItemCloseCall(self, item)
+end
+--endregion
+function EventCureDragClass:OnItemPressDown()
+    if self.dragItemList[1] then
+        self.dragItemList[1]:SetResult(nil, true)
+    end
+    self.curCheckIndex = 2
+    self.pressDown = true
+end
+function EventCureDragClass:OnItemDragBegin(ed)
+    local ret, uipos =
+        CS.UnityEngine.RectTransformUtility.ScreenPointToLocalPointInRectangle(
+        self.rectRoot,
+        ed.position,
+        _G.UIManager:GetInstance().UICamera
+    )
+    if self.curMousePos then
+        self.curMousePos.x = uipos.x
+        self.curMousePos.y = uipos.y
+    else
+        self.curMousePos = {x = uipos.x, y = uipos.y}
+    end
+    self.widthScale = _G.AppSetting.CONFIG_SCREEN_HEIGHT / _G.AppSetting.SCREEN_HEIGHT * _G.AppSetting.SCREEN_WIDTH
+end
+function EventCureDragClass:OnItemDrag(ed)
+    self.curMousePos.x = self.curMousePos.x + ed.delta.x / _G.AppSetting.SCREEN_WIDTH * self.widthScale
+    self.curMousePos.y =
+        self.curMousePos.y + ed.delta.y / _G.AppSetting.SCREEN_HEIGHT * _G.AppSetting.CONFIG_SCREEN_HEIGHT
+    if self.dragItemList[self.curCheckIndex] then
+        if
+            _G.Mathf.Abs(self.playData[self.curCheckIndex * 2] - self.curMousePos.y) < 75 and
+                _G.Mathf.Abs(self.playData[self.curCheckIndex * 2 - 1] - self.curMousePos.x) < 75
+         then
+            self.dragItemList[self.curCheckIndex]:SetResult(nil, true)
+            self.curCheckIndex = self.curCheckIndex + 1
+        end
+    end
+end
+function EventCureDragClass:OnItemDragEnd(ed)
+    if not self.pressDown then
+        return
+    end
+    self:OnGameEnd()
+end
+function EventCureDragClass:OnGameEnd()
+    self.pressDown = nil
+    if self.dragItem then
+        self.dragItem:OnPutItem()
+        self.dragItem = nil
+    end
+end
+--endregion
+--endregion
+
+--region 界面
+local barImageName = "ui_jqwf_jindutiao_02"
+local base = require "EventViewBase"
+---@class LabourDayEventCureView : UIBaseView	中文描述
+---@field public go_table LabourDayEventCureView_GoTable GoTable
+---@field public curGameIndex number 当前游戏轮次
+---@field public curGameData table 当前游戏数据
+local LabourDayEventCureView = _G.BaseClass("LabourDayEventCureView", base)
+
+function LabourDayEventCureView:Awake()
+    EventCureItemPoolInstance = EventCureItemPool.New()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+---界面的入口函数
+---@param data table min_button配置ID{{"id","type","typeCls"}} type ==0 为剧情 type==1 为庙会
+function LabourDayEventCureView:OnCreate(callback,cfg)
+    self.callback=callback
+    local doneCall, closeCall
+    local data={{cfg.ID,2}}
+    local id
+    self.StartAnim = self.go_table.aorbtn_start:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+    -- self.ResultHoriGroup = self.go_table.obj_Txt:GetComponentE(_G.typeof(_G.CS.UnityEngine.UI.HorizontalLayoutGroup))
+    base.OnCreate(self, doneCall, closeCall)
+    gameData = {}
+    if not _G.table.isEmptyOrNil(data) then
+        id = _G.tonumber(data[1] and data[1][1] or nil)
+        GameType = _G.tonumber(data[1] and data[1][2] or 1)
+        self.typeCls = data[1] and data[1][3] or nil
+        self:InitCfgData(id)
+    end
+    self.onGameEnd = _G.handler(self, self.OnGameEnd)
+    if GameType == 1 then
+        self.BgContent = _G.GetAutoGoTable(self.go_table.obj_xindiantu)
+    elseif GameType == 2 then
+        self.BgContent = _G.GetAutoGoTable(self.go_table.obj_yinfu)
+    end
+    -- _G.GameUtil.SetActiveByCondition(self.go_table.obj_fanhui, GameType == 2)
+    self.gameTimesImage = {
+        self.BgContent.aorimage_bar1,
+        self.BgContent.aorimage_bar2,
+        self.BgContent.aorimage_bar3,
+        self.BgContent.aorimage_bar4
+    }
+    self.typeClass = {
+        EventCureClickClass.New(self.onGameEnd),
+        EventCureDragClass.New(self.onGameEnd, self.go_table.trans_root)
+    }
+    EventCureItemPoolInstance:SetObj(
+        self.go_table.obj_itemClick,
+        self.go_table.obj_itemDrag,
+        self.go_table.obj_dragClick
+    )
+    EventCureItemPoolInstance:SetParent(self.go_table.trans_root, self.go_table.trans_hide)
+    self.go_table.aortext_Score.text = MScore
+    self.go_table.aortext_Slider.text = "0%"
+    self:DoGameStart()
+end
+
+---按钮点击事件在这里派发
+function LabourDayEventCureView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_start then
+        self:DoGameStart()
+    elseif go == self.go_table.aorbtn_Close or go == self.go_table.aorbtn_CloseView then
+        if _G.AppSetting.ArraignedType == _G.ArraignedStartType.Music then
+            self:Reset()
+            self.go_table.obj_GameEnd:SetActiveE(0)
+            self:DoGameStart()
+            return
+        end
+        _G.Events:GetInstance():Broadcast(GameDied)
+        self:Close()
+    elseif go == self.go_table.aorbtn_restart then
+        self:Reset()
+        self.go_table.obj_GameEnd:SetActiveE(0)
+        self:DoGameStart()
+    elseif go == self.go_table.aorbtn_pause then
+        if not self.curGameData then
+            if self.callback then
+                self:callback(0)
+            end
+            return 
+        end
+        if self.GameStart then
+            self.curPlayIndex = #self.curGameData.game + 1
+            self.curGameIndex = #gameData + 1
+            self:OnGameEnd( function()
+                if self.callback then
+                    self:callback(0)
+                end
+            end)
+        end
+    end
+end
+
+function LabourDayEventCureView:DoGameStart()
+    if not self.GameStart then
+        _G.Events:GetInstance():AddListener(ListenerEnum, self.DisposeResourceAndCreate, self)
+        self.curGameIndex = 1
+        self.StartAnim.enabled = true
+        self.countDownNum = 3
+        self:UpdateCountDown()
+        self.countdown = _G.TimerManager:GetInstance():GetTimer(1, self.ShowCountdown, self, false, false, true)
+        self.countdown:Start()
+    end
+end
+
+function LabourDayEventCureView:UpdateCountDown()
+    if self.countDownNum and self.countDownNum > 0 then
+        self.go_table.aorimage_countDown.SpriteName = "ui_hbdj_djs_" .. self.countDownNum
+        self.go_table.aorimage_countDown:SetActiveE(1)
+    elseif self.countDownNum and self.countDownNum <= 0 then
+        self.go_table.aorimage_countDown:SetActiveE(0)
+    end
+end
+
+function LabourDayEventCureView:ShowCountdown()
+    self.countDownNum = self.countDownNum - 1
+    if self:IsNil() then
+        return
+    end
+    if self.countDownNum <= 0 then
+        self.GameStart = true
+        self.go_table.obj_mask:SetActiveE(0)
+        self.countdown:Stop()
+        -- _G.GameUtil.SetActiveByCondition(self.go_table.obj_yinfu, GameType == 2)
+        -- _G.GameUtil.SetActiveByCondition(self.go_table.obj_xindiantu, GameType == 1)
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_Score, GameType == 2)
+        _G.GameUtil.SetActiveByCondition(self.go_table.aorbtn_start, false)
+        self:PlayGame()
+    end
+    self:UpdateCountDown()
+end
+
+
+function LabourDayEventCureView:CreateNum(num)
+    local item = _G.InstantiateObject(self.go_table.aorimage_num, self.go_table.obj_lianjiContent)
+    item:GetComponentE(_G.typeof(_G.CS.AorImage)).SpriteName = numImage .. num
+    if not self.NumList then
+        self.NumList = {}
+    end
+    _G.table.insert(self.NumList, item)
+end
+function LabourDayEventCureView:DisposeResourceAndCreate(count, perfect)
+    -- if self.go_table.aorimage_Rate.SpriteName ~= CurLevelImage then
+    --     _G.GameUtil.SetActiveByCondition(self.go_table.obj_Score, false)
+    --     _G.GameUtil.SetActiveByCondition(self.go_table.obj_Score, true)
+    -- end
+    -- self.go_table.aorimage_Rate.SpriteName = CurLevelImage
+    self.go_table.aortext_Score.text = MScore
+    self.go_table.aorimage_Progress.fillAmount = MScore / MaxScore
+    if self.NumList then
+        for k, v in pairs(self.NumList) do
+            v:DestroyObject()
+        end
+    end
+    if count < 2 or not perfect then
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_lianji, false)
+        return
+    end
+    local str = tostring(count)
+    local len = string.len(count)
+    local numlist = {}
+    for i = 1, len do
+        table.insert(numlist, string.sub(str, i, i))
+    end
+    -- for k, v in pairs(numlist) do
+    --     self:CreateNum(tonumber(v))
+    -- end
+    -- _G.GameUtil.SetActiveByCondition(self.go_table.obj_lianji, false)
+    -- _G.GameUtil.SetActiveByCondition(self.go_table.obj_lianji, true)
+    self.go_table.obj_fireEff:SetActiveE(0)
+    self.go_table.obj_fireEff:SetActiveE(1)
+end
+---初始化配置数据
+---@param id number min_button配置ID
+function LabourDayEventCureView:InitCfgData(id)
+    local cfg = _G.ConfigManager.min_button_cfg[id]
+    if not cfg then
+        return
+    end
+    if not _G.string.IsNullOrEmpty(cfg.Fragment_image) then
+        self.go_table.aorrawimage_bg:LoadImage(cfg.Fragment_image)
+    end
+    local minBtnEventCfgs = _G.ConfigManager.min_button_event_cfg
+    ComputeMaxScore(cfg)
+    local mbtCfg
+    local index = 1
+    for i = 1, #cfg.EventID do
+        mbtCfg = minBtnEventCfgs[cfg.EventID[i]]
+        if mbtCfg then
+            if not gameData[index] then
+                gameData[index] = {story = 0, game = nil}
+            end
+            gameData[index].ID = mbtCfg.ID
+            gameData[index].story = mbtCfg.StoryID
+            gameData[index].game = _G.DeepCopyCfgTable(mbtCfg.IntervalPos)
+            if not MinBtnData[index] then
+                MinBtnData[index] = {}
+            end
+            MinBtnData[index].StayTime = mbtCfg.StayTime
+            MinBtnData[index].GameStartTime = mbtCfg.GameStartTime
+            MinBtnData[index].IntervalTime = mbtCfg.IntervalTime
+            MinBtnData[index].LiveTime = mbtCfg.LiveTime
+            MinBtnData[index].TimeRatio = mbtCfg.TimeRatio
+            MinBtnData[index].fraction = mbtCfg.fraction
+            index = index + 1
+        end
+    end
+end
+function LabourDayEventCureView:PlayGame()
+    self.curGameData = _G.DeepCopy(gameData[self.curGameIndex])
+    self.curPlayIndex = 1
+    -- self:LoadEffect(BgContentEffPath[GameType], self.gameTimesImage[self.curGameIndex])
+    self.gameTimesImage[self.curGameIndex]:GetComponentE(_G.typeof(_G.CS.AorImage)).enabled = false
+    self.go_table.slider_progress.value = self.curGameIndex / 4
+    self.go_table.aortext_Slider.text = self.curGameIndex * 25 .. "%"
+    self:OnPlay()
+end
+function LabourDayEventCureView:OnPlay()
+    local t = remove(self.curGameData.game[self.curPlayIndex], 1)
+    self.typeClass[t]:Play(self.curGameData.game[self.curPlayIndex])
+end
+function LabourDayEventCureView:OnGameEnd(callback)
+    if _G.AppSetting.IsXzns and not self.GameStart or self:IsNil() then
+        return
+    end
+    if self.curGameData.story > 0 then
+        _G.AutomaticPlayStory.PlayStoryByID(self.curGameData.story, _G.handler(self, self.OnGameEnd))
+        self.curGameData.story = 0
+        return
+    end
+    self.curPlayIndex = self.curPlayIndex + 1
+    if self.curPlayIndex > #self.curGameData.game then
+        CurGameIndex = self.curGameIndex + 1
+        self.curGameIndex = self.curGameIndex + 1
+        if self.curGameIndex > #gameData then
+            CurGameIndex = #gameData
+            self:OnEventDone()
+            if GameType == 2 then
+                if self.isgameend then 
+                    return 
+                end
+                self.isgameend=true
+                self:ShowResult(callback)
+            elseif GameType == 1 then
+                self:Close()
+            end
+        else
+            self:PlayGame()
+        end
+    else
+        self:OnPlay()
+    end
+end
+function LabourDayEventCureView:LoadEffect(path, parent, call, loadcall)
+    _G.UIUtils.LoadEffectByCfg(
+        path,
+        parent,
+        function(tran)
+            if loadcall then
+                loadcall()
+            end
+        end,
+        function()
+            if call then
+                call()
+            end
+        end
+    )
+end
+local scoreUpTime = 1
+function LabourDayEventCureView:DoScoreUp(score)
+    local _score = 0
+    while _score < MScore - score do
+        _score = _score + score
+        if self:IsNil() then
+            return
+        end
+        self.go_table.aortext_turnScore.text = _score
+        _G.coroutine.waitforendofframe()
+    end
+    if self:IsNil() then
+        return
+    end
+    self.go_table.aortext_turnScore.text = MScore
+    _G.coroutine.waitforendofframe()
+end
+function LabourDayEventCureView:ShowResult(callback)
+    local fundScore = math.floor(MScore / 30)
+    -- self.ResultHoriGroup.enabled = false
+    self.go_table.aortext_turnScore.text = MScore
+    -- self.ResultHoriGroup.enabled = true
+    self.go_table.aorimage_Result.SpriteName = CurLevelImage
+    --self.go_table.obj_GameEnd:SetActiveE(1)
+    --self:Submit(MScore)
+    self.ScoreCo = _G.coroutine.start(_G.handlerbind(self, self.DoScoreUp, fundScore))
+    if callback then
+        callback()
+    else
+        if self.callback then
+            self:callback(1)
+        end
+    end
+    --[[_G.DelayDo(
+        1,
+        function()
+            if self:IsNil() then
+                return
+            end
+            self.go_table.aorimage_Result:SetActiveE(1)
+            self.go_table.aorbtn_Close:SetActiveE(1)
+        end
+    )]]
+end
+function LabourDayEventCureView:Submit(MScore)
+    if _G.AppSetting.ArraignedType == _G.ArraignedStartType.Music then
+        return
+    end
+    if self.typeCls.curActivityClass:GetTypeId() == 10070 then
+        self.typeCls:Finish(
+            MScore,
+            function()
+                if self.doneCallback then 
+                    self.doneCallback()
+                end
+            end
+        )
+    elseif self.typeCls.Mscore < MScore then
+        self.typeCls:SubmitScore(
+            MScore,
+            function()
+                self.typeCls:SetNewRankData(
+                    MScore,
+                    function()
+                        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.TempleView.Name)
+                        if view then
+                            view:SetData()
+                        end
+                        self.typeCls:RefreshRedPointTemple()
+                    end
+                )
+            end
+        )
+    end
+end
+
+function LabourDayEventCureView:Reset()
+    self.go_table.obj_GameEnd:SetActiveE(0)
+    self.curGameIndex = 1
+    CurGameIndex = 1
+    MScore = 0
+    LianjiCount = 0
+    self.go_table.obj_lianji:SetActiveE(0)
+    SetLevelByScore()
+    self.go_table.aorimage_Result.SpriteName = CurLevelImage
+    self.go_table.aortext_Score.text = MScore
+    self.go_table.aorimage_Progress.fillAmount = MScore / MaxScore
+    self.go_table.aortext_Slider.text = "0%"
+    self.go_table.slider_progress.value = 0
+    self.GameStart = false
+end
+
+function LabourDayEventCureView:OnDestroy()
+    if self.ScoreCo ~= nil then
+        _G.coroutine.stopwaiting(self.ScoreCo)
+        self.ScoreCo = nil
+    end
+    self.curGameIndex = nil
+    for i = 1, #self.typeClass do
+        self.typeClass[i]:Dispose()
+    end
+    self.typeClass = nil
+    self.curPlayIndex = nil
+    gameData = nil
+    _G.Events:GetInstance():RemoveListener(ListenerEnum, self.DisposeResourceAndCreate, self)
+    gameData = nil
+    GameType = 2
+    MinBtnData = {}
+    CurGameIndex = 1
+    MScore = 0
+    MaxScore = 0
+    LianjiCount = 0
+    CurLevelImage = LevelImage[1]
+    EventCureItemPoolInstance:Dispose()
+end
+return LabourDayEventCureView
+--endregion

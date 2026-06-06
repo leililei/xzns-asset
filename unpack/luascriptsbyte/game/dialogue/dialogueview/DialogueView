@@ -1,0 +1,2206 @@
+-----------------------------------------------------------------------
+-- Created by lsy 03.11
+--
+-- @Description 对话界面
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+---@type DialogueOptionAction
+local DialogueOptionAction = require("DialogueOptionAction")
+
+---@class DialogueView : UIBaseView
+---@field isPlayFinalOptions bool 只播放最后一段
+---@field taskOptionData TaskOptionData 支线任务显示数据
+---@field isShowBtn  boolean 默认true显示自动播放及跳过按钮
+---@class Params_DialogueView
+local DialogueView = _G.BaseClass("DialogueView", _G.UIBaseView)
+---@type number 通用时间 用作角色的渐显 渐隐
+local COMMON_TIME = 0.5
+local table = _G.table
+
+--- 初始化数据      DialogueOptionAction.ShowDialogueCfg 时会调用
+function DialogueView:InitData()
+    --- 关闭类型 1点击跳过关闭
+    self.CloseType = nil
+    --- 允许点击选项按钮 一个选项点击过后 需要事情做完之后才能再次点击
+    ---@type boolean
+    self.EnableClick = true
+
+    --- 左 (0) 右 (1) 两个位置显示的模型对应的资源名字
+    ---@type string[]
+    self.RoleRes = {
+        [0] = "",
+        [1] = ""
+    }
+
+    --- 目前说话的角色 3D 模型
+    ---@type number
+    self.CurSpeakingRole3DShowIndex = -1
+
+    --- 本次对话的所有段落 Sid 每个 Sid 对应 dialogue_script_cfg 配表中的一行数据
+    ---@type number[]
+    self.ScriptSids = nil
+    --- 打字效果 Tweener
+    ---@type DG.Tweening.Tweener
+    self.ContentTweener = nil
+
+    --- 预加载完成的角色模型数量 预加载完成一个就可以 完后进行对话内容的显示了
+    ---@type number
+    self.PreLoadModelNum = 0
+
+    --- 选项对话按钮的数据
+    ---@type OptionData[]
+    self.Options = {}
+    --- 当前对话类型
+    ---@type _G.DialogueEnum.DialogueType.btn
+    self.Type = 0
+    --- 支线任务按钮数据
+    ---@type TaskOptionData[]
+    self.TaskOptionData = nil
+
+    --- 协程关闭方法 begin
+    ---@type fun() Action 协程的停止方法
+    self.StopAction = nil
+    ---@type fun() 预加载角色模型资源协程的停止方法
+    -- self.StopPreLoadRoleModels = nil
+    ---@type fun() 各个角色依次表演协程的停止方法
+    self.StopShowAllScripts = nil
+    ---@type fun() 当前角色表演协程的停止方法
+    self.StopShowScript = nil
+    ---@type fun() 移动角色位置等待协程的停止方法
+    self.StopUpdateRolePositionDelay = nil
+    ---@type fun() 当前角色出场渐显协程的停止方法
+    self.StopShowRolesDelay = nil
+    ---@type fun() 当前角色的台词协程的停止方法
+    self.StopShowContent = nil
+    ---@type fun() 当句台词协程的停止方法
+    self.StopShowLine = nil
+    ---@type fun() 台词之间的停顿协程的停止方法
+    self.StopPauseBetweenLines = nil
+    --- 协程关闭方法 end
+
+    --- 是否正在跳过本次对话
+    ---@type boolean
+    self.SkippingAll = false
+
+    -- 正常速度
+    self.ratio_speed1 = 0.011
+    if _G.DialogueView_speed ~= nil then
+        self.ratio_speed1 = _G.DialogueView_speed
+    end
+    -- 快速
+    self.ratio_speed2 = self.ratio_speed1 --  / 2
+    ---文字显示速度  值越小 文字显示越快
+    self.ratio = self.ratio_speed1
+
+    ---说台词时  点击   文字全部显示 并暂停
+    self.clickStop = false
+
+    --- 任务对话相关
+
+    --- 对话完成回调  只有点击任务按钮  才会执行回调 (临时存储FinishCallback  )
+    self.taskTempCall = nil
+    ---任务奖励item
+    self.taskItemList = {}
+
+    --- 自动跳过  跳到选项
+    self.isSkipDialogue = false
+
+    --- 是否点击了任务按钮   防止重复点击
+    self.isClicktask = nil
+
+    --- 本次是否选项对话
+    self.isOptionDialogue = nil
+end
+
+---
+function DialogueView:Awake()
+    --- 快进 自动跳过  -- 防止初始化
+    ---@type boolean
+    self.SkippingAuto = false
+    -- 物品展示 预制体
+    self.itemShow_Item = nil
+    self.Audio = {
+        ---对话音效  单个
+        acoustics = nil,
+        ---对话台词 单个
+        voice = nil
+    }
+
+    --- 添加按钮响应事件
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+
+    ---自动播放特效的动画控制器  effect -> @_obj_effectAuto
+    self.effAutoAni = nil
+    if self.go_table.obj_effectAuto ~= nil then
+        self.effAutoAni = self.go_table.obj_effectAuto:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+        self.effAutoAni.speed = 0
+    end
+
+    -- self.obj_itemShowAnimator =
+    --     self.go_table.obj_itemShow:GetChildE(0):GetComponentE(_G.typeof(CS.UnityEngine.Animator))
+
+    ---为了 防止新手关 无角色 所以用账号来标识
+    ---@type SDKServerShowInfo
+    local info = _G.ServerManager:GetInstance().CurServer
+
+    --- 保存记录 是否自动播放 key
+    self.Key_isAuto = "DialogueIsAuto" .. info.AccountName
+end
+
+--- 启动
+---@param dialogueCfgSid number dialogue_cfg 配表里的 Sid
+---@param finishCallback fun(dialogueCfgSid:string) 对话完成回调
+---@param Data Params_DialogueView
+function DialogueView:OnCreate(dialogueCfgSid, finishCallback, Data)
+    self.isPlayFinalOptions = nil
+    self.DialogueCfgSid = dialogueCfgSid
+    self.TaskOptionData = nil
+    self.FinishCallback = finishCallback
+    self.isShowBtn = true
+
+    if Data then
+        self.isShowBtn = Data.isShowBtn
+        self.TaskOptionData = Data.taskOptionData
+        self.isPlayFinalOptions = Data.isPlayFinalOptions
+    end
+
+    --- 初始化成员变量 可能会多次初始
+    self:InitData()
+    self:CacheComponent()
+
+    --- 当前是否有显示主界面  防止对话完毕 擅自打开
+    if self.isStartShowMain == nil then
+        local isActive = _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        if isActive == true then
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+            self.isStartShowMain = true
+        end
+    end
+
+    -- local cam_3d = _G.GraphicsManager.Instance:GetSubCamera("3DUICam")
+    -- if not _G.IsNil(cam_3d) then
+    --     --- 对话中不显示血条  免得层级错误
+    --     cam_3d:SetActiveE(0)
+    -- end
+
+    ---@type dialogue_cfg_Item
+    local dialogue = _G.ConfigManager.dialogue_cfg[dialogueCfgSid]
+
+    if (not dialogue) and (not self.TaskOptionData) then
+        --("dialogue_cfg Not Found. and TaskOptionData nil. " .. dialogueCfgSid)
+        self:CloseView()
+        return
+    end
+
+    self.ScriptSids = dialogue.Scripts
+    if self.isPlayFinalOptions == true then
+        if #self.ScriptSids > 0 then
+            self.ScriptSids = { self.ScriptSids[#self.ScriptSids] }
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" 对话 序列有误 dialogueCfgSid:" .. tostring(dialogueCfgSid))
+            end
+            self:Close()
+            return
+        end
+    end
+
+    self:SetIsEnterWorld()
+    self:ShowOptions(-1)
+    -- self:SetAtuto(true)
+    self.StopAction = nil
+    self.StopAction = coroutine.start(_G.handler(self, self.CoAction), self.ScriptSids, _G.handler(self, self.CallStopAction))
+
+    self.go_table.aorbtn_close_mask:SetActiveE(1)
+end
+
+--- 按钮单击事件
+---@param go CS.UnityEngine.GameObject
+function DialogueView:OnClickBtn(go)
+    local name = go:GetName()
+    if name == "@_aorbtn_close_mask" then
+        --- 玩家主动点击对话 就取消 自动播放
+        -- self:SetAtuto(false)
+        self:SkipCurrentScriptLine()
+    elseif name == "@_aorbtn_SkipDialogue" then
+        -- if self.isSkipDialogue == true then
+        --     ---防止 界面加载慢了 按钮未隐藏
+        --     self:ShowAorbtn(false)
+        --     return
+        -- end
+        -- if self:GetIsOptionDialogue() == false then
+        --     self:SkipAllScripts()
+        --     return
+        -- end
+        -- self:ShowAorbtn(false)
+        -- self:SetAtuto(false, true)
+        -- self:CallStopPauseBetweenLines()
+        -- self:StopAllCoroutine(true)
+        -- self.SkippingAuto = true
+        --- 如果跳到了最后一句  不能再操作
+
+        if self.isPlayFinalOptions == true then
+            return
+        end
+        self:ShowOptions(-1)
+        self.isPlayFinalOptions = true
+
+        local finalid = self.ScriptSids[#self.ScriptSids]
+        local finalcfg = _G.ConfigManager.dialogue_script_cfg[finalid]
+        if _G.IsNil(finalcfg) then
+            if finalid ~= nil and finalid > 100 then
+                _G.LogError(
+                        "DialogueView aorbtn_SkipDialogue " .. tostring(self.ScriptSids) .. " " .. tostring(finalid)
+                )
+            end
+            self.CloseType = 1
+            self:Close()
+            return
+        end
+        local isOptions = finalcfg.Type1 == _G.DialogueEnum.DialogueType.btn
+        if isOptions == false then
+            self.CloseType = 1
+            self:Close()
+            return
+        end
+
+        DialogueOptionAction["PlayFinalOptions"]()
+    elseif name == "@_aorbtn_AutoDialogue" then
+        -- self:StopAllCoroutine()
+        self:SetAtuto()
+        self:SkipCurrentScriptLine()
+    elseif name == "@_aorbtn_task" then
+        if self.isClicktask then
+            return
+        end
+        self.isClicktask = true
+
+        local taskoFun = function()
+            self.FinishCallback = self.taskTempCall
+            self.taskTempCall = nil
+            self:SkipAllScripts()
+        end
+
+        if self.TaskOptionData.state == _G.TaskEnum.ETaskState.Completed then
+            _G.UIUtils.LoadEffectByCfg(
+                    _G.ConfigManager.ui_effect_cfg.fx_c_renwu_cao,
+                    self.transform,
+                    nil,
+                    function()
+                        taskoFun()
+                    end
+            )
+        else
+            taskoFun()
+        end
+    end
+end
+
+---@param 变量名 boolean nil 当前状态取反
+---@param isNotPlayer boolean true程序操作 false玩家操作 (用于判断是否要保存状态)
+function DialogueView:SetAtuto(isAuto, isNotPlayer)
+    if _G.IsNil(self.go_table) then
+        return
+    end
+    local isAuto = isAuto
+    if isAuto == nil then
+        isAuto = not self.SkippingAuto
+    end
+    if self.Type == _G.DialogueEnum.DialogueType.movie then
+        isNotPlayer = true
+        isAuto = true
+    end
+
+    if isAuto == false then
+        -- 镇魂街ZHJ-4854 【主任务】剧情系统ZHJ-5809
+        -- 【客户端】修改自动播放图标
+        -- 去掉灰色的自动播放按钮
+        -- on和off都用白色的自动播放按钮
+        -- "ui_ty_btn_zidongbof_off"
+
+        -- self.go_table.aortext_AutoDialogue.text = "自动播放"
+        if self.effAutoAni ~= nil then
+            self.effAutoAni.speed = 0
+        end
+        self.SkippingAuto = false
+    else
+        -- self.go_table.aortext_AutoDialogue.text = "自动播放中"
+        if self.effAutoAni ~= nil then
+            self.effAutoAni.speed = 1
+        end
+        self.SkippingAuto = true
+    end
+    if not isNotPlayer then
+        self:SetPlayerPrefsIsAuto(isAuto)
+    end
+end
+
+function DialogueView:SetPlayerPrefsIsAuto(isAuto)
+    _G.PlayerPrefsManager.SetInt(self.Key_isAuto, isAuto and 1 or 0)
+end
+
+--- 获取是否自动播放 true自动播放
+function DialogueView:GetPlayerPrefsIsAuto()
+    return _G.PlayerPrefsManager.GetInt(self.Key_isAuto) == 1
+end
+
+--- 读取配置  是否开始自动播放
+function DialogueView:CheckAndPlayAuto()
+    self:CheckAndPlayAuto_Stop()
+    if _G.IsNil(self.go_table) then
+        return
+    end
+    local isauto = self:GetPlayerPrefsIsAuto()
+    if isauto == true then
+        self:SetAtuto(true, true)
+    end
+    --     end,
+    --     self,
+    --     true,
+    --     false
+    -- )
+    -- self.timerr_Auto:Start()
+end
+
+--- 读取配置  是否开始自动播放
+function DialogueView:CheckAndPlayAuto_Stop()
+    if self.timerr_Auto ~= nil then
+        self.timerr_Auto:Stop()
+        self.timerr_Auto = nil
+    end
+end
+
+--- 缓存需要使用到的组件
+function DialogueView:CacheComponent()
+    if not table.isEmptyOrNil(self.ScriptRootGoTable) then
+        return
+    end
+    --- ScriptRoot go_table
+    ---@type DialogueView._obj_ScriptRoot_GoTable
+    self.ScriptRootGoTable = {}
+
+    ---@type DialogueView._obj_ScriptRoot_letter_GoTable
+    self.ScriptRootGoTable_letter = {}
+
+    self.ScriptRootGoTable = _G.GetAutoGoTable(self.go_table.obj_ScriptRoot)
+    --- 左右两个位置显示的模型对应的位置
+    self.roleModelList = {
+        [_G.DialogueEnum.PosIndex.left] = self.ScriptRootGoTable.obj_modelLeft,
+        [_G.DialogueEnum.PosIndex.mid] = self.ScriptRootGoTable.obj_modelMiddle,
+        [_G.DialogueEnum.PosIndex.right] = self.ScriptRootGoTable.obj_modelRight
+    }
+    self.ScriptRootGoTable_letter = _G.GetAutoGoTable(self.go_table.obj_ScriptRoot_letter)
+    if self.ScriptRootGoTable == nil then
+        self.ScriptRootGoTable = -1
+
+        if _G.AppSetting.DEBUG then
+            _G.LogError("ScriptRootGoTable nil. ")
+        end
+    end
+end
+
+--- 切换为 当前要用的组件 1默认  2 _letter
+---@param currentScript dialogue_script_cfg_Item
+function DialogueView:SetScriptRootGoTable(currentScript, index)
+    if self:IsDes() then
+        return
+    end
+
+    if currentScript.Type1 == _G.DialogueEnum.DialogueType.nullShow then
+        _G.GameUtil.SetActiveByCondition(self.ScriptRootGoTable.gameObject, false)
+    else
+        _G.GameUtil.SetActiveByCondition(self.ScriptRootGoTable.gameObject, index == 1)
+    end
+
+    _G.GameUtil.SetActiveByCondition(self.ScriptRootGoTable_letter.gameObject, index == 2)
+end
+
+--- 开始表演
+---@param scriptSids number[] dialogue_script_cfg 配表里面 Sid 的数组
+---@param callback fun() 完成回调
+function DialogueView:CoAction(scriptSids, callback)
+    _G.coroutine.waitforendofframe()
+    ---防止还未获取到组件 就开始播放
+    while self.ScriptRootGoTable == nil do
+        if self.ScriptRootGoTable == -1 then
+            return
+        end
+        coroutine.yield()
+    end
+
+    -- self.StopPreLoadRoleModels = nil
+    --("preload begin " .. tostring(Time.unity_time.time))
+    -- if scriptSids.Model ~= nil then
+    --     self.StopPreLoadRoleModels =
+    --         coroutine.start(
+    --             _G.handler(self, self.CoPreLoadRoleModels),
+    --             scriptSids,
+    --             _G.handler(self, self.CallStopPreLoadRoleModels)
+    --         )
+
+    --     while self.PreLoadModelNum <= 0 and not self.SkippingAll do
+    --         coroutine.yield()
+    --     end
+    -- end
+    --("preload end " .. tostring(Time.unity_time.time))
+
+    self.StopShowAllScripts = nil
+    self.StopShowAllScripts = coroutine.start(
+            _G.handler(self, self.CoShowAllScripts),
+            scriptSids,
+            _G.handler(self, self.CallStopShowAllScripts)
+    )
+
+    while self.StopShowAllScripts and not self.SkippingAll do
+        coroutine.yield()
+    end
+
+    _G.StoryManager:GetInstance():SetPlayerPrefs_PlayDialogueid(self.DialogueCfgSid)
+    if callback then
+        callback()
+    end
+
+    --- 有可能已经被关闭 只是等待后
+    if self:IsDes() then
+        return
+    else
+        -- 普通对话完成之后 非跳过对话的情况下  没有任务信息 直接关闭对话
+        if not (#self.Options > 0) and not self.SkippingAll and self:GetIsOptionDialogue() == false then
+            self:CloseView()
+        end
+    end
+end
+
+--- 所有角色依次表演
+---@param scriptSids number[] dialogue_script_cfg 配表里面 Sid 的数组
+---@param callback fun() 所有角色表演完成的回调
+function DialogueView:CoShowAllScripts(scriptSids, callback)
+    _G.coroutine.waitforendofframe()
+    -- 目前对话进行到第几个段落
+    local scriptIndex = 1
+    while scriptIndex <= #scriptSids and not self.SkippingAll do
+        local scriptSid = scriptSids[scriptIndex]
+        self.StopShowScript = nil
+        if self.model then
+            require("CardInfoManager").DelRole(self.model, _G.ePoolType.Temporary)
+            self.model = nil
+        end
+
+        -- 黑幕 过度时间 10以内
+        local blacktypeid = _G.Mathf.Abs(scriptSid)
+        local showTime = 0
+        if scriptSid <= 20 then
+            showTime = blacktypeid % 10
+        end
+        -- 黑屏过度 10以内
+        if blacktypeid <= 10 and blacktypeid ~= 0 then
+            local mcolor = _G.Color.black
+            if scriptSid > 0 then
+                self.StopShowScript = function()
+                    -- body
+                end
+                self.StopShowScript = self:ShowBlackCurtain(1, showTime, mcolor, _G.handler(self, self.CallStopShowScript))
+            else
+                self:ShowBlackCurtain(0, showTime, mcolor)
+            end
+        elseif blacktypeid <= 20 and blacktypeid ~= 0 then
+            -- 白屏过度 20以内
+            local mcolor = _G.Color.white
+
+            if scriptSid > 0 then
+                self.StopShowScript = function()
+                    -- body
+                end
+                self.StopShowScript = self:ShowBlackCurtain(1, showTime, mcolor, _G.handler(self, self.CallStopShowScript))
+            else
+                self:ShowBlackCurtain(0, showTime, mcolor)
+            end
+        else
+            -- 各个角色依次进行对话表演
+            self.StopShowScript = self:ShowScript(scriptSid, _G.handler(self, self.CallStopShowScript))
+        end
+
+        while self.StopShowScript and not self.SkippingAll do
+            coroutine.yield()
+        end
+
+        scriptIndex = scriptIndex + 1
+        if self.isSkipDialogue == true and scriptIndex < #scriptSids then
+            scriptIndex = #scriptSids
+        elseif self.isSkipDialogue == true then
+            self.isSkipDialogue = false
+        end
+    end
+    --("ShowAllScripts end.")
+
+    if callback then
+        callback()
+    end
+end
+
+--- 播放一段配置在 dialogue_script_cfg 表里面的对话
+---@param scriptSid number DialogueScriptCfg配表里的 Sid
+---@param callback fun() 对话播放完成之后的回调
+function DialogueView:ShowScript(scriptSid, callback)
+    -- if self.go_table.obj_bg:GetActiveSelf() == 1 then
+    --     self.go_table.obj_bg:SetActiveE(0)
+    -- end
+    return coroutine.start(_G.handler(self, self.CoShowScript), scriptSid, callback)
+end
+
+--- 播放一段配置在 dialogue_script_cfg 表里面的对话 协程
+---@param scriptSid number DialogueScriptCfg配表里的 Sid
+---@param callback fun() 对话播放完成之后的回调
+function DialogueView:CoShowScript(scriptSid, callback)
+    _G.coroutine.waitforendofframe()
+    --("CurrentScriptId " .. scriptSid)
+    ---@type dialogue_script_cfg
+    local currentScript = _G.ConfigManager.dialogue_script_cfg[scriptSid]
+    if currentScript == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("currentScript nil. scriptSid " .. scriptSid)
+        end
+        if callback then
+            callback()
+        end
+        return
+    end
+    ---@type dialogue_script_cfg_Item
+    self.currentScript = currentScript
+
+    --("DialogueView:CoShowScript--------- " .. scriptSid)
+    local name = _G.LangUtil.GetLangPackValue(currentScript.Name)
+    local type = currentScript.Type1
+    self.StopShowRolesDelay = nil
+
+    -- 防止 角色展示延迟事件
+    self.StopShowRolesDelay = function()
+        -- body
+    end
+
+    self:ShowRoles(currentScript)
+
+    while self.StopShowRolesDelay and not self.SkippingAll do
+        coroutine.yield()
+        if self.isSkipDialogue == true then
+            break
+        end
+    end
+
+    self:ShowIconAndName(currentScript, name)
+    self:ParseOption(currentScript)
+    local pngPath = currentScript.Option_Icon[1]
+    if pngPath then
+        _G.ResourcesManager:GetInstance():LoadTexture(
+                pngPath,
+                function(texture, resRef)
+                    if self:IsDes() then
+                        if resRef ~= nil then
+                            resRef:Release()
+                        end
+                        return
+                    end
+                    self.PlayPngResRef = resRef
+                    -- local StoryManager = _G.StoryManager:GetInstance()
+                    -- if StoryManager.isDialogueRootTranDicInit then
+                    --     StoryManager:RestorCameraFov()
+                    --     _G.GameUtil.SetActiveByCondition(StoryManager.DialogueRootTranDic.BgDic.FullScreen, true)
+                    --     StoryManager.DialogueRootTranDic.BgDic.StoryFullScreenBG:Init(texture)
+                    --     StoryManager:ShowDialoguseCamera()
+                    -- end
+                end,
+                self
+        )
+    end
+
+    self.StopShowContent = nil
+    self.StopShowContent = coroutine.start(_G.handler(self, self.CoShowContent), currentScript, _G.handler(self, self.CallStopShowContent))
+    self:ShowOptions(type)
+
+    while self.StopShowContent and not self.SkippingAll do
+        coroutine.yield()
+    end
+
+    if callback then
+        callback()
+    end
+    --("Showcript end.")
+end
+
+--- 显示角色 3D 模型
+---@param scriptCfg dialogue_script_cfg_Item
+function DialogueView:ShowRoles(scriptCfg)
+    if self:IsDes() or _G.string.IsNullOrEmpty(scriptCfg.Model) then
+        self:CallStopShowRolesDelay()
+        return
+    end
+    local isLoad = true
+    if _G.AppSetting.IsXzns then
+        isLoad = not GameUtil.IsHeXieHide()
+    end
+    if isLoad then
+        require("CardInfoManager").GetRole(
+                scriptCfg.Model,
+                _G.ePoolType.Temporary,
+                self.roleModelList[scriptCfg.Position],
+                _G.RoleEffTypeEnum.Dialogue,
+                function(trans, path)
+                    if trans then
+                        self.model = trans
+                    end
+                    local argument = scriptCfg.argument or {}
+                    if argument[1] then
+                        local x, y = table.unpack(argument[1])
+                        x = x or 1
+                        y = y or x
+                        trans:SetLocalScale(x, y, 1)
+                    end
+                    if argument[2] then
+                        trans:SetLocalPosition(argument[2][1] or 0, argument[2][2] or 0, argument[2][3] or 0)
+                    end
+                    self:CallStopShowRolesDelay()
+                    if _G.AppSetting.IsXzns then
+                        local cardCfg = _G.ConfigManager.card_cfg
+                        local id = 0
+                        for _, v in pairs(cardCfg) do
+                            if v.ModelPathHi == scriptCfg.Model then
+                                id = v.id
+                            end
+                        end
+                        if id ~= 0 then
+                            local spineCfg = _G.ConfigManager.card_show_cfg[id] or _G.ConfigManager.skin_cfg[id]
+                            local idle = spineCfg.display_idle[1]
+                            _G.GameUtil.SetCardUiSpineAnimation(trans, idle, true)
+                        else
+                            _G.GameUtil.SetCardUiSpineAnimation(trans, "idle", true)
+                        end
+                        _G.GameUtil.SetUiHeXieMask(self.ScriptRootGoTable)
+                    end
+                end
+        )
+    else
+        self:CallStopShowRolesDelay()
+    end
+end
+
+--- 更新角色站位
+--- 第一个出场的角色默认站中央，第二个出场的角色位置根据自身配置的站位决定
+--- 第二个角色出场时，已经在场上的角色需要移动到自身配置的站位位置
+---@param scriptCfg dialogue_script_cfg_Item
+---@return  boolean 是否需要 DOLocalMoveX
+function DialogueView:UpdateRolePosition(scriptCfg)
+    if self:IsDes() then
+        return
+    end
+    if scriptCfg.Position == 0 then
+        if self.RoleRes[0] == "" and self.RoleRes[1] ~= "" then
+            self.go_table.obj_Dialogue3DShow_0:SetLocalPosition(-480, 0, 0)
+
+            self.go_table.obj_Dialogue3DShow_1:DOLocalMoveX(480, COMMON_TIME)
+            return true
+        end
+    else
+        if self.RoleRes[1] == "" and self.RoleRes[0] ~= "" then
+            self.go_table.obj_Dialogue3DShow_1:SetLocalPosition(480, 0, 0)
+
+            self.go_table.obj_Dialogue3DShow_0:DOLocalMoveX(-480, COMMON_TIME)
+            return true
+        end
+    end
+    return false
+end
+
+--- 显示名字
+---@param currentScript dialogue_script_cfg
+---@param name string 当前说话角色的名字
+function DialogueView:ShowIconAndName(currentScript, name)
+    if self:IsDes() then
+        return
+    end
+    local DialogueShowType = currentScript.DialogueShowType
+
+    local tSpriteName = "ui_xsyd_liaotian_frame"
+    self.ScriptRootGoTable.aortext_Content.text = ""
+    ---RootGoTable 位置
+    local objPos = _G.Vector3.New(0, 0, 0)
+    ---背景框 坐标
+    local anchor_pos = _G.Vector3.New(383.2, -41.7, 0)
+    ---内容背景框 是否显示
+    local isShow_ContentBg = true
+    ---背景框 坐标
+    local ContentBg_pos = _G.Vector3.New(6, -42, 0)
+    ---内容背景框  大小
+    local ContentBg_SizeDelta = _G.Vector2.New(1040, 192)
+    ---名字背景框 是否显示
+    local isShow_namebg = true
+    ---名字背景框 是否显示
+    local ContentColor = Color.New(81 / 255, 82 / 255, 104 / 255, 1)
+    local fontSize = 24
+    ---聊天内容文本框坐标
+    ---@type UnityEngine.Vector3
+    local ContentPos = _G.Vector3.New(-115, -115, 0)
+    ---聊天内容文本框大小
+    ---@type UnityEngine.Vector2
+    local tSizeDelta = _G.Vector2.New(645, 95)
+    --- 是否显示Anchor
+    self.ScriptRootGoTable.isAnchorShow = true
+    -- 对齐方式
+    local alignment = _G.CS.UnityEngine.TextAnchor.UpperLeft
+    if currentScript.Type1 == _G.DialogueEnum.DialogueType.black then
+        ContentPos = _G.Vector3.New(0, -51.1, 0)
+        tSizeDelta = _G.Vector2.New(717.38, 95)
+        alignment = _G.CS.UnityEngine.TextAnchor.MiddleCenter
+        objPos = _G.Vector3.New(0, 240, 0)
+        isShow_ContentBg = false
+    elseif currentScript.Type1 == _G.DialogueEnum.DialogueType.movie then
+        ContentPos = _G.Vector3.New(0, -150, 0)
+        tSizeDelta = _G.Vector2.New(1069, 100)
+        isShow_ContentBg = false
+        fontSize = 24
+        ContentColor = Color.New(255 / 255, 255 / 255, 255 / 255, 1)
+
+        alignment = _G.CS.UnityEngine.TextAnchor.MiddleLeft
+    elseif currentScript.Type1 == _G.DialogueEnum.DialogueType.letter then
+        isShow_ContentBg = false
+    elseif DialogueShowType == _G.DialogueEnum.DialogueShowType.none then
+    elseif DialogueShowType == _G.DialogueEnum.DialogueShowType.fight then
+    elseif DialogueShowType == _G.DialogueEnum.DialogueShowType.aside then
+        -- tSpriteName = "ui_chat_img_liaotiandi_02"
+        -- ContentPos = _G.Vector3.New(-58.12, -106, 0)
+        -- tSizeDelta = _G.Vector2.New(762.76, 84)
+        -- ContentColor = Color.New(164 / 255, 171 / 255, 220 / 255, 1)
+        ContentBg_pos = _G.Vector3.New(9, -55, 0)
+        ContentBg_SizeDelta = _G.Vector2.New(1030, 164)
+        isShow_namebg = false
+        anchor_pos = _G.Vector3.New(380, -27, 0)
+    else
+    end
+
+    if not _G.IsNil(self.ScriptRootGoTable) and not _G.IsNil(self.ScriptRootGoTable.aortext_Content) then
+        --self.ScriptRootGoTable.gameObject:SetAnchorPosition(objPos.x, objPos.y, objPos.z)
+
+        self.ScriptRootGoTable.aortext_Content.alignment = alignment
+
+        self.ScriptRootGoTable.aortext_Name1.text = _G.LangUtil.GetLangPackValue(currentScript.Name)
+        self.ScriptRootGoTable.aortext_Name2.text = _G.LangUtil.GetLangPackValue(currentScript.Name)
+
+        if not isShow_ContentBg then
+            self.ScriptRootGoTable.isAnchorShow = false
+        else
+            self.ScriptRootGoTable.obj_nameLeft:SetActiveE(currentScript.Position ~= 3 and 1 or 0)
+            self.ScriptRootGoTable.obj_nameRight:SetActiveE(currentScript.Position == 3 and 1 or 0)
+        end
+
+        -- self.ScriptRootGoTable.obj_anchor:SetAnchorPosition(anchor_pos.x, anchor_pos.y, anchor_pos.z)
+        -- 隐藏箭头符号  句子显示完后显示
+        -- _G.GameUtil.SetActiveByCondition(self.ScriptRootGoTable.obj_anchor, false)
+    end
+end
+
+--- 从配置中解析组装对话选项数据
+---@param script dialogue_script_cfg_Item
+function DialogueView:ParseOption(script)
+    self.Options = {}
+
+    if not script or script.type == 0 then
+    else
+        local len = #table.keys(script.Option_Desc)
+        for i = 1, len, 1 do
+            --- 正常显示该选项
+            local isAdd = true
+            --- 是否是隐藏选项
+            local ishide = false
+
+            local conditionType = tonumber(script.Option_Desc[i][2])
+            local conditionParams = tonumber(script.Option_Desc[i][3])
+            --- 如果有解锁条件
+            if conditionType ~= nil then
+                ishide = true
+                -- 不满足  则不显示
+                if not _G.GlobalConditionManager.CheckCondition(conditionType, conditionParams) then
+                    isAdd = false
+                else
+                    ---  满足
+                end
+            end
+
+            if isAdd == true then
+                ---@type OptionData
+                local option = {}
+                option.Icon = script.Option_Icon[i]
+                option.Desc = _G.LangUtil.GetLangPackValue(script.Option_Desc[i][1])
+                option.Action = script.Option_Action[i][1]
+                option.Params = script.Option_Action_Params[i]
+                option.ishide = ishide or false
+
+                _G.table.insert(self.Options, option)
+            end
+        end
+    end
+end
+
+-- 显示选项
+---@param type number 对话类型 0 普通对话 1 选项框对话 -1隐藏所有选项
+function DialogueView:ShowOptions(type)
+    if _G.IsNil(self.go_table) then
+        return
+    end
+    if self.isPlayFinalOptions == true or type == -1 then
+        self:ShowAorbtn(false)
+        self:SetAtuto(false, true)
+        return
+    end
+    self.Type = type
+    if
+    self.Type == _G.DialogueEnum.DialogueType.btn or self.Type == _G.DialogueEnum.DialogueType.letter or
+            self.Type == _G.DialogueEnum.DialogueType.movie or
+            self.isShowBtn ~= true
+    then
+        --- 不显示 跳过 按钮
+        self:ShowAorbtn(false)
+        ---关闭自动
+        self:SetAtuto(false, true)
+    else
+        --- 显示 跳过 按钮
+        self:ShowAorbtn(true)
+
+        self:CheckAndPlayAuto()
+    end
+end
+
+--- 设置按钮显示
+function DialogueView:ShowAorbtn(isShow)
+    --- 如果跳到了最后一句  不能显示
+    if self.isSkipDialogue == true and isShow == true then
+        return
+    end
+
+    -- self.go_table.aorbtn_SkipDialogue:SetActiveE(isShow and 1 or 0)
+    -- self.go_table.aorbtn_AutoDialogue:SetActiveE(isShow and 1 or 0)
+end
+
+--- 功能选项NPC 就显示功能选项按钮
+function DialogueView:ShowItemOptions(currentScript)
+    if self:IsDes() then
+        return
+    end
+    ---有可能提前跳过 关闭界面
+    if self.go_table == nil then
+        return
+    end
+
+    -- 功能任务Npc选项对话框
+    if not (#self.Options > 0) then
+        -- self.go_table.obj_bg:SetActiveE(0)
+        self.go_table.obj_EasyListV_Options:SetActiveE(0)
+    else
+        ---关闭自动
+        self:SetAtuto(false, true)
+        local ls = self.go_table.obj_EasyListV_Options:GetComponentE(_G.typeof(_G.CS.UnityEngine.UI.LoopScrollRect))
+        ls.totalCount = #self.Options
+        ls.CreateItemEvent = _G.handler(self, self.UpdateOption)
+        ls:RefillCells()
+        -- self.go_table.obj_bg:SetActiveE(1)
+        self.go_table.obj_EasyListV_Options:SetActiveE(1)
+    end
+end
+
+-- 解析选项数据
+function DialogueView:UpdateOption(trans, index)
+    local dataIndex = index + 1
+    if _G.AppSetting.IsShowTeach then
+        trans:SetName(dataIndex)
+    end
+    local go_table = _G.GetAutoGoTable(
+            trans,
+            function(btn, isOn)
+                self:OnClickOptionItemBtn(self.Options[dataIndex])
+            end
+    )
+
+    self.ShowOptionItem(go_table, self.Options[dataIndex])
+end
+
+-- 选项点击后的事情做完
+function DialogueView:OptionClickActionFinish()
+    self.EnableClick = true
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("OptionClickActionFinish. ")
+    end
+end
+
+-- 选项按钮点击响应
+---@param data OptionData 选项按钮数据
+function DialogueView:OnClickOptionItemBtn(data)
+    if self:IsDes() then
+        return
+    end
+    if not self.EnableClick then
+        if _G.AppSetting.DEBUG then
+            _G.Log("waiting for last option action finish. ")
+        end
+        return
+    end
+
+    if not data then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("OnClickOptionItemBtn data nil. ")
+        end
+    else
+        -- DialogueOptionAction:GetInstance():Do(data, self.OptionClickActionFinish)
+        if not DialogueOptionAction[data.Action] then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("Action Not Found. " .. data.Action)
+            end
+        else
+            --("Action " .. tostring(DialogueOptionAction[data.Action]))
+            DialogueOptionAction[data.Action](data, _G.Bind(self, self.OptionClickActionFinish))
+        end
+        self.EnableClick = false
+    end
+    -- 要把选项按钮隐藏
+    self.go_table.obj_EasyListV_Options:SetActiveE(0)
+end
+
+---@param item_table OptionItem 选项按钮控件
+---@param data OptionData 选项按钮数据
+function DialogueView.ShowOptionItem(item_table, data)
+    if (not item_table) or not data then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("ShowOptionItem item_table or data nil. ")
+        end
+    else
+        item_table.aortext_Desc.text = data.Desc
+
+        item_table.obj_ef_yin:SetActiveE(data.ishide and 1 or 0)
+    end
+end
+
+--- 显示对话内容
+---@param currentScript dialogue_script_cfg
+---@param callback fun() 整段台词说完之后的回调
+function DialogueView:CoShowContent(currentScript, callback)
+    _G.coroutine.waitforendofframe()
+    if self.isSkipDialogue == true and currentScript.Sid ~= self.ScriptSids[#self.ScriptSids] then
+        ---如果开始跳过到最后一句了  忽略其他对话(玩家自动播放 且一段里有两句以上对话期间 点跳过  容易播放上次对话 (模型加载等其他延迟的原因))
+        --("isSkipDialogue-----------------1")
+        return
+    end
+    --("DialogueView:CoShowContent-->------- " .. currentScript.Sid)
+    if currentScript.Lines == nil then
+        if callback then
+            callback()
+        end
+
+        if _G.AppSetting.DEBUG then
+            _G.LogError("ShowContent lines nil.")
+        end
+    else
+        -- 目前对话段落里面的第几句话
+        local lineIndex = 1
+
+        while lineIndex <= #currentScript.Lines and not self.SkippingAll do
+            if self.isSkipDialogue == true and currentScript.Sid ~= self.ScriptSids[#self.ScriptSids] then
+                ---如果开始跳过到最后一句了  忽略其他对话(玩家自动播放 且一段里有两句以上对话期间 点跳过  容易播放上次对话 (模型加载等其他延迟的原因))
+                --("isSkipDialogue-----------------2")
+                return
+            end
+            --("DialogueView:CoShowContent-->------- " .. currentScript.Sid .. " ---" .. lineIndex)
+
+            ---对话音效  单个
+            local acoustics = currentScript.acoustics[lineIndex]
+            ---对话台词 单个
+            local voice = currentScript.voice[lineIndex]
+
+            if string.IsNullOrEmpty(acoustics) == false or string.IsNullOrEmpty(voice) == false then
+                self:Audio_Stop_dialogue()
+            end
+
+            self.Audio.acoustics = acoustics
+            self.Audio.voice = voice
+
+            self.StopShowLine = nil
+
+            --(" DialogueView:CoShowContent Sid:" .. currentScript.Sid)
+            ---显示一行的对白
+            self.StopShowLine = coroutine.start(
+                    _G.handler(self, self.CoShowLineMgr),
+                    currentScript,
+                    lineIndex,
+                    _G.handler(self, self.CallStopShowLine)
+            )
+            self:Audio_Play_dialogue()
+
+            -- 最后一句
+            if lineIndex == #currentScript.Lines then
+                -- 如果是功能选项对话  有任务数据(必须有 #self.Options不准)  且没设置选项参数  则打开任务信息界面
+                self:SetTaskInfo(
+                        currentScript.Type1 == _G.DialogueEnum.DialogueType.btn and self.TaskOptionData ~= nil and
+                                not (#self.Options > 0)
+                )
+            end
+
+            --文字滚动和语音都结束了才进入下一段，语音判定有帧延迟，所以在前面和文字连起来做判定
+            while (self.StopShowLine or self:Audio_CheckIsPlay_dialogue()) and not self.SkippingAll do
+                if self.isSkipDialogue == true and currentScript.Sid ~= self.ScriptSids[#self.ScriptSids] then
+                    ---如果开始跳过到最后一句了  忽略其他对话(玩家自动播放 且一段里有两句以上对话期间 点跳过  容易播放上次对话 (模型加载等其他延迟的原因))
+                    --("isSkipDialogue-----------------3")
+                    return
+                end
+                coroutine.yield()
+            end
+
+            lineIndex = lineIndex + 1
+        end
+    end
+    self:ShowItemOptions(currentScript)
+    if callback then
+        callback()
+    end
+    --("ShowContent mCurScriptLinesFinished. ")
+end
+
+---@param currentScript dialogue_script_cfg_Item
+function DialogueView:CoShowLineMgr(currentScript, lineIndex, callback)
+    _G.coroutine.waitforendofframe()
+    self:StopTextDoTween()
+
+    local currentScriptType1 = currentScript.Type1
+    if currentScriptType1 == _G.DialogueEnum.DialogueType.black then
+        self:SetScriptRootGoTable(currentScript, 1)
+        self:CoFadeShowLine(currentScript, lineIndex, callback)
+    elseif currentScriptType1 == _G.DialogueEnum.DialogueType.letter then
+        self:SetScriptRootGoTable(currentScript, 2)
+        self:CoShowLine_letter(currentScript, lineIndex, callback)
+    elseif currentScriptType1 == _G.DialogueEnum.DialogueType.nullShow then
+        self:SetScriptRootGoTable(currentScript, 1)
+        self:CoNullLine(currentScript, lineIndex, callback)
+    else
+        self:SetScriptRootGoTable(currentScript, 1)
+        self:CoShowLine(currentScript, lineIndex, callback)
+    end
+end
+
+---物品展示
+---@param params dialogue_script_cfg_Item.imagePath
+---@param  callback function 只有ui_ef才会回调
+function DialogueView:ShowItemImage(params, callback)
+    --  params= dialogue_script_cfg_Item.imagePath                                                                   UI_eff不填  默认用配置表生存时间
+    --- {  是否显示0不显示/1显示） ，  类型（1image/2ui_ef）  ， image路径/ui_ef名字 ， 缩放（1） ，    坐标x（0）  ， 坐标y（0），延时（Image存在时间）  }
+    local delImage = function()
+        if _G.IsNil(self.obj_itemShowAnimator) then
+            return
+        end
+        self.obj_itemShowAnimator:Play("a_DialogueItemShow_xiaoshi")
+
+        self.go_table.aorrawimage_item.Alpha = 0
+        self.Timer_DelImage = _G.TimerManager:GetInstance():GetTimer(
+                0.31,
+                self.Timer_DelImageFunc,
+                self,
+                true,
+                false
+        )
+        self.Timer_DelImage:Start()
+    end
+    local delPrf = function()
+        if not _G.IsNil(self.itemShow_Item) then
+            _G.DestroyObject(self.itemShow_Item)
+            self.itemShow_Item = nil
+        end
+    end
+
+    if _G.IsNil(self.gameObject) then
+        return
+    end
+
+    if params == nil then
+        delImage()
+        delPrf()
+        return
+    end
+
+    local imagePath = params
+    -- 是否显示
+    local mIsShow = tonumber(imagePath[1]) == 1 and true or false
+    -- 类型
+    local type = tonumber(imagePath[2])
+
+    local scale = tonumber(imagePath[4])
+    if scale == nil then
+        scale = 1
+    end
+
+    local x = tonumber(imagePath[5])
+    if x == nil then
+        x = 0
+    end
+
+    local y = tonumber(imagePath[6])
+    if y == nil then
+        y = 0
+    end
+
+    local delaytime = tonumber(imagePath[7])
+
+    if type == 1 or type == 3 then
+        -- 如果是image 或者是需要物品框的image
+        local path = imagePath[3]
+        if _G.string.IsNullOrEmpty(path) then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(string.format("对话系统 dialogue_script sid:%s imagePath字段 [3]配置有误"))
+            end
+            return
+        end
+
+        if mIsShow then
+            self.go_table.aorrawimage_item:LoadImage(
+                    imagePath[3],
+                    function(image)
+                        if not _G.IsNil(image) then
+                            self.go_table.obj_itemShow:SetActiveE(1)
+
+                            image:SetNativeSize()
+
+                            self.go_table.aorrawimage_item:SetLocalScale(scale, scale, scale)
+                            image:SetAnchorPosition(x, y)
+                            -- _G.DelayDo(
+                            --     delaytime or 1,
+                            --     function()
+                            --         delImage()
+                            --     end
+                            -- )
+                        end
+                    end
+            )
+        else
+            delImage()
+        end
+    elseif type == 2 then
+        -- 如果是ui_effect
+        delPrf()
+
+        if mIsShow then
+            local ui_eCfg = _G.ConfigManager.ui_effect_cfg[imagePath[3]]
+            if _G.IsNil(ui_eCfg) then
+                return
+            end
+            --- 防止跳过对话过快 界面已关闭
+            if not _G.IsNil(self.go_table) then
+                _G.UIUtils.LoadEffectByCfg(
+                        ui_eCfg,
+                        self.go_table.gameObject,
+                        function(tran)
+                            if not _G.IsNil(tran) then
+                                self.itemShow_Item = tran
+                                if x > 0 or y > 0 then
+                                    tran:SetLocalPosition(x, y, 0)
+                                end
+                                self.itemShow_Item:SetLocalScale(scale, scale, scale)
+                            end
+                        end,
+                        function()
+                            delPrf()
+                            if callback ~= nil then
+                                callback()
+                            end
+                        end
+                )
+            end
+        end
+    end
+end
+
+function DialogueView:Timer_DelImageFunc()
+    if not _G.IsNil(self.go_table) then
+        self.go_table.aorrawimage_item:SetLocalScaleToOne()
+        self.go_table.aorrawimage_item:SetAnchorPosition(0, 0)
+        self.go_table.obj_itemShow:SetActiveE(0)
+    end
+end
+
+--- 打字显示单句台词
+---@param currentScript dialogue_script_cfg
+---@param lineIndex number 台词下标索引
+---@param callback fun()
+function DialogueView:CoShowLine(currentScript, lineIndex, callback)
+    local function CallBackFun()
+        if callback then
+            callback()
+            callback = nil
+        end
+    end
+
+    --(" DialogueView:CoShowLine Sid:" .. currentScript.Sid)
+    if self:IsDes() then
+        return
+    end
+    local lines = currentScript.Lines[lineIndex]
+    ---@type number 动画播放延迟
+    local delayTime = currentScript.DelayTime[lineIndex]
+    ---@type number[]
+    local pauseTimes = currentScript.PauseTime[lineIndex]
+    local posindex = currentScript.Position
+    if posindex <= 0 then
+        posindex = 1
+    end
+    if lines == nil then
+        CallBackFun()
+        return
+    end
+    self.ScriptRootGoTable.aortext_Content.text = ""
+
+    --- 播放说话动作动画
+    if delayTime == nil or delayTime <= 0 then
+        delayTime = 0
+    end
+
+    local text = ""
+    if currentScript.Type1 == _G.DialogueEnum.DialogueType.movie then
+        text = _G.LangUtil.GetLangPackValue(currentScript.Name) .. ": "
+    end
+    local i = 1
+    local pauseTime = (pauseTimes ~= nil and pauseTimes[i] ~= nil) and pauseTimes[i] or 0
+
+    while i <= #lines do
+        if self:IsDes() then
+            return
+        end
+        local line = _G.LangUtil.GetLangPackValue(lines[i])
+
+        --(" DialogueView:CoShowLine line:" .. line)
+        self.clickStop = true
+        self.ratio = self.ratio_speed1
+        if self.SkippingAuto then
+            self.ratio = self.ratio_speed2
+        end
+
+        local duration = self.ratio * _G.string.len(line)
+        --- 可以尝试限制最短的打字时间 1.5 防止 字打完了 过渡动画还没播完
+        duration = (duration < 0.01) and 0.01 or duration
+        --("ShowContent duration " .. duration)
+        text = text .. line
+        --("duration", "<color=red>" .. duration .. "</color>")
+
+        -- 防止不识别 \n换行  csv转义string \n
+        text = string.gsub(
+                text,
+                "\\n",
+                function(s)
+                    return " \n"
+                end
+        )
+
+        self.ContentTweener = self.ScriptRootGoTable.aortext_Content:DOText(text, duration)
+        self.ContentTweener:SetEase(_G.CS.DG.Tweening.Ease.Linear)
+        if self.ContentTweener then
+            self.ContentTweener.onComplete = _G.handler(self, self.OnContentTweenerComplete)
+        end
+        --- 收到 Tweener 完成的回调时 会将 mContentTweener 置为 nil
+        --- 根据 mContentTweener 是否为 nil 来表示 Tweener 是否在运行中
+        local function tweenerPlaying()
+            if self.ContentTweener then
+                return true -- self.mContentTweener:IsPlaying()
+            else
+                return false
+            end
+        end
+        -- _G.coroutine.waitwhile(tweenerPlaying)
+        while tweenerPlaying() do
+            coroutine.yield()
+        end
+
+        if self:IsDes() then
+            return
+        end
+        -- self.mWaitForSeconds = _G.coroutine.waitforseconds(1.2)
+        -- 台词说完过后的停顿
+        pauseTime = (pauseTimes ~= nil and pauseTimes[i] ~= nil) and pauseTimes[i] or 1000
+
+        -- 如果是自动播放状态 则设置停顿间隔
+        if self.SkippingAuto then
+            pauseTime = 1500
+        end
+
+        pauseTime = pauseTime / 1000
+        ---本段对话的最后一句的最后一小节 换行的时候 需要播放默认动作动画
+        -- pauseTime = (lineIndex == #currentScript.Lines and i == #lines) and 1.0 or pauseTime
+
+        --("pauseTime", "<color=red>" .. pauseTime .. "</color>" .. text)
+
+        --(" DialogueView:CoShowLine pauseTime:" .. pauseTime)
+        if pauseTime > 0 then
+            self.StopPauseBetweenLines = nil
+
+            -- if _G.IsNil(self.ScriptRootGoTable.obj_anchor) == false and self.ScriptRootGoTable.isAnchorShow == true then
+            --     _G.GameUtil.SetActiveByCondition(self.ScriptRootGoTable.obj_anchor, true)
+            -- end
+            self.StopPauseBetweenLines = coroutine.start(
+                    _G.handler(self, self.CoDelay),
+                    pauseTime,
+                    _G.handler(self, self.CallStopPauseBetweenLines)
+            )
+
+            while (self.StopPauseBetweenLines and self.clickStop == true) and (not self.SkippingAll) do
+                coroutine.yield()
+            end
+        end
+
+        i = i + 1
+    end
+    --(" DialogueView:CoShowLine self:IsDes()  Sid:" .. currentScript.Sid)
+    if self:IsDes() then
+        return
+    end
+    local delCount = 0
+
+    if delCount == 0 then
+        self:ShowItemImage(currentScript.imagePath)
+    end
+    if callback then
+        callback()
+    end
+end
+
+--- 不显示对话框(背景展示)
+---@param currentScript dialogue_script_cfg_Item
+---@param lineIndex number 台词下标索引
+---@param callback fun()
+function DialogueView:CoNullLine(currentScript, lineIndex, callback)
+    local lines = currentScript.Lines[lineIndex]
+    lines = _G.LangUtil.GetLangPackValue(lines)
+    ---@type number[]
+    local pauseTimes = currentScript.PauseTime[lineIndex]
+    if lines == nil then
+        if callback then
+            callback()
+        end
+        return
+    end
+
+    self.clickStop = true
+
+    -- self.mWaitForSeconds = _G.coroutine.waitforseconds(1.2)
+    -- 台词说完过后的停顿
+    local pauseTime = (pauseTimes ~= nil and pauseTimes[1] ~= nil) and pauseTimes[1] or 1000
+
+    -- 如果是自动播放状态 则设置停顿间隔
+    if self.SkippingAuto then
+        pauseTime = 800
+    end
+
+    pauseTime = pauseTime / 1000
+    ---本段对话的最后一句的最后一小节 换行的时候 需要播放默认动作动画
+    -- pauseTime = (lineIndex == #currentScript.Lines and i == #lines) and 1.0 or pauseTime
+
+    --("pauseTime", "<color=red>" .. pauseTime .. "</color>" .. text)
+
+    if pauseTime > 0 then
+        self.StopPauseBetweenLinesT = nil
+        self.StopPauseBetweenLinesT = coroutine.start(
+                _G.handler(self, self.CoDelay),
+                pauseTime,
+                function()
+                    self.StopPauseBetweenLinesT = nil
+                end
+        )
+
+        while (self.StopPauseBetweenLinesT) and (not self.SkippingAll) do
+            --  and self.clickStop == true
+            coroutine.yield()
+        end
+    end
+
+    if callback then
+        callback()
+    end
+end
+
+--- 渐隐渐显 打印单句台词
+---@param currentScript dialogue_script_cfg_Item
+---@param lineIndex number 台词下标索引
+---@param callback fun()
+function DialogueView:CoFadeShowLine(currentScript, lineIndex, callback)
+    if _G.IsNil(self.ScriptRootGoTable) or _G.IsNil(self.ScriptRootGoTable.aortext_Content) then
+        return
+    end
+    local lines = currentScript.Lines[lineIndex]
+    ---@type number[]
+    local pauseTimes = currentScript.PauseTime[lineIndex]
+    if lines == nil then
+        if callback then
+            callback()
+        end
+    end
+
+    -- self.ScriptRootGoTable.aortext_Content.color = CS.UnityEngine.Color.gray
+
+    local text = ""
+    local i = 1
+
+    local pauseTime = (pauseTimes ~= nil and pauseTimes[i] ~= nil) and pauseTimes[i] or 0
+
+    while i <= #lines do
+        ---防止界面关闭 仍再循环
+        if self.ScriptRootGoTable == nil then
+            return
+        end
+
+        local line = _G.LangUtil.GetLangPackValue(lines[i])
+        self.clickStop = true
+        self.ratio = self.ratio_speed1
+        if self.SkippingAuto then
+            self.ratio = self.ratio_speed2
+        end
+
+        local duration = self.ratio * _G.string.len(line)
+        --- 可以尝试限制最短的打字时间 1.5 防止 字打完了 过渡动画还没播完
+        duration = (duration < 0.01) and 0.01 or duration
+        --("ShowContent duration " .. duration)
+        text = text .. line
+        --("duration", "<color=red>" .. duration .. "</color>")
+
+        -- 防止不识别 \n换行  csv转义string \n
+        text = string.gsub(
+                text,
+                "\\n",
+                function(s)
+                    return " \n"
+                end
+        )
+        -- if i == 1 then
+        -- self.ScriptRootGoTable.aortext_Content.color = Color.New(0, 0, 0, 0)
+        -- else
+        self.ContentTweenerFade = self.ScriptRootGoTable.aortext_Content:DOColor(Color.New(0, 0, 0, 0), 1)
+        self.ContentTweenerFade:SetEase(_G.CS.DG.Tweening.Ease.Linear)
+        if self.ContentTweenerFade then
+            self.ContentTweenerFade.onComplete = _G.handler(self, self.OnContentTweenerCompleteFade)
+        end
+        --- 收到 Tweener 完成的回调时 会将 mContentTweener 置为 nil
+        --- 根据 mContentTweener 是否为 nil 来表示 Tweener 是否在运行中
+        local function tweenerPlayingFade()
+            if self.ContentTweenerFade then
+                return true -- self.mContentTweener:IsPlaying()
+            else
+                return false
+            end
+        end
+        -- _G.coroutine.waitwhile(tweenerPlayingFade)
+        while tweenerPlayingFade() do
+            coroutine.yield()
+        end
+
+        if self:IsDes() then
+            return
+        end
+        self.ScriptRootGoTable.aortext_Content.text = text
+        self.ContentTweener = self.ScriptRootGoTable.aortext_Content:DOColor(Color.New(214 / 255, 214 / 255, 214 / 255, 214 / 255), 1)
+        if self.ContentTweener then
+            self.ContentTweener.onComplete = _G.handler(self, self.OnContentTweenerComplete)
+        end
+        local function tweenerPlaying()
+            if self.ContentTweener then
+                return true -- self.mContentTweener:IsPlaying()
+            else
+                return false
+            end
+        end
+        -- _G.coroutine.waitwhile(tweenerPlaying)
+        while tweenerPlaying() do
+            coroutine.yield()
+        end
+
+        if self:IsDes() then
+            return
+        end
+        -- self.mWaitForSeconds = _G.coroutine.waitforseconds(1.2)
+        -- 台词说完过后的停顿
+        pauseTime = (pauseTimes ~= nil and pauseTimes[i] ~= nil) and pauseTimes[i] or 1000
+
+        -- 如果是自动播放状态 则设置停顿间隔
+        if self.SkippingAuto then
+            pauseTime = 800
+        end
+
+        pauseTime = pauseTime / 1000
+        ---本段对话的最后一句的最后一小节 换行的时候 需要播放默认动作动画
+        -- pauseTime = (lineIndex == #currentScript.Lines and i == #lines) and 1.0 or pauseTime
+
+        --("pauseTime", "<color=red>" .. pauseTime .. "</color>" .. text)
+
+        if pauseTime > 0 then
+            self.StopPauseBetweenLines = nil
+
+            self.StopPauseBetweenLines = coroutine.start(
+                    _G.handler(self, self.CoDelay),
+                    pauseTime,
+                    _G.handler(self, self.CallStopPauseBetweenLines)
+            )
+
+            while (self.StopPauseBetweenLines and self.clickStop == true) and (not self.SkippingAll) do
+                coroutine.yield()
+            end
+        end
+        if self:IsDes() then
+            return
+        end
+        ---如果最后一句话  则再 淡入消失
+        if lineIndex == #currentScript.Lines then
+            self.ContentTweenerFade = self.ScriptRootGoTable.aortext_Content:DOColor(Color.New(0, 0, 0, 0), 1)
+            self.ContentTweenerFade:SetEase(_G.CS.DG.Tweening.Ease.Linear)
+            if self.ContentTweenerFade then
+                self.ContentTweenerFade.onComplete = _G.handler(self, self.OnContentTweenerCompleteFade)
+            end
+
+            -- _G.coroutine.waitwhile(tweenerPlayingFade)
+            while tweenerPlayingFade() do
+                coroutine.yield()
+            end
+
+            if self:IsDes() then
+                return
+            end
+        end
+
+        i = i + 1
+    end
+
+    if callback then
+        callback()
+    end
+end
+
+---言灵信
+---@param currentScript dialogue_script_cfg_Item
+---@param lineIndex number 台词下标索引
+---@param callback fun()
+function DialogueView:CoShowLine_letter(currentScript, lineIndex, callback)
+    local lines = currentScript.Lines[lineIndex]
+    local line2 = {}
+    ---@type number[]
+    local pauseTimes = currentScript.PauseTime[lineIndex]
+    if lines == nil then
+        if callback then
+            callback()
+        end
+    end
+    if lines[2] then
+        local str = _G.LangUtil.GetLangPackValue(lines[2])
+        local _ary = string.split(str, "#")
+        local firstCount
+        for i = 1, #_ary do
+            local count = math.ceil(string.len(_ary[i]) / 30)
+            firstCount = i > 1 and 30 or 27
+            for j = 1, count do
+                if count == 1 then
+                    table.insert(line2, string.sub(_ary[i], 1, -1))
+                else
+                    if j == 1 then
+                        table.insert(line2, string.sub(_ary[i], 1, firstCount))
+                    elseif j == count then
+                        table.insert(line2, string.sub(_ary[i], (firstCount + 1) + (j - 2) * 30, -1))
+                    else
+                        table.insert(
+                                line2,
+                                string.sub(_ary[i], (firstCount + 1) + (j - 2) * 30, (firstCount + 1) + (j - 1) * 30 - 1)
+                        )
+                    end
+                end
+            end
+        end
+    end
+    _G.AudioManager.PlayAudioByAudioCfgID(2038)
+    ---加载特效
+    _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_yanlingxin_ui,
+            self.ScriptRootGoTable_letter.transform,
+            function(trans)
+                -- self.clickStop = true
+
+                ---等待特效时间
+                self.StopShowLine_ylxEff = _G.DelayDo(
+                        3,
+                        function()
+                            if self:IsDes() then
+                                return
+                            end
+                            self.clickStop = true
+                            self.ScriptRootGoTable_letter.aortext_title.text = _G.LangUtil.GetLangPackValue(lines[1])
+                            for i = 1, #line2 do
+                                if i > 4 then
+                                    break
+                                end
+                                self.ScriptRootGoTable_letter[string.format("aortext_Content%d", i)].text = line2[i]
+                            end
+                            self.ScriptRootGoTable_letter.aortext_name.text = _G.LangUtil.GetLangPackValue(lines[3])
+
+                            local pauseTime = (pauseTimes ~= nil and pauseTimes[1] ~= nil) and pauseTimes[1] or 0
+                            -- self.mWaitForSeconds = _G.coroutine.waitforseconds(1.2)
+                            -- 台词说完过后的停顿
+                            pauseTime = (pauseTimes ~= nil and pauseTimes[1] ~= nil) and pauseTimes[1] or 1000
+
+                            -- 如果是自动播放状态 则设置停顿间隔
+                            if self.SkippingAuto then
+                                pauseTime = 800
+                            end
+
+                            pauseTime = pauseTime / 1000
+                            if pauseTime > 0 then
+                                self.StopPauseBetweenLines = nil
+
+                                self.StopPauseBetweenLines = coroutine.start(
+                                        _G.handler(self, self.CoDelay),
+                                        pauseTime,
+                                        _G.handler(self, self.CallStopPauseBetweenLines)
+                                )
+
+                                while (self.StopPauseBetweenLines and self.clickStop == true) and (not self.SkippingAll) do
+                                    coroutine.yield()
+                                end
+                            end
+
+                            if callback then
+                                callback()
+                            end
+                        end
+                )
+            end
+    )
+end
+
+--- 本 View 公用的延时执行 Callback 的接口 注意时序 两次使用的时间有交叉的话 会出现问题
+--- TODO 需要抽离出来 并支持打断
+---@param delayTime number 延时时间
+---@param callback fun() 完成回调
+function DialogueView:CoDelay(delayTime, callback)
+    --("DelayCoroutine delayTime ", "<color=red>" .. ">>>" .. _G.tostring(delayTime) .. "</color>")
+    --- 停顿时间的计时器
+    ---@type number
+    local delayTimmer = 0
+    while delayTimmer < delayTime and not self.SkippingAll do
+        coroutine.yield()
+        delayTimmer = delayTimmer + _G.Time.unity_time.deltaTime
+    end
+    if callback then
+        callback()
+    end
+end
+
+--- 一句台词打字出现的 Tweener 完成的回调
+function DialogueView:OnContentTweenerComplete()
+    --("ContentTweenerComplete . " .. self.mScriptRootGoTable.aortext_Content.text)
+    self.ContentTweener = nil
+end
+
+function DialogueView:OnContentTweenerCompleteFade()
+    --("ContentTweenerComplete . " .. self.mScriptRootGoTable.aortext_Content.text)
+    self.ContentTweenerFade = nil
+end
+
+--- 快进 完全显示当前正在打印的台词
+function DialogueView:SkipCurrentScriptLine()
+    if not _G.IsNil(self.ContentTweenerFade) then
+        return
+    end
+
+    if self.ContentTweener then
+        --- 说台词的阶段
+        self.ContentTweener:Complete()
+        self.clickStop = true
+    else
+        self.clickStop = false
+        --- 说完台词的停顿阶段
+        self:CallStopPauseBetweenLines()
+        --关闭语音
+        self:Audio_Stop_dialogue()
+    end
+end
+
+--- 跳过所有的 协程
+function DialogueView:StopAllCoroutine(isSkipDialogue)
+    if not isSkipDialogue then
+        self:CallStopAction()
+        self:CallStopPreLoadRoleModels()
+        self:CallStopShowAllScripts()
+        self:CallStopUpdateRolePositionDelay()
+    end
+
+    self:CallStopShowRolesDelay()
+    self:SkipCurrentScriptLine()
+    self:CallStopShowLine()
+    self:CallStopShowContent()
+    self:CallStopShowScript()
+end
+
+--- 跳过这次对话 显示 剧情概要面板
+function DialogueView:SkipAllScripts()
+    _G.StoryManager:GetInstance():SetPlayerPrefs_PlayDialogueid(self.DialogueCfgSid)
+
+    -- self.SkippingAll = true
+    -- self:StopAllCoroutine()
+
+    -- --- 本次对话的概要
+    -- ---@type string
+    -- local summary = ""
+    -- ---@type DialogueCfg_Item
+    -- local dialogue = _G.ConfigManager.dialogue_cfg[self.DialogueCfgSid]
+    -- if dialogue and dialogue.Summary then
+    --     summary = dialogue.Summary
+    -- end
+
+    -- local function OnSummaeyClose()
+    self:CloseView()
+    -- end
+    -- self.go_table.obj_Summary:SetActiveE(1)
+    -- self:AddComponent(
+    --     self.go_table.obj_Summary,
+    --     DialogueSummary.New(_G.GetAutoGoTable(self.go_table.obj_Summary), summary, OnSummaeyClose)
+    -- )
+end
+
+--- 关闭界面
+---@param boolean true对话未完成  (false完成对话提交任务  true对话未完成 不更改任务)
+function DialogueView:CloseView()
+    self:Close()
+end
+
+--- 关闭界面
+function DialogueView:OnDialogueComplete()
+    if self.FinishCallback then
+        self.FinishCallback(self.DialogueCfgSid, self.CloseType)
+    end
+end
+
+-- region 协程关闭方法调用
+function DialogueView:CallStopAction()
+    if self.StopAction then
+        if self.StopAction.base then
+            _G.coroutine.stopwaiting(self.StopAction)
+        end
+        self.StopAction = nil
+    end
+end
+
+function DialogueView:CallStopPreLoadRoleModels()
+    -- if self.StopPreLoadRoleModels then
+    --     if self.StopPreLoadRoleModels.base then
+    --         _G.coroutine.stopwaiting(self.StopPreLoadRoleModels)
+    --     end
+    --     self.StopPreLoadRoleModels = nil
+    -- end
+end
+
+function DialogueView:CallStopShowAllScripts()
+    if self.StopShowAllScripts then
+        if self.StopShowAllScripts.base then
+            _G.coroutine.stopwaiting(self.StopShowAllScripts)
+        end
+        self.StopShowAllScripts = nil
+    end
+end
+
+function DialogueView:CallStopShowScript()
+    if self.StopShowScript then
+        if type(self.StopShowScript) == "function" then
+            self:StopShowScript()
+        elseif self.StopShowScript.base then
+            _G.coroutine.stopwaiting(self.StopShowScript)
+        end
+        self.StopShowScript = nil
+    end
+end
+
+function DialogueView:CallStopUpdateRolePositionDelay()
+    if self.StopUpdateRolePositionDelay then
+        if self.StopUpdateRolePositionDelay.base then
+            _G.coroutine.stopwaiting(self.StopUpdateRolePositionDelay)
+        end
+        self.StopUpdateRolePositionDelay = nil
+    end
+end
+
+function DialogueView:CallStopShowRolesDelay()
+    if self.StopShowRolesDelay then
+        if type(self.StopShowRolesDelay) == "function" then
+            self:StopShowRolesDelay()
+        elseif self.StopShowRolesDelay.base then
+            _G.coroutine.stopwaiting(self.StopShowRolesDelay)
+        end
+        self.StopShowRolesDelay = nil
+    end
+end
+
+function DialogueView:CallStopShowContent()
+    if self.StopShowContent then
+        if self.StopShowContent.base then
+            _G.coroutine.stopwaiting(self.StopShowContent)
+        end
+        self.StopShowContent = nil
+    end
+end
+
+function DialogueView:CallStopShowLine()
+    --(" DialogueView:CallStopShowLine")
+    if self.StopShowLine then
+        if self.StopShowLine.base then
+            _G.coroutine.stopwaiting(self.StopShowLine)
+        end
+        self.StopShowLine = nil
+    end
+    if self.StopShowLine_ylxEff then
+        _G.coroutine.stopwaiting(self.StopShowLine_ylxEff)
+        self.StopShowLine_ylxEff = nil
+    end
+end
+
+function DialogueView:CallStopPauseBetweenLines()
+    if self.ContentTweener ~= nil then
+        self.ContentTweener:Kill()
+        self.ContentTweener = nil
+    end
+    if self.ContentTweenerFade ~= nil then
+        self.ContentTweenerFade:Kill()
+        self.ContentTweenerFade = nil
+    end
+
+    if self.StopPauseBetweenLines then
+        if self.StopPauseBetweenLines.base then
+            _G.coroutine.stopwaiting(self.StopPauseBetweenLines)
+        end
+        self.StopPauseBetweenLines = nil
+    end
+end
+
+-- endregion
+
+function DialogueView:ShowBlackCurtain(showtype, showtime, mcolor, completecb)
+    self.View = _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.BlackCurtainView.Name).View
+    while (_G.IsNil(self.View.gameObject)) do
+        coroutine.yield()
+    end
+    self.View.go_table.aorrawimage_curtain.color = mcolor
+
+    local tagerAlpha = 1
+    if showtype == 1 then
+        -- 初始alpha值
+        self.View.go_table.aorrawimage_curtain.Alpha = 0
+    elseif showtype == 0 then
+        ---目标alpha值
+        tagerAlpha = 0
+        self.View.go_table.aorrawimage_curtain.Alpha = 1
+    end
+    self.TweenerIng = self.View.go_table.aorrawimage_curtain:DOFade(tagerAlpha, showtime)
+    self.TweenerIng.onComplete = _G.handler(
+            self,
+            function()
+                if showtype == 0 then
+                    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BlackCurtainView.Name)
+                end
+                if completecb then
+                    completecb()
+                end
+            end
+    )
+    return function()
+        self.TweenerIng:Kill(true)
+    end
+end
+
+function DialogueView:ShowFightBG(isShow)
+    if not _G.IsNil(self.FightDic) then
+        local RoleTargetCamera = self.FightDic.RoleTargetCamera
+        if not _G.IsNil(RoleTargetCamera) and not _G.IsNil(self.FightDic.NodeTran) then
+            if isShow == true then
+                _G.StoryManager:GetInstance():RestorCameraFov()
+                self.FightDic.NodeTran:SetActiveE(1)
+                _G.StoryManager:GetInstance():ShowDialoguseCamera()
+            end
+
+            if isShow and RoleTargetCamera.InScreenRate ~= _G.DialogueEnum.RotIndexV3_x.fightBg then
+                self.dotween_FightMove = _G.DOTween.To(
+                        function()
+                            return RoleTargetCamera.InScreenRate
+                        end,
+                        function(x)
+                            RoleTargetCamera.InScreenRate = x
+                        end,
+                        _G.DialogueEnum.RotIndexV3_x.fightBg,
+                        _G.DialogueEnum.DoMoveTime
+                )
+            elseif isShow == false then
+                RoleTargetCamera.InScreenRate = _G.DialogueEnum.PosIndexV3_init_x.left
+                if self.timer_ShowFightBG ~= nil then
+                    _G.coroutine.stopwaiting(self.timer_ShowFightBG)
+                    self.timer_ShowFightBG = nil
+                end
+                self.timer_ShowFightBG = _G.DelayDo(
+                        0.5,
+                        function()
+                            self.timer_ShowFightBG = nil
+                            if self:IsDes() then
+                                return
+                            end
+                            if RoleTargetCamera.InScreenRate == _G.DialogueEnum.PosIndexV3_init_x.left then
+                                self.FightDic.NodeTran:SetActiveE(0)
+                                _G.StoryManager:GetInstance():HideDialoguseCamera()
+                            end
+                        end
+                )
+            end
+        end
+    end
+end
+
+function DialogueView:OnDisable()
+    self:StopAllCoroutine()
+    local StoryManager = _G.StoryManager:GetInstance()
+    ---如果对话结束完需要加载布阵前剧情则
+    if not require("AfkBattleManager"):GetInstance():GetFrontEmbattleStoryIsWaitLoad() then
+        StoryManager:HideDialogueRootFullScreen()
+    end
+    -- if self.Role3DShowsLua ~= nil then
+    --     if not _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.left]) then
+    --         self.Role3DShowsLua[_G.DialogueEnum.PosIndex.left]:delRole(_G.DialogueEnum.RoleShowType.direct)
+    --     end
+    --     if not _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.mid]) then
+    --         self.Role3DShowsLua[_G.DialogueEnum.PosIndex.mid]:delRole(_G.DialogueEnum.RoleShowType.direct)
+    --     end
+    --     if not _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.right]) then
+    --         self.Role3DShowsLua[_G.DialogueEnum.PosIndex.right]:delRole(_G.DialogueEnum.RoleShowType.direct)
+    --     end
+    -- end
+    if _G.IsNil(_G.GraphicsManager.Instance) == false then
+        local cam_3d = _G.GraphicsManager.Instance:GetSubCamera("3DUICam")
+        if not _G.IsNil(cam_3d) then
+            --- 对话中不显示血条  免得层级错误
+            cam_3d:SetActiveE(1)
+        end
+    end
+
+    self:ShowItemImage()
+    ---初始化 防止遗留
+
+    self.SkippingAll = true
+    if self.isStartShowMain then
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        self.isStartShowMain = nil
+    end
+
+    self:OnDialogueComplete()
+    local PoolsManager = _G.PoolsManager:GetInstance()
+    if PoolsManager:isCSPoolsManagerNil() == false then
+        PoolsManager:DespawnAll(_G.ePoolType.Temporary)
+    end
+    if self.PlayPngResRef ~= nil then
+        self.PlayPngResRef:Release()
+        self.PlayPngResRef = nil
+    end
+    if self.timer_ShowFightBG ~= nil then
+        _G.coroutine.stopwaiting(self.timer_ShowFightBG)
+        self.timer_ShowFightBG = nil
+    end
+    -- self.FightDic.NodeTran:SetActiveE(0)
+    -- _G.StoryManager:GetInstance():HideDialoguseCamera()
+    if self.dotween_FightMove ~= nil then
+        self.dotween_FightMove:Kill()
+    end
+
+    self:SetNil()
+end
+
+--- 关闭 文字的Dotween效果
+function DialogueView:StopTextDoTween()
+    if self.ContentTweener ~= nil then
+        self.ContentTweener:Kill()
+        self.ContentTweener = nil
+    end
+    if self.ContentTweenerFade ~= nil then
+        self.ContentTweenerFade:Kill()
+        self.ContentTweenerFade = nil
+    end
+end
+
+-- region --------------------------------------任务界面--------
+function DialogueView:SetTaskInfo(isShowTaskinfo)
+    -- self.go_table.obj_ef_sidsTask:SetActiveE(isShowTaskinfo and 1 or 0)
+    if table.isEmptyOrNil(self.taskItemList) == false then
+        for i = #self.taskItemList, 1, -1 do
+            local item = self.taskItemList[i]
+            item.transform:SetLocalScaleXYZ(1)
+            require("ItemViewBase").Despawn(item)
+        end
+
+        self.taskItemList = {}
+    end
+
+    if isShowTaskinfo == false then
+        return
+    end
+    if self.TaskOptionData == nil then
+        _G.PopWindowManager:ShowAllTips(1001, "无任务信息")
+        self:CloseView()
+        return
+    end
+
+    self.taskTempCall = nil
+
+    local taskinfo = _G.TaskModule:GetInstance():GetTaskInfoWithID(self.TaskOptionData.taskid)
+    if taskinfo == nil then
+        _G.PopWindowManager:ShowAllTips(1001, "任务无效" .. self.TaskOptionData.taskid)
+        self:CloseView()
+        return
+    end
+    local task = _G.TaskModule:GetInstance():GetTaskWithID(self.TaskOptionData.taskid)
+    if task == nil then
+        _G.PopWindowManager:ShowAllTips(1001, "任务无效" .. self.TaskOptionData.taskid)
+        self:CloseView()
+        return
+    end
+
+    -- local go_taskTable = _G.GetAutoGoTable(self.go_table.obj_ef_sidsTask, _G.handler(self, self.OnClickBtn))
+
+    -- go_taskTable.aortext_des.text = _G.LangUtil.GetLangPackValue(task.TaskCfg.describe)
+    -- go_taskTable.aortext_tager.text = _G.TaskUtilities.GetAllChildTaskDes(task)
+
+    -- go_taskTable.aorimage_jie:SetActiveE(self.TaskOptionData.state == _G.TaskEnum.ETaskState.WaitClaim and 1 or 0)
+    -- go_taskTable.aorimage_wan:SetActiveE(self.TaskOptionData.state == _G.TaskEnum.ETaskState.Completed and 1 or 0)
+
+    self.taskItemList = {}
+
+    local len = #task.TaskCfg.award
+    for i = 1, len do
+        _G.StorageManager:GetInstance():GetItemBaseViewNew(
+                task.TaskCfg.award[i],
+                self.go_table.obj_Node,
+                function(item)
+                    if item ~= nil then
+                        item.transform:SetParentE(go_taskTable.obj_Content)
+                        item.transform:SetLocalScaleXYZ(0.8)
+                        item:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+                        table.insert(self.taskItemList, item)
+                    end
+                end
+        )
+    end
+    self.taskTempCall = self.FinishCallback
+    self.FinishCallback = nil
+
+    _G.Events:GetInstance():Broadcast(_G.eDialogueEvent.ShowTaskinfo, task.TaskID)
+
+    self.go_table.aorbtn_close_mask:SetActiveE(0)
+end
+
+-- endregion
+
+function DialogueView:GetIsOptionDialogue()
+    if self.isOptionDialogue == nil then
+        local sid = self.ScriptSids[#self.ScriptSids]
+
+        local scriptCfg = _G.ConfigManager.dialogue_script_cfg[sid]
+        if _G.IsNil(scriptCfg) == false and scriptCfg.Type1 == 1 then
+            ---只要最后 是选项 就不能跳过
+            --  and self.TaskOptionData ~= nil
+            self.isOptionDialogue = true
+        else
+            self.isOptionDialogue = false
+        end
+    end
+
+    return self.isOptionDialogue
+end
+
+---当前脚本是否还存在  true不存在
+function DialogueView:IsDes()
+    return _G.IsNil(self.ScriptRootGoTable)
+end
+
+function DialogueView:Audio_Play_dialogue()
+    if self.Audio.acoustics ~= nil then
+        _G.AudioManager.Dialogue_PlayPath(self.Audio.acoustics)
+    end
+    if self.Audio.voice ~= nil then
+        _G.AudioManager.Dialogue_PlayPath(self.Audio.voice)
+    end
+end
+
+function DialogueView:Audio_Stop_dialogue()
+    if self.Audio.acoustics ~= nil then
+        _G.AudioManager.Dialogue_StopPath(self.Audio.acoustics)
+        self.Audio.acoustics = nil
+    end
+    if self.Audio.voice ~= nil then
+        _G.AudioManager.Dialogue_StopPath(self.Audio.voice)
+        self.Audio.voice = nil
+    end
+end
+
+function DialogueView:Audio_CheckIsPlay_dialogue()
+    return _G.AudioManager.CheckIsPlay(self.Audio.voice)
+end
+
+function DialogueView:SetIsEnterWorld()
+    if self.isEnterWorld == nil then
+        ---是否在世界场景里面  afk放置对战场景是临时场景(不能通过World操控显示隐藏)
+        self.isEnterWorld = _G.StoryManager:GetInstance():IsDialogueEnterWorld()
+    end
+end
+
+function DialogueView:SetNil()
+    self.effAutoAni = nil
+    self.CloseType = nil
+    self.obj_itemShowAnimator = nil
+    self.DialogueCfgSid = nil
+    self.TaskOptionData = nil
+    self.ScriptSids = nil
+    self.StopAction = nil
+    self.FinishCallback = nil
+    self.taskTempCall = nil
+    self.Role3DShowsLua = nil
+    self.FightDic = nil
+    self.BgDic = nil
+    self.ScriptRootGoTable = nil
+    self.ScriptRootGoTable_letter = nil
+    self.currentScript = nil
+    self.RoleRes = nil
+    self.Options = nil
+    self.isPlayFinalOptions = nil
+    if self.timerr_Auto ~= nil then
+        self.timerr_Auto:Stop()
+        self.timerr_Auto = nil
+    end
+
+    if not _G.IsNil(self.itemShow_Item) then
+        _G.DestroyObject(self.itemShow_Item)
+        self.itemShow_Item = nil
+    end
+    if table.isEmptyOrNil(self.taskItemList) == false then
+        for i = #self.taskItemList, 1, -1 do
+            local item = self.taskItemList[i]
+            item.transform:SetLocalScaleXYZ(1)
+            require("ItemViewBase").Despawn(item)
+        end
+
+        self.taskItemList = nil
+    end
+
+    if self.Timer_DelImage then
+        self.Timer_DelImage:Stop()
+        self.Timer_DelImage = nil
+    end
+
+    self:Audio_Stop_dialogue()
+end
+
+return DialogueView
+
+---@class OptionData dialogue_script_cfg 配表里面的按钮点击相关
+---@field Icon string 图标
+---@field Desc string 描述
+---@field Action string 按钮点击后的行为名称
+---@field Params any[] 按钮点击后的行为参数
+---@field ishide boolean 是否是隐藏选项 true是隐藏选项
+
+---@class TaskOptionData
+---@field state number 任务状态
+---@field taskid number 任务 Uid

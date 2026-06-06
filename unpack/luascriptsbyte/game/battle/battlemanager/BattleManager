@@ -1,0 +1,1193 @@
+-----------------------------------------------------------------------
+-- Battle.BattleManager	(修改路径必须修正此项!)
+-- Created by csw
+-- DateTime: 2020/01/08
+-- Description 战斗管理器
+
+-- 流程：
+-- lua点击战斗
+-- lua端战斗管理器，通知C#端注入监听事件，然后发请求，获取战斗数据
+-- 获取战斗数据后，数据分发，c#端接到数据后清理监听
+-- lua端完成正常的通信流程，加载loading、场景、战斗资源，通过解析数据加载资源，完成后打开战斗窗口，开始战斗
+-- 战斗结束，战斗数据传到lua端，发后台验证，结束后获取战斗奖励数据，lua端做展示
+
+-----------------------------------------------------------------------
+require("SettlementModel")
+require("TestBattleManager")
+require("BattleControllerBase")
+local TrackingPointModel = require("TrackingPointModel")
+
+---@class BattleManager : Singleton    战斗管理器
+---@field public LoadedCallBack function 完成加载后的回调
+---@field public Running boolean 是否加载中
+---@field public Progress number 当前进度
+---@field CurNpcItem WorldNPCItem 当前点击的NPC
+---@field cacheStatistics table @缓存战报数据, 开始战斗前需要清空(remark: 每次获取战报将走一遍C#逻辑因此需缓存结果)
+local BattleManager = _G.BaseClass("BattleManager", _G.Singleton)
+_G.BattleManager = BattleManager
+
+---@return BattleManager BattleManager
+function BattleManager:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function BattleManager:__init()
+    self.LoadedCallBack = nil
+    self.Running = false
+    self.Progress = 0.0
+    self.State = nil
+    self.FightType = _G.FightType.None
+    self.EnableLog = true
+    self.curBattleController = nil
+    self.IsRecordFight = false
+    self.maxSpeed = nil
+end
+
+--region 发起战斗
+
+---进入战斗
+---@param bct BattleControllerType 战斗类型
+---@param ... any 战斗参数
+function BattleManager:EnterFight(bct, ...)
+    if self.curBattleController then
+        _G.PopWindowManager:GetInstance():ShowAllTips(710101)
+        return
+    end
+    self.Progress = 0
+    self.curBattleController = _G.require(bct).New()
+    self.curBattleController:EnterFight(...)
+end
+
+---进入回放战斗
+---@param index number 回放场次
+---@param notInBattle boolean 当前是否在战斗场景
+---@param bct _G.BattleControllerType 战斗控制器类型
+---@param win boolean 战斗结果
+function BattleManager:EnterRecordFight(index, notInBattle, bct, win, ...)
+    if self.curBattleController then
+        self.curBattleController._fightResult = win
+        self.curBattleController:EnterRecordFight(index, notInBattle, ...)
+    else
+        self.Progress = 0
+        self.curBattleController = _G.require(bct).New()
+        self.curBattleController._fightResult = win
+        self.curBattleController:EnterRecordFight(index, notInBattle, ...)
+    end
+    if notInBattle then
+        _G.Events:GetInstance():Broadcast(_G.eBattleState.RecordStart)
+    end
+end
+
+---设置战斗控制器对象
+---@param controller BattleControllerBase 战斗控制器
+function BattleManager:SetBattleController(controller)
+    self.curBattleController = controller
+end
+
+---判定是否在战斗中(收到战斗消息后，直到战斗销毁(结算之后))
+---@return 变量类型 中文描述
+function BattleManager:CheckInBattle()
+    return self.isInBattle and true or false
+end
+
+---设置是否在战斗
+---@param battle boolean 是否在战斗中
+function BattleManager:SetInBattle(battle)
+    self.isInBattle = battle
+end
+
+---设置是否在回放战斗
+---@param battle boolean 是否在战斗中
+function BattleManager:SetInRecordBattle(battle)
+    self.IsRecordFight = battle
+end
+
+---是否在回放战斗
+---@param battle boolean 是否在战斗中
+function BattleManager:GetInRecordBattle()
+    return self.IsRecordFight
+end
+
+function BattleManager:GetCurSpeed()
+    return CS.BattleManager.Inst:GetCurSpeed(), self.maxSpeed
+end
+
+--endregion 发起战斗
+---设置战斗使用的池名
+---@param 变量名 变量类型 中文描述
+function BattleManager:SetPoolName(scene, attackerRole, attackerEffect, defenderRole, defenderEffect)
+    self.curPoolsNameDic = {}
+    self.curPoolsNameDic[scene] = true
+    self.curPoolsNameDic[attackerRole] = true
+    self.curPoolsNameDic[attackerEffect] = true
+    self.curPoolsNameDic[defenderRole] = true
+    self.curPoolsNameDic[defenderEffect] = true
+    CS.BattleResManager.Inst:SetPoolName(scene, attackerRole, attackerEffect, defenderRole, defenderEffect)
+end
+
+--region 对外功能接口
+-----获取配置进攻方的数据
+---@param id number monsterGroupId
+---@return table cardsids
+function BattleManager:GetDefaultAttackSids(id)
+    local sids = CS.BattleResManager.Inst:GetAttackSids(id)
+    local tSids = {}
+    for i = 0, sids.Length - 1 do
+        if sids[i] > 0 then
+            tSids[#tSids + 1] = sids[i] or 0
+        else
+            tSids[#tSids + 1] = 0
+        end
+    end
+    return tSids
+end
+
+-----获取配置敌方的数据
+---@param id number monsterGroupId
+---@return table cardsids
+function BattleManager:GetDefaultDefenserSids(id)
+    local sids = CS.BattleResManager.Inst:GetDefenserSids(id)
+    local tSids = {}
+    if sids ~= nil then
+        for i = 0, sids.Length - 1 do
+            for j = 0, sids[i].Length - 1 do
+                if sids[i][j] > 0 then
+                    tSids[#tSids + 1] = sids[i][j]
+                end
+            end
+        end
+    end
+    return tSids
+end
+
+---获取角色特效资源路径
+---@param sid number 卡牌的sid
+---@return array 特效路径组(C#端的数组对象)
+function BattleManager:GetEffectPathBySid(sid)
+    local vla, skin = require "CardCommentManager":GetInstance():CardData(sid, false)
+
+    if skin then
+        return _G.CS.BattleResManager.Inst:GetAttackCachePath(sid, 0)
+    end
+    return _G.CS.BattleResManager.Inst:GetAttackCachePath(sid, 0)
+end
+
+---设置战斗结束后，角色回收的父节点
+---@param parent Transform 父节点
+function BattleManager:SetRoleParent(parent)
+    self.roleParent = parent
+    CS.BattleManager.Inst:SetRolePool(parent)
+end
+
+---获取本地保存的战斗角色数据
+---@param 变量名 变量类型 中文描述
+---@return 变量类型 中文描述
+function BattleManager:GetCardData()
+    return self.cardData and _G.DeepCopy(self.cardData) or {}
+end
+
+---显示隐藏战斗跳过按钮
+---@param isShow boolean true = 显示
+---@param isShow number 倒计时时间秒
+function BattleManager:ShowSkipBattleBtn(isShow, disableTime)
+    CS.BattleManager.Inst:ShowSkipBattleBtn(isShow, disableTime)
+end
+
+---显示隐藏宠物技按钮
+---@param active boolena
+function BattleManager:SetPetSkillActive(active)
+    local instance = _G.CS.BattleManager.Inst
+    if not instance or not instance.View then
+        return
+    end
+    --C#还未初始化, 此处手动Find节点进行处理
+    --instance.View.SkillView:SetPetSkillActive(active)
+    instance.View.SkillView.transform:FindE("PetSkillGroup"):SetActiveE(active and 1 or 0)
+end
+
+---显示隐藏战斗倍速按钮
+---@param isShow boolean true = 显示
+function BattleManager:ShowSpeedBattleBtn(isShow)
+    CS.BattleManager.Inst:ShowSpeedBattleBtn(isShow)
+end
+
+---调整时间倒计时描述的位置，y坐标
+---@param posY number
+function BattleManager:SetTimeTxtPos(posY)
+    CS.BattleManager.Inst:SetTimeTxtPos(posY)
+end
+
+---VIP 加速特权 （开了4倍 速）
+---@param index number 1 = 开启了4倍速  0= 没有开启
+---@param noTip boolean 战斗界面未开启4倍速时不显示提示
+function BattleManager:SetExSpeedIndex(index, noSpTip, IsMaxOne)
+    CS.BattleManager.Inst:SetExSpeedIndex(index)
+    if not IsMaxOne then
+        self.maxSpeed = index + 2
+    else
+        self.maxSpeed = 1
+    end
+    self.noSpTip = noSpTip
+end
+
+---设置倍速
+---@param index number 倍速，0默认最低配速
+function BattleManager:SetSpeed(index)
+    _G.CS.BattleManager.Inst:LuaCallCsSetSpeed(index)
+end
+
+---设置倍速
+---@param value number 倍数数值
+function BattleManager:SetSpeedByValue(value)
+    local instance = _G.CS.BattleManager.Inst
+    if not instance then
+        return
+    end
+    instance:LuaCallCsSetSpeed(value >= 4 and 2 or value >= 2 and 1 or 0)
+end
+
+---设置进攻方的阵容
+---@param sids table 卡牌SID数组
+---@param forceAutoSkillType 用于镇魂特训，不用于竞技场：0是非镇魂特训战斗 1 全手动，2自动怒气技 3 自动合击技 4 自动怒气 和 合击技
+--- recordTyp:0.正常战斗；1.战斗结束时的回放战斗；2.服务器存储的战报
+--- recordTeamNum:高阶竞技场回放三场战斗中其中一场战斗
+function BattleManager:initAttackSids(
+    sids,
+    type1,
+    IsLoadScene,
+    recordType,
+    recordTeamNum,
+    forceAutoSkillType,
+    describe,
+    recordDamage,
+    leftDescribe,
+    rightDescribe)
+    if recordType == nil then
+        recordType = 0
+    end
+    if recordTeamNum == nil then
+        recordTeamNum = 0
+    end
+    if not forceAutoSkillType then
+        forceAutoSkillType = 0
+    end
+    if not recordDamage then
+        recordDamage = 0
+    end
+    if not describe then
+        describe = ""
+    end
+    leftDescribe = leftDescribe or _G.PlayerModel:GetInstance():GetName()
+    rightDescribe = rightDescribe or ""
+    local fourSpeed = false
+    local twoSpeed = true
+    if _G.AppSetting.IsAlipay then
+        local conditions = _G.ConfigManager.discrete_cfg[126101]
+        if _G.GlobalConditionManager.CheckCondition(conditions[1][2], conditions[1][3]) then
+            twoSpeed = true
+            if _G.GlobalConditionManager.CheckCondition(conditions[2][2], conditions[2][3]) then
+                fourSpeed = true
+            end
+        else
+            twoSpeed = false
+        end
+    else
+        --VIP 功能开启战斗 4倍 加速 判断
+        fourSpeed = fourSpeed or require "AfkModel":GetInstance():CheckVipSpeed4()
+        --4倍数功能开放条件
+        fourSpeed = fourSpeed or _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(81)
+    end
+    if twoSpeed then
+        if fourSpeed then
+            self:SetExSpeedIndex(1)
+        else
+            self:SetExSpeedIndex(0)
+        end
+    else
+        self:SetExSpeedIndex(0, false, true)
+    end
+    self:Reset()
+    CS.BattleManager.Inst:Init(
+        sids,
+        type1 or 1,
+        IsLoadScene,
+        recordType,
+        recordTeamNum,
+        forceAutoSkillType,
+        describe,
+        recordDamage,
+        leftDescribe,
+        rightDescribe
+    )
+end
+
+---初始化战斗倍速
+---@return void
+function BattleManager:InitExSpeedIndex()
+    --倍速开放
+    local fourSpeed = not _G.PlayerModel:GetInstance():CheckCreateRole()
+    local twoSpeed = true
+    if not fourSpeed then
+        if _G.AppSetting.IsAlipay then
+            local conditions = _G.ConfigManager.discrete_cfg[126101]
+            if _G.GlobalConditionManager.CheckCondition(conditions[1][2], conditions[1][3]) then
+                twoSpeed = true
+                if _G.GlobalConditionManager.CheckCondition(conditions[2][2], conditions[2][3]) then
+                    fourSpeed = true
+                end
+            else
+                twoSpeed = false
+            end
+        else
+            --VIP 功能开启战斗 4倍 加速 判断
+            fourSpeed = fourSpeed or require "AfkModel":GetInstance():CheckVipSpeed4()
+            --4倍数功能开放条件
+            fourSpeed = fourSpeed or _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(81)
+        end
+    end
+    if twoSpeed then
+        if fourSpeed then
+            self:SetExSpeedIndex(1)
+        else
+            self:SetExSpeedIndex(0)
+        end
+    else
+        self:SetExSpeedIndex(0, false, true)
+    end
+end
+
+---结算接手相机控制权
+---@param isOpen boolean true 战斗控制 false取消战斗控制
+function BattleManager:SetCineAndVisualCam(isOpen)
+    CS.BattleManager.Inst:SetCineAndVisualCam(isOpen)
+end
+
+---结算隐藏战斗场景 （光源影响结算场景）
+---@param isShow boolean true 显示 false 隐藏
+function BattleManager:SetSceneObjActive(isShow)
+    CS.BattleManager.Inst:SetSceneObjActive(isShow)
+end
+
+---结算隐藏战斗人物模型 （光源影响结算场景）
+---@param isShow boolean true 显示 false 隐藏
+function BattleManager:HideFighterRootItem(isShow)
+    CS.BattleManager.Inst:HideFighterRootItem(isShow)
+end
+
+---战斗界面battleview隐藏除提示之外部分
+function BattleManager:HideBattleViewExceptTips()
+    CS.BattleManager.Inst:HideBattleViewExceptTips()
+end
+
+---设定游戏开始
+function BattleManager:SetBattleStart()
+    _G.Log("  调用了开始战斗   " .. debug.traceback())
+    _G.CS.BattleManager.Inst:SetBattleStart()
+end
+
+---设置战斗暂停
+---@param pause boolean 是否暂停
+function BattleManager:SetBattlePause(pause)
+    _G.CS.BattleManager.Inst.Pause = pause
+    if _G.AppSetting.DEBUG then
+        _G.Log("lua战斗暂停.SetBattlePause：" .. (pause and "true" or "false"))
+    end
+end
+
+-- 连同特效的暂停
+function BattleManager:PauseBattle(pause)
+    if self.curBattleController then
+        if pause then
+            _G.CS.BattleManager.Inst:PauseBattle(false)
+            if _G.AppSetting.DEBUG then
+                _G.Log("lua战斗暂停.PauseBattle")
+            end
+        else
+            _G.CS.BattleManager.Inst:ResumeBattle()
+            if _G.AppSetting.DEBUG then
+                _G.Log("lua战斗恢复.PauseBattle：")
+            end
+        end
+    end
+end
+
+function BattleManager:LoadNexBout()
+    _G.CS.BattleManager.Inst:LoadNexBout()
+end
+
+function BattleManager:OnStartNextFight()
+    _G.CS.BattleManager.Inst:OnStartNextFight()
+end
+
+---显示战斗队伍
+function BattleManager:ShowBattleTeam()
+    _G.CS.BattleManager.Inst:ShowBattleTeam()
+end
+
+---销毁战斗
+---@param retainPool boolean 是否保留池中对象
+function BattleManager:DestroyBattle(retainPool)
+    if self.curBattleController == nil then
+        return
+    end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleDamageRankView.Name)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+    _G.CS.BattleManager.Inst:Destroy()
+    self.curBattleController = nil
+    local PoolsManagerIns = _G.PoolsManager:GetInstance()
+    -- if not retainPool and self.curPoolsNameDic then
+    --     for pool, _ in pairs(self.curPoolsNameDic) do
+    --         PoolsManagerIns:ClearPoolAll(pool)
+    --     end
+    -- end
+    self.curPoolsNameDic = nil
+    local ePoolType = _G.ePoolType
+    PoolsManagerIns:ClearPoolAll(ePoolType.Temporary)
+end
+
+function BattleManager:GetMonsterGroupId()
+    return CS.BattleManager.Inst:GetMonsterGroupId()
+end
+
+---添加战报消息事件
+function BattleManager:AddLuaNetEvent(cmd)
+    self:Reset()
+    CS.BattleManager.Inst:AddLuaNetEvent(cmd, _G.Net.sign)
+end
+
+---初始CS战报
+function BattleManager:AddLuaNetMsg(id)
+    self:Reset()
+    CS.BattleManager.Inst:AddLuaNetMsg(id)
+end
+
+---设置本地战报
+function BattleManager:SetArgData(arg)
+    if table.isEmptyOrNil(arg) then
+        return
+    end
+    self:Reset()
+    CS.BattleManager.Inst:SetArgData(arg)
+end
+
+---直接创建测试战斗
+function BattleManager:BeginTestBattle(
+    scene,
+    isTest,
+    attackUids,
+    defenceSids,
+    battleType,
+    testGhostSkills,
+    testPetSkills)
+    --testPetSkills传递的是宠物id, 需要转为card_skill_id
+    if testPetSkills then
+        for i = 1, #testPetSkills do
+            if testPetSkills[i] > 1 then
+                local cfg = _G.ConfigManager.pet_cfg[testPetSkills[i]]
+                if cfg then
+                    testPetSkills[i] = cfg.skill_id[#cfg.skill_id]
+                else
+                    testPetSkills[i] = 0
+                end
+            end
+        end
+    end
+    --attackSids丶defenceSids可能是皮肤id, 需要处理转化
+    local attackSkin, defenceSkin = {}, {}
+    if attackUids then
+        for i, skinId in pairs(attackUids) do
+            local cfg = _G.ConfigManager.skin_cfg[skinId]
+            if cfg then
+                attackSkin[i] = skinId
+                attackUids[i] = cfg.card
+            else
+                attackSkin[i] =0
+            end
+        end
+    end
+    if defenceSids and defenceSids[1] then
+        for i, skinId in pairs(defenceSids[1]) do
+            local cfg = _G.ConfigManager.skin_cfg[skinId]
+            if cfg then
+                defenceSkin[i] = skinId
+                defenceSids[1][i] = cfg.card
+            else
+                defenceSkin[i] = 0
+            end
+        end
+    end
+
+    self:Reset()
+    self:InitExSpeedIndex()
+
+    CS.BattleManager.Inst:BeginTestBattle(
+        scene,
+        isTest,
+        attackUids,
+        defenceSids,
+        nil,
+        battleType,
+        testGhostSkills,
+        testPetSkills,
+        attackSkin,
+        defenceSkin
+    )
+end
+
+---直接创建测试战斗
+function BattleManager:BeginTryPlayBattle(scene, isTest, attackUids, defenceSids, data, battleType, testGhostSkills)
+    self:Reset()
+    self:InitExSpeedIndex()
+    CS.BattleManager.Inst:BeginTestBattle(scene, isTest, attackUids, defenceSids, data, battleType, testGhostSkills)
+end
+
+-- 扫荡测试战斗
+function BattleManager:SweepTestBattle(scene, attackUids, defenceSids, fightArg, useDefender)
+    self:Reset()
+    return CS.BattleManager.Inst:SweepTestBattle(scene, attackUids, defenceSids, fightArg, useDefender)
+end
+
+---手动重新开始战斗，调用CS脚本
+function BattleManager:ReFight()
+    self:Reset()
+    CS.BattleManager.Inst:RestartGame()
+end
+
+-- 开启或关闭怒气技，teamType:0.攻击方；1.防守方，enable:true.开启；false.关闭
+function BattleManager:SetAutoMasterSkill(teamType, enabled)
+    CS.BattleManager.Inst:SetAutoMasterSkill(teamType, enabled)
+end
+
+-- 开启或关闭怒气技，teamType:0.攻击方；1.防守方，enable:true.开启；false.关闭
+function BattleManager:SetAutoMasterSkillEx(teamType, enabled)
+    if _G.AppSetting.DEBUG then
+        _G.LogError(teamType, enabled)
+    end
+    CS.BattleManager.Inst:SetAutoMasterSkillEx(teamType, enabled)
+end
+
+---销毁战斗
+---@param cardSid number 卡牌sid
+---@param isSelf boolean 是否是进攻方
+---@return Transform transform
+function BattleManager:GetCacheRole(cardSid, isSelf)
+    local vla, skin = require "CardCommentManager":GetInstance():CardData(cardSid, false)
+
+    return CS.BattleManager.Inst:GetCacheRole(vla.sid, isSelf, skin.sid)
+end
+
+function BattleManager:GameNetTipsPauseBattle()
+    --CS.BattleManager.GameNetTipsPauseBattle()
+end
+
+function BattleManager:GameNetTipsResumeBattle()
+    --CS.BattleManager.GameNetTipsResumeBattle()
+end
+
+---根据monster_group_cfg的id获取是否是boss战
+---@param sid number monster_group_cfg的sid
+---@return boolean isBossType
+function BattleManager:IsBossType(sid)
+    return CS.BattleManager.Inst:IsBossType(sid)
+end
+
+---获取当前战斗总时间
+---@return number totalTime
+function BattleManager:GetTotalTime()
+    return CS.BattleManager.Inst:GetTotalTime()
+end
+
+---获取当前战斗SceneTime时间
+---@return number sceneTime
+function BattleManager:GetCurSceneTime()
+    return CS.BattleManager.Inst:GetCurSceneTime()
+end
+
+---获取当前战斗进攻方dps
+---@return number allDps
+function BattleManager:GetAllDps()
+    return CS.BattleManager.Inst:GetAllDps()
+end
+
+---设置transform朝向战斗3DUI摄像机
+---@param tran Transform 卡牌sid
+---@param moveTrans Transform 是否是进攻方
+function BattleManager:LookAtBattleUICamera(tran, moveTrans)
+    CS.BattleManager.Inst:LookAtBattleUICamera(tran, moveTrans)
+end
+
+---获取当前战斗观众模型root
+---@return Transform allDps
+function BattleManager:GetAudienceModelRoot()
+    return CS.BattleManager.Inst:GetAudienceModelRoot()
+end
+
+---获取当前战斗观众光环root
+---@return Transform allDps
+function BattleManager:GetAudienceHaloRoot()
+    return CS.BattleManager.Inst:GetAudienceHaloRoot()
+end
+
+---加载观众
+function BattleManager.CSBattleAudience()
+    local inst = BattleManager:GetInstance()
+    local curController = inst.curBattleController
+    if curController then
+        if not inst:GetInRecordBattle() then
+            curController:ShowAudience()
+        end
+    end
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleAudience = BattleManager.CSBattleAudience
+---保存战斗日志
+function BattleManager:SaveLogNew()
+    _G.CS.BattleManager.Inst:SaveLogNew()
+end
+
+--endregion
+
+local function Switch3DUICamClearFlags(clearFlags)
+    local Cam3DUI = _G.GraphicsManager.Instance:GetSubCamera("3DUICam")
+    if not _G.IsNil(Cam3DUI) then
+        Cam3DUI.clearFlags = clearFlags
+    end
+end
+
+--region 战斗开始 以及 战斗结束 管理跑动场景
+---重开战斗
+function BattleManager:OnRefight()
+    -- _G.PopWindowManager:GetInstance():ShowAllTips(
+    --     110105,
+    --     nil,
+    --     function()
+    if self.curBattleController then
+        self.curBattleController:ReFight()
+        _G.CS.BattleManager.Inst:UnLoadCinemachieCamera()
+    end
+    --     end
+    -- )
+end
+
+---手动结束战斗
+function BattleManager:OnEndFight()
+    -- _G.PopWindowManager:GetInstance():ShowAllTips(
+    --     110104,
+    --     nil,
+    --     function()
+    if self.curBattleController then
+        if self:GetInRecordBattle() then
+            self.curBattleController:FightRecordExit()
+        else
+            self.curBattleController:EndFight()
+            _G.CS.BattleManager.Inst:UnLoadCinemachieCamera()
+        end
+    end
+    --     end
+    -- )
+end
+
+---手动结束战斗
+function BattleManager:OnAutoFight()
+    _G.PopWindowManager:GetInstance():ShowAllTips(110113)
+end
+
+function BattleManager:SetPauseBtnState(btn1State, btn2State, btn3State)
+    _G.CS.BattleManager.Inst:SetPauseBtnState(btn1State, btn2State, btn3State)
+end
+
+-- 当场战斗的统计信息
+function BattleManager:GetStatistics()
+    if not self.cacheStatistics then
+        self.cacheStatistics = _G.CS.BattleManager.Inst:GetStatistics()
+    end
+    return self.cacheStatistics
+end
+
+---是否有战斗统计数据缓存
+---@return boolean
+function BattleManager:HasStatisticsCached()
+    return not not self.cacheStatistics
+end
+
+---设置战斗统计缓存信息
+---@param data any
+---@return void
+function BattleManager:SetStatisticsCached(data)
+    self.cacheStatistics = data
+end
+
+-- 当场战斗的统计信息
+function BattleManager:GetTestBattleStatistics()
+    return _G.CS.BattleManager.Inst:GetTestBattleStatistics()
+end
+
+-- 解析战斗的统计信息
+function BattleManager:ParseStatistics(data)
+    if not data then
+        data = self:GetStatistics()
+    end
+    if not data then
+        return nil
+    end
+    local damage = {}
+    local count = #data.FighterInfo
+    for i = 1, count do
+        local statisticsData = data.FighterInfo[i]
+        local statisticsMax = { DmgOut = 1, DmgIn = 1, HpRecover = 1, CreateGuard = 1 }
+        for j = 1, #statisticsData.Attacker do
+            if statisticsMax.DmgOut < statisticsData.Attacker[j].DmgOut then
+                statisticsMax.DmgOut = statisticsData.Attacker[j].DmgOut
+            end
+
+            if statisticsMax.DmgIn < statisticsData.Attacker[j].DmgIn then
+                statisticsMax.DmgIn = statisticsData.Attacker[j].DmgIn
+            end
+
+            if statisticsMax.HpRecover < statisticsData.Attacker[j].HpRecover then
+                statisticsMax.HpRecover = statisticsData.Attacker[j].HpRecover
+            end
+            if statisticsMax.CreateGuard < statisticsData.Attacker[j].CreateGuard then
+                statisticsMax.CreateGuard = statisticsData.Attacker[j].CreateGuard
+            end
+        end
+        for j = 1, #statisticsData.Defender do
+            if statisticsMax.DmgOut < statisticsData.Defender[j].DmgOut then
+                statisticsMax.DmgOut = statisticsData.Defender[j].DmgOut
+            end
+
+            if statisticsMax.DmgIn < statisticsData.Defender[j].DmgIn then
+                statisticsMax.DmgIn = statisticsData.Defender[j].DmgIn
+            end
+
+            if statisticsMax.HpRecover < statisticsData.Defender[j].HpRecover then
+                statisticsMax.HpRecover = statisticsData.Defender[j].HpRecover
+            end
+            if statisticsMax.CreateGuard < statisticsData.Defender[j].CreateGuard then
+                statisticsMax.CreateGuard = statisticsData.Defender[j].CreateGuard
+            end
+        end
+        local CombMax = { DmgOut = 1, CreateGuard = 1, HpRecover = 1 }
+        for j = 1, #statisticsData.AtkCombineSkills[1] do
+            if CombMax.DmgOut < statisticsData.AtkCombineSkills[1][j].DmgOut then
+                CombMax.DmgOut = statisticsData.AtkCombineSkills[1][j].DmgOut
+            end
+
+            if CombMax.CreateGuard < statisticsData.AtkCombineSkills[1][j].CreateGuard then
+                CombMax.CreateGuard = statisticsData.AtkCombineSkills[1][j].CreateGuard
+            end
+
+            if CombMax.HpRecover < statisticsData.AtkCombineSkills[1][j].HpRecover then
+                CombMax.HpRecover = statisticsData.AtkCombineSkills[1][j].HpRecover
+            end
+        end
+        for j = 1, #statisticsData.DefCombineSkills[1] do
+            if CombMax.DmgOut < statisticsData.DefCombineSkills[1][j].DmgOut then
+                CombMax.DmgOut = statisticsData.DefCombineSkills[1][j].DmgOut
+            end
+
+            if CombMax.CreateGuard < statisticsData.DefCombineSkills[1][j].CreateGuard then
+                CombMax.CreateGuard = statisticsData.DefCombineSkills[1][j].CreateGuard
+            end
+
+            if CombMax.HpRecover < statisticsData.DefCombineSkills[1][j].HpRecover then
+                CombMax.HpRecover = statisticsData.DefCombineSkills[1][j].HpRecover
+            end
+        end
+        local PetMax = { DmgOut = 1, CreateGuard = 1, HpRecover = 1 }
+        for j = 1, #statisticsData.AtkPetSkills[1] do
+            if PetMax.DmgOut < statisticsData.AtkPetSkills[1][j].DmgOut then
+                PetMax.DmgOut = statisticsData.AtkPetSkills[1][j].DmgOut
+            end
+
+            if PetMax.CreateGuard < statisticsData.AtkPetSkills[1][j].CreateGuard then
+                PetMax.CreateGuard = statisticsData.AtkPetSkills[1][j].CreateGuard
+            end
+
+            if PetMax.HpRecover < statisticsData.AtkPetSkills[1][j].HpRecover then
+                PetMax.HpRecover = statisticsData.AtkPetSkills[1][j].HpRecover
+            end
+        end
+        for j = 1, #statisticsData.DefPetSkills[1] do
+            if PetMax.DmgOut < statisticsData.DefPetSkills[1][j].DmgOut then
+                PetMax.DmgOut = statisticsData.DefPetSkills[1][j].DmgOut
+            end
+
+            if PetMax.CreateGuard < statisticsData.DefPetSkills[1][j].CreateGuard then
+                PetMax.CreateGuard = statisticsData.DefPetSkills[1][j].CreateGuard
+            end
+
+            if PetMax.HpRecover < statisticsData.DefPetSkills[1][j].HpRecover then
+                PetMax.HpRecover = statisticsData.DefPetSkills[1][j].HpRecover
+            end
+        end
+        _G.table.insert(
+            damage,
+            { statisticsData = statisticsData, statisticsMax = statisticsMax, CombMax = CombMax, PetMax = PetMax }
+        )
+    end
+    return damage
+end
+
+-- 历史战斗根据战报得到统计信息
+function BattleManager:GetStatisticsRecord(arg)
+    if table.isEmptyOrNil(arg) then
+        return
+    end
+    local record = _G.CS.BattleStatisticsManager.Inst:GetReportRecord(arg)
+    if record and record.result and arg.customFightCmd then
+        record.result.cmd = arg.fight_cmd
+    end
+    return record
+end
+
+---设置自动使用技能和合击技(进攻方数据)
+---@param arg any
+function BattleManager:SetArgDataAutoCmd(arg)
+    if table.isEmptyOrNil(arg) then
+        return
+    end
+    local allCmd = _G.CS.fightcmd.BattleAllCommand()
+    --自动使用技能
+    allCmd.AutoSkillCmd:Add(
+        (function()
+            local cmd = _G.CS.fightcmd.WebSetAutoSkillCmd()
+            local command = _G.CS.fightcmd.WebBattleCommand()
+            command.Frame = 1
+            cmd.Frame = command
+            cmd.AiSkillState = 0x1
+            cmd.TeamType = 0 --进攻方
+            return cmd
+        end)()
+    )
+    --自动使用合击技
+    if arg.attacker_team and #arg.attacker_team > 0 then
+        local team = arg.attacker_team[1]
+        if team.combine_skill and #team.combine_skill > 0 then
+            ---@param ghostIndex number
+            local function createAutoSkillCmd(ghostIndex)
+                local cmd = _G.CS.fightcmd.WebSetAutoGhostSkillCmd()
+                local command = _G.CS.fightcmd.WebBattleCommand()
+                command.Frame = 1
+                cmd.Frame = command
+                cmd.GhostIndex = ghostIndex
+                cmd.IsInit = true --是否初始化操作
+                cmd.IsAuto = 1    --1表示自动, 2表示手动
+                cmd.Order = 0
+                cmd.TeamType = 0  --进攻方
+                return cmd
+            end
+            for i = 1, #team.combine_skill do
+                allCmd.AutoGhostSkillCmd:Add(createAutoSkillCmd(i - 1))
+            end
+        end
+    end
+
+    arg.customFightCmd = true
+    arg.fight_cmd = _G.CS.ProtoUtils.Serialize(allCmd)
+end
+
+--endregion
+--region 静态注入
+
+---CallLuaProgress
+---@param progress number
+function BattleManager.CSCallLuaUpdateProgress(progress)
+    BattleManager:GetInstance().Progress = progress
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaProgress = BattleManager.CSCallLuaUpdateProgress
+
+---CallLuaStartTestFight
+---@param tab table 战斗数据
+function BattleManager.CSStartTestFight(tab, callback)
+    BattleManager:GetInstance():TestFight(tab.sceneSid, tab.attacker, tab.defender, callback)
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaStartTestFight = BattleManager.CSStartTestFight
+
+-- 高阶竞技场战斗开始
+function BattleManager.CSFightBoutStart(tab, callback)
+    -- local boutIndex = tab.boutIndex
+    if not BattleManager:GetInstance():GetInRecordBattle() then
+        BattleManager:GetInstance().curBattleController:BattleBoutStart(tab.boutIndex)
+    else
+        BattleManager:GetInstance().curBattleController:RecordBattleBoutStart(tab.boutIndex)
+    end
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaFightBoutStart = BattleManager.CSFightBoutStart
+
+---小波次结束等待中, 需手动加载下一场
+---@return void
+function BattleManager.CSBoutEndWait()
+    -- local boutIndex = tab.boutIndex
+    if not BattleManager:GetInstance():GetInRecordBattle() then
+        BattleManager:GetInstance().curBattleController:BoutEndWait()
+    else
+        BattleManager:GetInstance().curBattleController:RecordBoutEndWait()
+    end
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaBoutEndWait = BattleManager.CSBoutEndWait
+
+-- 高阶竞技场战斗结束
+function BattleManager.CSFightBoutEnd(tab, callback)
+    -- local boutIndex = tab.boutIndex
+    if not BattleManager:GetInstance():GetInRecordBattle() then
+        BattleManager:GetInstance().curBattleController:BattleBoutEnd(tab.boutIndex)
+    else
+        BattleManager:GetInstance().curBattleController:RecordBattleBoutEnd(tab.boutIndex)
+    end
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaFightBoutEnd = BattleManager.CSFightBoutEnd
+
+local fightResultTab = nil
+---CallLuaStartTestFight
+---@param tab table 战斗结束数据
+---@param callback fun() 回调给 CS
+function BattleManager.CSFightResult(tab, callback)
+    fightResultTab = tab
+    --直接获取战斗统计结果
+    BattleManager:GetInstance().cacheStatistics = _G.CS.BattleManager.Inst:GetStatisticsNormal()
+    BattleManager:GetInstance().cardData = tab.AttackerInfo
+    if BattleManager:GetInstance().curBattleController then
+        _G.Log("战斗结束了，返回了战斗的结果数据")
+        BattleManager:GetInstance().curBattleController:FightOverBeforePlayDeathAni(tab)
+        return
+    end
+    -- 获取战斗的数据
+    -- BattleManager:GetInstance():FightResult(tab, callback)
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaFightResult = BattleManager.CSFightResult
+
+function BattleManager.CSFightAllEnd(tab, callback)
+    if BattleManager:GetInstance().curBattleController then
+        if not BattleManager:GetInstance():GetInRecordBattle() then
+            --
+            if _G.AppSetting.DEBUG then
+                _G.Log("cToLua此次战斗结束通知")
+            end
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleDamageRankView.Name)
+            BattleManager:GetInstance().curBattleController:FightResultFunc(fightResultTab)
+            fightResultTab = nil
+            return
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log("cToLua此次回放战斗结束通知")
+            end
+            BattleManager:GetInstance().curBattleController:FightRecordResult()
+        end
+    end
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaFightAllEnd = BattleManager.CSFightAllEnd
+
+---CallLuaCSPutInPool
+---@param tab table 释放的资源
+function BattleManager.CSPutInPool(tab, callback)
+    if _G.BattleManager:GetInstance() == nil or _G.BattleManager:GetInstance().roleParent == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("[BattleManager]Manager is released.")
+        end
+        return
+    end
+
+    if tab ~= nil then
+        if tab.role ~= nil then
+            tab.role:SetParentE(_G.BattleManager:GetInstance().roleParent)
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("[BattleManager]CSPutInPool role is nil.")
+            end
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("[BattleManager]CSPutInPool tab is nil.")
+        end
+    end
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSPutInPool = BattleManager.CSPutInPool
+
+---CallLuaCSBattleExitClick
+function BattleManager.CSExitClick()
+    TrackingPointModel:GetInstance():CloseAFKEmBattleViewTracking()
+    ---退出战斗，就打断一下引导
+    if _G.AppSetting.IsShowTeach and _G.GuideManager:GetInstance().IsGuideing then
+        _G.GuideManager:GetInstance():DoBreak()
+    end
+    _G.BattleManager:GetInstance():OnEndFight()
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleExitClick = BattleManager.CSExitClick
+
+---CallLuaCSBattleReopenClick
+function BattleManager.CSBattleReopenClick()
+    _G.BattleManager:GetInstance():OnRefight()
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleReopenClick = BattleManager.CSBattleReopenClick
+
+---CallLuaCSBattleSettingClick
+function BattleManager.CSBattleSettingClick()
+    _G.BattleManager:GetInstance():OnAutoFight()
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleSettingClick = BattleManager.CSBattleSettingClick
+
+function BattleManager.CSBattleAudio(tab)
+    _G.AudioManager.PlayAudioByAudioCfgID(tab["sid"], tab["speed"])
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleAudio = BattleManager.CSBattleAudio
+
+function BattleManager.CSBattleStopAudio(tab)
+    _G.AudioManager.StopSound(tab["sid"])
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleStopAudio = BattleManager.CSBattleStopAudio
+
+function BattleManager.CSBattleChangePitchSound(tab)
+    _G.AudioManager.ChangePitchSound(tab["sid"])
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleChangePitchSound = BattleManager.CSBattleChangePitchSound
+
+function BattleManager.CSBattleOpenEmbattleShackleWindow(tab)
+    if tab["isOpen"] == 1 then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.EmbattleShackleWindowView.Name,
+            tab["eleID"],
+            tab["goldID"]
+        )
+    else
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.EmbattleShackleWindowView.Name)
+    end
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleOpenEmbattleShackleWindow = BattleManager.CSBattleOpenEmbattleShackleWindow
+
+function BattleManager.CSBattleShowAllTips(tab)
+    _G.PopWindowManager:GetInstance():ShowAllTips(40, tab["content"])
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaCSBattleShowAllTips = BattleManager.CSBattleShowAllTips
+
+function BattleManager.CSFunctionOpen(tab)
+    local isOpen = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(tab["function_id"])
+    _G.CS.BattleManager.Inst:SetAutoJointSkillOpen(isOpen)
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaFunctionOpen = BattleManager.CSFunctionOpen
+
+function BattleManager.ShowFunctionOpenTips(tab)
+    _G.PopWindowManager:GetInstance():ShowAllTips(tab["sid"])
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaShowFunctionOpenTips = BattleManager.ShowFunctionOpenTips
+
+function BattleManager.CSGetBattleRole(tab)
+    local path = tab["path"]
+    local poolName = tab["poolName"]
+    local parent = tab["parent"]
+    local callback = tab["callback"]
+    require("CardInfoManager").GetRole(path, poolName, parent, _G.RoleEffTypeEnum.Fight, callback)
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaGetBattleRole = BattleManager.CSGetBattleRole
+
+function BattleManager.CSBattleGetSceneObject()
+    return _G.WorldManager:GetInstance():GetCurWorld().SceneObject.gameObject
+end
+
+function BattleManager.CSOnClickPetSkill(tab)
+    require("PetModel"):GetInstance():BuySkillIdShowPetSkill(tab["PetSkillSid"])
+end
+
+_G.CS.BattleManager.Callbacks.CallLuaOnClickPetSkill = BattleManager.CSOnClickPetSkill
+
+--endregion
+
+---销毁对象时,析构函数
+function BattleManager:Dispose()
+end
+
+---重置战斗状态丶缓存数据(战斗开始前调用)
+function BattleManager:Reset()
+    self.cacheStatistics = nil
+end
+
+---@param log string 文本内容
+---@param tbl table 要打印的表
+function BattleManager:Log(log, tbl)
+    if self.EnableLog then
+        if not _G.string.IsNullOrEmpty(log) then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(log)
+            end
+        end
+        if tbl then
+            _G.log_error_table(tbl)
+        end
+    end
+end
+
+---@param sid monster_group_cfg_Item
+---@param type number 1.单机。 2.网络
+---@param tab table 敌我方布阵数据
+function BattleManager:StartTestFight(sid, AttackSid, DefenceSid, tab, type, call)
+    _G.coroutine.start(
+        function()
+            local view = _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+            while _G.IsNil(view.gameObject) do
+                _G.coroutine.waitforendofframe()
+            end
+            view = nil
+            local LoginView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.LoginView.Name)
+            if LoginView then
+                LoginView.gameObject:SetActiveE(0)
+            end
+            local MainView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+            if MainView then
+                _G.WorldManager:GetInstance():SetCurrentWorldVisible(false)
+            end
+            self:Reset()
+            _G.CS.BattleManager.Inst:BeginTestBattle(sid, true, AttackSid, DefenceSid, nil, type)
+            if call then
+                call()
+            end
+            return
+        end
+    )
+end
+
+---设置战斗场景显隐
+---@param active boolean
+---@return void
+function BattleManager:SetRendererActive(active)
+    _G.CS.BattleManager.Inst:SetRendererActive(active)
+end
+
+---只设置战斗场景显隐状态
+function BattleManager:SetRendererActiveState(active)
+    _G.CS.BattleManager.IsRenderer = active
+end
+
+---创建战斗剧情控制器
+---@param id number 剧情控制器id
+function BattleManager:CreateStory(id)
+    _G.CS.BattleManager.Inst:CreateStory(id)
+end
+
+---设置描述组
+---@param leftGroup string[] 左侧描述组
+---@param rightGroup string[] 右侧描述组
+function BattleManager:SetDescriptionGroup(leftGroup, rightGroup)
+    _G.CS.BattleManager.Inst.LeftDescribeGroup = leftGroup
+    _G.CS.BattleManager.Inst.RightDescribeGroup = rightGroup
+end

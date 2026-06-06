@@ -1,0 +1,544 @@
+-------------------------------------------------------
+-- File Name:       ServerManager.lua
+-- Description:     此处填写描述
+-- Author:          Administrator
+-- Create Date:     2020/05/18
+-------------------------------------------------------
+
+---@class LocalServerSaveInfo 本地服务器存储信息
+---@field public AccountName string 本地登录帐号
+---@field public ServerSid number 服务器Sid
+
+--local UIManager = require("UIManager")
+local SDKAppInfo = require("SDKAppInfo")
+local SDKServerShowInfo = require("SDKServerShowInfo")
+require("PlayerPrefsManager")
+
+---@class ServerManager : Singleton 描述
+---@field GetInstance fun():ServerManager
+---@field ServerList SDKServerShowInfo[][] 服务器列表
+---@field TagList string[] 标签列表
+---@field CurServer SDKServerShowInfo 当前选中服务器
+---@field AppInfo SDKAppInfo 当前应用信息
+local ServerManager = _G.BaseClass("ServerManager", _G.Singleton)
+_G.ServerManager = ServerManager
+
+---本地存档关键字
+---@type string
+local ConstKey = "LOGIN_INFO"
+---预留标签页
+---@type number
+local InitTagNum = 2
+--每页显示数量
+---@type number
+local PageNum = 10
+---推荐服务器列表
+---@type SDKServerShowInfo[]
+local RecommendList = {}
+--最近服务器列表
+---@type SDKServerShowInfo[]
+local NearList = {}
+---已注册服务器列表
+---@type SDKServerShowInfo[]
+local LoginList = {}
+---所有服务器列表
+---@type SDKServerShowInfo[]
+local AllServerList = {}
+---所有服务器id 对应服务器名字，游戏中用
+local AllServeridToNameList = {}
+
+---创建对象时,入口构造函数
+function ServerManager:__init()
+    self:SetCurServer(nil)
+    --初始化appInfo
+    self.AppInfo = SDKAppInfo.New()
+    self.AppInfo:ParseFromCS(_G.CS.FastSDKEx.AppInfo.Instance) --获取C#静态变量, AppInfo.Instance在游戏初始化中处理, 初始化完成之后才会执行lua代码
+    --- 内部服务器 id  编号
+    self.InsideServerId = 18
+end
+
+---是否指定服务器 true指定服务器   --self.InsideServerId
+function ServerManager:IsAssignServer()
+    return _G.AppSetting.IS_EDITOR == false and _G.AppSetting.ServerListType == 1
+end
+
+---设置CurServer
+---@param v table
+function ServerManager:SetCurServer(v)
+    self.CurServer = v
+end
+
+--region -------------初始化服务器数据-------------
+
+---初始化本地服务器配置信息
+function ServerManager:InitLocalServerList()
+    AllServerList = {}
+    local cfg = _G.ConfigManager.server_list_cfg
+
+    ---false全服务器 true体验服  编辑器全服务器 否则只有内部体验服
+    local isSkip = self:IsAssignServer()
+    for _, v in pairs(cfg) do
+        if v.id == self.InsideServerId then
+            isSkip = false
+        end
+        if isSkip == false then
+            local info = SDKServerShowInfo.New()
+            info:InitLocalCfgInfo(v)
+            AllServerList[#AllServerList + 1] = info
+        end
+    end
+    table.sort(
+        AllServerList,
+        function(a, b)
+            return a.Sid < b.Sid
+        end
+    )
+    LoginList = {}
+
+    ---@type LocalServerSaveInfo[]
+    local tab = _G.PlayerPrefsManager.GetTable(ConstKey, true)
+    local account_name = ""
+    local server_sid = -1
+
+    --兼容旧的配置格式
+    if not table.isEmptyOrNil(tab) then
+        if tab.AccountName ~= nil then
+            --本地服把上次登录的,当成已存在角色服务器
+            LoginList[#LoginList + 1] = self:GetLastServer()
+        else
+            ---@param value LocalServerSaveInfo info
+            for index, value in ipairs(tab) do
+                local s = self:GetServerBySid(value.ServerSid)
+                if s ~= nil then
+                    if isSkip == false or s.Sid == self.InsideServerId then
+                        LoginList[#LoginList + 1] = s
+                    end
+                end
+            end
+        end
+    end
+    self:UpdateServerList()
+end
+
+---初始化SDK服务器配置信息
+---@param json string SDK返回的服务器Json数据
+function ServerManager:InitSDKServerList(json)
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.InitSDKServerList)
+    --json = {\"recent\":[[\"5\",\"5服\",0,0,0,\"0\",0,0,\"10\",\"10001\"],\"recommended\":[[\"1000\",\"1000服\",0,1,0,\"test\",0,0,\"1010\",\"10001\"],\"serverUserinfo\":[],\"currLoginServers\":\"5|1\"}
+    -- local json_data = _G.Json2Table(json)
+    if _G.AppSetting.DEBUG then
+        _G.Log(json, "<color=red>" .. "get_server_list_success" .. "</color>")
+    end
+    AllServerList = {}
+    local serverList = json.server_list
+    local recent = json.recent_login_server_list
+    local serverUserinfo = json.role_info_list
+    if _G.AppSetting.DEBUG then
+        _G.Log(serverList, "<color=red>" .. "serverList" .. "</color>")
+        _G.Log(recent, "<color=red>" .. "recent" .. "</color>")
+        _G.Log(serverUserinfo, "<color=red>" .. "serverUserinfo" .. "</color>")
+    end
+
+    RecommendList = {}
+    for _, v in pairs(serverList) do
+        if not AllServeridToNameList[v.server_id] then
+            AllServeridToNameList[v.server_id] = v.server_name
+        end
+        local info = SDKServerShowInfo.New()
+        info:InitSDKInfo(v)
+        if info.IsNew then
+            _G.table.insert(RecommendList, info)
+        end
+        AllServerList[v.server_id] = info
+    end
+
+    NearList = {}
+    if recent then
+        for _, v in ipairs(recent) do
+            if not AllServerList[v] then
+                -- local info = SDKServerShowInfo.New()
+                -- info:InitSDKInfo(v.role_info)
+                -- NearList[#NearList + 1] = info
+            else
+                NearList[#NearList + 1] = AllServerList[v]
+            end
+        end
+    end
+
+    _G.SortList(
+        RecommendList,
+        function(a)
+            return a.IsLogin and 1 or 0, a.Sid
+        end
+    )
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(NearList, "<color=red>" .. "NearList" .. "</color>")
+        _G.Log(RecommendList, "<color=red>" .. "RecommendList" .. "</color>")
+    end
+
+    if serverUserinfo then
+        LoginList = {}
+        for _, v in pairs(serverUserinfo) do
+            local server_id = v.server_id
+            local info_json_data = v.role_info
+            if _G.AppSetting.DEBUG then
+                _G.Log(info_json_data, "<color=red>" .. "InitUserInfo" .. "</color>")
+            end
+            --这里挂接说了，一定能在最近登录里面找到我有账号的服务器
+            ---@type SDKServerShowInfo info
+            local info = AllServerList[server_id]
+            if info then
+                info:InitUserInfo(info_json_data)
+                LoginList[#LoginList + 1] = info
+            else
+                if _G.AppSetting.DEBUG then
+                    _G.LogError(server_id, "<color=red>" .. "注册了一个不存在的server_id" .. "</color>")
+                end
+            end
+        end
+    end
+    AllServerList = _G.table.values(AllServerList)
+    self:UpdateServerList()
+    if(_G.table.count(RecommendList) == 0 )then
+        _G.LogError("没有找到推荐服务器，产品说好的必须配一个，一定要改,程序临时用服务器最大的id去当推荐服务器，让玩家可以继续玩")
+        ---这里如果一个服务器都没有，就报错找产品吧没救了
+        ---@class SDKServerShowInfo 服务器描述
+        local addInfo 
+        for _, v in ipairs(AllServerList) do
+            if addInfo then
+                if v.Sid > addInfo.Sid then
+                    addInfo = v
+                end
+            else
+                addInfo = v
+            end
+        end
+        addInfo.IsNew = true
+        _G.table.insert(RecommendList, addInfo)
+    end
+end
+
+---初始化登录挂接中心返回的服务器信息
+function ServerManager:InitLoginServerInfo(json)
+    ---@type SDKServerShowInfo info
+    local info = self.CurServer
+    if info then
+        info:InitLoginServerInfo(json)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log(json, "<color=red>" .. "登录了一个不存在的server_sid" .. "</color>")
+        end
+    end
+    self:SetCurServer(info)
+end
+
+---初始化登录本地服务器信息
+---@param account_name string 本地登录帐号
+function ServerManager:InitLocalServerInfo(account_name)
+    ---@type SDKServerShowInfo info
+    local Sid = self.CurServer.Sid or self.CurServer.id
+
+    local info = self:GetServerBySid(Sid)
+    --dumpInFile(info, "info")
+    if info then
+        info.AccountName = account_name
+        info.IP = self.CurServer.IP
+        info.Port = self.CurServer.Port
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log(Sid, "<color=red>" .. "登录了一个不存在的server_sid" .. "</color>")
+        end
+    end
+    self:SetCurServer(info)
+end
+
+---更新服务器数据
+function ServerManager:UpdateServerList()
+    _G.SDKManager:GetInstance():GameStepInfo(require("SDKDef").BIStep.UpdateServerList)
+    if  _G.AppSetting.IsTuoGuan then
+        self.TagList = {}
+        self.ServerList = {}
+
+        local tag_list = {}
+        local server_list = {}
+
+        --已注册服务器
+        -- todo::
+        tag_list[#tag_list + 1] = "haveRole"
+        server_list[#server_list + 1] = LoginList
+
+        --推荐服务器
+        -- todo::
+        tag_list[#tag_list + 1] = "recommendServer"
+
+
+        RecommendList = {}
+        for i, v in ipairs(AllServerList) do
+            if v.IsNew then
+                RecommendList[#RecommendList + 1] = v
+            end
+        end
+        server_list[#server_list + 1] = RecommendList
+
+        --其他服务器分页显示
+        local max = -1
+        for i = #AllServerList, 1, -1 do
+            --(_G.math.floor(i / 10), "<color=red>" .. i .. " % 10===" .. i % 10 .. "</color>")
+            if i % 10 > max and max ~= 0 then
+                max = i % 10 + _G.math.floor(i / 10) * 10
+            end
+            if i % 10 == 1 then
+                if max == 0 then
+                    max = _G.math.floor(1 + i / 10) * 10
+                end
+                local min = 1 + _G.math.floor(i / 10) * 10
+                local tapkey = _G.GetLangPackValue(90022500423, min, max)
+
+                local tempList = {}
+                for j = max, min, -1 do
+                    tempList[#tempList + 1] = AllServerList[j]
+                end
+
+                tag_list[#tag_list + 1] = tapkey
+                server_list[#server_list + 1] = tempList
+                max = 0
+            end
+        end
+
+        self.TagList = tag_list
+        self.ServerList = server_list
+
+        if _G.AppSetting.DEBUG then
+            _G.Log(self.TagList, "<color=red>" .. "标签列表" .. "</color>")
+        end
+
+        if _G.AppSetting.DEBUG then
+            _G.Log(self.ServerList, "<color=red>" .. "服务器列表" .. "</color>")
+        end
+    end
+    self.isInitSuccess = true
+end
+
+---初始化应用信息
+function ServerManager:InitServerName(json)
+    local json_data = _G.Json2Table(json)
+    if _G.AppSetting.DEBUG then
+        _G.Log(json_data, "<color=red>" .. "InitServerName" .. "</color>")
+    end
+    AllServeridToNameList = json_data
+end
+
+--endregion
+
+--region -------------本地持久化-------------
+
+---获取上次登陆的服务器，没有就给推荐，再没有就给最后一个服务器
+---@return SDKServerShowInfo 服务器信息，登录账号
+function ServerManager:GetLastServer()
+    if _G.CS.Launcher.Inst.IsSDK and not _G.AppSetting.IsTuoGuan then
+        --这里肯定有一个推荐服务器，这个规定好的必须有
+        if NearList and #NearList > 0 then
+            return NearList[1]
+        else
+            if RecommendList then
+                local reCount = #RecommendList
+                if reCount > 0 then
+                    if reCount > 1 then
+                        local ms = _G.LoginManager:GetInstance():GetRandRecommend(reCount)
+                        return RecommendList[ms]
+                    else
+                        return RecommendList[1]
+                    end
+                end
+            end
+        end
+        _G.LogError("没有找到推荐服务器，产品说好的必须配一个")
+    else
+        local tab = _G.PlayerPrefsManager.GetTable(ConstKey, true)
+        local account_name = ""
+        local server_sid = -1
+
+        --兼容旧的配置格式
+        if not table.isEmptyOrNil(tab) and tab[1] ~= nil then
+            if tab.AccountName ~= nil then
+                account_name = tab.AccountName
+                server_sid = tab.ServerSid
+            else
+                account_name = tab[1].AccountName
+                server_sid = tab[1].ServerSid
+            end
+        end
+
+        local server_info = nil
+        if server_sid == -1 and RecommendList and #RecommendList > 0 then
+            server_info = RecommendList[1]
+        elseif server_sid ~= -1 then
+            server_info = self:GetServerBySid(server_sid)
+        end
+
+        if not server_info then
+            server_info = AllServerList[1]
+        end
+
+        if server_info and server_info.AccountName == nil and (string.IsNullOrEmpty(account_name) == false) then
+            if _G.AppSetting.DEBUG then
+                _G.Log("从本地读取账户名称")
+            end
+            server_info.AccountName = account_name
+        end
+
+        return server_info
+    end
+end
+
+---本地登陆数据存档
+function ServerManager:SaveLastServer()
+    if not _G.CS.Launcher.Inst.IsSDK then
+        ---@type LocalServerSaveInfo[]
+        local newSaveList = {}
+        ---@type LocalServerSaveInfo
+        local cur = {}
+        cur.AccountName = self.CurServer.AccountName
+        cur.ServerSid = self.CurServer.Sid
+
+        newSaveList[1] = cur
+        ---@type LocalServerSaveInfo[]
+        local localSaveList = _G.PlayerPrefsManager.GetTable(ConstKey, true)
+        --兼容旧的配置格式
+        if localSaveList == nil or localSaveList.AccountName ~= nil then
+            localSaveList = nil
+        else
+            local pos = 0
+            for index, value in ipairs(localSaveList) do
+                if value.ServerSid == cur.ServerSid then
+                    pos = index
+                end
+            end
+            if pos ~= 0 then
+                table.remove(localSaveList, pos)
+            end
+        end
+        if localSaveList ~= nil then
+            table.AddRange(newSaveList, localSaveList)
+        end
+        _G.PlayerPrefsManager.SetTable(ConstKey, newSaveList, true)
+    end
+end
+
+--endregion
+
+--region -------------功能方法------------
+
+---打开选服界面
+---@param info SDKServerShowInfo 上次登录的服务器
+function ServerManager:OpenUI(info)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.UIConfig.SelectServerView.Name, self.CurServer, info)
+end
+
+---通过Sid查找服务器  这个本地包含所有，sdk只有最近登录的服务器
+---@param server_sid number 服务器sid
+function ServerManager:GetServerBySid(server_sid)
+    local server_info =
+        table.find(
+            AllServerList,
+            function(a)
+                return a.Sid == server_sid
+            end
+        )
+    return server_info
+end
+
+---通过Sid查找服务器  这个接口返回的服务器不全
+---@param server_sid number 服务器sid
+function ServerManager:GetServerByServerID(server_sid)
+    local server_info = self:GetCurServer()
+    if not server_info or server_info.ServerID ~= server_sid then
+        server_info =
+            table.find(
+                AllServerList,
+                function(a)
+                    return a.ServerID == server_sid
+                end
+            )
+    end
+    return server_info
+end
+
+---通过Sid查找服务器名字
+---@param server_sid number 服务器sid
+function ServerManager:GetServerNameByServerID(server_sid)
+    if _G.CS.Launcher.Inst.IsSDK then
+        local server_info = self:GetCurServer()
+        if server_info and server_info.ServerID == server_sid then
+            return server_info.ServerName
+        else
+            local lsName = AllServeridToNameList[_G.tostring(server_sid)]
+            if lsName then
+                return lsName
+            end
+        end
+    else
+        local server_info = self:GetServerByServerID(server_sid)
+        if server_info then
+            return server_info.ServerName
+        end
+    end
+    --ZHJ-35299【客户端】公平竞技场&街机乱斗-排行榜点击不可查看玩家名片
+    --找不到玩家服务器, 兼容显示为"异域强者-xxx"
+    return _G.GetLangPackValue(90031700169)
+end
+
+--endregion
+
+function ServerManager:GetAllServerList()
+    --这个返回的是已经知道的服务器，角色信息是全部知道
+    return AllServerList
+end
+
+function ServerManager:GetNearList()
+    return NearList
+end
+
+function ServerManager:GetRecommendList()
+    return RecommendList
+end
+
+---获取 服务器 是否 是新的 服务器
+function ServerManager:GetServerIsNew()
+    return self.CurServer.IsNew
+end
+
+---获取当前服务器sid
+function ServerManager:GetServerSid()
+    if self.CurServer == nil then
+        return
+    end
+    return self.CurServer.Sid
+end
+
+function ServerManager:GetCurServer()
+    return self.CurServer
+end
+
+---销毁对象时,析构函数
+function ServerManager:Dispose()
+    InitTagNum = nil
+    PageNum = nil
+    RecommendList = nil
+    NearList = nil
+    LoginList = nil
+    AllServeridToNameList = nil
+end
+
+---检测是否已经拥有角色
+function ServerManager:CheckHasPlayer()
+    if not LoginList then
+        return false
+    end
+    if _G.CS.Launcher.Inst.IsSDK then
+        return #LoginList > 0
+    else
+        return false
+    end
+end

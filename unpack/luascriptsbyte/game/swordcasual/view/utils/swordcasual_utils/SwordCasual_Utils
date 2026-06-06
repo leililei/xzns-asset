@@ -1,0 +1,211 @@
+local SwordCasual_Utils = {}
+
+---buff类型定义
+local Effects = {
+    Speed = 1,            --增加速度
+    BeatbackPercent = 2,  --击退距离增加百分比
+    SwordDirection = 3,   --刀刃反向旋转(额外增加一把刀)
+    AddSword2 = 4,        --额外增加两把刀
+    SwordRotateSpeed = 5, --刀转速增加
+    Reset = 6,            --重置效果列表
+    ProbAddSword = 7,     --概率加减刀: 50%加两把刀, 50%失去两把刀
+    Shooter = 8,          --发射飞刀(子弹)
+    SwordAddAttack = 9,   --2级以上刀增加攻击力
+}
+SwordCasual_Utils.Effects = Effects
+
+
+local Physics = {}
+
+---@private
+function Physics:dot(ax, ay, bx, by)
+    return ax * bx + ay * by
+end
+
+---@private
+function Physics:normalize(x, y)
+    local len = math.sqrt(x * x + y * y)
+    if len == 0 then
+        return 0, 0
+    end
+    return x / len, y / len
+end
+
+---计算矩形的四个顶点(带角度)
+---@private
+---@param cx number @中心x
+---@param cy number @中心y
+---@param w number @宽度
+---@param h number @高度
+---@param rot number @旋转角度(弧度)
+---@return {x:number,y:number}[] @矩形的四个顶点
+function Physics:getRectVerts(cx, cy, w, h, rot)
+    local hw, hh = w / 2, h / 2
+    local cosr, sinr = math.cos(rot), math.sin(rot)
+    local corners = {
+        { -hw, -hh },
+        { hw,  -hh },
+        { hw,  hh },
+        { -hw, hh }
+    }
+
+    local verts = {}
+    for i = 1, 4 do
+        local x, y = corners[i][1], corners[i][2]
+        local rx = x * cosr - y * sinr + cx
+        local ry = x * sinr + y * cosr + cy
+        verts[i] = { x = rx, y = ry }
+    end
+    return verts
+end
+
+---计算投影
+---@private
+---@param verts {x:number,y:number}[] @矩形的四个顶点
+---@param ax number @轴x
+---@param ay number @轴y
+---@return number,number @最小投影,最大投影
+function Physics:projectOntoAxis(verts, ax, ay)
+    local minProj = self:dot(verts[1].x, verts[1].y, ax, ay)
+    local maxProj = minProj
+    for i = 2, #verts do
+        local p = self:dot(verts[i].x, verts[i].y, ax, ay)
+        if p < minProj then
+            minProj = p
+        end
+        if p > maxProj then
+            maxProj = p
+        end
+    end
+    return minProj, maxProj
+end
+
+---SAT算法检测矩形是否重叠
+---@param a SwordCasual_Rect @矩形a
+---@param b SwordCasual_Rect @矩形b
+---@return boolean
+function Physics:rectOverlapOBB(a, b)
+    local av = self:getRectVerts(a.x, a.y, a.w, a.h, a.rot)
+    local bv = self:getRectVerts(b.x, b.y, b.w, b.h, b.rot)
+    -- 4个检测轴：A的两边法线 + B的两边法线
+    local axes = {}
+    for i = 1, 2 do
+        local j = i % 4 + 1
+        local ex, ey = av[j].x - av[i].x, av[j].y - av[i].y
+        local ax, ay = self:normalize(-ey, ex)
+        table.insert(axes, { x = ax, y = ay })
+    end
+    for i = 1, 2 do
+        local j = i % 4 + 1
+        local ex, ey = bv[j].x - bv[i].x, bv[j].y - bv[i].y
+        local ax, ay = self:normalize(-ey, ex)
+        table.insert(axes, { x = ax, y = ay })
+    end
+    -- 在每个轴上测试投影是否重叠
+    for _, axis in ipairs(axes) do
+        local amin, amax = self:projectOntoAxis(av, axis.x, axis.y)
+        local bmin, bmax = self:projectOntoAxis(bv, axis.x, axis.y)
+        if amax < bmin or bmax < amin then
+            return false -- 找到分离轴 -> 不碰撞
+        end
+    end
+    return true
+end
+
+---计算矩形的中心距离
+---@param a SwordCasual_Rect @矩形a
+---@param b SwordCasual_Rect @矩形b
+function Physics:magnitude(a, b)
+    local offsetX = a.x - b.x
+    local offsetY = a.y - b.y
+    return math.sqrt(offsetX * offsetX + offsetY * offsetY)
+end
+
+---计算方向向量
+---@param from {GetPosition:fun():number,number} @起点
+---@param to {GetPosition:fun():number,number} @终点
+---@return {x:number,y:number} @方向向量
+function Physics:direction(from, to)
+    local fromX, fromY = from:GetPosition()
+    local toX, toY = to:GetPosition()
+
+    local offsetX, offsetY = self:normalize(toX - fromX, toY - fromY)
+    return { x = offsetX, y = offsetY }
+end
+
+SwordCasual_Utils.Physics = Physics
+
+
+---随机获取x个配置, 按照权重
+---@param cfgs jzxx_event_cfg[]
+---@param count number
+---@return jzxx_event_cfg[]
+local function randomCfgs(cfgs, count)
+    if not cfgs or #cfgs == 0 or count <= 0 then
+        return nil
+    end
+    if #cfgs <= count then
+        return cfgs
+    end
+
+    local results = {}
+    for _ = 1, count do
+        if #cfgs == 0 then
+            break
+        end
+        if #cfgs == 1 then
+            table.insert(results, cfgs[1])
+            break
+        end
+
+        --计算总权重
+        local totalWeight = 0
+        for _, cfg in ipairs(cfgs) do
+            totalWeight = totalWeight + cfg.weight
+        end
+
+        --生成随机点
+        local point = math.random(0, totalWeight)
+
+        -- 按权重遍历查找命中项
+        local acc = 0
+        for i, v in ipairs(cfgs) do
+            acc = acc + v.weight
+            if point <= acc then
+                table.insert(results, v)
+                table.remove(cfgs, i)
+                break
+            end
+        end
+    end
+    return results
+end
+SwordCasual_Utils.randomCfgs = randomCfgs
+
+
+---矩形信息
+---@class SwordCasual_Rect
+---@field x number @中心x
+---@field y number @中心y
+---@field w number @宽度
+---@field h number @高度
+---@field rot number @旋转角度(弧度)
+
+---状态buff
+---@class SwordCasual_Effect
+---@field id number         @效果id: 1增加角色移动速度, 2增加角色击退距离, 3刀刃反向旋转(额外增加一把刀), 4额外增加两把刀, 5刀转速增加, 6创建分身, 7概率加减刀, 8发射飞刀(子弹), 9.2级以上刀增加速度
+---@field value number      @效果数值: 万分比
+---@field overlay number    @当前叠层
+---@field time number       @剩余时间, -1表示无限时间
+
+---怪物创建逻辑
+---@class SwordCasual_CreateMonster
+---@field time number @下一次生成事件
+---@field startTime number @开始时间
+---@field endTime number @结束时间
+---@field interval number @生成间隔
+---@field count number @生成数量
+---@field monsterIds number[] @怪物ID
+
+
+return SwordCasual_Utils

@@ -1,0 +1,797 @@
+---@type numebr 顶级玩家展示数量
+local TOP_PLAYER_COUNT = 3
+
+---@type number 列表显示玩家不足以下数量时, 强制显示以下数量
+local EMPTY_LIST_COUNT = 10 - TOP_PLAYER_COUNT
+
+---@type number 传奇排行榜id
+local GOD_RANK_ID = 6
+
+local utils = {
+    ---强制更新一次Canvas, 然后重新计算ScrollView的大小
+    ---@param view ScrollLoopVertical
+    forceUpdateScrollRectHeight = function(view)
+        _G.CS.UnityEngine.Canvas.ForceUpdateCanvases()
+        local _, height = view.transform:GetRectTransformSize()
+        view:UpdateScrollRectHeight(height)
+    end
+}
+
+---@class RecordRankListView : UIBaseView    灵域薄排行视图
+---@field go_table RecordRankListView_GoTable
+---@field model RecordRankModel
+---@field showAllTag boolean                                                        @是否展示所有标签
+---@field rankId number                                                             @排行榜类型, 1-5雷风水火土死魂塔, 6神, 7冒险, 8死魂塔主塔
+---@field rankItems table<any,RecordRankListView._obj_rankItem_GoTable>             @排行榜列表节点
+---@field selfRankItem RecordRankListView._obj_rankItem_GoTable                     @自己的排行节点
+---@field rankDatas RecordRankData[]                                                @排行榜列表数据
+---@field awardDatas rank_cfg[]                                                     @奖励列表数据
+---@field topPlayerItems RecordRankListView._obj_info2_GoTable[]                    @顶级玩家节点
+---@field topPlayerDatas TopPlayerData[]                                            @顶级玩家数据
+---@field typeTogs table<string,RecordRankListView._toggle_type1_GoTable>           @排行榜类型toggle
+---@field view "rank"|"award"                                                       @当前视图模式
+local RecordRankListView = _G.BaseClass("RecordRankListView", _G.UIBaseView)
+
+function RecordRankListView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+
+    local resources = _G.ConfigManager.ui_cfg.RecordRankListView.resources
+    self:AddComponent(self.go_table.obj_goldInfo, require("ResourceCompont").New(self.go_table.obj_goldInfo, resources))
+    self:AddComponent(self.go_table.obj_playerInfo, require("PlayerComponent").New(self.go_table.obj_playerInfo))
+end
+
+function RecordRankListView:OnDestroy()
+    self:ClearAllRoleModel()
+    self.roleTrans = nil
+    _G.PoolsManager:GetInstance():ClearPoolAll(_G.ePoolType.Temporary)
+end
+
+function RecordRankListView:OnCreate(rankId, allTag, showTagList)
+    for i = 1, TOP_PLAYER_COUNT do
+        _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.RecordRankItem .. i,
+            _G.GetAutoGoTable(self.go_table["obj_info" .. i]))
+    end
+    for i = 1, TOP_PLAYER_COUNT do
+        _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.RecordRankItem .. i, _G.GetAutoGoTable(self.go_table["obj_info" .. i]))
+    end
+    self.model = require("RecordRankModel"):GetInstance()
+    --初始化
+    self.rankId = rankId
+    self.rankData = self.model:GetRankData(rankId)
+    self.showAllTag = allTag or false
+    ---@type RankUtils.RankType[]
+    self.showTagDict = showTagList
+    if showTagList == nil then
+        showTagList = { rankId }
+    end
+    utils.forceUpdateScrollRectHeight(self.go_table.scrollloopvectical_rankList)
+    self:Init()
+    self:SetRank(rankId)
+    self:SetView("rank")
+    --滑动视图到最左边
+    if rankId <= 3 and self.showAllTag then
+        ---@type UnityEngine.UI.ScrollRect
+        local component = self.go_table.obj_type:GetComponentE(_G.typeof(_G.CS.UnityEngine.UI.ScrollRect))
+        if not _G.IsNil(component) then
+            --_G.CS.UnityEngine.Canvas.ForceUpdateCanvases()
+            component.horizontalNormalizedPosition = 0
+            component:StopMovement()
+        end
+    end
+end
+
+function RecordRankListView:Init()
+    self.go_table.obj_rankItem:SetActiveE(0)
+
+    self.selfRankItem = _G.GetAutoGoTable(self.go_table.obj_selfRank)
+
+    --是否显示"传奇"标签, 以开服天数为准
+    local showGod = true
+    local cfg = _G.ConfigManager.discrete_cfg[106706]
+    if not cfg or _G.PlayerModel:GetInstance():GetServerOpenDuration() <= cfg[1][1] * 86400 then
+        showGod = false
+    end
+
+    --rank type
+    self.typeTogs = {}
+    for i = 1, 9 do
+        local temp = self.go_table["toggle_type" .. i]
+        if temp then
+            temp:SetName(tostring(i))
+            ---@type RecordRankListView._toggle_type1_GoTable
+            local tb = _G.GetAutoGoTable(temp)
+            self.typeTogs[temp:GetName()] = tb
+            if self.rankId == i then
+                temp.isOn = true
+            else
+                --if self.showTagDict[i] == nil then
+                --    tb.gameObject:SetActiveE(0)
+                --else
+                --    tb.gameObject:SetActiveE(1)
+                --end
+                if not self.showAllTag or i == GOD_RANK_ID and not showGod then
+                    tb.gameObject:SetActiveE(0)
+                end
+            end
+            tb.aorimage_isOn:SetActiveE(self.rankId == i and 1 or 0)
+            tb.aorimage_isOff:SetActiveE(self.rankId ~= i and 1 or 0)
+        end
+    end
+
+    self.go_table.scrollloopvectical_rankList:InitItemData(0, _G.handler(self, self.RefreshRankItem))
+end
+
+---切换rank id
+---@return void
+function RecordRankListView:SetRank(rankId)
+    self.rankId = rankId
+    self.RankData = self.model:GetRankData(rankId)
+    self.rankDatas = self.model:GetListData(self.rankId) or {}
+    self.awardDatas = self.model:GetAwardCfg(self.rankId) or {}
+    --初始化前三玩家
+    self:InitTopInfos()
+    --初始化红点系统
+    self.go_table.obj_redpointAward:UpdateRedPointItemIDAndParam(
+        _G.ConfigManager.redpoint_cfg.RecordRankAward.id,
+        rankId
+    )
+    --self.go_table.obj_redpointRank:UpdateRedPointItemIDAndParam(
+    --    _G.ConfigManager.redpoint_cfg.RecordRankLink.id,
+    --    rankId
+    --)
+end
+
+---切换视图状态
+---@param view "rank"|"award"   @切换至视图
+---@return void
+function RecordRankListView:SetView(view)
+    self.view = view
+    self.go_table.scrollloopvectical_rankList:SetActiveE(view == "rank" and 1 or 0)
+    --self.go_table.scrollloopvectical_awardList:SetActiveE(view == "award" and 1 or 0)
+    self.go_table.aorbtn_award:SetActiveE((view == "rank" and self.rankId ~= 10) and 1 or 0)
+    --self.go_table.aorbtn_rank:SetActiveE(view == "award" and 1 or 0)
+    --self.go_table.obj_tip:SetActiveE(view == "award" and 1 or 0)
+    self.go_table.obj_selfRoot:SetActiveE(view == "rank" and 1 or 0)
+    --标题
+    --local type = view == "rank" and 1 or view == "award" and 2 or 0
+    --self.go_table.aortext_title.text = self.model:GetTitleDescription(self.rankId, type)
+
+    --刷新视图
+    if view == "rank" then
+        utils.forceUpdateScrollRectHeight(self.go_table.scrollloopvectical_rankList)
+        self:InitRank()
+        self:UpdateSelfRank()
+
+        local tip = _G.GetLangPackValue(
+            self.rankId == 8 and 90037010118 or      --通关层数
+            self.rankId == 7 and 90021300109 or      --关卡
+            self.rankId == 9 and 90020300107 or      --战力
+            self.rankId == 10 and 90032800138 or     --大秘境层数
+            nil                                      --积分
+        )
+        if tip == "nil" then
+            tip = _G.GetLangPackValue(self.rankData:GetRankTitle3Tip())
+        end
+        --标题信息
+        self.go_table.aortext_rankTitle3.text = tip
+        --elseif view == "award" then
+        --    utils.forceUpdateScrollRectHeight(self.go_table.scrollloopvectical_awardList)
+        --    self:InitAward()
+    end
+end
+
+---初始化前三玩家数据
+---@return void
+function RecordRankListView:InitTopInfos()
+    --初始化前三玩家
+    self.topPlayerDatas = {}
+    for i = 1, TOP_PLAYER_COUNT do
+        if self.rankDatas[i] then
+            table.insert(self.topPlayerDatas, { data = self.rankDatas[i] })
+        else
+            break
+        end
+    end
+    self:GetTopInfos()
+end
+
+---获取前三玩家角色形象信息(全部完成后执行模型加载逻辑)
+---@return void
+function RecordRankListView:GetTopInfos()
+    if not self.topPlayerDatas or self:IsNil() then
+        return
+    end
+    local players = self.topPlayerDatas
+
+    for i = 1, TOP_PLAYER_COUNT do
+        local player = players[i]
+        if player and player.data and not player.role then
+            require("SystemSettingNet"):GetInstance():GetPlayerInfo(
+                { uid = player.data.role_info.uid },
+                function(msg)
+                    if players ~= self.topPlayerDatas then
+                        --加载逻辑已被中断
+                        return
+                    end
+                    if not msg.info then
+                        return
+                    end
+                    player.role = msg.info
+                    self:GetTopInfos() --拉取下一个玩家的信息
+                end
+            )
+            return
+        end
+    end
+
+    --所有角色数据已加载完毕
+    self:ClearAllRoleModel()
+    self:UpdateTopInfos()
+    self:UpdateAllRoleModel()
+end
+
+---更新前三玩家UI信息
+---@return void
+function RecordRankListView:UpdateTopInfos()
+    if not self.topPlayerItems then
+        self.topPlayerItems = {}
+        for i = 1, TOP_PLAYER_COUNT do
+            self.topPlayerItems[i] = _G.GetAutoGoTable(self.go_table["obj_info" .. i])
+            self.topPlayerItems[i].rank = i
+            _G.AddViewBtnClick(
+                self.topPlayerItems[i].gameObject,
+                _G.handlerbind(self, self.OnLinkClickBtn, self.topPlayerItems[i])
+            )
+        end
+    end
+    local model = require("RecordRankModel"):GetInstance()
+    for i = 1, TOP_PLAYER_COUNT do
+        local tb = self.topPlayerItems[i]
+        local player = self.topPlayerDatas[i]
+        if player and player.data then
+            tb.data = player.data
+            tb.gameObject:SetActiveE(1)
+            tb.aortext_name.text = player.data.role_info.name
+            tb.aortext_desc.text = self.model:GetProgressDescription(self.rankId, player.data.value, true)
+            --点赞状态
+            local uid = player.data.role_info.uid
+            local isLinked = self.model:IsLinked(self.rankId, uid)
+            local point = player.data.point + self.model:GetLinkPlayerCount(uid)
+            if uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                point = _G.PlayerModel:GetInstance():GetPoint()
+            end
+            tb.obj_link:SetActiveE(self.rankId ~= 10 and 1 or 0)
+            tb.aortext_linkNum.text = tostring(point)
+            tb.aorbtn_link:SetActiveE(isLinked and 0 or 1)
+            tb.obj_linked:SetActiveE(isLinked and 1 or 0)
+            tb.obj_redpoint:SetActiveE((isLinked or not model:HasLinkAward()) and 0 or 1)
+            self:UpdateTop3Title(tb, player.role.title, i)
+        else
+            tb.data = nil
+            tb.obj_link:SetActiveE(0)
+            tb.aortext_name.text = _G.GetLangPackValue(90000010159)
+            tb.aortext_desc.text = ""
+            tb.obj_redpoint:SetActiveE(0)
+        end
+        if _G.AppSetting.IsXzns then
+            GameUtil.SetUiHeXieMask(tb)
+        end
+    end
+end
+
+---生成称号
+---@param item table
+function RecordRankListView:UpdateTop3Title(tb, data, index)
+    if data.sid == 0 then
+        return
+    end
+    if self.curShowEffTitle == nil then
+        self.curShowEffTitle = {}
+    end
+    local titleScale = _G.ConfigManager.discrete_cfg[100111] and _G.ConfigManager.discrete_cfg[100111][1][1] or 1
+    local player_title = _G.ConfigManager.player_title_effect_cfg[data.sid]
+    if player_title.type_title == 1 then
+        tb.aorrawimage_title:LoadImage(player_title.title)
+        tb.aorrawimage_title:SetActiveE(1)
+        tb.aorrawimage_title:SetLocalScaleXYZ(0.29 * titleScale)
+        tb.obj_titleEffect:RemoveAllChildren()
+        self.curShowEffTitle[index] = nil
+    elseif player_title.type_title == 2 then
+        if self.curShowEffTitle[index] == nil or (self.curShowEffTitle[index] ~= nil and self.curShowEffTitle[index] ~= player_title.title) then
+            tb.obj_titleEffect:RemoveAllChildren()
+            self.curShowEffTitle[index] = player_title.title
+            _G.UIUtils.LoadEffectTitleOrFrame(
+                player_title.title,
+                tb.obj_titleEffect,
+                function(trans)
+                    if self.curShowEffTitle[index] ~= player_title.title then
+                        trans:DestroyObject()
+                        return
+                    end
+                    local parClip = trans:AddComponentE(_G.typeof(_G.CS.ParticleClipRect))
+                    parClip.NeedCheck = true
+                    parClip.CheckCount = 10
+                    parClip.CheckOne = 3
+                    trans:SetLocalScaleXYZ(titleScale)
+                end
+            )
+        end
+        tb.aorrawimage_title:SetActiveE(0)
+    end
+end
+
+--region 排行榜视图
+
+---初始化排行榜数据
+function RecordRankListView:InitRank()
+    local count = #self.rankDatas - TOP_PLAYER_COUNT
+    if count < EMPTY_LIST_COUNT then
+        count = EMPTY_LIST_COUNT
+    end
+    self.go_table.scrollloopvectical_rankList:UpdateCount(count)
+end
+
+---刷新排行榜节点
+---@param index number      数据序号(C#从0开始)
+---@param obj UnityEngine.GameObject
+function RecordRankListView:RefreshRankItem(index, obj)
+    if not self.rankItems then
+        self.rankItems = {}
+    end
+
+    local item = self.rankItems[obj:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(obj)
+        _G.AddViewBtnClick(obj, _G.handlerbind(self, self.OnLinkClickBtn, item))
+        self.rankItems[obj:GetInstanceIDE()] = item
+    end
+
+    local rank = index + 1 + TOP_PLAYER_COUNT
+    local data = self.rankDatas and self.rankDatas[rank] or nil
+    self:ShowRankItem(item, rank, data)
+end
+
+---设置排行榜节点数据
+---@param item RecordRankListView._obj_rankItem_GoTable
+---@param rank number
+---@param data RecordRankData
+function RecordRankListView:ShowRankItem(item, rank, data)
+    item.rank = rank
+    item.data = data
+
+    --排名
+    item.aortext_rank.text = tostring(rank)
+    item.aortext_rank:SetActiveE(rank >= 1 and 1 or 0)
+    if item.obj_noRank then
+        item.obj_noRank:SetActiveE(rank >= 1 and 0 or 1)
+    end
+    --人物数据
+    if data then
+        item.aortext_desc.text = self.model:GetProgressDescription(self.rankId, data.value)
+        item.aortext_name.text = data.role_info.name or "???"
+        if item.aortext_Power then
+            item.aortext_Power.text = _G.GameUtil.NumberToUnitStrFight(data.role_info.power)
+        end
+        --点赞状态
+        local uid = data.role_info.uid
+        local isLinked = self.model:IsLinked(self.rankId, uid)
+        local point = data.point + self.model:GetLinkPlayerCount(uid)
+        if uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+            point = _G.PlayerModel:GetInstance():GetPoint()
+            _G.UIUtils.SetPlayerHeadItemNew(
+                item.obj_head,
+                _G.PlayerModel:GetInstance():GetIRroleTable(),
+                1,
+                true,
+                true,
+                true
+            )
+        else
+            _G.UIUtils.SetPlayerHeadItemNew(item.obj_head, data.role_info, 1, true, true, true)
+        end
+        item.aortext_linkNum.text = tostring(point)
+        item.aortext_linkNum.color = _G.ColorTools.FormatColorByString(isLinked and "5d463a" or "cc551b")
+        item.aorbtn_link:SetActiveE(isLinked and 0 or 1)
+        item.obj_linked:SetActiveE(isLinked and 1 or 0)
+    end
+    item.obj_content:SetActiveE(data and 1 or 0)
+    if item.obj_noBody then
+        item.obj_noBody:SetActiveE(data and 0 or 1)
+    end
+
+    --红点
+    if item.obj_redpoint and self.rankId ~= 10 then
+        local hasLinkAward = data and self.model:CanLink(self.rankId, data.role_info.uid) and self.model:HasLinkAward()
+        item.obj_redpoint:SetActiveE(hasLinkAward and 1 or 0)
+    end
+end
+
+---更新自己的排名状态
+---@return void
+function RecordRankListView:UpdateSelfRank()
+    --获取自己的排行信息
+    local selfData, selfRank = self.model:GetSelfData(self.rankId, true)
+    if not selfData then
+        selfData, selfRank = self.model:GetSelfData(self.rankId, false)
+    end
+    self:ShowRankItem(self.selfRankItem, selfRank, selfData or self.model:GetSelfEmptyData())
+    if not selfData then
+        --从服务器重新拉取数据
+        self.model:GetSelfInfo(
+            self.rankId,
+            function()
+                selfData, selfRank = self.model:GetSelfData(self.rankId, false)
+                self:ShowRankItem(self.selfRankItem, selfRank, selfData or self.model:GetSelfEmptyData())
+            end
+        )
+    end
+end
+
+--endregion
+
+---处理按钮事件
+function RecordRankListView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_CloseView then
+        self:Close()
+        --elseif go == self.go_table.aorbtn_rank then
+        --    self:SetView("rank")
+    elseif go == self.go_table.aorbtn_award then
+        --self:SetView("award")
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RecordAwardListView.Name, self.rankId)
+    else
+        --rank type
+        local goName = go:GetName()
+        ---@type RecordRankListView._toggle_type1_GoTable
+        local typeTog = self.typeTogs and self.typeTogs[goName]
+        if typeTog then
+            typeTog.aorimage_isOn:SetActiveE(isOn and 1 or 0)
+            typeTog.aorimage_isOff:SetActiveE(not isOn and 1 or 0)
+            if isOn then
+                local rankId = tonumber(goName)
+                if rankId == self.rankId then
+                    return
+                end
+                self:ClearAllRoleModel()
+                --重新刷新列表
+                self:SetRank(rankId)
+                self:SetView(self.view or "rank")
+            end
+        end
+    end
+end
+
+---处理点赞事件
+---@param item {rank:number, data:RecordRankData, aorbtn_playerInfo:AorButton, aorbtn_link:AorButton}
+function RecordRankListView:OnLinkClickBtn(go, _, item)
+    if not item.data then
+        return
+    end
+
+    if go == item.aorbtn_link then
+        local playerUid = item.data.role_info.uid
+        ---检查能否点赞
+        local ok, tipId = self.model:CanLink(self.rankId, playerUid)
+        if not ok then
+            if tipId and tipId > 0 then
+                _G.PopWindowManager:GetInstance():ShowAllTips(tipId)
+            end
+            return
+        end
+        ---执行点赞请求
+        self.model:DoLink(
+            self.rankId,
+            playerUid,
+            function(msg)
+                --刷新节点状态
+                self:UpdateSelfRank()
+                self.go_table.scrollloopvectical_rankList:UpdateAllItem()
+
+                --如果是顶级玩家, 更新其状态
+                if item.rank <= TOP_PLAYER_COUNT then
+                    self:UpdateTopInfos()
+                end
+                --如果是自己
+                if playerUid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                    self:UpdateSelfRank()
+                end
+
+                --如果有奖励信息
+                if msg and msg.award then
+                    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                        _G.ConfigManager.redpoint_cfg.RecordRankLink.id
+                    )
+                    if AppSetting.IsXzns then
+                        require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                                _G.ConfigManager.redpoint_cfg.RecordRankChallenge.id
+                        )
+                        require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                                _G.ConfigManager.redpoint_cfg.RecordRankDevelop.id
+                        )
+                    end
+                    _G.UIUtils.ShowCommonAward(msg)
+                end
+            end
+        )
+    elseif go == item.aorbtn_playerInfo and item.data.role_info then
+        _G.SystemSettingManager:GetInstance():OpenView(item.data.role_info.uid)
+    end
+end
+
+--region ------------- 场景模型相关 -------------
+
+---加载单个角色
+---@param view table 视图
+---@param rolepath string 模型路径
+---@param posType number 摆放的位置
+function RecordRankListView:LoadRoleModel(rolepath, posIndex, scale,cfg,data)
+    ---@type RecordRankListView._obj_info1_GoTable
+    local info = _G.GetAutoGoTable(self.go_table["obj_info" .. posIndex])
+    _G.PoolsManager:GetInstance():Spawn(
+        rolepath,
+        _G.ePoolType.Temporary,
+        nil,
+        function(trans)
+            if trans == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("角色无法加载 path:" .. rolepath .. "    CardInfoView LoadRoleScene")
+                end
+                return
+            end
+            if self:IsNil() then
+                _G.DestroyObject(trans)
+                return
+            end
+            trans:SetParentE(info.trans_role)
+            trans:SetLocalPosition(0, 0, 0)
+            trans:SetLocalScaleXYZ(scale)
+            self.roleTrans[posIndex] = trans
+            local rolePoint = trans:GetComponentE(_G.typeof(_G.CS.RolePoint))
+            if rolePoint == nil then
+                rolePoint = trans:AddComponentE(_G.typeof(_G.CS.RolePoint))
+            end
+            -- self:UpdateHalo(posIndex, rolePoint)
+            -- self:UpdateTitle(posIndex, rolePoint)
+            --- 只有星座女神有神环
+            if _G.AppSetting.IsXzns then
+                local godHaloID = data.role.god_halo
+           
+                if godHaloID ~= 0 then
+                    local effCfg = _G.ConfigManager.god_halo_cfg[godHaloID].ui_effect_cfg
+                    --- 神环路径，父级路径(加载角色的下面)
+                    _G.UIUtils.LoadGodHalo(effCfg, trans, godHaloID)
+                end
+                if not table.isEmptyOrNil(data.role.artifact_skin) then
+                    _G.UIUtils.LoadArtifacteffect(trans,nil,data.role.artifact_skin[1],data.role.artifact_skin[2])
+                end
+            end
+        end
+    )
+end
+
+function RecordRankListView:UpdateHalo(pos, rolePoint)
+    if self.halo[pos] then
+        _G.PoolsManager:GetInstance():Despawn(self.halo[pos], _G.ePoolType.Temporary)
+        self.halo[pos] = nil
+    end
+    local haloId = self.topPlayerDatas[pos].role.halo.sid
+    if haloId == nil or haloId <= 0 then
+        return
+    end
+    local parent = self.roleTrans[pos]
+    ---@type player_halo_effect_cfg
+    local cfg = _G.ConfigManager.player_halo_effect_cfg[haloId]
+    _G.PoolsManager:GetInstance():Spawn(
+        cfg.halo,
+        _G.ePoolType.Temporary,
+        parent,
+        function(trans)
+            if _G.IsNil(parent) then
+                _G.DestroyObject(trans)
+                return
+            end
+            self.halo[pos] = trans
+            if cfg.type_halo == 2 then
+                self.halo[pos]:SetParentE(rolePoint.Point_Chest)
+            else
+                local scale = self.halo[pos]:GetParent():GetLocalScale()
+                local rate = 1
+                self.halo[pos]:SetLocalScaleXYZ(rate * _G.ConfigManager.discrete_cfg[103901][1][1] / scale)
+            end
+            self.halo[pos]:GetChildE(0):SetActiveE(1)
+            self.halo[pos]:SetEulerAngles(0, 0, 0)
+            self.halo[pos]:SetLocalPositionToZero()
+        end
+    )
+end
+
+function RecordRankListView:UpdateTitle(pos, rolePoint)
+    local titleId = self.topPlayerDatas[pos].role.title.sid
+    local parent = self.roleTrans[pos]
+    if not self.title[pos] or _G.IsNil(self.title[pos].gameObject) then
+        if not titleId or titleId <= 0 then
+            return
+        end
+        _G.PoolsManager:GetInstance():Spawn(
+            "CommonPrefab/World/Common_TitleWithDesignation",
+            _G.ePoolType.Temporary,
+            parent,
+            function(trans)
+                if (_G.IsNil(parent)) then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                local go_table = _G.GetAutoGoTable(trans)
+                trans:AddComponentE(_G.typeof(_G.CS.UnityEngine.Canvas))
+                self.title[pos] = go_table
+                self:SetTitlePos(pos, rolePoint)
+                go_table.aortext_TextName.text = ""
+
+                ---@type player_title_effect_cfg
+                local cfg = _G.ConfigManager.player_title_effect_cfg[titleId]
+                if cfg then
+                    if cfg.type_title == 1 then
+                        go_table.aorrawimage_Title:LoadImage(
+                            cfg.icon,
+                            function()
+                                go_table.aorrawimage_Title:SetNativeSize()
+                                go_table.aorrawimage_Title:SetLocalScaleXYZ(self.titleScale)
+                            end
+                        )
+                        if self.title[pos].item then
+                            _G.DestroyObject(self.title[pos].item)
+                            self.title[pos].item = nil
+                        end
+                        self.title[pos].aorrawimage_Title:SetActiveE(1)
+                    else
+                        self.title[pos].aorrawimage_Title:SetActiveE(0)
+                        if self.title[pos].item then
+                            _G.DestroyObject(self.title[pos].item)
+                            self.title[pos].item = nil
+                        end
+                        _G.UIUtils.LoadEffectTitleOrFrame(
+                            cfg.title,
+                            self.title[pos].gameObject,
+                            function(trans)
+                                if self:IsNil() then
+                                    _G.DestroyObject(trans)
+                                    return
+                                end
+                                trans:SetLayerAndChild(30)
+                                self.title[pos].item = trans
+                                local x, y, z = self.title[pos].aorrawimage_Title:GetPosition()
+                                trans:SetPosition(x, y + 0.2, z)
+                                self.title[pos].item:SetLocalScaleXYZ(self.titleScale)
+                                trans:SetActiveE(1)
+                            end
+                        )
+                    end
+                end
+            end
+        )
+    elseif self.title[pos] then
+        if self.title[pos].item then
+            _G.DestroyObject(self.title[pos].item)
+            self.title[pos].item = nil
+        end
+        if not titleId or titleId <= 0 then
+            self.title[pos].aorrawimage_Title:SetActiveE(0)
+            return
+        end
+        ---@type player_title_effect_cfg
+        local cfg = _G.ConfigManager.player_title_effect_cfg[titleId]
+        if cfg.type_title == 1 then
+            self.title[pos].aorrawimage_Title:LoadImage(
+                cfg.icon,
+                function()
+                    self.title[pos].aorrawimage_Title:SetNativeSize()
+                    self.title[pos].aorrawimage_Title:SetLocalScaleXYZ(self.titleScale)
+                end
+            )
+            self.title[pos].aorrawimage_Title:SetActiveE(1)
+        else
+            _G.UIUtils.LoadEffectTitleOrFrame(
+                cfg.title,
+                self.title[pos].gameObject,
+                function(trans)
+                    if self:IsNil() then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    trans:SetLayerAndChild(30)
+                    self.title[pos].item = trans
+                    local x, y, z = self.title[pos].aorrawimage_Title:GetPosition()
+                    trans:SetPosition(x, y + 0.2, z)
+                    self.title[pos].item:SetLocalScaleXYZ(self.titleScale)
+                    trans:SetActiveE(1)
+                end
+            )
+            self.title[pos].aorrawimage_Title:SetActiveE(0)
+        end
+    end
+end
+
+---初始化头顶名称位置
+---@param deltaY number Y轴便宜值
+function RecordRankListView:SetTitlePos(pos, rolePoint)
+    _G.DelayFrameDo(
+        function()
+            if self:IsNil() then
+                return
+            end
+            if self.title[pos] and not _G.IsNil(self.title[pos].gameObject) then
+                local x, y, z = rolePoint.Point_Head:GetPosition()
+                if x then
+                    local parent = self.roleTrans[pos]
+                    if parent == nil then
+                        ---快速切换角色时gameObj可能被置位nil
+                        return
+                    end
+                    local position = {}
+                    position.x = x
+                    position.z = z
+                    position.y = y - 0.19
+                    local scale = parent:GetLocalScale()
+                    local rate = 1
+                    self.title[pos].gameObject:SetLocalScaleXYZ(rate * 0.8 / scale)
+                    self.title[pos].transform:SetLocalPositionToZero()
+                    self.title[pos].transform:SetPosition(position.x, position.y, position.z)
+                end
+            end
+        end
+    )
+end
+
+---刷新所有角色
+function RecordRankListView:UpdateAllRoleModel()
+    if not self.title then
+        self.title = {}
+    end
+    if not self.halo then
+        self.halo = {}
+    end
+    if not self.roleTrans then
+        self.roleTrans = {}
+    end
+
+    for i = 1, TOP_PLAYER_COUNT do
+        local data = self.topPlayerDatas[i]
+        if data and data.role then
+            local cfg = require "CardCommentManager":GetInstance():CardData(data.role.city_style_id, false)
+            local path = _G.UIUtils.GetBattleSpine(cfg, _G.UseBattleSpine.RankView)
+            self:LoadRoleModel(path, i, cfg.size4, cfg,data)
+        else
+        end
+    end
+end
+
+function RecordRankListView:ClearAllRoleModel()
+    for i = 1, TOP_PLAYER_COUNT do
+        --回收角色模型
+        ---@type RecordRankListView._obj_info1_GoTable
+        local temp = _G.GetAutoGoTable(self.go_table["obj_info" .. i])
+        local tempCount = temp.trans_role:GetChildCountE()
+        if tempCount > 0 then
+            _G.PoolsManager:GetInstance():Despawn(temp.trans_role:GetChildE(0), _G.ePoolType.Temporary)
+        end
+        if self.halo and self.halo[i] then
+            _G.PoolsManager:GetInstance():Despawn(self.halo[i], _G.ePoolType.Temporary)
+            self.halo[i] = nil
+        end
+        if self.title and self.title[i] then
+            _G.PoolsManager:GetInstance():Despawn(self.title[i].gameObject, _G.ePoolType.Temporary)
+            self.title[i] = nil
+        end
+    end
+end
+
+--endregion
+
+--region  ----------------类型定义----------------
+
+---@class TopPlayerData
+---@field data RecordRankData
+---@field role any
+
+--endregion
+
+return RecordRankListView

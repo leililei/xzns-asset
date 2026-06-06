@@ -1,0 +1,480 @@
+--------------------------------------------------------------------------
+-- E:.Game.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Fuli.GeatherSoulArrayEmbattleFastView	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/05/29
+-- Description: 聚灵法阵布阵快捷设置界面
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+---@class EmbattleFastCardData
+---@field sid number 卡牌Sid
+---@field uid number 卡牌Uid
+---@field level number 卡牌等级
+---@field star number  卡牌星级
+---@field soulLink_lv number 卡牌魂链等级
+---@field tag number 标志(0无 1以上阵 2同名角色,3已阵亡 4人数已满,5助战已满)
+---@field arrayId number 所在阵法id
+---@field arrayIndex number 所在阵法index
+
+---@class GeatherSoulArrayEmbattleFastView : UIBaseView    中文描述
+---@field public go_table GeatherSoulArrayEmbattleFastView_GoTable GoTable
+---@field curEmbattleItem EmbattleItemBase 布阵item
+---@field embattleData table<number, EmbattleFastCardData> 布阵数据
+---@field model GeatherSoulArrayModel
+---@field cfg formation_s_cfg
+---@field roleItems table<number, GeatherSoulArrayEmbattleFastView._obj_roleItem1_GoTable> 角色item列表
+---@field arrayData table 当前角色对应的阵法列表
+---@field curIndex number 当前选中角色位置
+---@field curArray number 当前选中阵法
+---@field curArrayInfo table 当前选中阵法的角色信息
+local GeatherSoulArrayEmbattleFastView = _G.BaseClass("GeatherSoulArrayEmbattleFastView", _G.UIBaseView)
+
+local CS = _G.CS
+local typeof = _G.typeof
+local GetLangPackValue = _G.GetLangPackValue
+local GetAutoGoTable = _G.GetAutoGoTable
+local SetActiveByCondition = _G.GameUtil.SetActiveByCondition
+local ConfigManager = _G.ConfigManager
+local table = _G.table
+local LoadEffectByCfg = _G.UIUtils.LoadEffectByCfg
+
+---左侧角色法阵状态
+local ArrType = {
+    Lock = 1, --锁定
+    Add = 2, --待添加
+    Adding = 3, --添加中
+    Replace = 4, --可替换
+    Replacing = 5, --替换中
+    Assist = 6 --助战角色
+}
+
+---右侧阵法状态
+local ArrState = {
+    Lock = 1, --未激活
+    IsIn = 2, --在阵法中
+    Replace = 3, --替换
+    Go = 4 --上阵
+}
+
+function GeatherSoulArrayEmbattleFastView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+function GeatherSoulArrayEmbattleFastView:OnCreate(item, itemIndex, callback)
+    self.model = require "GeatherSoulArrayModel":GetInstance()
+    self.cfg = ConfigManager.formation_s_cfg
+    self.callback = callback
+    self.arrayData = {}
+    self.roleItems = {}
+    self.curEmbattleItem = item
+    self.embattleData = _G.DeepCopy(self.curEmbattleItem:GetEmbattleData(itemIndex))
+    self:DefaultChoose()
+    self:InitView()
+end
+
+---初始化显示
+---@private
+function GeatherSoulArrayEmbattleFastView:InitView()
+    local check = function(obj)
+        if self:IsNil() then
+            _G.UIUtils.RemoveEffect(obj)
+        end
+    end
+
+    ---@type GeatherSoulArrayEmbattleFastView._obj_roleItem1_GoTable
+    local tb
+    local uid, aid, idx, aType  ---角色uid, 法阵sid， 所处法阵位置id， 角色法阵状态
+    self.assists = {}
+    local borrowCardData = require("FriendHelpModel"):GetInstance():GetBorrowCardDatas()
+    for i = 1, 5 do
+        uid = self.embattleData[i].uid
+        tb = GetAutoGoTable(self.go_table["obj_roleItem" .. i], _G.handlerbind(self, self.OnClickEmbattleRoleItem, i))
+        self.roleItems[i] = tb
+        if self.embattleData[i].sid > 0 then
+            local card = require("ItemCardAllView").New(tb.obj_card)
+            local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+            local isDungones = require("DungonesModel"):GetInstance():CheckIsDungonesCard(uid)
+            local isTimer = false
+            if cardData then
+                isTimer = cardData.type == _G.CardType.Timer
+            end
+            if self.curEmbattleItem:CheckCardAssist(uid) or isDungones or isTimer then
+                ---助战角色
+                self.assists[i] = true
+                aType = ArrType.Lock
+
+                if self.curEmbattleItem:CheckIsNpcAssist(uid) or isDungones or isTimer then
+                    aType = ArrType.Lock
+                    cardData = self.curEmbattleItem:GetCardData(uid)
+                    card:ShowCardData(cardData, nil, false, true)
+                    --cardData = self.embattleData[i]
+                    --card:Show(cardData.sid, nil, cardData.star, cardData.soulLink_lv, cardData.level, nil, false)
+                else
+                    for j = 1, #borrowCardData do
+                        if uid == borrowCardData[j].uid then
+                            cardData = borrowCardData[j]
+                            break
+                        end
+                    end
+                    if cardData then
+                        card:ShowCardData(cardData, nil, false, true)
+                        local geatherInfo = cardData:GetGeatherSoul()
+                        if geatherInfo and geatherInfo.f_sid > 0 then
+                            tb.aorrawimage_skill:LoadImage(
+                                ConfigManager.card_skills_cfg[
+                                    self.model.StarCfg[geatherInfo.f_sid][geatherInfo.level + 1].skills
+                                ].icon
+                            )
+                            aType = ArrType.Assist
+                        end
+                    end
+                end
+            else
+                card:ShowCardData(cardData, nil, true, true)
+                aid, idx = self.model:CheckInArray(uid)
+                if aid then
+                    self.embattleData[i].arrayId = aid
+                    self.embattleData[i].arrayIndex = idx
+                    tb.aorrawimage_skill:LoadImage(
+                        ConfigManager.card_skills_cfg[self.model:GetArrayInfo(aid):GetStarSkill()].icon
+                    )
+                    if self.curIndex == i then
+                        aType = ArrType.Replacing
+                    else
+                        aType = ArrType.Replace
+                    end
+                else
+                    if self.curIndex == i then
+                        aType = ArrType.Adding
+                    else
+                        aType = ArrType.Add
+                    end
+                end
+            end
+        else
+            aType = ArrType.Lock
+        end
+        SetActiveByCondition(tb.obj_noCard, self.embattleData[i].sid == 0)
+        SetActiveByCondition(tb.obj_card, self.embattleData[i].sid > 0)
+        LoadEffectByCfg(_G.ConfigManager.ui_effect_cfg.ef_Selected_loop, tb.obj_effNoArrayChoose, check)
+        self:UpdateEmbattleItemSkill(tb, aType)
+    end
+
+    self.go_table.scrollloopvectical_arrayList:InitItemData(0, _G.handler(self, self.RefreshArrayItem))
+    self.go_table.scrollloopvectical_roleList:InitItemData(0, _G.handler(self, self.RefreshRoleItem))
+
+    self:ShowArrayList()
+    _G.DelayFrameDo(
+        function()
+            self.go_table.obj_Left:GetComponentE(typeof(CS.UnityEngine.CanvasGroup)).alpha = 1
+            self.go_table.obj_Right:GetComponentE(typeof(CS.UnityEngine.CanvasGroup)).alpha = 1
+        end
+    )
+end
+
+---刷新角色item的法阵信息
+---@param tb GeatherSoulArrayEmbattleFastView._obj_roleItem1_GoTable 角色item
+---@param aType number 法阵状态
+function GeatherSoulArrayEmbattleFastView:UpdateEmbattleItemSkill(tb, aType)
+    SetActiveByCondition(
+        tb.aorrawimage_skill,
+        aType == ArrType.Replace or aType == ArrType.Replacing or aType == ArrType.Assist
+    )
+    SetActiveByCondition(tb.aorbtn_replace, aType == ArrType.Replace or aType == ArrType.Replacing)
+    SetActiveByCondition(tb.aorimage_replace, aType == ArrType.Replace or aType == ArrType.Replacing)
+    SetActiveByCondition(tb.aorimage_choose, aType == ArrType.Replacing)
+    SetActiveByCondition(tb.aorimage_add, aType == ArrType.Add or aType == ArrType.Adding)
+    SetActiveByCondition(tb.aorbtn_add, aType == ArrType.Add or aType == ArrType.Adding)
+    SetActiveByCondition(tb.obj_effNoArrayChoose, aType == ArrType.Adding)
+    SetActiveByCondition(tb.aorimage_lock, aType == ArrType.Lock)
+end
+
+---设置打开页面默认选择的角色
+function GeatherSoulArrayEmbattleFastView:DefaultChoose()
+    local _aid, _idx
+    for i = 1, 5 do
+        if self.embattleData[i].sid > 0 and not self.curIndex then
+            self.curIndex = i
+        end
+        _aid, _idx = self.model:CheckInArray(self.embattleData[i].uid)
+        if _aid then
+            self.curIndex = i
+            break
+        end
+    end
+end
+
+---刷新显示右侧阵法列表
+function GeatherSoulArrayEmbattleFastView:ShowArrayList()
+    self.go_table.obj_allArray:SetActiveE(1)
+    self.go_table.obj_curArray:SetActiveE(0)
+    self.arrayData = {}
+    local data
+    local sortNum
+    for _, v in pairs(self.cfg) do
+        data = self.model:GetArrayInfo(v.id)
+        if data:IsUnlock() then
+            sortNum = v.id / (10 ^ (data:GetStar() + 1))
+        else
+            sortNum = v.id * 10
+        end
+        if self.embattleData[self.curIndex].arrayId == v.id then
+            sortNum = v.id
+        end
+        table.insert(self.arrayData, {cfg = v, data = data, sort = sortNum})
+    end
+    _G.SortList(
+        self.arrayData,
+        function(a)
+            return -a.sort
+        end
+    )
+    self.go_table.scrollloopvectical_arrayList:UpdateCount(#self.arrayData)
+end
+
+---刷新显示右侧阵法详情
+---@param arrayId number 法阵id
+function GeatherSoulArrayEmbattleFastView:ShowArrayRole(arrayId)
+    self.curArray = arrayId
+    self.go_table.obj_allArray:SetActiveE(0)
+    self.go_table.obj_curArray:SetActiveE(1)
+    self.go_table.aortext_curName.text = GetLangPackValue(self.cfg[arrayId].name)
+    self.go_table.aorrawimage_curIcon:LoadImage(self.cfg[arrayId].image)
+    local data = self.model:GetArrayInfo(arrayId)
+    for i = 1, 5 do
+        self.go_table["aorimage_fire" .. i]:SetGray(i > data:GetStar())
+    end
+    self.curArrayInfo = _G.DeepCopy(self.model:GetCurSelectCardInfo(arrayId))
+    _G.SortList(
+        self.curArrayInfo,
+        function(a)
+            return -a.key
+        end
+    )
+    self.go_table.scrollloopvectical_roleList:UpdateCount(#self.curArrayInfo)
+end
+
+---刷新法阵item
+---@private
+function GeatherSoulArrayEmbattleFastView:RefreshArrayItem(index, obj)
+    index = index + 1
+    ---@type GeatherArrayBaseData
+    local data = self.arrayData[index]
+    ---@type GeatherSoulArrayEmbattleFastView._obj_arrayItem_GoTable
+    local tb = GetAutoGoTable(obj, _G.handlerbind(self, self.OnClickArrayItem, data.cfg.id))
+    tb.aorrawimage_icon:LoadImage(data.cfg.image)
+    tb.aortext_name.text = GetLangPackValue(data.cfg.name)
+    for i = 1, 5 do
+        tb["aorimage_fire" .. i]:SetGray(i > data.data:GetStar())
+    end
+
+    local curNum = table.count(self.model:GetCurSelectCardInfo(data.cfg.id))
+    local unlockNum = self.model:GetCurArrayUnlockNum(data.cfg.id)
+    local state
+    if not data.data:IsUnlock() then
+        state = ArrState.Lock
+    else
+        if unlockNum == curNum then
+            state = ArrState.Replace
+        else
+            state = ArrState.Go
+        end
+    end
+    if self.embattleData[self.curIndex].arrayId == data.cfg.id then
+        state = ArrState.IsIn
+    end
+    SetActiveByCondition(tb.aorbtn_enter, state == ArrState.Go)
+    SetActiveByCondition(tb.aorimage_current, state == ArrState.IsIn)
+    SetActiveByCondition(tb.aortext_notActive, state == ArrState.Lock)
+    SetActiveByCondition(tb.aorbtn_replace, state == ArrState.Replace)
+    tb.aortext_count.text = GetLangPackValue(90000010804) .. curNum .. "/" .. unlockNum
+end
+
+---刷新法阵内角色item
+---@private
+function GeatherSoulArrayEmbattleFastView:RefreshRoleItem(index, obj)
+    index = index + 1
+    ---@type GeatherSoulArrayEmbattleFastView._obj_roleItem_GoTable
+    local tb =
+        GetAutoGoTable(
+        obj,
+        _G.handlerbind(self, self.OnClickRoleItem, self.curArrayInfo[index].value, self.curArrayInfo[index].key)
+    )
+    local card = require("ItemCardAllView").New(tb.obj_card)
+    local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, self.curArrayInfo[index].value)
+    local caradata = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, cardData.uid)
+    local skin
+
+    if caradata and caradata.skin ~= 0 then
+        skin = true
+    else
+        skin = false
+    end
+    card:ShowCardData(cardData, nil, skin, true)
+    tb.aortext_roleName.text = GetLangPackValue(cardData.cfg.Name)
+end
+
+---刷新左侧单个角色显示
+---@param aid number 法阵id
+---@param arrayIndex number 所处法阵位置id
+---@param uid number 角色uid
+function GeatherSoulArrayEmbattleFastView:UpdateEmbattleItem(aid, arrayIndex, uid)
+    local index = self.curIndex
+    if uid then
+        for i = 1, #self.embattleData do
+            if self.embattleData[i].uid == uid then
+                index = i
+                break
+            end
+        end
+    end
+    if aid then
+        self.roleItems[index].aorrawimage_skill:LoadImage(
+            ConfigManager.card_skills_cfg[self.model:GetArrayInfo(aid):GetStarSkill()].icon
+        )
+        if not self.embattleData[index].arrayId then
+            self:UpdateEmbattleItemSkill(self.roleItems[index], ArrType.Replacing)
+        end
+    else
+        self:UpdateEmbattleItemSkill(self.roleItems[index], ArrType.Add)
+    end
+    self.embattleData[index].arrayId = aid
+    self.embattleData[index].arrayIndex = arrayIndex
+end
+
+---法阵点击事件
+function GeatherSoulArrayEmbattleFastView:OnClickArrayItem(go, isOn, aid)
+    local name = go:GetName()
+    if name == "@_aorbtn_enter" then
+        local uid = self.embattleData[self.curIndex].uid
+        local index = self:GetNextArrayIndex(aid)
+        self.model:SetCard(
+            uid,
+            aid,
+            index,
+            aid,
+            function()
+                self:UpdateEmbattleItem(aid, index)
+                self:ShowArrayList()
+                if self.callback then
+                    self.callback()
+                end
+            end
+        )
+    elseif name == "@_aorbtn_replace" then
+        self:ShowArrayRole(aid)
+    elseif name == "@_aorbtn_tips" then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.CommonTipView.Name,
+            _G.TipType.GeatherSoulArray,
+            self.model:GetArrayInfo(aid)
+        )
+    end
+end
+
+---法阵角色点击事件
+function GeatherSoulArrayEmbattleFastView:OnClickRoleItem(go, isOn, uid, index)
+    local name = go:GetName()
+    if name == "@_aorbtn_replace" then
+        local curUid = self.embattleData[self.curIndex].uid
+        self.model:SetCard(
+            uid,
+            self.curArray,
+            index,
+            0,
+            function()
+                self:UpdateEmbattleItem(nil, nil, uid)
+                self.model:SetCard(
+                    curUid,
+                    self.curArray,
+                    index,
+                    self.curArray,
+                    function()
+                        self:UpdateEmbattleItem(self.curArray, index)
+                        self:ShowArrayList()
+                        if self.callback then
+                            self.callback()
+                        end
+                    end
+                )
+            end
+        )
+    end
+end
+
+---左侧角色点击事件
+function GeatherSoulArrayEmbattleFastView:OnClickEmbattleRoleItem(go, isOn, index)
+    if self.assists[index] then
+        return
+    end
+    local name = go:GetName()
+    if name == "@_aorbtn_replace" then
+        if self.assists[index] then
+            return
+        end
+        if index ~= self.curIndex then
+            self.roleItems[self.curIndex].aorimage_choose:SetActiveE(0)
+            self.roleItems[self.curIndex].obj_effNoArrayChoose:SetActiveE(0)
+            self.roleItems[index].aorimage_choose:SetActiveE(1)
+            self.curIndex = index
+            self:ShowArrayList()
+        end
+    elseif name == "@_aorbtn_add" then
+        if index ~= self.curIndex then
+            self.roleItems[self.curIndex].aorimage_choose:SetActiveE(0)
+            self.roleItems[self.curIndex].obj_effNoArrayChoose:SetActiveE(0)
+            self.roleItems[index].obj_effNoArrayChoose:SetActiveE(1)
+            self.curIndex = index
+            self:ShowArrayList()
+        end
+    elseif name == "@_aorbtn_showTipsArray" then
+        if self.assists[index] then
+            return
+        end
+        _G.PopWindowManager:GetInstance():ShowAllTips(1310)
+    elseif name == "@_aorbtn_showTips" then
+        _G.PopWindowManager:GetInstance():ShowAllTips(1310)
+    elseif name == "@_aorbtn_selectRole" then
+        if self.assists[index] then
+            return
+        end
+        if index ~= self.curIndex then
+            self.roleItems[self.curIndex].aorimage_choose:SetActiveE(0)
+            self.roleItems[self.curIndex].obj_effNoArrayChoose:SetActiveE(0)
+            if self.embattleData[index].arrayId then
+                self.roleItems[index].aorimage_choose:SetActiveE(1)
+            else
+                self.roleItems[index].obj_effNoArrayChoose:SetActiveE(1)
+            end
+            self.curIndex = index
+            self:ShowArrayList()
+        end
+    end
+end
+
+---主窗口点击事件
+function GeatherSoulArrayEmbattleFastView:OnClickBtn(go, isOn)
+    local name = go:GetName()
+    if name == "@_aorbtn_closeView" then
+        self:Close()
+    elseif name == "@_aorbtn_bgClose" then
+        self:Close()
+    end
+end
+
+---获取阵法的下一个可上阵槽位
+---@param aid number 法阵id
+function GeatherSoulArrayEmbattleFastView:GetNextArrayIndex(aid)
+    local unlockNum = self.model:GetCurArrayUnlockNum(aid)
+    for i = 1, unlockNum do
+        if self.model:GetCardByArrayIndex(aid, i) == nil then
+            return i
+        end
+    end
+    return nil
+end
+
+function GeatherSoulArrayEmbattleFastView:OnDestroy()
+end
+
+return GeatherSoulArrayEmbattleFastView

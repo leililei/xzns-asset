@@ -1,0 +1,268 @@
+-----------------------------------------------------------------------
+-- 功能名称：    GoblinTycoonRankingModel.lua
+-- Created by cy
+-- DateTime: 2025/10/23
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加   
+-----------------------------------------------------------------------
+local GoblinTycoonRankingNet = require "GoblinTycoonRankingNet"
+
+local base = require("ActivitySynTypeBase")
+local ActivitySynManager = require("ActivitySynManager")
+local PlayerPrefsManager = _G.PlayerPrefsManager
+---@class GoblinTycoonRankingModel : ActivitySynTypeBase 充值排行
+local GoblinTycoonRankingModel = _G.BaseClass("GoblinTycoonRankingModel", base)
+
+---入口构造函数
+function GoblinTycoonRankingModel:__init(activity)
+    self.ActivitySid = activity.activityID
+    --活动状态改变
+    self.curActivityClass:AddStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+    self.curActivityState = false
+    base.__init(self, activity)
+    -- 红点初始不显示
+    self.showRedDot = false
+    -- 监听充值事件
+    _G.Events:GetInstance():AddListener(_G.eRechargeEvent.TotalCash, self.OnRechargeTotalCash, self)
+end
+
+---初始化时解析数据
+function GoblinTycoonRankingModel:OnHandleGMData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+
+function GoblinTycoonRankingModel:IsShowBtn()
+    return true
+end
+
+function GoblinTycoonRankingModel:GetInfo(call)
+    self.infoCall = call
+    require("ActivitySynNet"):GetInstance():InitActivity(
+        self.curActivityClass:GetActivityID(),
+        _G.handler(self, self.UpdateInitData)
+    )
+end
+
+function GoblinTycoonRankingModel:UpdateInitData(msg)
+    if msg.ack == 1 then
+        self:OnHandleGMData(msg.activity[1].self_info)
+        if self.infoCall then
+            self.infoCall()
+        end
+    end
+end
+
+---解析数据,更新/初始化数据/重连调用
+function GoblinTycoonRankingModel:InitFunction()
+    if not self.curActivityState then
+        return
+    end
+
+    self:RefreshRedPointExchange()
+end
+
+---活动本身数据处理
+---@param info activity.i_activity_self_info
+function GoblinTycoonRankingModel:SetSelfData(info)
+    if info.goblin_tycoon == nil or info.goblin_tycoon.rank_cfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.Log("配置信息为空", "每日充值排行")
+        end
+        return
+    end
+
+    ---排行奖励信息
+    self.rank_list = {}
+    for _, v in ipairs(info.goblin_tycoon.rank_cfg) do
+        -- ZHJH-11051 GM活动的多语言调整需求
+        local cfg = _G.ConfigManager.store_gear_cfg[v.value_rank]
+        v.value_rank = cfg and cfg.price or v.value_rank
+        if v.reward then
+            for i, v2 in ipairs(v.reward) do
+                _G.table.insert(v.reward_daily, 1, v2)
+            end
+        end
+        local new_entry = v
+        new_entry.value_rank = _G.GameUtil.RatioControlNumber(v.value_rank)--math.floor(v.value_rank / 100)
+        table.insert(self.rank_list, new_entry)
+    end
+    --自己匿名情况
+    self.anonymous = info.goblin_tycoon.anonymous
+    self.myNum = info.goblin_tycoon.cash_num or 0
+    --大奖美术资源
+    self.resource = info.goblin_tycoon.resource
+    ---红点
+    self:CheckRed()
+    self:RefreshServerAnonymous()
+end
+
+---状态改变时
+function GoblinTycoonRankingModel:OnActivityStateChanged(state)
+    self:RefreshRedPointExchange()
+end
+
+function GoblinTycoonRankingModel:RefreshRedPointExchange()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+---View从Net获取排行榜数据
+function GoblinTycoonRankingModel:AccessAfkList(call)
+    GoblinTycoonRankingNet:GetInstance():AccessAfk(self.ActivitySid, call)
+end
+
+---获取玩家在排行榜上的名次
+function GoblinTycoonRankingModel:GetPlayerRank(call)
+    GoblinTycoonRankingNet:GetInstance():GetPlayerRank(self.ActivitySid, call)
+end
+
+---获取排行奖励信息
+function GoblinTycoonRankingModel:GetGiftsList()
+    return self.rank_list
+end
+
+---获取玩家自己是否匿名  是(1|0)否
+function GoblinTycoonRankingModel:GetPlayerAnonymous()
+    return self.anonymous
+end
+
+---获取玩家自己充值金额
+function GoblinTycoonRankingModel:GetPlayerCash_num()
+    return self.myNum
+end
+
+---获取大奖美术资源
+function GoblinTycoonRankingModel:GetAwardResource()
+    return self.resource
+end
+
+---设置是否玩家自己匿名 是(1|0)否
+function GoblinTycoonRankingModel:SaveAnonymousCondition(call)
+    require("GoblinTycoonRankingNet"):GetInstance():SetPlayerAnonymous(
+        self.ActivitySid, (1 - self.anonymous),
+        function()
+            self.anonymous = 1 - self.anonymous
+            if call then
+                call()
+            end
+            self:CachingAnonymous()
+        end
+    )
+end
+
+function GoblinTycoonRankingModel:CachingAnonymous()
+    _G.PlayerPrefsManager.SetInt("AnonymousStateGoblinTycoon", self.anonymous)
+end
+
+function GoblinTycoonRankingModel:CachingActiveID()
+    _G.PlayerPrefsManager.SetString("ActiveIDTopGoblinTycoonRanking", tostring(self.ActivitySid))
+end
+
+function GoblinTycoonRankingModel:GetCachingActiveID()
+    return _G.PlayerPrefsManager.GetString("ActiveIDTopGoblinTycoonRanking")
+end
+
+function GoblinTycoonRankingModel:GetCachingAnonymous()
+    return _G.PlayerPrefsManager.GetInt("AnonymousStateGoblinTycoon", self.anonymous)
+end
+
+function GoblinTycoonRankingModel:RefreshServerAnonymous()
+    local CachingActiveID = self:GetCachingActiveID()
+    local isRefresh = false
+    if CachingActiveID ~= tostring(self.ActivitySid) then
+        isRefresh = true
+        self:CachingActiveID()
+    end
+    if isRefresh and self:GetCachingAnonymous() ~= self.anonymous then
+        self:SaveAnonymousCondition()
+    end
+end
+
+---获取活动时间倒计时
+function GoblinTycoonRankingModel:GetEndTime()
+    return self.curActivityClass.cfg.time.start_time + self.curActivityClass.cfg.time.run_time
+end
+
+--region ------------------------------------------------ 红点 ------------------------------------------------
+
+--- 初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function GoblinTycoonRankingModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckRedPointStatus }
+    self.redpointTree = { false }
+end
+
+--- 六点（每轮结束）刷新红点可刷新的本地值
+function GoblinTycoonRankingModel:OnSixClockUpdate(endcall)
+    base.OnSixClockUpdate(self, endcall)
+    local playerUID = tostring(_G.PlayerModel:GetInstance().role_uid)
+    PlayerPrefsManager.SetInt(playerUID .. "GoblinTycoonHasReadRedDot", 0)
+end
+
+--- 监听充值事件的回调
+function GoblinTycoonRankingModel:OnRechargeTotalCash()
+    self:GetInfo(_G.handler(self, self.CheckRed))
+end
+
+function GoblinTycoonRankingModel:CheckRed()
+    local PlayerMoney = math.floor(self.myNum / 100)
+    local playerUID = tostring(_G.PlayerModel:GetInstance().role_uid)
+
+    -- 玩家是否已经点击进入页面过（读取后本轮不再激活红点）
+    local hasReadRedDot = PlayerPrefsManager.GetInt(playerUID .. "GoblinTycoonHasReadRedDot", 0) == 1
+
+    if PlayerMoney >= self.rank_list[#self.rank_list].value_rank and not hasReadRedDot then
+        self.showRedDot = true
+    else
+        self.showRedDot = false
+    end
+
+    -- 刷新红点状态
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+--- 红点检测函数，根据内部状态返回红点数量（0 或 1）
+function GoblinTycoonRankingModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+--- 具体的红点检测函数
+function GoblinTycoonRankingModel:CheckRedPointStatus()
+    if self.curActivityClass:GetCurActivityState() ~= ActivitySynManager.State.Open then
+        return 0
+    end
+    if self.showRedDot then
+        return 1
+    else
+        return 0
+    end
+end
+
+--- 当玩家点击进入活动页面时调用该方法
+function GoblinTycoonRankingModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GoblinTycoonRankingView.Name, self.curActivityClass)
+    -- 标记红点已读
+    self.showRedDot = false
+    local playerUID = tostring(_G.PlayerModel:GetInstance().role_uid)
+    local redBol = require "RedPointManager":GetInstance():GetNodeNum(self:GetRedpointIDByIndex(1))
+    if redBol > 0 then
+        PlayerPrefsManager.SetInt(playerUID .. "GoblinTycoonHasReadRedDot", 1)
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+
+    base.OnEnterActivity(self)
+end
+
+--endregion ------------------------------------------------ 红点 ------------------------------------------------
+
+-- 清理资源
+function GoblinTycoonRankingModel:Dispose()
+    if self.curActivityClass then
+        self.curActivityClass:RemoveStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eRechargeEvent.TotalCash, self.OnRechargeTotalCash, self)
+    base.Dispose(self)
+end
+
+return GoblinTycoonRankingModel

@@ -1,0 +1,197 @@
+-- 包路径:        Game.Story.Module.AutoStory
+-- File Name:    AutoStory.lua
+-- Description:    剧情系统管理类
+-- Author:       TangHuan
+-- Create Date:    2020/02/26
+
+require "EStoryPlayEvent"
+require "StoryData"
+require "BaseActionData"
+require "BaseStoryAction"
+require "Story"
+require "StoryStep"
+require "EntityData"
+require "StoryPlayController"
+require "AutomaticPlayStory"
+require "StoryUtilities"
+require "EntityUtilities"
+require "BaseEntity"
+require "GameBaseEntity"
+require "NPCEntity"
+
+--- 剧情设计如下：
+--- AutoStory.lua(负责剧情播放数据初始化进度控制以及资源加载等管理)
+--- StoryPlayController.lua(负责剧情的真实播放控制)
+--- Story.lua(抽象剧情，剧情由多个StoryStep组成)
+--- StoryStep.lua(剧情单个步骤抽象，剧情步骤由多个剧情行为组成)
+--- BaseStoryAction.lua(剧情单个行为父类抽象)
+--- BaseActionData.lua(抽象剧情行为的对应数据父类抽象)
+--- StoryUtilities.lua(剧情辅助工具类--比如提供一些对象创建和数据加载解析等工具接口)
+
+--- Note:
+--- 每次只能播放一个Story
+--- 每个Story的StoryStep是线性的顺序播放的
+--- StopStep里的StoryAction是并发执行的
+
+--- Note:
+--- AutomaticPlayStory.lua用于非剧情的自动化播放控制
+
+---@class AutoStory : IRecycle @剧情系统管理类
+---@field public StoryPlayOwner IStoryPlay @剧情播放拥有者
+---@field private CurrentStory Story @当前Story
+---@field private ResPoolType ePoolType @资源缓存类型
+---@field private NextStepIndex number @下一个播放的剧情步骤索引(Note: Lua Table从1开始索引)
+---@field private CompletedStepNumber number @已完成的剧情步骤数量
+---@field private IsResPreloaded boolean @剧情资源是否已预加载
+---@field private CacheResourceList string[] @需要缓存的资源列表
+---@field private ResourceCachedNumber number @已缓存的资源数量
+---@field private PreloadCompleteCB function<boolean> @预加载资源完成回调
+local AutoStory = _G.BaseClass("AutoStory", _G.IRecycle)
+AutoStory.StoryPlayOwner = nil
+AutoStory.CurrentStory = nil
+AutoStory.NextStepIndex = nil
+AutoStory.CompletedStepNumber = nil
+AutoStory.IsResPreloaded = nil
+AutoStory.CacheResourceList = nil
+AutoStory.ResourceCachedNumber = nil
+AutoStory.PreloadCompleteCB = nil
+
+---AutoStory出池构造函数
+---@param storyplayowner IStoryPlay @剧情播放拥有者
+---@param storyid number @剧情ID
+---@param pooltype ePoolType @缓存池类型
+function AutoStory:OnInit(storyplayowner, storyid, pooltype)
+    self:init(storyplayowner, storyid, pooltype)
+end
+
+---AutoStory进池析构函数
+function AutoStory:OnDispose()
+    self.StoryPlayOwner = nil
+    self.CurrentStory = nil
+    self.NextStepIndex = nil
+    self.CompletedStepNumber = nil
+    self.IsResPreloaded = nil
+    self.CacheResourceList = nil
+    self.ResourceCachedNumber = nil
+    self.PreloadCompleteCB = nil
+end
+
+---AutoStory构造函数
+---@param storyplayowner IStoryPlay @剧情播放拥有者
+---@param storyid number @剧情ID
+---@param pooltype ePoolType @缓存池类型
+function AutoStory:__init(storyplayowner, storyid, pooltype)
+    -- 通过OnInit
+    -- self:init(storyplayowner, storyid, pooltype)
+end
+
+---初始化代码
+---@param storyplayowner IStoryPlay @剧情播放拥有者
+---@param storyid number @剧情ID
+---@param pooltype ePoolType @缓存池类型
+function AutoStory:init(storyplayowner, storyid, pooltype)
+    self.StoryPlayOwner = storyplayowner
+    self.CurrentStory = _G.Story.New(self, storyid)
+    pooltype = pooltype or _G.ePoolType.Temporary
+    self.ResPoolType = pooltype
+    self.NextStepIndex = 1
+    self.CompletedStepNumber = 0
+    self.IsResPreloaded = false
+    self.CacheResourceList = {}
+    self.ResourceCachedNumber = 0
+    self.PreloadCompleteCB = nil
+end
+
+---当前设置的Story是否支持跳过
+---@return boolean @当前设置的Story是否支持跳过
+function AutoStory:IsStoryCanSkip()
+    if self.CurrentStory ~= nil then
+        return self.CurrentStory.IsCanSkip
+    else
+        return false
+    end
+end
+
+---预加载剧情资源(上层手动调用)
+---@param preloadcompletecb function<boolean> @预加载完成回调
+function AutoStory:PreloadStoryResources(preloadcompletecb)
+    if self.CurrentStory ~= nil then
+        if not self.IsResPreloaded then
+            --TODO: 预加载Story相关资源
+            for k1, step in pairs(self.CurrentStory.Steps) do
+                for k2, storyaction in pairs(step.AllStoryActions) do
+                    if storyaction.PreloadResources ~= nil then
+                        for k3, preloadres in pairs(storyaction.PreloadResources) do
+                            table.insert(self.CacheResourceList, preloadres)
+                        end
+                    end
+                end
+            end
+            --Note:
+            --暂时只支持GameObject资源类型预加载
+            if #self.CacheResourceList > 0 then
+                for i, preloadres in ipairs(self.CacheResourceList) do
+                    _G.PoolsManager:GetInstance():Preload(
+                        preloadres,
+                        _G.handler(self, self.OnPreloadSingleResourceComplete, self.ResPoolType)
+                    )
+                end
+                self.PreloadCompleteCB = preloadcompletecb
+            else
+                preloadcompletecb(true)
+            end
+        else
+            preloadcompletecb(true)
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("当前没有设置有效的Story，无法预加载资源!")
+        end
+        preloadcompletecb(false)
+    end
+end
+
+---单个预加载资源加载完成回调
+function AutoStory:OnPreloadSingleResourceComplete(go)
+    self.ResourceCachedNumber = self.ResourceCachedNumber + 1
+    if self.ResourceCachedNumber == #self.CacheResourceList then
+        self.PreloadCompleteCB(true)
+    end
+end
+
+---获取剧情下一步
+---@return StoryStep @剧情下一步骤
+function AutoStory:GetNextStep()
+    if self.CurrentStory ~= nil and self.NextStepIndex <= #self.CurrentStory.Steps then
+        local nextstep = self.CurrentStory.Steps[self.NextStepIndex]
+        self.NextStepIndex = self.NextStepIndex + 1
+        return nextstep
+    else
+        return nil
+    end
+end
+
+---触发完成一个剧情步骤
+function AutoStory:CompleteOneStep()
+    self.CompletedStepNumber = self.CompletedStepNumber + 1
+end
+
+---剧情是否结束
+function AutoStory:IsStoryOver()
+    return self.CurrentStory ~= nil and (#self.CurrentStory.Steps == self.CompletedStepNumber)
+end
+
+---清除剧情数据(播放完成后上层手动调用)
+function AutoStory:Clear()
+    self.NextStepIndex = 1
+    self.CompletedStepNumber = 0
+    self.IsResPreloaded = false
+    self.CacheResourceList = {}
+    self.ResourceCachedNumber = 0
+    self.PreloadCompleteCB = nil
+end
+
+---@type AutoStory @剧情系统管理类
+_G.AutoStory = AutoStory
+---@type AutoStory @剧情系统管理类
+return AutoStory

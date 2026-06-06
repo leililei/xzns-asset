@@ -1,0 +1,224 @@
+local ActiveSeverMergeTaskData = require("ActiveSeverMergeTaskData")
+---@class OptionalGiftModel : GameDataModelBase	中文描述
+local OptionalGiftModel = _G.BaseClass("OptionalGiftModel", _G.GameDataModelBase)
+
+function OptionalGiftModel:GetInfoCall(activity)
+    self.activity = activity
+    self.active_StartTime = activity.cfg.time.start_time
+    self.active_EndTime = activity.cfg.time.start_time + activity.cfg.time.run_time
+    self:ParseData(activity.cfg.self_info)
+    self:InitFunction()
+end
+
+---创建对象时,入口构造函数
+function OptionalGiftModel:__init()
+    self.gifts={}
+    self.roleInfo={}
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnGetUpdate, self)
+end
+
+function OptionalGiftModel:Dispose()
+    self.gifts={}
+    self.roleInfo={}
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnGetUpdate, self)
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+function OptionalGiftModel:OnGetUpdate()
+    if self.activity and self.activity.typeClass then
+        require("RedPointManager"):GetInstance():RefreshNode(self.activity.typeClass:GetRedpointIDByIndex(1))
+    end
+end
+
+function OptionalGiftModel:OnMallCashListener(data)
+    if not data.activity_id or data.activity_id ~= self.activity.activityID then
+        return
+    end
+    if data.cash_rmb and data.cash_rmb > 0 then
+        self:SetGiftBuyTimes(data.sid,1)
+        --刷新界面中
+        local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.OptionalGiftView.Name)
+        if window then
+            window.View:BuyBackUpData()
+        end
+        _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    end
+end
+---设置礼包购买次数
+---@param sid number 礼包id
+---@param count number 购买次数
+function OptionalGiftModel:SetGiftBuyTimes(sid,count)
+    if table.ContainsKey(self.roleInfo,sid) then
+        if self.roleInfo[sid].count   then
+            self.roleInfo[sid].count=self.roleInfo[sid].count+count
+        else
+            self.roleInfo[sid].count=count
+        end
+    end
+end
+---判断礼包是否售罄
+---@param sid number 礼包id
+---@return boolean 
+function OptionalGiftModel:CheckGiftIsSellOut(sid)
+    if table.ContainsKey(self.roleInfo,sid) then
+        return  self.roleInfo[sid].count >= self.gifts[sid].count
+    end
+    return false
+end
+
+---数据解析完成
+function OptionalGiftModel:ParseData(data)
+    self.data = {}
+    self.data = data.optional_gift
+    self.super.ParseData(self)
+end
+
+function OptionalGiftModel:InitFunction()
+    if _G.table.isEmptyOrNil(self.data) then
+        return
+    end
+    self.gifts={}
+    self.roleInfo={}
+    for i = 1, #self.data.gifts do
+        self.gifts[self.data.gifts[i].sid] =self.data.gifts[i]
+    end
+    if not table.isEmptyOrNil(self.data.choose) then
+        for i = 1, #self.data.choose do
+            self.roleInfo[self.data.choose[i].sid] =self.data.choose[i]
+        end
+    end
+    self:InitGiftTypeList()
+end
+function OptionalGiftModel:InitGiftTypeList()
+    local cfglist=_G.ConfigManager.heroic_icons_cfg
+    self.GiftTypeList={}
+    local sid=0
+    for _,v in pairs(self.gifts) do
+        for i = 1, #v.base_award do
+            sid=v.base_award[i].type[1]
+            if cfglist[sid] then
+                table.insert(self.GiftTypeList,v.sid)
+            end
+        end
+    end
+end
+function OptionalGiftModel:CheckGiftIsShowType(sid)
+    return table.ContainsValue(self.GiftTypeList,sid)
+end
+function OptionalGiftModel:GetNowShowGift()
+    local GiftList={}
+    for i = 1, #self.data.gifts do
+        table.insert(GiftList,self.data.gifts[i])
+    end
+    _G.SortList(GiftList,function(data)
+        return self:CheckGiftIsSellOut(data.sid) and -1 or 1 ,self:CheckGiftIsShowType(data.sid) and 1 or -1,data.buy_type>0 and 1 or -1,-data.price
+    end)
+    if self:CheckGiftIsSellOut(GiftList[1].sid) then
+        return self.data.gifts[1]
+    end
+    return GiftList[1]
+end
+---保存礼包自选奖励
+---@param sid number 礼包id
+---@param chooseindex table<number> 选择的奖励id下标列表
+function OptionalGiftModel:SaveGiftInfo(sid, chooseindex)
+    local data = {
+        activity_id = self.activity.activityID,
+        choose = {
+            {
+                sid = sid,
+                choose = chooseindex
+            }
+        }
+    }
+    require "OptionalGiftNet":GetInstance():AccessSave(data, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        for  i= 1, #data.choose do
+            if table.ContainsKey(self.roleInfo,data.choose[i].sid) then
+                local tab=self.roleInfo[data.choose[i].sid]
+                tab.choose_index=data.choose[i].choose
+            else
+                self.roleInfo[data.choose[i].sid]={sid=data.choose[i].sid,count=0,choose_index=data.choose[i].choose}
+            end
+        end
+        --刷新界面中
+        local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.OptionalGiftView.Name)
+        if window then
+            window.View:UpdateView()
+        end
+    end)
+end
+function OptionalGiftModel:BuyGift(sid)
+    local giftinfo=self:GetOneGift(sid)
+    if giftinfo.buy_type and giftinfo.buy_type>0 then
+        self.activity.typeClass:GetActivityAward(
+                { sid },
+                function(data)
+                    if data.ack ~= 1 then
+                        return
+                    end
+                    self:SetGiftBuyTimes(sid,1)
+                    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                    _G.StorageManager:GetInstance():Consume({giftinfo.buy_type,giftinfo.price})
+                    _G.UIManager:GetInstance():OpenWindow(
+                            _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                            data
+                    )
+                    --刷新界面中
+                    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.OptionalGiftView.Name)
+                    if window then
+                        window.View:BuyBackUpData()
+                    end
+                end
+        )
+    else
+        require "MallManager":GetInstance():BuyActiveGift(
+                giftinfo.price,
+                self.activity.activityID,
+                giftinfo.sid
+        )
+        _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    end
+end
+---判断是选择了所有的可选奖励
+---@param sid number 礼包id
+---@param count number 已选择的奖励列表长度
+---@return boolean 
+function OptionalGiftModel:CheckIsChooseAllAward(sid,count)
+    local data= self.gifts[sid]
+    return data.choose_count==count
+end
+---获取礼包配置
+---@param sid number 礼包id
+function OptionalGiftModel:GetOneGift(sid)
+    return self.gifts[sid]
+end
+function OptionalGiftModel:GetRoleInfoBySid(sid)
+    if table.isEmptyOrNil(self.roleInfo[sid]) then
+        return nil 
+    end
+    return self.roleInfo[sid]
+end
+function OptionalGiftModel:ToDayIsFristEnter()
+    local nowTime=_G.TimeUtil.GetServerUnixTime()
+    local today=_G.TimeUtil.GetIntervalDayBySix(self.activity.cfg.time.start_time,nowTime)+1
+    local timestring =_G.PlayerPrefsManager.GetString("OptionalGiftDay")
+    local lasttime= string.IsNullOrEmpty(timestring) and 0 or tonumber(timestring)
+    local lastDay=_G.TimeUtil.GetIntervalDayBySix(self.activity.cfg.time.start_time,lasttime)+1
+    if lasttime==0 or today~=lastDay then
+        return 1
+    end
+    return 0
+end
+function OptionalGiftModel:CheckAllGiftIsSellOut()
+    for k,v in pairs(self.gifts) do
+        local dataroleinfo=self:GetRoleInfoBySid(k)
+        if not dataroleinfo or dataroleinfo.count<v.count then
+            return false
+        end
+    end
+    return true
+end
+
+return OptionalGiftModel

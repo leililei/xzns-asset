@@ -1,0 +1,633 @@
+-----------------------------------------------------------------------
+-- E:.01.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.BattleEmbattle.Model.AfkBattleManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/12/16
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+---@class AfkBattleManager : Singleton    中文描述
+---@field GetInstance fun():AfkBattleManager
+---@field openingEmbattle boolean       @是否正在打开布阵页面
+local AfkBattleManager = _G.BaseClass("AfkBattleManager", _G.Singleton)
+
+---创建对象时,入口构造函数
+function AfkBattleManager:__init()
+    self.CurPage = 1
+    self.Caches = {}
+    self.openingEmbattle = false
+    --放置挂机（冒险 刷新 装备红点) 暂时存放
+    _G.Events:GetInstance():AddListener(_G.eRedPointAFKEquip.RedPointRefreshAFkEquip, self.ChangAfkZhenRongData, self)
+end
+
+---销毁对象时,析构函数
+function AfkBattleManager:Dispose()
+    _G.Events:GetInstance():RemoveListener(
+        _G.eRedPointAFKEquip.RedPointRefreshAFkEquip,
+        self.ChangAfkZhenRongData,
+        self
+    )
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleOpened, self)
+end
+
+--region 对外接口
+---获取当前场次
+function AfkBattleManager:GetPage()
+    return self.CurPage or 1
+end
+
+---设置当前场次
+function AfkBattleManager:SavePage(num)
+    self.CurPage = num
+end
+
+---获取配置表中的场景
+function AfkBattleManager:GetMap()
+    return require("AfkModel"):GetInstance():GetSceneID()
+end
+
+---获取当前挑战的布阵ID组
+---@return number id
+function AfkBattleManager:GetCurEmbattleID()
+    local sceneids = self:GetMap()
+    local ids
+    local embattleType = _G.EmbattleType
+    if #sceneids == 1 then
+        ids = { embattleType.AFKOnly }
+    else
+        ids = { embattleType.AFKGroup1 }
+        for i = 2, #sceneids do
+            ids[i] = ids[i - 1] + 1
+        end
+    end
+    return ids
+end
+
+---根据布阵数量 获取布阵ID组
+---@param count number 数量
+---@return table ID组
+function AfkBattleManager:GetEmbattleIDS(count)
+    local ids = {}
+    for i = 1, count do
+        ids[i] = 100000 + count * 100 + i
+    end
+    return ids
+end
+
+---设置战斗多场之间是否自动战斗
+function AfkBattleManager:SetAutoFight(autofight)
+    self.AutoFight = autofight or false
+end
+
+function AfkBattleManager:GetAutoFight()
+    return self.AutoFight
+end
+
+---进入布阵界面，准备战斗
+---@param autofight boolean 是否自动进入战斗
+function AfkBattleManager:EnterEmbattle(autofight)
+    self:SetAutoFight(autofight)
+    local openFun = function()
+        --ZHJ-35204【放置关卡】下一关的倒计时1s时快速点击聊天，再快速点击玩家头像，会出现场景穿透
+        --此变量指示是否正在加载布阵中
+        self.openingEmbattle = true
+
+        _G.CS.BattleManager.Inst:Destroy()
+        _G.BattleManager:GetInstance():SetRendererActiveState(true)
+
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleOpened, self)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ShadowTopView.Name)
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.AfkEmbattleView.Name,
+            _G.handler(self, self.ExitEmbattle),
+            function(scene)
+                self:EnterFight(scene, true)
+            end,
+            autofight
+        )
+    end
+    local cfg = require("AfkModel"):GetInstance():GetCurSectionCfg()
+    if cfg and cfg.FrontBuzhenStoryID > 0 and _G.StoryUtilities.HasStoryIDSavedUID(cfg.FrontBuzhenStoryID) == false then
+        self.isFrontEmbattleStory = true
+        _G.AutomaticPlayStory.PlayStoryByID(
+            cfg.FrontBuzhenStoryID,
+            function()
+                openFun()
+            end
+        )
+    else
+        openFun()
+    end
+end
+
+---进入下一场挑战
+function AfkBattleManager:NextFight()
+    -- local isToggledAfk = _G.MainManager:GetInstance():IsToggledAfkWindow(true)
+    -- if isToggledAfk then
+    --     --判断当前在MainView afk选项卡页面, 走"布阵->自动战斗"流程
+    --     self:EnterEmbattle(true)
+    --     return
+    -- end
+
+    --直接进入战斗逻辑
+    local monsterGroupIds = self:GetMap()
+    local scene = monsterGroupIds[self:GetPage()]
+
+    local isShowFighting = self:IsShowFighting()
+
+    --如果是后台战斗, 隐藏战斗场景
+    local isToggledAfk = _G.MainManager:GetInstance():IsToggledAfkWindow(false)
+    _G.CS.BattleManager.Inst:Destroy()
+    _G.BattleManager:GetInstance():SetRendererActiveState(isToggledAfk)
+
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnBattleViewOpenedInBackground, self)
+    _G.Events:GetInstance():AddListener(_G.FightPlayState.FightStart, self.OnFightStartInBackground, self)
+    self:EnterFight(scene, isShowFighting)
+end
+
+---更新下一场战斗的布阵(多场战斗)
+---@param callback fun(ok:boolean):void
+function AfkBattleManager:UpdateNextEmbattle(callback)
+    local monsterGroupIds = self:GetMap()
+    if #monsterGroupIds == 1 then
+        if callback then
+            callback(true)
+        end
+        return
+    end
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+    ---获取当前挑战中的布阵id, 并且校验布阵数据
+    local curEmbattleId = _G.EmbattleType.AFKGroup1 + self:GetPage() - 1
+    if not embattleModel:CheckEmbattleData(curEmbattleId) then
+        if callback then
+            callback(false)
+        end
+        return
+    end
+    --更新布阵数据
+    embattleModel:SaveEmbattleDataNew(
+        curEmbattleId,
+        function(ret)
+            if callback then
+                callback(ret == 0)
+            end
+        end,
+        _G.EmbattleSaveType.localfile,
+        false
+    )
+end
+
+---进入第一场挑战
+function AfkBattleManager:FirstFight()
+    --直接进入战斗逻辑
+    local monsterGroupIds = self:GetMap()
+    local scene = monsterGroupIds[self:GetPage()]
+
+    --调用开始战斗
+    --self:SetFightView(false)
+    -- _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnBattleViewOpenedInBackground, self)
+    -- _G.Events:GetInstance():AddListener(_G.FightPlayState.FightStart, self.OnFightStartInBackground, self)
+    _G.CS.BattleManager.Inst:Destroy()
+    _G.BattleManager:GetInstance():SetRendererActiveState(true)
+    self:EnterFight(scene, true)
+end
+
+---如果有布阵前剧情则需要在剧情对话界面等待加载布阵
+function AfkBattleManager:GetFrontEmbattleStoryIsWaitLoad()
+    return self.isFrontEmbattleStory
+end
+
+---获取当前布阵卡牌的sid组
+---@return table 卡牌sid组
+function AfkBattleManager:GetCurEmbattleSids()
+    return self.curEmbattleSids or {}
+end
+
+---初始化布阵sid组
+function AfkBattleManager:InitCurEmbattleSids()
+    self.curEmbattleSids = {}
+    local cfgs = _G.ConfigManager.monster_cfg
+    local monsterGroupID = require("AfkModel"):GetInstance():GetSceneID()[1]
+    local groupCfg = _G.ConfigManager.monster_group_cfg[monsterGroupID]
+    local storyEmbattle = _G.DeepCopyCfgTable(groupCfg.DefaultAttackerSids)
+    for i = 1, 5 do
+        if storyEmbattle[i] > 1 then
+            storyEmbattle[i] = cfgs[storyEmbattle[i]].CardID
+            self.curEmbattleSids[storyEmbattle[i]] = 1
+        end
+    end
+    local data = require("EmbattleModel"):GetInstance():GetEmbattleSidsData(_G.EmbattleType.AFKOnly)
+    for i = 1, 5 do
+        if data[i] > 0 and not self.curEmbattleSids[data[i]] then
+            if storyEmbattle[i] == 0 then
+                self.curEmbattleSids[data[i]] = 1
+            end
+        end
+    end
+    storyEmbattle = _G.DeepCopyCfgTable(groupCfg.DefaultDefenserSids[1])
+    for i = 1, 5 do
+        if storyEmbattle[i] > 1 then
+            storyEmbattle[i] = cfgs[storyEmbattle[i]].CardID
+            if self.curEmbattleSids[storyEmbattle[i]] then
+                self.curEmbattleSids[storyEmbattle[i]] = self.curEmbattleSids[storyEmbattle[i]] + 1
+            else
+                self.curEmbattleSids[storyEmbattle[i]] = 1
+            end
+        end
+    end
+end
+
+---缓存资源
+---@param callback function 完成回调
+function AfkBattleManager:CoCacheAfkRes(callback)
+    local afkCfgId = require("AfkModel"):GetInstance():GetCurSection()
+    if afkCfgId == nil or afkCfgId <= 0 then
+        if callback then
+            callback()
+        end
+        return
+    end
+    self:InitCurEmbattleSids()
+    local playerRes = {}
+    for id, num in pairs(self.curEmbattleSids) do
+        for i = 1, num do
+            playerRes[#playerRes + 1] = require "CardInfoManager".GetBattleModelPath(id)
+        end
+    end
+    local count = #playerRes
+    local index = 0
+    local loadDone = false
+    local loadCallback = function()
+        count = count - 1
+        if count <= 0 then
+            --场景
+            if callback then
+                callback()
+            end
+        end
+    end
+    --角色
+    if count > 0 then
+        local PoolsManagerIns = _G.PoolsManager:GetInstance()
+        local statictype = _G.ePoolType.Static
+        for i = 1, count do
+            PoolsManagerIns:Preload(playerRes[i], loadCallback, statictype)
+        end
+    else
+        loadCallback()
+    end
+end
+
+---设置统计数据
+---@param data table 数据
+---@param id number monster_group_cfg的ID
+function AfkBattleManager:SetCurStatisticsData(data, id)
+    if not self.statisticsTab then
+        self.statisticsTab = { [id] = data }
+    else
+        self.statisticsTab[id] = data
+    end
+end
+
+---清理统计数据
+function AfkBattleManager:ClearStatisticsData()
+    self.statisticsTab = nil
+end
+
+---获取所有场次的统计数据
+---@param cfg afk_cfg
+---@return table 统计数据
+function AfkBattleManager:GetStatisticsData(cfg)
+    if _G.table.isEmptyOrNil(self.statisticsTab) then
+        return nil
+    end
+    cfg = cfg or require("AfkModel"):GetInstance():GetPreviousSectionCfg()
+    local data = cfg.monster_group
+    local statistics = { FighterInfo = {} }
+    for i = 1, #data do
+        statistics.FighterInfo[i] = self.statisticsTab[data[i]].FighterInfo[1]
+        statistics.FighterInfo[i].TeamIndex = i
+    end
+    return statistics
+end
+
+--endregion
+---多场战斗缓存战斗数据
+---@param arg table FightArg
+---@param groupid number monster_group_cfg的ID
+function AfkBattleManager:SetCurFightArg(arg, groupid)
+    if not self.CurFightArgTable then
+        self.CurFightArgTable = {}
+    end
+    self.CurFightArgTable[groupid] = arg
+    self.LastFightArgTable = arg
+end
+
+---多场战斗缓存战斗指令(否则回放时不会释放技能, 与实际战斗表现不一致)
+---@param fightCmd table 战斗指令
+function AfkBattleManager:SetLastFightCmd(fightCmd)
+    if not self.LastFightArgTable then
+        return
+    end
+    self.LastFightArgTable.fight_cmd = fightCmd
+end
+
+---清理统计数据
+function AfkBattleManager:ClearCurFightArg()
+    self.CurFightArgTable = nil
+    self.LastFightArgTable = nil
+end
+
+---获取所有场次的统计数据
+---@param cfg afk_cfg
+---@return table 统计数据
+function AfkBattleManager:GetCurFightArg(cfg)
+    if _G.table.isEmptyOrNil(self.CurFightArgTable) then
+        return nil
+    end
+    cfg = cfg or require("AfkModel"):GetInstance():GetPreviousSectionCfg()
+    if not cfg then
+        return nil
+    end
+    local curFightArgTable = {}
+    local data = cfg.monster_group
+    for i = 1, #data do
+        curFightArgTable[i] = self.CurFightArgTable[data[i]]
+    end
+    return curFightArgTable
+end
+
+---是否正在打在布阵页面
+---AFK自动挑战下一关, 在关闭结算页面到布阵页面显示出来有一定时间间隔
+---此方法指明是否正在加载布阵页面
+---@ZHJ-35204【放置关卡】下一关的倒计时1s时快速点击聊天，再快速点击玩家头像，会出现场景穿透
+---@return boolean
+function AfkBattleManager:CheckOpeningEmbattle()
+    return self.openingEmbattle
+end
+
+---监听布阵页面打开打开
+---@return void
+function AfkBattleManager:OnEmbattleOpened(name)
+    if name ~= _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        return
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleOpened, self)
+    self.openingEmbattle = false
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+end
+
+---检查布阵角色是否全部满足
+---@param sid number    @关卡sid
+---@return boolean
+function AfkBattleManager:CheckEmbattleValid(sid)
+    local cfg = _G.ConfigManager.afk_cfg[sid]
+    if not cfg then
+        return false
+    end
+
+    --获取布阵id
+    ---@type number[]
+    local embattleIds = {}
+    if #cfg.monster_group == 1 then
+        table.insert(embattleIds, _G.EmbattleType.AFKOnly)
+    else
+        for i = 1, #cfg.monster_group do
+            if i == 1 then
+                table.insert(embattleIds, _G.EmbattleType.AFKGroup1)
+            else
+                table.insert(embattleIds, embattleIds[i - 1] + 1)
+            end
+        end
+    end
+
+    --布阵id是否都是有效的
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+    for _, embattleId in pairs(embattleIds) do
+        if not embattleModel:CheckEmbattleData(embattleId) then
+            return false
+        end
+    end
+    return true
+end
+
+---检查当前关卡布阵是否满足
+---@return boolean
+function AfkBattleManager:CheckCurrentEmbattleValid()
+    return self:CheckEmbattleValid(require("AfkModel"):GetInstance():GetCurSection())
+end
+
+--region 内部方法
+
+---退出布阵
+function AfkBattleManager:ExitEmbattle()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView then
+        if _G.AppSetting.IsXzns then
+            mainView:OnAfk(true, nil, true)
+        else
+            mainView:OnAfk(true)
+        end
+    end
+end
+
+---进入战斗
+---@param scene monster_group_cfg  ID
+---@param showFightView boolean 是否显示战斗页面(默认true)
+function AfkBattleManager:EnterFight(scene, showFightView)
+    self.openingEmbattle = false
+    --存储战斗状态
+    self.fighting = true
+    self.fightingView = showFightView == nil and true or showFightView
+
+    --对战双方名称
+    local afkModel = require("AfkModel"):GetInstance()
+    local cfg = _G.ConfigManager.afk_cfg[afkModel:GetCurSection()]
+    local nameT = afkModel:GetCurChapterName()
+    local leftName, rightName =
+        _G.PlayerModel:GetInstance():GetName(),
+        string.format("%s  %d-%d", _G.GetLangPackValue(nameT[1]), cfg.chapter, cfg.section)
+
+    _G.Events:GetInstance():AddListener(_G.FightPlayState.FightStart, self.OnFightStartInBackground, self)
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.afkChallenge, scene, leftName, rightName)
+
+    --显示主页面下边栏
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    _G.MainManager:GetInstance():RefreshAfkWindow()
+    _G.MainManager:GetInstance():RefreshAfkToggleEffect()
+
+    --初始化下边栏动画
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView then
+        mainView:InitAnimation()
+    end
+end
+
+---监听战斗界面打开后后, 隐藏战斗界面
+---@return void
+function AfkBattleManager:OnBattleViewOpenedInBackground(name)
+    if name ~= _G.ConfigManager.ui_cfg.BattleView.Name then
+        return
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnBattleViewOpenedInBackground, self)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.BattleView.Name)
+    if view then
+        view:Hide()
+    end
+end
+
+---监听进入战斗界面后, 隐藏战斗界面
+---@return void
+function AfkBattleManager:OnFightStartInBackground(name)
+    _G.Events:GetInstance():RemoveListener(_G.FightPlayState.FightStart, self.OnFightStartInBackground, self)
+
+    --设置是否显示战斗页面
+    local isToggledAfk = _G.MainManager:GetInstance():IsToggledAfkWindow(true)
+    local isShowFighting = isToggledAfk and self:IsShowFighting()
+    ---@type BattleView
+    local battleView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.BattleView.Name)
+    if battleView then
+        if isShowFighting then
+            battleView:Show()
+        else
+            battleView:Hide()
+        end
+    end
+    self:SetFightView(isShowFighting)
+
+    --播放下边栏动画
+    if isToggledAfk then
+        ---@type MainView
+        local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+        if mainView then
+            mainView:PlayAnimation()
+        end
+    end
+end
+
+---退出战斗(手动停止)
+---@return void
+function AfkBattleManager:ExitFight()
+    --存储战斗状态
+    self.fighting = false
+    --是否显示战斗页面
+    --self.fightingView = false
+    --显示主页面下边栏
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    _G.MainManager:GetInstance():RefreshAfkWindow()
+    _G.MainManager:GetInstance():RefreshAfkToggleEffect()
+end
+
+---设置战斗状态
+function AfkBattleManager:SetFighting(value)
+    self.fighting = value
+    if not value then
+        --是否显示战斗页面
+        --self.fightingView = false
+    end
+end
+
+---是否正在战斗中
+---@return boolean
+function AfkBattleManager:IsFighting()
+    return self.fighting
+end
+
+---是否显示战斗页面
+---@return boolean
+function AfkBattleManager:IsShowFighting()
+    return true --策划说总是显示战斗
+    --return self.fightingView
+end
+
+--是否显示战斗界面(用于判断是否可以弹出弹窗)
+function AfkBattleManager:ShowFighting()
+    return self.fightingView
+end
+
+---设置战斗场景显隐
+---@param active boolean
+---@return void
+function AfkBattleManager:SetFightView(active)
+    if not self:IsFighting() then
+        return
+    end
+    self.fightingView = active
+    _G.BattleManager:GetInstance():SetRendererActive(active)
+end
+
+--endregion
+--region缓存资源
+
+-----计算战斗角色资源
+function AfkBattleManager:CalculateBattleRole(cfg)
+    local playerSids = {}
+    local cacheFunc = function(sids)
+        for i = 1, #sids do
+            if sids[i] > 0 then
+                if not playerSids[sids[i]] then
+                    playerSids[sids[i]] = 1
+                else
+                    playerSids[sids[i]] = playerSids[sids[i]] + 1
+                end
+            end
+        end
+    end
+    if #cfg.monster_group > 0 then
+        --实际战斗
+        -- for i = 1, #cfg.monster_group do
+        local sids = _G.BattleManager:GetInstance():GetDefaultDefenserSids(cfg.monster_group[1])
+        cacheFunc(sids)
+        sids = _G.BattleManager:GetInstance():GetDefaultAttackSids(cfg.monster_group[1])
+        cacheFunc(sids)
+        -- end
+    end
+    return playerSids
+end
+
+--endregion
+
+--region 刷新红点 阵容数据 发生改变
+function AfkBattleManager:ChangAfkZhenRongData(data, changeUids)
+    if _G.table.isEmptyOrNil(changeUids.down) and _G.table.isEmptyOrNil(changeUids.up) then
+        return
+    end
+    local RedPointManagerIns = require "RedPointManager":GetInstance()
+    if not _G.table.isEmptyOrNil(changeUids.down) then
+        for _, v in pairs(changeUids.down) do
+            for _, v2 in pairs(_G.EquipmentPart) do
+                if v2 ~= _G.EquipmentPart.Trousers then
+                    RedPointManagerIns:RefreshNode(_G.ConfigManager.redpoint_cfg.RoleEquipment.id, v * 10 + v2)
+                end
+            end
+            RedPointManagerIns:RefreshNode(_G.ConfigManager.redpoint_cfg.SpiritualPage.id, v)
+            for i = 1, 4 do
+                require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DecorationSlot.id, v * 10 + i)
+            end
+            --_G.StorageManager:GetInstance().SelectCardUid = v
+            --RedPointManagerIns:RefreshNode(_G.ConfigManager.redpoint_cfg.SpiritualPage.id, v)
+        end
+        RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Spiritual.id) --需要刷新self.num参数
+        RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SpiritualLevelUp.id)
+
+        RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MineCardList.id)
+    end
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DecorationSlot.id)
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.EngraveSoulPage.id)
+    --刷新红点 (放置挂机) --临时(装备，魂链，刻魂)
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleEquipment.id)
+    --刷新 死魂塔的 快速挑战红点
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DeadsoulFast.id)
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifact.id)
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SpiritualPage.id)
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RedPointCardUpStar.id)
+end
+
+--endregion
+
+return AfkBattleManager

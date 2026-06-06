@@ -1,0 +1,1155 @@
+-- 包路径:        UI.Task.Module.BaseTask
+-- File Name:    BaseTask.lua
+-- Description:  任务基类抽象
+-- Author:       TangHuan
+-- Create Date:  2020/01/13
+
+---@class BaseTask : BaseEvent @任务基类抽象
+---@field protected TaskID number @任务ID
+---@field protected TaskCfg task_cfg @当前任务对应的配置数据段(方便快速读取)
+---@field protected type ETaskType @任务类型
+---@field protected ParentTaskID number @父任务ID
+---@field protected AllTaskContentsID number[] @所有任务内容ID列表
+---@field protected AllTaskContents BaseTaskContent[] @所有的任务内容列表
+---@field protected AllClaimPreConditionsInfo number[] @任务领取的前置条件ID列表
+---@field protected AllClaimPreConditions BaseTaskCondition[] @任务领取的前置条件列表
+---@field protected IsExecuting boolean @当前任务是否正在执行
+---@field protected OnSceneNavCompleteCB function @场景导航完成回调
+---@field protected OnNavCompleteCB function @导航完成回调
+---@field protected RecentlyCompletedTaskContent BaseTaskContent @最近完成的任务内容
+---@field protected ClaimedNPCUID number @任务领取的NPC UID
+---@field protected SubmitedNPCUID number @任务提交的NPC UID
+---@field protected ClaimedAPS AutomaticPlayStory @任务接受时的自动化剧情播放
+---@field protected AfterSubmitAPS AutomaticPlayStory @任务提交后的自动化剧情播放
+---@field protected StoryTriggerType EStoryTriggerType @触发器触发任务剧情类型
+---@field protected StoryTriggerUid number @触发器触发UID
+---@field protected StoryTriggerAPS AutomaticPlayStory @触发器可触发任务时机的自动化剧情播放(时机分类：0.接受前；1.接收时到提交前；2.提交后)(默认只允许配一个)
+---@field protected complete_parameters number[] @完成条件参数（1: %玩家对话；2:副本采集(key:副本sid*10+0|1，value），次数；3:采集道具（key:道具sid，value:数量);4:击杀怪物(key:怪物sid，value:数量);5::数值任务(key:数值类型(1:玩家等级)，value:目标数值))）
+---@field protected complete_num number 需要完成的任务目标个数
+local BaseTask = _G.BaseClass("BaseTask", _G.BaseEvent)
+BaseTask.TaskID = nil
+BaseTask.TaskCfg = nil
+BaseTask.type = nil
+BaseTask.ParentTaskID = nil
+BaseTask.AllTaskContentsID = nil
+BaseTask.AllTaskContents = nil
+BaseTask.AllClaimPreConditionsInfo = nil
+BaseTask.AllClaimPreConditions = nil
+BaseTask.IsExecuting = false
+BaseTask.OnSceneNavCompleteCB = nil
+BaseTask.OnNavCompleteCB = nil
+BaseTask.RecentlyCompletedTaskContent = nil
+BaseTask.ClaimedNPCUID = nil
+BaseTask.SubmitedNPCUID = nil
+BaseTask.ClaimedAPS = nil
+BaseTask.AfterSubmitAPS = nil
+BaseTask.StoryTriggerType = nil
+BaseTask.StoryTriggerUid = nil
+BaseTask.StoryTriggerAPS = nil
+
+BaseTask.complete_parameters = nil
+BaseTask.complete_num = nil
+
+---BaseTask构造函数
+---@param taskid number @任务ID
+function BaseTask:__init(taskid)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("构建任务ID:%d的任务抽象!", taskid))
+    self.TaskID = taskid
+    -- 读取任务相关表格数据
+    self.TaskCfg = _G.ConfigManager.task_cfg[taskid]
+    self.type = self.TaskCfg.Type1
+    self.ParentTaskID = self.TaskCfg.ParentTaskID
+    self.AllTaskContentsID = self.TaskCfg.complete_parameters
+    self.AllTaskContents = {}
+    self.AllClaimPreConditionsInfo = self.TaskCfg.conditions
+    self.AllClaimPreConditions = {}
+    self.IsExecuting = false
+    if #self.TaskCfg.rec_npc > 0 then
+        self.ClaimedNPCUID = tonumber(self.TaskCfg.rec_npc[2])
+    end
+    if #self.TaskCfg.submit > 0 then
+        self.SubmitedNPCUID = tonumber(self.TaskCfg.submit[2])
+    end
+    self.ClaimedAPS = _G.AutomaticPlayStory.New()
+    self.AfterSubmitAPS = _G.AutomaticPlayStory.New()
+    if #self.TaskCfg.StoryTriggerParams > 0 then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, self.TaskCfg.StoryTriggerParams)
+        self.StoryTriggerType = tonumber(self.TaskCfg.StoryTriggerParams[1])
+        self.StoryTriggerUid = tonumber(self.TaskCfg.StoryTriggerParams[2])
+        self.StoryTriggerAPS = _G.AutomaticPlayStory.New()
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format(
+                "任务ID:%s创建触发器剧情数据初始化, StoryTriggerType:%s, StoryTriggerUid:%s!",
+                self.TaskID,
+                self.StoryTriggerType,
+                self.StoryTriggerUid
+            )
+        )
+    end
+    self.complete_parameters = self.TaskCfg.complete_parameters
+    ---需要完成的任务目标个数
+    self.complete_num = self.TaskCfg.complete_num
+
+    -- 任务领取前置条件相关数据
+    if self:IsAvalibleClaim() == 1 then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, "任务可领取，构建领取前置条件数据!")
+        for k, v in pairs(self.AllClaimPreConditionsInfo) do
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, "ClaimPreCondition:", v)
+            local conditiontype = tonumber(v[1])
+            local conditionparams = v[2]
+            local claimpretaskcondition = _G.TaskUtilities.CreateTaskCondition(self, conditiontype, conditionparams)
+            table.insert(self.AllClaimPreConditions, claimpretaskcondition)
+        end
+    end
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "是最里层任务，构建任务内容数据!")
+    --
+    if _G.AppSetting.DEBUG then
+        _G.Log("是最里层任务，构建任务内容数据", "<color=red>" .. ">>>" .. "</color>")
+    end
+    -- _G.print_table(self.AllTaskContentsID)
+    local index = 1
+    for k, v in pairs(self.AllTaskContentsID) do
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskContentID:", v)
+        local taskcontent = _G.TaskUtilities.CreateTaskContent(self, v, index)
+        index = index + 1
+        table.insert(self.AllTaskContents, taskcontent)
+        if taskcontent:IsDone() == false then
+            _G.LogUtilities.Log(
+                _G.EModuleName.TaskModule,
+                string.format("任务ID：%d的任务内容ID:%d处于未完成状态，监听完成状态!", self.TaskID, taskcontent.TaskContentID)
+            )
+            taskcontent:AddListener(
+                _G.BaseTaskContentEvent,
+                _G.BaseTaskContentEvent.EnumValue.TaskContentComplete,
+                self.OnTaskContentComplete,
+                self,
+                true
+            )
+        end
+    end
+end
+
+---任务内容完成回调
+---@param taskcontent BaseTaskContent @任务内容
+function BaseTask:OnTaskContentComplete(taskcontent)
+    if _G.AppSetting.DEBUG then
+        _G.Log(_G.EModuleName.TaskModule, string.format("任务内容ID:%d完成!", taskcontent.TaskContentID))
+    end
+    self.RecentlyCompletedTaskContent = taskcontent
+    -- self:UpdateTaskContentsInfo()
+    if self:IsAvalibleSubmit() then
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format(
+                "self.RecentlyCompletedTaskContent.IsAfterStoryCompleted = %s",
+                self.RecentlyCompletedTaskContent.IsAfterStoryCompleted
+            )
+        )
+        if
+            self.RecentlyCompletedTaskContent:HasAfterStory() and
+                self.RecentlyCompletedTaskContent.IsAfterStoryCompleted == false
+         then
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, "有后置剧情需要等待播放完成!")
+            self.RecentlyCompletedTaskContent:AddListener(
+                _G.BaseTaskContentEvent,
+                _G.BaseTaskContentEvent.EnumValue.AfterStoryComplete,
+                self.OnTaskContentAfterStoryCompleted,
+                self,
+                true
+            )
+        else
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, "无后置剧情需要等待播放完成!")
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%d满足提交条件，自动提交!", self.TaskID))
+            if self.TaskCfg.is_auto_submit == 1 then
+                self:SubmitTask()
+            end
+        end
+    end
+end
+
+---获取任务数据(每次都从任务数据模块获取最新的)
+---@return task.i_task @对应的任务数据
+function BaseTask:GetTaskInfo()
+    --return _G.TaskModule:GetInstance():GetTaskInfo(self.type, self.TaskID)
+    local taskinfo = _G.TaskModule:GetInstance():GetTaskInfo(self.type, self.TaskID)
+    if taskinfo ~= nil then
+        return taskinfo
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("找不到任务类型:%s任务ID:%s的任务信息!", self.type, self.TaskID))
+        end
+        return nil
+    end
+end
+
+---获取任务状态
+---@return ETaskState @任务状态
+function BaseTask:GetTaskState()
+    local taskinfo = self:GetTaskInfo()
+    if taskinfo ~= nil then
+        return taskinfo.state
+    else
+        return nil
+    end
+end
+
+---获取任务最上层任务
+---@return BaseTask @最上层任务
+function BaseTask:GetRootTask()
+    local roottask = self
+    while roottask ~= nil and roottask.ParentTaskID ~= 0 do
+        local newroottask = _G.TaskModule:GetInstance():GetTaskInfo(self.type, roottask.ParentTaskID)
+        if newroottask ~= nil then
+            roottask = newroottask
+        else
+            return roottask
+        end
+    end
+    return roottask
+end
+
+---获取父任务任务数据
+---@return BaseTask @父任务任务数据(没有返回nil)
+function BaseTask:GetParentTask()
+    if self.ParentTaskID ~= 0 then
+        return _G.TaskModule:GetInstance():GetTask(self.type, self.ParentTaskID)
+    else
+        return nil
+    end
+end
+
+---获取任务完成进度
+---Note:
+---如果任务是最里层任务即包含任务内容的任务，任务完成进度 = 任务内容完成数
+---如果任务是非最里层任务即包含任务内容的任务，任务完成进度 = 子任务完成数
+function BaseTask:GetTaskCompleteProgress()
+    return self:GetCompletedTaskContentNumber()
+end
+
+---获取已完成的任务内容数量
+---Note:
+---仅当此任务是最里层任务即包含任务内容的任务时才有意义
+function BaseTask:GetCompletedTaskContentNumber()
+    local completedtaskcontentnumber = 0
+    for k, v in pairs(self.AllTaskContents) do
+        ---@type BaseTaskContent
+        local taskcontent = v
+        if taskcontent.IsDone() then
+            completedtaskcontentnumber = completedtaskcontentnumber + 1
+        end
+    end
+    return completedtaskcontentnumber
+end
+
+---得到当前任务第一个可执行的任务内容
+---@return BaseTaskContent @任务内容
+function BaseTask:GetFirstAvalibleExecuteTaskContent()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:GetFirstAvalibleExecuteTaskContent()")
+    for index, taskcontent in ipairs(self.AllTaskContents) do
+        if taskcontent:IsAvalibleExecute() then
+            return taskcontent
+        end
+    end
+    return nil
+end
+
+---更新任务内容信息(当任务信息更新时需要触发其旗下的任务内容信息更新)
+function BaseTask:UpdateTaskContentsInfo()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:UpdateTaskCOntentsInfo()")
+    for _, taskContent in pairs(self.AllTaskContents) do
+        taskContent:UpdateInfo()
+    end
+    local taskinfo = self:GetTaskInfo()
+    if _G.TaskUtilities.GetTaskProgressIsAllOver(self) and taskinfo.state ~= _G.TaskEnum.ETaskState.Completed then
+        taskinfo.state = _G.TaskEnum.ETaskState.Completed
+    end
+
+    _G.TaskModule:GetInstance():DispatchEvent(
+        _G.TaskModuleEvent,
+        _G.TaskModuleEvent.EnumValueTable.TaskInfoUpdate,
+        self.TaskID
+    )
+
+    if
+        _G.TaskModule:GetInstance():IsCompletedTask(self.TaskID) == false and self:IsAvalibleSubmit() and
+            self.TaskCfg.is_auto_submit == 1
+     then
+        self:SubmitTask()
+    end
+end
+
+---[public]执行当前任务里第一个可做的任务内容(如果未领取则先判定是否可领取并引导对应操作)
+---@return boolean @是否成功执行任务
+function BaseTask:ExecuteTask()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:ExecuteTask()")
+    --执行任务流程(无论是领取还是执行任务内容还是提交任务)：
+    --1. 执行任务场景导航
+    --2. 执行任务目标导航
+    --3. 执行任务相关操作
+    if self:IsAvalibleClaim() == 1 then
+        self.IsExecuting = true
+        self:ExecuteClaimTask()
+        return true
+    elseif self:IsAvalibleExecute() then
+        --TODO:执行第一个可做的子任务
+        --elseif
+        --已经是最里层任务，直接执行任务内容(暂时默认内容只有一个)
+
+        for i = 1, #self.AllTaskContents do
+            local Content = self.AllTaskContents[i]
+            if Content:IsAvalibleExecute() and Content:ExecuteTask() then
+                self.IsExecuting = true
+                _G.LogUtilities.Log(
+                    _G.EModuleName.TaskModule,
+                    string.format("任务ID:%d是最里层任务，执行任务内容ID:%d!", self.TaskID, Content.TaskContentID)
+                )
+                return true
+            end
+        end
+
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning(" 无 可执行任务")
+        end
+        return false
+    elseif self:IsAvalibleSubmit() then
+        if self:IsDone() then
+            --提交任务
+            self.IsExecuting = true
+            self:SubmitTask(true)
+            return true
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log(string.format("当前任务状态%s不满足提交条件,提交失败!", self.TaskState))
+            end
+            return false
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log(string.format("当前任务ID:%s任务状态:%s不满足执行状态要求!", self.TaskID, self.TaskState))
+        end
+        return false
+    end
+end
+
+---[private]执行领取当前任务操作
+function BaseTask:ExecuteClaimTask()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:ExecuteClaimTask()")
+    local scenceID = tonumber(self.TaskCfg.rec_npc[1])
+    --场景寻路引导
+    if scenceID ~= nil then
+        ---如果 不在关卡里
+        if not _G.WorldManager:GetInstance():CheckSceneType(_G.SceneType.Section) then
+            local openSectionID = tonumber(self.TaskCfg.rec_npc[3])
+            local chapterID = tonumber(self.TaskCfg.rec_npc[4])
+            if openSectionID ~= nil and chapterID ~= nil then
+                --- 就打开 关卡选择界面
+                _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.SelectSectionMapView.Name,
+                    chapterID,
+                    openSectionID,
+                    function()
+                        -- body
+                    end
+                    -- ,            self.TaskContentCfg.TaskContentParam[2]
+                )
+
+                return
+            end
+            if _G.WorldManager:GetInstance():GetCurWorldSid() == scenceID then
+                ---如果是当前场景 则不处理
+            elseif _G.ConfigManager.scene_world_cfg[scenceID] ~= nil then
+                --- 如果是其他主城场景 打开世界地图 ZHJ-3788
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.WorldMapView.Name)
+                return
+            end
+        end
+
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("领任务ID:%d 场景:%d引导", self.TaskID, scenceID))
+        self.OnSceneNavCompleteCB = _G.handler(self, self.OnClaimTaskSceneNavigationComplete)
+        self.OnNavCompleteCB = _G.handler(self, self.OnClaimTaskNPCNavigationComplete)
+        self:DoSceneNavigation(scenceID)
+    elseif self.TaskCfg.is_auto_receive then
+        self:DoClaimTask()
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("领任务ID:%d不需要场景引导", self.TaskID))
+    end
+end
+
+---打断当前任务正在做的任务内容
+---@return boolean @是否打断任务成功
+function BaseTask:InterruptTaskExecution()
+    if self.IsExecuting == true then
+        self.OnSceneNavCompleteCB = nil
+        self.OnNavCompleteCB = nil
+        if self:IsAvalibleClaim() == 1 then
+            --打断任务领取
+            self.IsExecuting = false
+            self:DispatchEvent(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskInterrupt, self)
+            return true
+        elseif self:IsAvalibleExecute() then
+            --TODO:打断第一个可做的子任务
+            --elseif
+            --打断执行任务内容
+            self.IsExecuting = false
+            self:DispatchEvent(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskInterrupt, self)
+            return true
+        elseif self:IsAvalibleSubmit() then
+            --打断任务提交
+            self.IsExecuting = false
+            self:DispatchEvent(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskInterrupt, self)
+            return true
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log(string.format("当前任务ID:%s任务状态:%s不满足打断状态要求!", self.TaskID, self.TaskState))
+            end
+            return false
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log(string.format("当前任务ID:%s并未处于执行中，打断失败!", self.TaskID))
+        end
+        return false
+    end
+end
+
+---[public]放弃当前任务(外部放弃任务接口)
+---@return boolean @放弃当前任务
+function BaseTask:GiveUpTask()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:GiveUpTask()")
+    if self:IsAvalibleGiveUp() then
+        --TODO:发送放弃任务消息，等待消息返回做对应操作
+        --放弃成功执行DoGiveUpTask()
+
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("放弃任务ID:%s", self.TaskID))
+        return true
+    else
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("任务ID:%s任务状态:%s不允许放弃!", self.TaskID, self.TaskState)
+        )
+        return false
+    end
+end
+
+---[private]执行放弃当前任务操作
+function BaseTask:DoGiveUpTask()
+    if self:IsAvalibleGiveUp() then
+        -- TODO: 支持任务放弃
+
+        if _G.AppSetting.DEBUG then
+            _G.LogError("TODO:支持任务放弃")
+        end
+    else
+        _G.LogUtilities.Log(string.format("任务ID:%s任务状态:%s不允许放弃，放弃任务失败!", self.TaskID, self.TaskState))
+        return false
+    end
+end
+
+---提交当前任务
+------@param isPlayer boolean true是玩家操作 点击提交任务
+function BaseTask:SubmitTask(isPlayer)
+    ---防止刚上线 loading中 自动提交
+    if _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.LoadingView.Name) == true then
+        return
+    end
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:SubmitTask()")
+    local scenceID = tonumber(self.TaskCfg.submit[1])
+    --找NPC提交
+    if self.TaskCfg.is_auto_submit == 0 then
+        if scenceID ~= nil then
+            ---如果 不在关卡里
+            if not _G.WorldManager:GetInstance():CheckSceneType(_G.SceneType.Section) then
+                local openSectionID = tonumber(self.TaskCfg.submit[3])
+                local chapterID = tonumber(self.TaskCfg.submit[4])
+                if openSectionID ~= nil and chapterID ~= nil then
+                    --- 就打开 关卡选择界面
+                    _G.UIManager:GetInstance():OpenWindow(
+                        _G.ConfigManager.ui_cfg.SelectSectionMapView.Name,
+                        chapterID,
+                        openSectionID,
+                        function()
+                            -- body
+                        end
+                        -- ,            self.TaskContentCfg.TaskContentParam[2]
+                    )
+                    return
+                end
+                if _G.WorldManager:GetInstance():GetCurWorldSid() == scenceID then
+                    ---如果是当前场景 则不处理
+                elseif _G.ConfigManager.scene_world_cfg[scenceID] ~= nil then
+                    --- 如果是其他主城场景 打开世界地图 ZHJ-3788
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.WorldMapView.Name)
+                    return
+                end
+            end
+
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("提交任务ID:%d 场景:%d引导", self.TaskID, scenceID))
+            self.OnSceneNavCompleteCB = _G.handler(self, self.OnSubmitTaskSceneNavigationComplete)
+            self.OnNavCompleteCB = _G.handler(self, self.OnSubmitTaskNPCNavigationComplete)
+            self:DoSceneNavigation(scenceID)
+        else
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("提交任务ID:%d不需要场景引导,直接提交任务!", self.TaskID))
+            self:OnSubmitTaskNPCNavigationComplete()
+        end
+    elseif self.TaskCfg.is_auto_submit == 1 or isPlayer == true then
+        --自动提交
+        self:OnSubmitTaskNPCNavigationComplete()
+    end
+end
+
+---[private]执行任务场景寻路导航
+---@param targetsceneid number @目标场景id
+function BaseTask:DoSceneNavigation(targetsceneid)
+    local sceneCfg = _G.ConfigManager.scene_cfg[targetsceneid]
+    if sceneCfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("没有该场景配置 targetsceneid:" .. targetsceneid)
+        end
+        return
+    end
+
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("BaseTask:DoSceneNavigation(%d)", targetsceneid))
+    local worldmanager = _G.WorldManager:GetInstance()
+    local worldSid = worldmanager:GetCurWorldSid()
+    if worldSid ~= targetsceneid then
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("当前场景:%d和目标场景:%d不同需要引导切换场景!", worldSid, targetsceneid)
+        )
+        local mainplayer = worldmanager:GetCurWorldPlayer()
+        ---@type NavParam
+        local navparam = {}
+        navparam.Object = mainplayer
+        navparam.OriginSceneSid = worldSid
+        navparam.TargetSceneSid = targetsceneid
+        local navitem = _G.NavManager:GetInstance():DoNavMove(navparam)
+        if navitem == nil then
+            _G.PopWindowManager:GetInstance():ShowAllTips(_G.TipsSystemCfgDic.task.CanNotGo)
+            if _G.AppSetting.DEBUG then
+                _G.LogError("无法寻路 至目标点 targetsceneid:" .. targetsceneid)
+            end
+        else
+            navitem:AddListener(
+                _G.NavItemEvent,
+                _G.NavItemEvent.EnumValue.NavComplete,
+                self.OnSceneNavigationComplete,
+                self,
+                true
+            )
+        end
+    else
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("当前场景:%d和目标场景:%d相同，无需引导切换场景!", worldSid, targetsceneid)
+        )
+        self:OnSceneNavigationComplete()
+    end
+end
+
+---[private]执行任务NPC寻路导航
+---@param npcid number @目标NPC id
+function BaseTask:DoNPCNavigation(npcid)
+    if _G.WorldManager:GetInstance():GetCurWorld() == nil then
+        return
+    end
+    -- _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("BaseTask:DoNPCNavigation(%d)", npcid))
+    ---@type WorldNPCItem
+    local npc = _G.WorldManager:GetInstance():GetCurWorld():GetItemInfo(npcid)
+    if npc == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 未在该场景 找到NPC:" .. npcid)
+        end
+        return
+    end
+    if _G.IsNil(npc.Transform) or npc.Transform:GetActiveSelf() == 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 该NPC已隐藏 不可寻路 NPCid:" .. npcid)
+        end
+        return
+    end
+
+    ---@type NavParam
+    local navparam = {}
+    navparam.Position = _G.Vector3.New(npc.Transform:GetPosition())
+    navparam.Object = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+
+    local x, y, z = npc.Transform:GetPosition()
+    local x1, y1, z1 = navparam.Object.Transform:GetPosition()
+
+    local subX = x - x1
+    local subY = y - y1
+    local subZ = z - z1
+    subX = Mathf.Abs(subX)
+    subY = Mathf.Abs(subY)
+    subZ = Mathf.Abs(subZ)
+    local sub = subX + subY + subZ
+    if sub < 3 then
+        self:OnNPCNavigationComplete()
+        return
+    end
+    local navitem, navstate = _G.NavManager:GetInstance():DoNavMove(navparam)
+    ---寻路点太近
+    if navitem == nil and navstate == _G.NavState.TooClose then
+        self:OnNPCNavigationComplete()
+    else
+        navitem:AddListener(
+            _G.NavItemEvent,
+            _G.NavItemEvent.EnumValue.NavComplete,
+            self.OnNPCNavigationComplete,
+            self,
+            true
+        )
+    end
+end
+
+---[private]场景寻路完成回调
+function BaseTask:OnSceneNavigationComplete()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnSceneNavigationComplete()")
+    --考虑到任务数据大部分都是要到指定场景才能获取到
+    --所以初始化任务数据延迟到切换对应场景后
+    self:InitTaskData()
+
+    if self.OnSceneNavCompleteCB ~= nil then
+        self.OnSceneNavCompleteCB()
+        self.OnSceneNavCompleteCB = nil
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("场景导航完成回调为空!")
+        end
+    end
+end
+
+---[protected]初始化任务数据(子类重写去实现自定义任务数据初始化)
+function BaseTask:InitTaskData()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:InitTaskData()")
+end
+
+---[private]NPC寻路完成回调
+function BaseTask:OnNPCNavigationComplete()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnNPCNavigationComplete()")
+    if self.OnNavCompleteCB ~= nil then
+        self.OnNavCompleteCB()
+        self.OnNavCompleteCB = nil
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("NPC导航完成回调为空!")
+        end
+    end
+end
+
+---任务提交场景寻路完成回调
+function BaseTask:OnSubmitTaskSceneNavigationComplete()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnSubmitTaskSceneNavigationComplete()")
+    --NPC导航
+    local submitnpcid = tonumber(self.TaskCfg.submit[2])
+    self:DoNPCNavigation(submitnpcid)
+end
+
+---任务提交寻路完成回调
+function BaseTask:OnSubmitTaskNPCNavigationComplete()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnSubmitTaskNPCNavigationComplete()")
+
+    _G.TaskModule:GetInstance():DispatchEvent(_G.TaskModuleEvent, _G.TaskModuleEvent.EnumValueTable.NavComplete)
+    if self.TaskCfg.submit_default ~= 0 then
+        --TODO:开始任务提交
+        --1. 前置对话(任务提交需要等待前置对话完成)
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("触发任务ID:%d提交前置对话ID:%d", self.TaskID, self.TaskCfg.submit_default)
+        )
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.DialogueView.Name)
+
+        ---@type TaskOptionData
+        local TaskOptionData = {}
+        TaskOptionData.state = _G.TaskEnum.ETaskState.Completed
+        TaskOptionData.taskid = self.TaskID
+
+        ---@type Params_DialogueView
+        local data = {}
+        data.taskOptionData = TaskOptionData
+        _G.StoryManager:GetInstance():PlayDialogueView(
+            self.TaskCfg.submit_default,
+            _G.handler(self, self.OnSubmitPreDialogueCompleted),
+            data
+        )
+    else
+        self:DoSubmitTask()
+    end
+end
+
+---提交前任务对话完成
+function BaseTask:OnSubmitPreDialogueCompleted()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnSubmitPreDialogueCompleted()")
+    self:DoSubmitTask()
+end
+
+---执行任务提交
+function BaseTask:DoSubmitTask()
+    if self.type == _G.TaskEnum.ETaskType.MainTask then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ChapterRewardsView.Name)
+        return
+    end
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:DoSubmitTask()")
+    self:DispatchEvent(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.PreTaskSubmit, self)
+
+    _G.TaskModule:GetInstance():FinishTask(self.TaskID, _G.handler(self, self.OnReplySubmitTask))
+end
+
+---请求提交任务返回回调
+---@param data task.s2c_task_finish
+function BaseTask:OnReplySubmitTask(data)
+    if self.TaskCfg.SubmitPostDailogueID ~= 0 then
+        _G.LogUtilities.Log(string.format("触发任务ID:%d领取后置对话ID:%d", self.TaskID, self.TaskCfg.SubmitPostDailogueID))
+        _G.MainManager:GetInstance():AddMainFunQueue(
+            {
+                OpenViewFun = function()
+                    _G.StoryManager:GetInstance():PlayDialogueView(
+                        self.TaskCfg.SubmitPostDailogueID,
+                        _G.handler(self, self.DoTaskAfterSubmitStory)
+                    )
+                end
+            },
+            _G.MainViewShowOrder.mainOthen
+        )
+    else
+        self:DoTaskAfterSubmitStory()
+    end
+end
+
+---提交任务全部表现完成
+function BaseTask:OnSubmitTaskOver()
+    self:DispatchEvent(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskSubmit, self)
+    _G.TaskModule:GetInstance():DispatchEvent(_G.TaskModuleEvent, _G.TaskModuleEvent.EnumValueTable.TaskSubmit, self)
+
+    local curWorld = _G.WorldManager:GetInstance():GetCurWorld()
+
+    local npcUid = tonumber(self.TaskCfg.submit[2])
+    if tonumber(npcUid) ~= nil then
+        _G.TaskModule:GetInstance():DispatchEvent(
+            _G.TaskModuleEvent,
+            _G.TaskModuleEvent.EnumValueTable.CheckNowNpcHaveTask,
+            npcUid
+        )
+    end
+
+    -- _G.TaskModule:GetInstance():PlayTaskEff_01(_G.TaskEnum.ETaskState.Completed, self.TaskCfg.Type1)
+    _G.TaskModule:GetInstance():SetCurClickTask(self.TaskID)
+end
+---领取任务全部表现完成
+function BaseTask:OnClaimTaskOver()
+    self:DispatchEvent(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskClaimed, self)
+    _G.TaskModule:GetInstance():DispatchEvent(_G.TaskModuleEvent, _G.TaskModuleEvent.EnumValueTable.TaskClaim, self)
+
+    local npcUid = self.TaskCfg.rec_npc[2]
+    if tonumber(npcUid) ~= nil then
+        _G.TaskModule:GetInstance():DispatchEvent(
+            _G.TaskModuleEvent,
+            _G.TaskModuleEvent.EnumValueTable.CheckNowNpcHaveTask,
+            npcUid
+        )
+    end
+    _G.TaskModule:GetInstance():PlayTaskEff_01(_G.TaskEnum.ETaskState.Claimed, self.TaskCfg.Type1)
+    -- _G.UIUtils.LoadEffectByCfg(
+    --     _G.ConfigManager.ui_effect_cfg.fx_c_renwulingqu_effect,
+    --     _G.UIManager:GetInstance():GetUILayerTrans(_G.UILayers.InfoLayer.Name)
+    -- )
+end
+
+---执行任务提交后的剧情表现
+function BaseTask:DoTaskAfterSubmitStory()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:DoTaskAfterSubmitStory()")
+    --4. 交任务后的剧情表现
+    if self.TaskCfg.submit_story ~= 0 then
+        -- self.AfterSubmitAPS:Play(self.TaskCfg.submit_story, _G.handler(self, self.OnAfterSubmitStoryPlayCompleted))
+
+        _G.MainManager:GetInstance():AddMainFunQueue(
+            {
+                OpenViewFun = function()
+                    _G.AutomaticPlayStory.PlayStoryByID(
+                        self.TaskCfg.submit_story,
+                        _G.handlerbind(self, self.OnAfterSubmitStoryPlayCompleted)
+                    )
+                end
+            },
+            _G.MainViewShowOrder.mainOthen
+        )
+    else
+        self:OnSubmitTaskOver()
+    end
+end
+
+---交任务后剧情表现完成
+---@param storyid number @剧情ID
+---@param result boolean @剧情是否播放完成
+function BaseTask:OnAfterSubmitStoryPlayCompleted(storyid, result)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%d的交任务后剧情ID:%d播放完成!", self.TaskID, storyid))
+    self:OnSubmitTaskOver()
+end
+
+---任务内容的后置剧情播放完成
+---@param taskcontent BaseTaskContent @任务内容
+function BaseTask:OnTaskContentAfterStoryCompleted(taskcontent)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnTaskContentAfterStoryCompleted()")
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("TaskContentID:%d", taskcontent.TaskContentID))
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%d满足提交条件，自动提交!", self.TaskID))
+    if self.TaskCfg.is_auto_submit == 1 then
+        self:SubmitTask()
+    end
+    -- self:RemoveAllTaskContentListeners()
+end
+
+---检查是否需要切换场景
+---@return boolean @是否需要切换场景
+function BaseTask:CheckSwitchScene()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:CheckSwitchScene()")
+    if #self.TaskCfg.SceneSwitching > 0 then
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("任务ID:%d配置了切换场景:%d", self.TaskID, self.TaskCfg.SceneSwitching[1])
+        )
+        local sceneid = tonumber(self.TaskCfg.SceneSwitching[1])
+        local x = tonumber(self.TaskCfg.SceneSwitching[2])
+        local y = tonumber(self.TaskCfg.SceneSwitching[3])
+        local z = tonumber(self.TaskCfg.SceneSwitching[4])
+        local function endCallBack(_)
+            _G.LogUtilities.Log(
+                _G.EModuleName.TaskModule,
+                string.format("切换到场景:%s的目标位置:[%s, %s, %s]", self.TaskCfg.SceneSwitching, x, y, z)
+            )
+            _G.WorldManager:GetInstance():GetCurWorldPlayer().Transform:SetPosition(x, y, z)
+        end
+        _G.WorldManager:GetInstance():EnterWorld(sceneid, endCallBack)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%d没有配置切换场景!", self.TaskID))
+    end
+end
+
+---移除任务的所有任务内容的监听
+function BaseTask:RemoveAllTaskContentListeners()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:RemoveAllTaskContentListeners()")
+    ---@type taskcontent BaseTaskContent @任务内容
+    for k, taskcontent in pairs(self.AllTaskContents) do
+        taskcontent:RemoveAllListeners()
+    end
+end
+
+---任务领取场景寻路完成回调
+function BaseTask:OnClaimTaskSceneNavigationComplete()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnClaimTaskSceneNavigationComplete()")
+    --NPC导航
+    local claimnpcid = tonumber(self.TaskCfg.rec_npc[2])
+    self:DoNPCNavigation(claimnpcid)
+end
+
+---[private]领取任务NPC寻路完成回调
+function BaseTask:OnClaimTaskNPCNavigationComplete()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnClaimTaskNPCNavigationComplete()")
+
+    _G.TaskModule:GetInstance():DispatchEvent(_G.TaskModuleEvent, _G.TaskModuleEvent.EnumValueTable.NavComplete)
+
+    if self.TaskCfg.ClaimPreDailogueID ~= 0 then
+        --TODO:开始任务领取
+        --1. 前置对话
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("触发任务ID:%d领取前置对话ID:%d", self.TaskID, self.TaskCfg.ClaimPreDailogueID)
+        )
+        ---@type TaskOptionData
+        local TaskOptionData = {}
+        TaskOptionData.state = _G.TaskEnum.ETaskState.WaitClaim
+        TaskOptionData.taskid = self.TaskID
+
+        ---@type Params_DialogueView
+        local data = {}
+        data.taskOptionData = TaskOptionData
+
+        _G.StoryManager:GetInstance():PlayDialogueView(
+            self.TaskCfg.ClaimPreDailogueID,
+            _G.handler(self, self.OnClaimPreDialogueCompleted),
+            data
+        )
+    else
+        self:OnClaimPreDialogueCompleted()
+    end
+end
+
+---领任务前对话完成回调
+function BaseTask:OnClaimPreDialogueCompleted()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnClaimPreDialogueCompleted()")
+    self:DoClaimTask()
+end
+
+---执行领任务
+function BaseTask:DoClaimTask()
+    --- 领取任务 检测是否能装下任务道具
+    if
+        #self.TaskCfg.receive_item > 0 and
+            not _G.StorageManager:GetInstance():IsCheckAddGetItem(self.TaskCfg.receive_item)
+     then
+        _G.PopWindowManager:GetInstance():ShowAllTips(1001, "无法容纳任务道具")
+        return
+    end
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:DoClaimTask()")
+
+    --2. 领取任务(需要发送消息)
+
+    _G.TaskModule:GetInstance():AcceptTask(self.TaskID, _G.handler(self, self.OnReplyClaimTask))
+end
+
+---请求领取任务返回回调
+---@param data task.s2c_task_accept
+function BaseTask:OnReplyClaimTask(data)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:OnReplyClaimTask()")
+
+    if self.TaskCfg.receive_default ~= 0 then
+        --3. 后置对话
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("触发任务ID:%d领取后置对话ID:%d", self.TaskID, self.TaskCfg.receive_default)
+        )
+
+        _G.StoryManager:GetInstance():PlayDialogueView(
+            self.TaskCfg.receive_default,
+            _G.handler(self, self.OnClaimedReceive_defaulted)
+        )
+    else
+        self:OnClaimedReceive_defaulted()
+    end
+end
+
+function BaseTask:OnClaimedReceive_defaulted()
+    --4. 领任务时的剧情表现
+    if self.TaskCfg.receive_story ~= 0 and _G.StoryUtilities.HasStoryIDSavedUID(self.TaskCfg.receive_story) == false then
+        -- self.ClaimedAPS:Play(self.TaskCfg.receive_story, _G.handler(self, self.OnClaimedStoryPlayCompleted))
+        _G.AutomaticPlayStory.PlayStoryByID(
+            self.TaskCfg.receive_story,
+            _G.handler(self, self.OnClaimedStoryPlayCompleted)
+        )
+    else
+        self:OnClaimedStoryPlayCompleted()
+    end
+end
+
+---领任务时剧情播放完成
+---@param storyid number @剧情ID
+---@param playresult boolean @是否播放成功
+function BaseTask:OnClaimedStoryPlayCompleted(storyid, playresult)
+    self:OnClaimTaskOver()
+end
+
+--- 执行任务接受时的剧情表现
+function BaseTask:DoClaimedStory()
+    -- _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:DoClaimedStory()")
+    -- if self.TaskContentState == _G.TaskEnum.ETaskState.Executing then
+    --     if _G.WorldManager:GetInstance():GetCurWorld() ~= nil then
+    --         local currentworldsid = _G.WorldManager:GetInstance():GetCurWorldSid()
+    --         if self.TargetSceneID == currentworldsid then
+    --             if self.TaskContentCfg.receive_story ~= 0 then
+    --                 _G.LogUtilities.Log(
+    --                     _G.EModuleName.TaskModule,
+    --                     _G.string.format("符合任务内容场景Sid:%s要求,直接执行任务前剧情表现!", self.TargetSceneID)
+    --                 )
+    --                 self.BeforeAutoPlayStory:Play(
+    --                     self.TaskContentCfg.BeforeStoryID,
+    --                     _G.handler(self, self.OnBeforeStoryPlayCompleted)
+    --                 )
+    --             else
+    --                 _G.LogUtilities.Log(
+    --                     _G.EModuleName.TaskModule,
+    --                     _G.string.format("任务内容ID:%d没有配置执行任务前剧情表现ID!", self.TaskContentID)
+    --                 )
+    --             end
+    --         else
+    --             _G.LogUtilities.Log(
+    --                 _G.EModuleName.TaskModule,
+    --                 _G.string.format("不符合任务内容场景Sid:%s要求，当前场景Sid:%s,等待任务内容执行!", self.TargetSceneID, currentworldsid)
+    --             )
+    --         end
+    --     else
+    --         -- 第一次进游戏，消息比场景先进入，需要等待进入场景完成后再触发逻辑
+    --         _G.LogUtilities.Log(
+    --             _G.EModuleName.TaskModule,
+    --             _G.string.format("任务内容ID:%d,第一次进场景等待进入场景!", self.TaskContentID)
+    --         )
+    --         _G.Events:GetInstance():RemoveListener(_G.eScene.EnterWorldOver, self.OnChangeWorldOver, self)
+    --         _G.Events:GetInstance():AddListener(_G.eScene.EnterWorldOver, self.OnChangeWorldOver, self)
+    --     end
+    -- end
+end
+
+---更新触发器剧情监听
+function BaseTask:UpdateStoryTriggerListener()
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "BaseTask:UpdateStoryTriggerListener()")
+    if self.StoryTriggerAPS ~= nil then
+        --TODO:优化成判定是否有监听的形式再移除
+        _G.Events:GetInstance():RemoveListener(_G.eTriggerStatus.TriggerEnter, self.OnWorldTriggerEnter, self)
+        local taskstate = self:GetTaskState()
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("self.StoryTriggerType = %s taskstate = %s", self.StoryTriggerType, taskstate)
+        )
+        if self.StoryTriggerType == _G.EStoryTriggerType.BeforeClaimed and taskstate == _G.TaskEnum.ETaskState.WaitClaim then
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%s监听接受前触发器剧情监听!", self.TaskID))
+            _G.Events:GetInstance():AddListener(_G.eTriggerStatus.TriggerEnter, self.OnWorldTriggerEnter, self)
+        elseif
+            self.StoryTriggerType == _G.EStoryTriggerType.AfterClaimedBeforeSubmited and
+                taskstate > _G.TaskEnum.ETaskState.WaitClaim and
+                taskstate < _G.TaskEnum.ETaskState.Completed
+         then
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%s监听接受后提交前触发器剧情监听!", self.TaskID))
+            _G.Events:GetInstance():AddListener(_G.eTriggerStatus.TriggerEnter, self.OnWorldTriggerEnter, self)
+        elseif
+            self.StoryTriggerType == _G.EStoryTriggerType.AfterSubmited and
+                taskstate == _G.TaskEnum.ETaskState.Completed
+         then
+            _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%s监听提交后触发器剧情监听!", self.TaskID))
+            _G.Events:GetInstance():AddListener(_G.eTriggerStatus.TriggerEnter, self.OnWorldTriggerEnter, self)
+        else
+            _G.LogUtilities.LogError(_G.EModuleName.TaskModule, string.format("不支持的剧情触发器类型:%s", self.StoryTriggerType))
+        end
+    end
+end
+
+---响应进入世界触发器
+---@param triggeruid number @触发器UID
+---@param triggertype string @触发器触发类型
+---@param storyuid number @触发剧情UID
+function BaseTask:OnWorldTriggerEnter(triggeruid, triggertype, storyuid)
+    --_G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("BaseTask:OnWorldTriggerEnter()triggeruid:%s triggertype:%s storyuid:%s", triggeruid, triggertype, storyuid))
+    if triggeruid == self.StoryTriggerUid and triggertype == "TriggerStory" then
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("BaseTask:OnWorldTriggerEnter()匹配触发器UID:%s，触发任务剧情UID:%s", triggeruid, storyuid)
+        )
+        self.StoryTriggerAPS:Play(storyuid)
+    end
+end
+
+---是否是最上层任务即主任务(没有父任务的任务即为最顶层任务)
+---@return bool @是否是最上层任务即主任务(没有父任务的任务即为最顶层任务)
+function BaseTask:IsRootTask()
+    return self.ParentTaskID == 0
+end
+
+---@return number @任务是否可领取(-1-前置条件不满足 0-WaitClaim状态不满足 1-可领取)[public]
+function BaseTask:IsAvalibleClaim()
+    local taskinfo = self:GetTaskInfo()
+    if taskinfo.state == _G.TaskEnum.ETaskState.WaitClaim then
+        if self.TaskCfg.per_sid ~= 0 then
+            --TODO:如果有领取前置条件写在这(e.g. 等级条件，前置任务条件等)
+            for key, perTaskid in pairs(self.TaskCfg.per_sid) do
+                if perTaskid ~= 0 then
+                    local perTask = _G.TaskModule:GetInstance():GetTaskInfoWithID(perTaskid)
+                    if _G.IsNil(perTask) or perTask.state ~= _G.TaskEnum.ETaskState.Completed then
+                        return -1
+                    end
+                end
+            end
+        end
+
+        for k, v in pairs(self.AllClaimPreConditions) do
+            ---@type BaseTaskCondition
+            local claimprecondition = v
+            if claimprecondition:CheckCondition() == false then
+                return -1
+            end
+        end
+        return 1
+    else
+        return 0
+    end
+end
+
+---@return boolean @任务是否可执行(Executing状态才允许执行)[public]
+function BaseTask:IsAvalibleExecute()
+    -- TODO:修改可执行状态判定到正确状态
+    local taskinfo = self:GetTaskInfo()
+    local parenttask = self:GetParentTask()
+    return taskinfo.state == _G.TaskEnum.ETaskState.Claimed and
+        (parenttask == nil or (parenttask ~= nil and parenttask:IsAvalibleExecute()))
+end
+
+---@return boolean @任务是否可放弃[public]
+function BaseTask:IsAvalibleGiveUp()
+    --配置表配置是否可放弃且无父任务(即为根任务)的才可以放弃
+    local taskinfo = self:GetTaskInfo()
+    local isroottask = self:IsRootTask()
+    return taskinfo.state == _G.TaskEnum.ETaskState.Claimed and isroottask and self.TaskCfg.IsTaskAbandonable
+end
+
+---@return boolean @任务是否可提交[public]
+function BaseTask:IsAvalibleSubmit()
+    if self.type == _G.TaskEnum.ETaskType.NoviceTask or self.type == _G.TaskEnum.ETaskType.MainTask then
+        --- 新手任务 必须  顺序依次提交
+        if self.TaskCfg.per_sid[1] ~= nil and TaskModule:GetInstance():IsCompletedTask(self.TaskCfg.per_sid[1]) == false then
+            return
+        end
+    end
+    --TODO:
+    --任务可提交相关判定
+    local isalltaskcontentcompleted = true
+    ---@type taskcontent BaseTaskContent @任务内容
+    for k, taskcontent in pairs(self.AllTaskContents) do
+        if taskcontent:IsDone() == false then
+            isalltaskcontentcompleted = false
+            return self:IsDone() or isalltaskcontentcompleted
+        end
+    end
+    _G.LogUtilities.Log(
+        _G.EModuleName.TaskModule,
+        string.format("任务ID:%d是否可提交:%s", self.TaskID, self:IsDone() or isalltaskcontentcompleted)
+    )
+    return self:IsDone() or isalltaskcontentcompleted
+end
+
+---@return boolean @任务是否已放弃[public]
+function BaseTask:IsGiveUped()
+    local taskinfo = self:GetTaskInfo()
+    return taskinfo.state == _G.TaskEnum.ETaskState.GiveUp
+end
+
+---@return boolean @任务是否完成[public]
+function BaseTask:IsDone()
+    local taskinfo = self:GetTaskInfo()
+    return taskinfo.state == _G.TaskEnum.ETaskState.Completed
+end
+
+---@return boolean @任务是否已提交[public]
+function BaseTask:IsSubmitted()
+    local taskinfo = self:GetTaskInfo()
+    --现在没有任务提交状态，所以默认Completed等价于Submited
+    return taskinfo.state == _G.TaskEnum.ETaskState.Completed
+    --return taskinfo.state == _G.TaskEnum.ETaskState.Submited
+end
+
+---@return boolean 是否是副本支线任务
+function BaseTask:IsScetionBranchTask()
+    return self.TaskCfg.script_type ~= nil and self.TaskCfg.script_type[2] ~= nil
+end
+
+---返回所属任务关卡id
+---@return number _0无所属关卡
+function BaseTask:GetScetionId()
+    local id = 0
+    if self.TaskCfg.script_type ~= nil and self.TaskCfg.script_type[1] ~= nil then
+        id = self.TaskCfg.script_type[1]
+    end
+    return id
+end
+
+---返回所属任务关卡房间id
+---@return number _0无所属关卡房间
+function BaseTask:GetScetionRoomId()
+    local id = 0
+    if self.TaskCfg.script_type ~= nil and self.TaskCfg.script_type[2] ~= nil then
+        id = self.TaskCfg.script_type[2]
+    end
+    return id
+end
+
+---@type BaseTask @任务基类抽象
+_G.BaseTask = BaseTask
+
+---@type BaseTask @任务基类抽象
+return BaseTask

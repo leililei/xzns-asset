@@ -1,0 +1,185 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.DecorationBoss.Model.DecorationBossController	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/09/10
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local DecorationBossModel = require("DecorationBossModel")
+---@class DecorationBossController : Singleton	中文描述
+local DecorationBossController = _G.BaseClass("DecorationBossController", _G.Singleton)
+
+---@return DecorationBossController DecorationBossController
+function DecorationBossController:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function DecorationBossController:__init()
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+end
+
+---入口打开的界面
+function DecorationBossController:OpenView(OnViewOpened)
+    DecorationBossModel:GetInstance():EnterRefreshRedPoint()
+    local sid = DecorationBossModel:GetInstance():GetMonsterSid()
+    if sid and sid > 0 then
+        local config = _G.ConfigManager.decoration_boss_cfg[sid]
+        if OnViewOpened then
+            OnViewOpened(_G.ConfigManager.ui_cfg.DecorationBossMainView.Name)
+        end
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecorationBossBattleView.Name, config)
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecorationBossMainView.Name)
+    end
+end
+
+---打开布阵界面
+function DecorationBossController:OpenEmbattle(bossConfig, isTestFight)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    self.isTestFight = isTestFight
+    self.bossConfig = bossConfig
+    local embattleTypeArray = {
+        _G.EmbattleType.DecorationBoss1,
+        _G.EmbattleType.DecorationBoss2,
+        _G.EmbattleType.DecorationBoss3,
+        _G.EmbattleType.DecorationBoss4
+    }
+    local embattleType = _G.EmbattleType.DecorationBoss
+    if bossConfig then
+        embattleType = embattleTypeArray[bossConfig.id % 10] or embattleType
+    end
+    require("EmbattleController"):GetInstance():OpenEmbattle(
+        embattleType,
+        _G.EmbattleSaveType.server,
+        nil,
+        _G.EmbattleControllerItemType.DecorationBoss,
+        _G.handler(self, self.OnEmbattleQuit),
+        _G.handler(self, self.OnBattle),
+        bossConfig.monster
+    )
+end
+
+---监听布阵界面打开时间
+function DecorationBossController:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        if self.isTestFight then
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DecorationBossTrainView.Name)
+            if view then
+                view:Close()
+            end
+        else
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DecorationBossBattleView.Name)
+            if view then
+                view:Close()
+            end
+        end
+    end
+end
+
+---退出布阵界面
+function DecorationBossController:OnEmbattleQuit()
+    if self.isTestFight then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecorationBossTrainView.Name, self.bossConfig)
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecorationBossBattleView.Name, self.bossConfig)
+    end
+end
+
+---战斗界面
+function DecorationBossController:OnBattle(_, _, isSkip)
+    if self.isTestFight then
+        if isSkip then
+            self:SkipTestBattle(self.bossConfig.id)
+        else
+            self:EnterTestFight(self.bossConfig.id)
+        end
+    else
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DecorationBossMainView.Name)
+        if view then
+            view:Close()
+        end
+        if isSkip then
+            self:SkipBattle(self.bossConfig.id)
+        else
+            self:EnterFight(self.bossConfig.id)
+        end
+    end
+end
+
+---跳过正式战斗
+function DecorationBossController:SkipBattle(sid)
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    require("DecorationBossNet"):GetInstance():StartFight(
+        { monster_sid = sid },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                _G.SettlementModel:GetInstance():Settlement(
+                    _G.SettlementModel.SettlementType.DecorationBoss,
+                    function()
+                        self:OnEmbattleQuit()
+                    end,
+                    sid,
+                    0
+                )
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+            DecorationBossModel:GetInstance():SetMonsterSid(sid)
+            DecorationBossModel:GetInstance():SetLastFightTime(_G.TimeUtil.GetServerUnixTime())
+            self:SetSkipBattle(sid, msg, false)
+        end
+    )
+end
+
+---跳过测试战斗
+function DecorationBossController:SkipTestBattle(sid)
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    require("DecorationBossNet"):GetInstance():StartTestFight(
+        { monster_sid = sid },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+            DecorationBossModel:GetInstance():SetLastTestTime(_G.TimeUtil.GetServerUnixTime())
+            self:SetSkipBattle(sid, msg, true)
+        end
+    )
+end
+
+function DecorationBossController:SetSkipBattle(sid, msg, isTestFight)
+    --计算战斗结果
+    _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.data)
+    local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.data)
+    if not record then
+        _G.BattleManager:GetInstance():SetInBattle(false)
+        return
+    end
+
+    ---@type BattleControllerDecorationBoss
+    local controller = _G.require(_G.BattleControllerType.DecorationBoss).New()
+    controller.curFightState = 4 --设置战斗结束
+
+    _G.BattleManager:GetInstance():SetArgData(msg.data)
+    _G.BattleManager:GetInstance():SetStatisticsCached(record)
+    _G.BattleManager:GetInstance():SetBattleController(controller)
+    controller:SetArgs(sid, isTestFight, msg.dps, msg.fight_card)
+    controller:FightResultFunc(record.result)
+end
+
+---练功房战斗
+function DecorationBossController:EnterTestFight(sid)
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.DecorationBoss, sid, true)
+end
+
+---战斗
+function DecorationBossController:EnterFight(sid)
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.DecorationBoss, sid, false)
+end
+
+---销毁对象时,析构函数
+function DecorationBossController:Dispose()
+end
+
+return DecorationBossController

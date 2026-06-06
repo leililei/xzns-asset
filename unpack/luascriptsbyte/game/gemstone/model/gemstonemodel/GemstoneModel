@@ -1,0 +1,836 @@
+-----------------------------------------------------------------------
+-- F:.H5.Client.Assets.Resources.LuaScripts.Game.Gemstone.Model.GemstoneModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2026/03/24
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+--- 槽位上的宝石的数量
+local slotGemstoneNum = 4
+
+---@class GemstoneModel : GameDataModelBase	中文描述
+---@field public gemstoneList table<GemstoneData> 宝石数据
+---@field public gemstoneInCard table<table<GemstoneData>> 槽位上的宝石
+---@field public resonanceGemstone table<GemstoneData> 共鸣槽位的宝石
+local GemstoneModel = _G.BaseClass("GemstoneModel", _G.GameDataModelBase)
+---创建对象时,入口构造函数
+function GemstoneModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.Gemstone
+    self.gemstoneList = {}
+    self.gemstoneInCard = {}
+    self.resonanceGemstone = {}
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.p2c_gem_change.Cmd, self.OnCardChange, self)
+end
+
+function GemstoneModel:GetDataFormServer()
+    self:InitGemData()
+    self.super.ParseData(self)
+end
+
+function GemstoneModel:InitGemData()
+    local cardUidList = require("CardResonanceModel"):GetInstance():GetAllPosCardsUids()
+    for _, v in pairs(cardUidList) do
+        self.gemstoneInCard[v] = {}
+    end
+    local data = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Gemstone)
+    for _, gem in pairs(data) do
+        self.gemstoneList[gem.uid] = gem
+        if gem.cardUid ~= 0 then
+            if not self.gemstoneInCard[gem.cardUid] then
+                self.gemstoneInCard[gem.cardUid] = {}
+            end
+            self.gemstoneInCard[gem.cardUid][gem.professional] = gem
+        end
+    end
+    self:UpdateResonanceGem(true)
+end
+
+---更新共鸣宝石
+function GemstoneModel:UpdateResonanceGem()
+    for i = 1, slotGemstoneNum do
+        local gem
+        local minGrade, minStar = 99, 99
+        -- 等级单独计算
+        local minLevel = 9999
+        for _, v in pairs(self.gemstoneInCard) do
+            if not v[i] then
+                gem = nil
+                minLevel = 0
+                break
+            else
+                if v[i].level < minLevel then
+                    minLevel = v[i].level
+                end
+                if v[i].grade < minGrade then
+                    minGrade = v[i].grade
+                    minStar = v[i].star
+                    gem = v[i]
+                elseif v[i].grade == minGrade and v[i].star < minStar then
+                    minGrade = v[i].grade
+                    minStar = v[i].star
+                    gem = v[i]
+                end
+            end
+        end
+        local newGem = _G.DeepCopy(gem)
+        if newGem then
+            newGem.cardUid = 0
+            newGem:SetLevel(minLevel)
+            newGem.isResonance = true
+        end
+        if self.resonanceGemstone[i] then
+            self.resonanceGemstone[i]:Dispose()
+        end
+        self.resonanceGemstone[i] = newGem
+    end
+end
+
+---销毁对象时,析构函数
+function GemstoneModel:Dispose()
+    for _, v in pairs(self.gemstoneList) do
+        v:Dispose()
+    end
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.p2c_gem_change.Cmd, self.OnCardChange, self)
+end
+
+function GemstoneModel:OnCardChange(msg)
+    local lastUid, nowUid
+    for _, gem in pairs(msg.gem) do
+        if not lastUid then
+            lastUid = self.gemstoneList[gem.uid].cardUid
+        end
+        if not nowUid then
+            nowUid = gem.card_uid
+        end
+        self.gemstoneList[gem.uid].cardUid = gem.card_uid
+    end
+    self.gemstoneInCard[nowUid] = self.gemstoneInCard[lastUid]
+    self.gemstoneInCard[lastUid] = nil
+    self:UpdateResonanceGem()
+end
+
+--region 对外接口
+
+function GemstoneModel:AddGemstone(data)
+    self.gemstoneList[data.uid] = data
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneReplace.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpGrade.id)
+end
+
+--- 获取所有宝石数据
+function GemstoneModel:GetAllGemData()
+    return self.gemstoneList
+end
+
+function GemstoneModel:GetAllUseGemData()
+    local outList = {}
+    for _, list in pairs(self.gemstoneInCard) do
+        for i = 1, 4 do
+            _G.table.insert(outList, list[i] or {})
+        end
+    end
+    return outList
+end
+
+--- 获取所有没有装备宝石
+function GemstoneModel:GetAllNotUseGemData()
+    local outList = {}
+    for _, gem in pairs(self.gemstoneList) do
+        if gem.cardUid == 0 then
+            _G.table.insert(outList, gem)
+        end
+    end
+    return outList
+end
+
+--- 获取所有没有装备宝石，以类型为索引，按照评分降序排序
+function GemstoneModel:GetAllNotUseGemDataByProfessional()
+    local GemByProfess = {}
+    local allUnloadGem = self:GetAllNotUseGemData()
+    for _, v in pairs(allUnloadGem) do
+        if not GemByProfess[v.professional] then
+            GemByProfess[v.professional] = {}
+        end
+        _G.table.insert(GemByProfess[v.professional], v)
+    end
+    for _, v in pairs(GemByProfess) do
+        _G.SortList(
+            v,
+            function(a)
+                return a:GetAttrScore()
+            end
+        )
+    end
+    return GemByProfess
+end
+
+--- 通过uid获取宝石数据
+---@return GemstoneData
+function GemstoneModel:GetGemDataByUid(uid)
+    return self.gemstoneList[uid]
+end
+
+--- 获取指定卡牌上的宝石
+function GemstoneModel:GetGemListByCardUid(cardUid)
+    local gemList = self.gemstoneInCard[cardUid]
+    if not gemList then
+        return self.resonanceGemstone
+    else
+        return gemList
+    end
+end
+
+--- 获取共鸣宝石
+function GemstoneModel:GetResonanceGemstone()
+    return self.resonanceGemstone
+end
+
+--- 获取装备在卡牌上的宝石
+function GemstoneModel:GetGemListInCard()
+    return self.gemstoneInCard
+end
+
+--- 获取所有同类型的宝石
+function GemstoneModel:GetGemListByProfessional(professional)
+    if not professional then
+        return
+    end
+    local outList = {}
+    for _, gem in pairs(self.gemstoneList) do
+        if gem.professional == professional then
+            _G.table.insert(outList, gem)
+        end
+    end
+    return outList
+end
+
+--- 获取角色装备的宝石属性
+function GemstoneModel:GetGemAttrByCardUid(cardUid)
+    local gemList = self:GetGemListByCardUid(cardUid)
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+
+    for _, gem in pairs(gemList) do
+        local attr = gem:GetAttr()
+        for _, v in pairs(attr) do
+            for _, value in pairs(v) do
+                local type = _G.tonumber(value[2]) == 2 and _G.AttCountType.basePercent or _G.AttCountType.other
+                attribute:AddValueByName(
+                    value[1],
+                    AttributeClassManager:GetValueWithName(value[1], value[3], value[2]),
+                    false,
+                    type
+                )
+            end
+        end
+        local randomAttr = gem:GetRandomAttr()
+        local cfg = _G.ConfigManager.gem_add_att_cfg
+        for _, v in pairs(randomAttr) do
+            local key = cfg[v.sid].type_attribute
+            local value = v.value
+            attribute:AddValueByName(
+                key,
+                AttributeClassManager:GetValueWithName(key, value, "2"),
+                false,
+                _G.AttCountType.basePercent
+            )
+        end
+    end
+
+    local changeAttrTypes = AttributeClassManager:GetChangeAttrTypes(attribute)
+    return attribute, changeAttrTypes
+end
+
+function GemstoneModel:GetAllUpStarGem()
+    local showGemList = { {}, {}, {}, {} }
+    local gemInCardList = self:GetGemListInCard()
+    local foodList = self:GetAllNotUseGemData()
+    local foodDict = {}
+    for _, v in pairs(foodList) do
+        if not foodDict[v.sid] then
+            foodDict[v.sid] = {}
+        end
+        _G.table.insert(foodDict[v.sid], v)
+    end
+
+    local AddShowList = function(showGemList, gem, dict)
+        local maxStarNum = gem.cfg.star_limit - gem.star
+        maxStarNum = gem.cfg.upgrade_equip == 0 and maxStarNum or maxStarNum + 1
+        local foods = {}
+        while true do
+            if maxStarNum <= 0 then
+                break
+            end
+            if #dict[gem.sid] <= 0 then
+                break
+            end
+            local food = _G.table.remove(dict[gem.sid], 1)
+            maxStarNum = maxStarNum - food.star - 1
+            _G.table.insert(foods, food.uid)
+        end
+        local sid, star
+        if maxStarNum > 0 then
+            sid = gem.sid
+            star = gem.cfg.star_limit - maxStarNum + 1
+        else
+            sid = gem.cfg.upgrade_equip == 0 and gem.sid or gem.cfg.upgrade_equip
+            star = 0
+        end
+        _G.table.insert(showGemList[gem.professional],
+            { sid = sid, uid = gem.uid, food = foods, star = star })
+    end
+
+    for _, list in pairs(gemInCardList) do
+        for _, gem in pairs(list) do
+            if foodDict[gem.sid] and #foodDict[gem.sid] > 0 then
+                AddShowList(showGemList, gem, foodDict)
+            end
+        end
+    end
+
+    local temp = {}
+    for _, v in pairs(foodDict) do
+        if #v >= 2 then
+            _G.table.insert(temp, v)
+        end
+    end
+    for i = 1, #temp do
+        if temp[i] and #temp[i] > 0 then
+            local gem = _G.table.remove(temp[i], 1)
+            AddShowList(showGemList, gem, foodDict)
+        end
+    end
+    return showGemList
+end
+
+---镶嵌
+---@param gemList table<table<professional,gemUid>> 镶嵌列表
+function GemstoneModel:Mosaic(cardUid, gemList, call)
+    require("GemstoneNet"):GetInstance():Mosaic(
+        { mosaics = { { hero_uid = cardUid, mosaic = gemList } } }, function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            for _, v in pairs(gemList) do
+                local gem = self:GetGemDataByUid(v.value)
+                gem.cardUid = cardUid
+                if not self.gemstoneInCard[cardUid] then
+                    self.gemstoneInCard[cardUid] = {}
+                end
+                if self.gemstoneInCard[cardUid][v.key] then
+                    gem.level = self.gemstoneInCard[cardUid][v.key].level
+                    self.gemstoneInCard[cardUid][v.key].cardUid = 0
+                    self.gemstoneInCard[cardUid][v.key].level = 0
+                end
+                self.gemstoneInCard[cardUid][v.key] = gem
+            end
+            local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid)
+            cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            self:UpdateResonanceGem()
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneReplace.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpLv.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpGrade.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---卸下宝石
+function GemstoneModel:Upload(cardUid, professional, call)
+    require("GemstoneNet"):GetInstance():Unload(
+        { hero_uid = cardUid, slot_index = professional },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local gemList = self:GetGemListByCardUid(cardUid)
+            local gem = gemList[professional]
+            gemList[professional] = nil
+            gem.cardUid = 0
+            gem.level = 0
+            self:UpdateResonanceGem()
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Gemstone)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneReplace.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpLv.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpGrade.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---宝石替换
+function GemstoneModel:Replace(cardUid1, cardUid2, professional, call)
+    require("GemstoneNet"):GetInstance():Replace(
+        { hero_uid = cardUid1, target_hero_uid2 = cardUid2, slot_index = professional },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local gem = self.gemstoneInCard[cardUid1][professional]
+            if gem then
+                gem.cardUid = cardUid2
+            end
+            self.gemstoneInCard[cardUid2][professional].cardUid = cardUid1
+            self.gemstoneInCard[cardUid1][professional] = self.gemstoneInCard[cardUid2][professional]
+            self.gemstoneInCard[cardUid2][professional] = gem
+            local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid1)
+            cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid2)
+            cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---两个卡牌相互交换
+function GemstoneModel:CardReplace(cardUid1, cardUid2, call)
+    require("GemstoneNet"):GetInstance():CardReplace(
+        { hero_uid = cardUid1, target_hero_uid2 = cardUid2 },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local gemList1 = self.gemstoneInCard[cardUid1] or {}
+            local gemList2 = self.gemstoneInCard[cardUid2] or {}
+            for _, gem in pairs(gemList1) do
+                gem.cardUid = cardUid2
+            end
+            for _, gem in pairs(gemList2) do
+                gem.cardUid = cardUid1
+            end
+            self.gemstoneInCard[cardUid1] = gemList2
+            self.gemstoneInCard[cardUid2] = gemList1
+            local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid1)
+            cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid2)
+            cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---一键卸下
+function GemstoneModel:AutoUnload(cardUidList, call)
+    require("GemstoneNet"):GetInstance():AutoUnload(
+        { hero_uid = cardUidList },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            for _, uid in pairs(cardUidList) do
+                local gemList = self.gemstoneInCard[uid] or {}
+                for _, gem in pairs(gemList) do
+                    gem.cardUid = 0
+                    gem.level = 0
+                end
+                self.gemstoneInCard[uid] = {}
+            end
+            for _, uid in pairs(cardUidList) do
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, uid)
+                cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            end
+            self:UpdateResonanceGem()
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneReplace.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpLv.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpGrade.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---重生
+function GemstoneModel:Reborn(uid, call)
+    require("GemstoneNet"):GetInstance():ManualReborn(
+        { gem_uid = uid },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.gemstoneList[uid].level = 0
+            self:UpdateResonanceGem(true)
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Gemstone)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpLv.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---升级
+---@param upInfo table<table<key,value>> key:professional,类型；value:toLv,到达的等级
+function GemstoneModel:LevelUp(cardUid, upInfo, call)
+    require("GemstoneNet"):GetInstance():Upgrade(
+        { card_uid = cardUid, info = upInfo },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local minLevel = 9999
+            for _, info in pairs(upInfo) do
+                self.gemstoneInCard[cardUid][info.key]:SetLevel(info.value)
+                minLevel = _G.math.min(minLevel, info.value)
+            end
+            local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid)
+            cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            self:UpdateResonanceGem()
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpLv.id)
+            _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {
+                    _G.ActiveTaskEnum.ConditionEnum.Gemstone.HasGemWithLevelHistory,
+                    minLevel
+                },
+                #upInfo
+            )
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---升星
+---@param uid number 宝石uid
+---@param consumeUidList list<number> 消耗的宝石uid
+---@param upStar number 指定的星级
+function GemstoneModel:UpStar(uid, consumeUidList,upStar , call)
+    require("GemstoneNet"):GetInstance():UpStar(
+        { gem_uid = uid, consume_gem_uids = consumeUidList },
+        function(msg)
+            for _, v in pairs(consumeUidList) do
+                local gem = self.gemstoneList[v]
+                _G.StorageManager:GetInstance():ConsumeItem(gem.sid, v, 1)
+                gem:Dispose()
+                self.gemstoneList[v] = nil
+            end
+            self.gemstoneList[uid]:StarUp(upStar)
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            local cardUid = self.gemstoneList[uid].cardUid
+            if cardUid ~= 0 then
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid)
+                cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            end
+            self:UpdateResonanceGem()
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneReplace.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpGrade.id)
+            _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {
+                    _G.ActiveTaskEnum.ConditionEnum.Gemstone.HasGemWithGradeHistory,
+                    self.gemstoneList[uid].grade
+                },
+                1
+            )
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---一键升星
+function GemstoneModel:AllUpStar(data, call)
+    local db = {}
+    for _, v in pairs(data) do
+        _G.table.insert(db, v.info)
+    end
+    require("GemstoneNet"):GetInstance():OneUpStar(
+        {infos = db},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            for _, info in pairs(data) do
+                for _, v in pairs(info.info.consume_gem_uids) do
+                    local gem = self.gemstoneList[v]
+                    if gem then
+                        _G.StorageManager:GetInstance():ConsumeItem(gem.sid, v, 1)
+                        gem:Dispose()
+                        self.gemstoneList[v] = nil
+                    end
+                end
+                -- self.gemstoneList[info.info.gem_uid]:StarUp(info.upStar)
+                if info.cardUid ~= 0 then
+                    local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, info.cardUid)
+                    cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+                end
+                _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                        _G.ActiveTaskEnum.ConditionEnum.Gemstone.HasGemWithGradeHistory,
+                        self.gemstoneList[info.info.gem_uid].grade
+                    },
+                    1
+                )
+            end
+            for _, v in pairs(msg.gem) do
+                local gem = self.gemstoneList[v.uid]
+                gem:Parse(v)
+            end
+            self:UpdateResonanceGem()
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneReplace.id)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GemstoneUpGrade.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---洗炼
+---@param uid number 宝石uid
+---@param type number 洗炼类型 1：单次洗练，2：五次洗练
+---@param lock_index list<number> 锁定的词条索引
+function GemstoneModel:Reset(uid, type, lock_index, call)
+    require("GemstoneNet"):GetInstance():ResetAttr(
+        { gem_uid = uid, type = type, lock_index = lock_index },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local gem = self.gemstoneList[uid]
+            for _, v in pairs(msg.attr) do
+                _G.SortList(
+                    v.addition,
+                    function(a)
+                        return -a.index
+                    end
+                )
+            end
+            gem.reset = msg.attr
+            local cardUid = gem.cardUid
+            if cardUid ~= 0 then
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid)
+                cardData:CalcNowSumProp(_G.AttrFunType.Gemstone)
+            end
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---词条选择
+---@param index number 选择词条索引
+---@param type number 1:保留 2:替换 ,保留时，不用索引
+function GemstoneModel:SelectResetAttr(uid, index, type, newAttr, call)
+    require("GemstoneNet"):GetInstance():ChooseAttr(
+        { uid = uid, index = index, type = type },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if type == 2 then
+                local gem = self.gemstoneList[uid]
+                if gem then
+                    if not _G.table.isEmptyOrNil(newAttr) then
+                        _G.SortList(
+                            newAttr,
+                            function(a)
+                                return -a.index
+                            end
+                        )
+                        gem.randomAttr = newAttr
+                    end
+                    gem.reset = {}
+                    if gem.cardUid and gem.cardUid ~= 0 then
+                        local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, gem.cardUid)
+                        cardData:CalcNowSumProp()
+                    end
+                end
+            end
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+-- 获取属性评分
+function GemstoneModel:GetAdditionsScore(attr)
+    local gem_add_att_cfg = _G.ConfigManager.gem_add_att_cfg
+    local score = 0
+    local sid, num
+    for _, value in pairs(attr) do
+        ---- 当前属性格式   or   洗炼出的属性格式
+        sid = value.sid
+        num = value.value
+        ---属性评分 = 配置值 直接 *  基数
+        score = score + num * gem_add_att_cfg[sid].score_base
+    end
+    return score
+end
+
+function GemstoneModel:GetExtraAttrChangeLevel()
+    if not self.extraAttrChangeLevel then
+        local extraAttrList = {}
+        for _, v in pairs(_G.ConfigManager.gem_level_cfg) do
+            if v.extra_growth ~= 0 then
+                if #extraAttrList == 0 or extraAttrList[#extraAttrList][2] ~= v.extra_growth then
+                    _G.table.insert(extraAttrList, {v.level, v.extra_growth})
+                end
+            end
+        end
+        self.extraAttrChangeLevel = extraAttrList
+    end
+    return self.extraAttrChangeLevel
+end
+
+--endregion
+
+--region 红点接口
+
+function GemstoneModel:ReplaceRedPoint()
+    local gemList = {}
+    for _, gem in pairs(self.gemstoneList) do
+        if not gemList[gem.professional] then
+            gemList[gem.professional] = {}
+        end
+        if gem.cardUid == 0 then
+            _G.table.insert(gemList[gem.professional], gem)
+        end
+    end
+    for _, v in pairs(gemList) do
+        _G.SortList(v,function (item)
+            return item:GetAttrScore()
+        end)
+    end
+    for _, v in pairs(self.gemstoneInCard) do
+        for i = 1, 4 do
+            if not v[i] and gemList[i] and gemList[i][1] then
+                return 1
+            else
+                if gemList[i] and gemList[i][1] and v[i]:GetAttrScore() < gemList[i][1]:GetAttrScore() then
+                    return 1
+                end
+            end
+        end
+    end
+    return 0
+end
+
+function GemstoneModel:UpLvRedPoint()
+    local maxLv = 10
+    local count = 0
+    local cardUidList = require("CardResonanceModel"):GetInstance():GetAllPosCardsUids()
+    local material = {}
+    local lvList = {}
+    local level_cfg = _G.ConfigManager.gem_level_cfg
+
+    for _, v in pairs(cardUidList) do
+        local gemDataList = self:GetGemListByCardUid(v)
+        lvList[v] = {}
+        for i, gem in pairs(gemDataList) do
+            lvList[v][i] = gem.level
+        end
+    end
+
+    local function getMinLv()
+        local lv = 99999
+        for _, list in pairs(lvList) do
+            for i = 1, 4 do
+                local num = list[i] or 0
+                if num < lv then
+                    lv = num
+                end
+            end
+        end
+        return lv
+    end
+
+    local curMinLv = getMinLv()
+
+    for _, cardUid in pairs(cardUidList) do
+        if cardUid and cardUid ~= 0 then
+            local gemDataList = self:GetGemListByCardUid(cardUid)
+            for _ = 1, maxLv do
+                local upLv = false
+                for k, v in pairs(lvList[cardUid]) do
+                    local gemData = gemDataList[k]
+                    if v >= gemData.cfg.strengthen_level then
+                    elseif level_cfg[v + 1].min_level > curMinLv or not _G.GlobalConditionManager.CheckConditionArrays(level_cfg[v + 1].condition) then
+                    else
+                        local flag = true
+                        local AddMater = {}
+                        local nextCfg = level_cfg[v + 1]
+                        for _, mater in pairs(nextCfg.material_1) do
+                            AddMater[mater[1]] = mater[2]
+                        end
+                        for _, mater in pairs(level_cfg[v].material_1) do
+                            AddMater[mater[1]] = AddMater[mater[1]] - mater[2]
+                        end
+                        for sid, num in pairs(AddMater) do
+                            local sum = material[sid] or 0
+                            if not _G.StorageManager:GetInstance():CheckItem(sid, num + sum) then
+                                flag = false
+                                break
+                            end
+                        end
+                        if flag then
+                            for sid, num in pairs(AddMater) do
+                                material[sid] = (material[sid] or 0) + num
+                            end
+                            lvList[cardUid][k] = v + 1
+                            upLv = true
+                            if v == curMinLv then
+                                curMinLv = getMinLv()
+                            end
+                        end
+                    end
+                end
+                if not upLv then
+                    break
+                end
+                count = count + 1
+                if count >= 10 then
+                    return 1
+                end
+            end
+        end
+    end
+    return 0
+end
+
+function GemstoneModel:UpGradeRedPoint()
+    local gemInCardList = self:GetGemListInCard()
+    local foodList = self:GetAllNotUseGemData()
+
+    local foodBySid = {}
+    for _, v in pairs(foodList) do
+        if v:CheckCanStarUp() then
+            -- 用来判断是否为最高品质的最高星级
+            foodBySid[v.sid] = 1 + (foodBySid[v.sid] or 0)
+            if foodBySid[v.sid] > 1 then
+                return 1
+            end
+        end
+    end
+
+    for _, v in pairs(gemInCardList) do
+        for _, gem in pairs(v) do
+            if gem:CheckCanStarUp() then
+                if foodBySid[gem.sid] then
+                    return 1
+                end
+            end
+        end
+    end
+
+    return 0
+end
+
+--endregion
+
+return GemstoneModel

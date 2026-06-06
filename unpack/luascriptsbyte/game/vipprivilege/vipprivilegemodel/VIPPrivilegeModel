@@ -1,0 +1,579 @@
+-------------------------------------------------------------------------
+-- D:.Game.Client.Assets.Resources.LuaScripts.Game.VIPPrivilege.VIPPrivilegeModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/08/04
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local GameDataModelBase = require "GameDataModelBase"
+local VIPPrivilegeData = require "VIPPrivilegeData"
+---@class VIPPrivilegeModel : Singleton	vip特权
+local VIPPrivilegeModel = _G.BaseClass("VIPPrivilegeModel", GameDataModelBase)
+---@return VIPPrivilegeModel VIPPrivilegeModel
+function VIPPrivilegeModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+---@param currentVipLevel number 当前特权vip 等级
+---@param oldVipLevel number 以前的特权vip 等级
+---@param total_exp number 经验总值
+---@param isUpLevel boolean 等级是否提升
+---@param Conversion_Rate number 兑换比例
+function VIPPrivilegeModel:__init()
+    self.endCallback = nil
+    self.curFunctionOpenID = 0
+    self.currentVipLevel = 1
+    self.realVipLevel = 1
+    self.oldVipLevel = 1
+    self.total_exp = 0
+    self.p_award = {}
+    self.isUpLevel = false
+    self.vipmaxlevel = _G.ConfigManager.discrete_cfg[105903][1][1]
+    self.Conversion_Rate = {}
+    self.all_player_vip = {}
+    self.uplevel = 0
+    self.day_award = false
+    self.isRedFirt = false --- 用来检测时 每次登录
+end
+
+---销毁对象时,析构函数
+function VIPPrivilegeModel:Dispose()
+    self.currentVipLevel = nil
+    self.realVipLevel = nil
+    self.oldVipLevel = nil
+    self.total_exp = nil
+    self.p_award = nil
+    self.Conversion_Rate = nil
+    self.day_award = nil
+end
+
+function VIPPrivilegeModel:GetDataFormServer()
+    require "VIPPrivilegeNet":GetInstance():AccessVipInfo(_G.handler(self, self.ParseData))
+end
+
+function VIPPrivilegeModel:ParseData(msg)
+    self.msg = msg
+    self.Conversion_Rate = _G.ConfigManager.discrete_cfg[105901]
+    self:InitPlayerVipData()
+    self.super.ParseData(self)
+end
+
+function VIPPrivilegeModel:InitFunction()
+end
+
+function VIPPrivilegeModel:ReConnect(endcall)
+    require "VIPPrivilegeNet":GetInstance():AccessVipInfo(
+        function(msg)
+            self.msg = msg
+            self:InitFunction()
+            self.Conversion_Rate = _G.ConfigManager.discrete_cfg[105901]
+            self:InitPlayerVipData()
+            self:GetFreeGift(true)
+            local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.VIPPrivilegeView.Name)
+            if window then
+                window.View:UpdateDesc()
+                window.View:UpdateView()
+            end
+            if endcall then
+                endcall()
+            end
+        end
+    )
+end
+
+---跨天刷新
+function VIPPrivilegeModel:OnSixClockUpdate(endcall)
+    require "VIPPrivilegeNet":GetInstance():AccessVipInfo(
+        function(msg)
+            self.msg = {}
+            self.p_award = {} --人民币 购买
+            self.msg = msg
+            self:InitPlayerVipData()
+            local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.VIPPrivilegeGiftView.Name)
+            if window then
+                window.View:UpdateDesc()
+            end
+        end
+    )
+
+    if endcall then
+        endcall()
+    end
+end
+
+function VIPPrivilegeModel:InitPlayerVipData()
+    if self.msg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("palyer_msg  数据是空")
+        end
+    end
+    self.all_player_vip = {}
+    self.oldVipLevel = self.msg.lv
+    self.currentVipLevel = self.msg.lv
+    self.realVipLevel = self.msg.lv
+    self.lastRealVipLv = self.msg.lv
+    self.total_exp = self.msg.exp
+    self.p_award = self.msg.p_award
+    self.award_list = self.msg.award_list or {}
+    self.day_award = self.msg.day_award or false
+    self.vip_repair = self.msg.vip_repair or false
+    self.need_count = self.msg.need_count
+
+    --封装数据
+    local MallManager = require("MallManager"):GetInstance()
+    local cfg = _G.ConfigManager.player_vip_cfg
+    for i = 1, #cfg do
+        local p_data = VIPPrivilegeData.New()
+        p_data:ParseInitMsg({ id = i })
+        local state, buystate = 0, 0
+        --设置奖励的状态
+        if self.msg.lv < i and self.total_exp < cfg[i].exp then
+            state = 0
+        else
+            state = 1
+            p_data:SetVIPPrivile()
+            buystate = 1
+            ---购买状态
+            if MallManager:GetItemBuyTimes(p_data.goods.itemid, p_data.goods.type_reset) > 0 then
+                buystate = 2
+            end
+        end
+        p_data:SetIsLock(state)
+        p_data:SetAwardState(buystate)
+        if self.all_player_vip[i] == nil then
+            self.all_player_vip[i] = {}
+        end
+        self.all_player_vip[i] = p_data
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.VipPage.id)
+    require("AfkModel"):GetInstance():SetPrivilegeAward()
+
+    --客户端是否自动更新vip经验代币的背包数据 true:需要更新  false:不用管
+    --说明: 由于vip抽奖系统上线后,玩家第一次登陆后,后台自动补发奖励,可能会导致客户端与服务器道具数
+    --据不一致的情况。因此给客户端一个标记符，在服务器发奖后.让客户端更新背包数据
+    local maxexp = cfg[#cfg].exp
+    if self.total_exp >= maxexp then
+        self.IsMaxExp = true
+        _G.PlayerPrefsManager.SetInt("VIPDrawTenTimes", 0)
+        if self.vip_repair and (self.total_exp - maxexp) > 0 then
+            _G.StorageManager:GetInstance():AddItemByData(_G.StorageID.ResProp, 79, self.total_exp - maxexp)
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LotteryPremium.id)
+        end
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LotteryPremium.id)
+    else
+        self.IsMaxExp = false
+    end
+end
+
+---改变 oldVipLevel 等级 用在升级界面
+function VIPPrivilegeModel:ChangeOldLevel()
+    self.oldVipLevel = self.oldVipLevel + self.uplevel
+    if self.oldVipLevel >= self.currentVipLevel then
+        self.oldVipLevel = self.currentVipLevel
+    end
+    if self.oldVipLevel >= self.vipmaxlevel then
+        self.oldVipLevel = self.vipmaxlevel
+    end
+end
+
+---改变 当前的等级
+function VIPPrivilegeModel:ChangeCurLevel(level)
+    self.currentVipLevel = self.currentVipLevel + level
+    _G.Events:GetInstance():Broadcast(_G.ePlayerStatus.PlayerUpVipLevel, self.currentVipLevel)
+    if self.currentVipLevel > self.realVipLevel then
+        self.currentVipLevel = self.realVipLevel
+    end
+    if self.currentVipLevel >= self.vipmaxlevel then
+        self.currentVipLevel = self.vipmaxlevel
+    end
+end
+
+---改变 等级是否提升 是否可以打开升级界面
+function VIPPrivilegeModel:ChangeIsUpLevel()
+    self.isUpLevel = not self.isUpLevel
+end
+
+function VIPPrivilegeModel:NotificationLevel(level)
+    self:ChangeCurLevel(level)
+end
+
+function VIPPrivilegeModel:ChangerTotaleExp(exp)
+    self.total_exp = self.total_exp + exp
+    local cfg = _G.ConfigManager.player_vip_cfg
+    local maxexp = cfg[#cfg].exp
+    if self.total_exp >= maxexp then
+        self.IsMaxExp = true
+    else
+        self.IsMaxExp = false
+    end
+    for _, v in ipairs(cfg) do
+        if self.total_exp < v.exp then
+            if v.id - 1 ~= self.realVipLevel then
+                self.realVipLevel = v.id - 1
+                _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.VIP)
+            end
+            return
+        end
+    end
+    if self.realVipLevel ~= self.vipmaxlevel then
+        self.realVipLevel = self.vipmaxlevel
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.VIP)
+    end
+end
+
+function VIPPrivilegeModel:GetVIpInfo(level)
+    return self.all_player_vip[level]
+end
+
+--region 对外接口调用 打开界面
+---特殊判定
+function VIPPrivilegeModel:ChangeVipFirstState()
+    if self.oldVipLevel == 1 then
+        local exp = self.all_player_vip[1].max_exp
+        if self.total_exp >= exp and self.all_player_vip[1]:GetIsLock() == 0 then
+            self.all_player_vip[1]:SetIsLock(1)
+            self.all_player_vip[1]:SetAwardState(1)
+            self.all_player_vip[1]:SetVIPPrivile()
+            self.isRedFirt = false
+        end
+    end
+end
+
+function VIPPrivilegeModel:NotificationExp(coin)
+    if self.currentVipLevel >= self.vipmaxlevel then
+        return
+    end
+    if self.tempExp and self.tempExp ~= self.total_exp then
+        self.tempExp = self.total_exp
+        return
+    end
+    if not self.isUpLevel then
+        self.uplevel = 0
+    end
+
+    self:ChangerTotaleExp(coin)
+    ---特殊判定 等级是1 处理
+    self:ChangeVipFirstState()
+    --改变奖励状态
+    for i = 2, #self.all_player_vip do
+        if self.all_player_vip[i].max_exp <= self.total_exp and self.all_player_vip[i]:GetIsLock() == 0 then
+            self.all_player_vip[i]:SetIsLock(1)
+            self.all_player_vip[i]:SetAwardState(1)
+            self.all_player_vip[i]:SetVIPPrivile()
+            self.uplevel = self.uplevel + 1
+        end
+    end
+    --是否是提升等级
+    if self.uplevel > 0 then
+        self.isRedFirt = false
+        self.isUpLevel = true
+        self:GetFreeGift()
+        ---发送VIP 检测事件
+        _G.Events:GetInstance():Broadcast(_G.ePlayAactionEvent.VIP, 0)
+        ---刷新红点
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.VipPage.id)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StoreVoucher.id)
+        self:AddVipPopQuene()
+    end
+    self.lastRealVipLv = self.realVipLevel
+    ---当界面中打开时 更新界面数据
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.VIPPrivilegeView.Name)
+    if window then
+        if not self.isUpLevel then
+            window.View:UpdateViewOneData()
+        end
+    end
+    self.tempExp = self.total_exp
+end
+
+---Vip提升弹窗
+function VIPPrivilegeModel:AddVipPopQuene()
+    local popFuncItem = {}
+    popFuncItem.OpenViewFun = function(endCallback)
+        self:ChangeCurLevel(self.uplevel)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.VIPPrivilegeUpLevelView.Name, endCallback)
+    end
+    _G.PopWindowManager:GetInstance():AddPopWindowQuene(popFuncItem, _G.PopViewShowOrder.VipLevelUp)
+end
+
+---领取免费礼包
+function VIPPrivilegeModel:RequestFreeGift(i)
+    local promotion = self.all_player_vip[i].player_vip_cfg.promotion
+    if not _G.table.isEmptyOrNil(promotion) and _G.table.indexof(self.award_list, i) == false then
+        require("VIPPrivilegeNet"):GetInstance():FreeAwardVIp({ id = i }, function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.table.insert(self.award_list, i)
+        end)
+    end
+end
+
+---获取免费礼包
+---@param isReconnect boolean 是否重连
+function VIPPrivilegeModel:GetFreeGift(isReconnect)
+    if isReconnect then
+        for i = 1, self.realVipLevel do
+            self:RequestFreeGift(i)
+        end
+        return
+    end
+
+    if self.lastRealVipLv < self.realVipLevel then
+        for i = self.lastRealVipLv + 1, self.realVipLevel do
+            self:RequestFreeGift(i)
+        end
+    end
+end
+
+---资源数据改变
+-----region 对外接口 获得 卡牌,删除卡牌
+---@param add table key== uid,value == sid
+---@param rem table key == uid,value == sid
+---@param change table key == uid,vale == sid
+function VIPPrivilegeModel:AddorRemOrChange(add, rem, change)
+    local temp = {}
+    if not _G.table.isEmptyOrNil(add) then
+        for key, va in pairs(add) do
+            if va == 12 then
+                _G.table.insert(temp, va)
+            end
+        end
+    end
+    if not _G.table.isEmptyOrNil(change) then
+        for key, va in pairs(change) do
+            if va == 12 then
+                _G.table.insert(temp, va)
+            end
+        end
+    end
+    if _G.table.isEmptyOrNil(temp) then
+        return
+    end
+    ---刷新红点
+    -- require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.VipPage.id)
+end
+
+function VIPPrivilegeModel:OpenWindow()
+    --打开VIP界面
+    --打开VIP 升级界面
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.VIPPrivilegeView)
+    if self.isUpLevel then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.VIPPrivilegeUpLevelView.Name)
+    end
+end
+
+---购买VIP礼包
+---@param vipid number vip特权配置表 id
+function VIPPrivilegeModel:BuyVipGiftBag(vipLv, call)
+    local vipinfo = self.all_player_vip[vipLv]
+    local goods = vipinfo.goods
+    require("MallNet"):GetInstance():BuyItem(
+        goods.store_exchange,
+        1,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            require("MallManager"):GetInstance():SetItemBuyTimes(goods.itemid, goods.type_reset, 1)
+            _G.StorageManager:GetInstance():ConsumeItem(goods.type_price, 0, goods.price)
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.PopWindowManager:GetInstance():AddAwardPopQuene(msg)
+            vipinfo:SetAwardState_Buy(2)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---领取特权礼包
+---@param p_id number 26周礼包 27月礼包
+function VIPPrivilegeModel:BuyVipPrivilegeGiftBag(p_id, call)
+    local msg = {
+        p_id = p_id
+    }
+    require "VIPPrivilegeNet":GetInstance():BuyVipPrivilegeGiftBag(
+        msg,
+        _G._G.handlerbind(self, self.BuyVipPrivilegeGiftBagSuc, p_id, call)
+    )
+end
+
+function VIPPrivilegeModel:BuyVipPrivilegeGiftBagSuc(data, p_id, call)
+    if data.ack ~= 1 then
+        return
+    end
+    --添加仓库
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    _G.PopWindowManager:GetInstance():AddAwardPopQuene(data)
+    --添加
+    if self.p_award == nil then
+        self.p_award = {}
+    end
+    _G.table.insert(self.p_award, p_id)
+    --刷新密令特权红点
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.VipGift.id)
+    if call then
+        call()
+    end
+end
+
+--region 对外接口
+---红点关闭逻辑，点击关闭界面，不在显示红点数据
+function VIPPrivilegeModel:CloseVIpRedPoint()
+    self.isRedFirt = true
+    ---刷新红点
+    --require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.VipPage.id)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.VipBattle.id)
+end
+
+---镇魂密令 页签检测红点 (每次登录得时候检测)
+function VIPPrivilegeModel:CheckYeQianRed()
+    --是否有数据
+    if self.all_player_vip then
+    else
+        return false
+    end
+    ---检测每次登录
+    if self.isRedFirt then
+        return false
+    end
+    --是不是未解锁的状态
+    for i = 1, #self.all_player_vip do
+        if self.all_player_vip[i]:GetIsLock() == 0 then
+            return true
+        end
+    end
+    return false
+end
+
+---缓存vip
+---@param forceRefresh boolean 强制刷新红点
+function VIPPrivilegeModel:RefreshRedPoint(vipId, forceRefresh)
+    local unlockLv = _G.PlayerPrefsManager.GetTable("VIP_Unlock_Lv") or {}
+
+    if vipId then
+        if self.realVipLevel >= vipId and not unlockLv[vipId] then
+            unlockLv[vipId] = 1
+            _G.PlayerPrefsManager.SetTable("VIP_Unlock_Lv", unlockLv)
+            require "RedPointManager":GetInstance():RefreshNode(
+                _G.ConfigManager.redpoint_cfg.VipPage.id,
+                vipId
+            )
+        elseif forceRefresh then
+            require "RedPointManager":GetInstance():RefreshNode(
+                _G.ConfigManager.redpoint_cfg.VipPage.id,
+                vipId
+            )
+        end
+        -- else
+        --     if self.realVipLevel and self.realVipLevel > _G.table.count(unlockLv) then
+        --         for lv = 1, self.realVipLevel do
+        --             if not unlockLv[lv] then
+        --                 unlockLv[lv] = 1
+        --             end
+        --         end
+        --         _G.PlayerPrefsManager.SetTable("VIP_Unlock_Lv", unlockLv)
+        --         require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.VipPage.id)
+        --     end
+    end
+end
+
+---检测vip等级解锁后是否点击
+function VIPPrivilegeModel:CheckGiftBagIsBuy(vipid)
+    local unlockLv = _G.PlayerPrefsManager.GetTable("VIP_Unlock_Lv") or {}
+    if not unlockLv[vipid] and self.realVipLevel >= vipid then
+        return true
+    end
+
+    local vipinfo = self.all_player_vip[vipid]
+    if vipid <= self.realVipLevel and vipinfo:GetAwardState_Buy() ~= 2 then
+        local cfg = _G.ConfigManager.store_exchange_cfg[vipinfo.player_vip_cfg.store_exchange]
+        if cfg.price == 0 then
+            return true
+        end
+    end
+
+    return false
+end
+
+---红点检测
+function VIPPrivilegeModel:CheckRedNumer(param)
+    local flag = self:CheckGiftBagIsBuy(param)
+    return flag and 1 or 0
+end
+
+---对外接口 检测密令特权红点
+--检测密令特权有可领取未领取奖励时，在页签和福利按钮上显示红点；全部领取后，红点消失；
+--密令特权有未达到领取条件时在页签和福利按钮上显示红点，进入一次页签后红点消失；
+function VIPPrivilegeModel:CheckRedMiling()
+    --没有开启
+    if not self:CheckGiftOpen() then
+        return false
+    end
+    if _G.table.isEmptyOrNil(self.all_player_vip) or self.all_player_vip == nil then
+        return false
+    end
+    if _G.PlayerPrefsManager.GetInt("VIPPrivilegeMiLing" .. _G.PlayerModel:GetInstance():GetPlayerUid()) ~= 1 then
+        return true
+    end
+
+    local gift_list = {}
+    for i = 1, #self.all_player_vip do
+        if self.all_player_vip[i].weekid > 0 then
+            _G.table.insert(gift_list, self.all_player_vip[i])
+        elseif self.all_player_vip[i].monthid > 0 then
+            _G.table.insert(gift_list, self.all_player_vip[i])
+        end
+    end
+    ---1 代表周礼包 2 代表月礼包
+    --local unLingqu = false
+    for i = 1, 2 do
+        local pri_enum = _G.PrivilegeType.VIP.WeekGift
+        if i == 2 then
+            pri_enum = _G.PrivilegeType.VIP.MonthGift
+        end
+        local falg = self:CheckGift(pri_enum, gift_list[i].id)
+        if falg == 1 then -- 有可以领取的奖励
+            return true
+        end
+    end
+    return false
+end
+
+function VIPPrivilegeModel:CheckGiftOpen()
+    local falg = false
+    local open = _G.ConfigManager.discrete_cfg[105902]
+    if self.currentVipLevel >= (open[1][1] - open[1][2]) then
+        falg = true
+    end
+    return falg
+end
+
+function VIPPrivilegeModel:CheckGift(id, vipid)
+    if vipid > self.currentVipLevel then
+        return 0   --没有达到领取条件
+    end
+    local flag = 1 -- 可以领取
+    if self.p_award then
+        for i = 1, #self.p_award do
+            if self.p_award[i] == id then
+                flag = 2 --已经领取
+            end
+        end
+    end
+    return flag
+end
+
+function VIPPrivilegeModel:GetAllAttribute()
+    if _G.table.isEmptyOrNil(self.all_player_vip) then
+        return { attribute = {}, attributePercent = {}, attriOther = {} }, {}
+    end
+    local attr = self.all_player_vip[self.realVipLevel]:GetAllAttribute()
+    local attributeChangeType = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attr)
+    return attr, attributeChangeType
+end
+
+return VIPPrivilegeModel

@@ -1,0 +1,471 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.HellGuardView.Model.AcientEvilComesModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/08/01
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+---@class AcientEvilComesModel:GameDataModelBase	中文描述
+---@field infoData HellGuardInfoData 信息数据
+---@field TaskDatas HellRoadTaskData[] 任务数据
+local AcientEvilComesModel = _G.BaseClass("AcientEvilComesModel", _G.GameDataModelBase)
+---@return AcientEvilComesModel AcientEvilComesModel
+function AcientEvilComesModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+local TimeID = 107101
+local stars_goal_cfg = _G.ConfigManager.stars_goal_cfg
+local stars_mission_cfg = _G.ConfigManager.stars_mission_cfg
+---创建对象时,入口构造函数
+function AcientEvilComesModel:__init()
+    self.TaskDatas = {}
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIShow, self.UpdataOnUIShow, self)
+
+    self.taskModel = require "AcientEvilTaskModel".New()
+    self.curFunctionOpenID = _G.FunctionID.AcientEvilComes
+    self:InitCfgData()
+end
+
+---销毁对象时,析构函数
+function AcientEvilComesModel:Dispose()
+    self.GoalCfg = nil
+    self.TaskCfg = nil
+    self.MissionCfg = nil
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    self.TaskDatas = nil
+    self.curFunctionOpenID = nil
+    self.MaxActiveGoalValue = nil
+    self.taskArray = nil
+    if self.Timer ~= nil then
+        self.Timer:Stop()
+        self.Timer = nil
+    end
+end
+---初始化配置表信息
+function AcientEvilComesModel:InitCfgData()
+    self.GoalCfg = {}
+    self.TaskCfg = {}
+    --{key:taskid,value:mission_cfg.id}
+    self.MissionCfg = {}
+    self.MaxActiveGoalValue = 0 --活跃度最大值
+    for k, v in pairs(stars_goal_cfg) do
+        if v.value_active > self.MaxActiveGoalValue then
+            self.MaxActiveGoalValue = v.value_active
+        end
+        self.GoalCfg[v.id] = {id = v.id, value = v.value_active, reward = v.reward, state = 0}
+    end
+    for k, v in pairs(stars_mission_cfg) do
+        _G.table.insert(
+            self.MissionCfg,
+            {id = v.id, display_priority = v.display_priority, name = v.name, missions = v.mission_group}
+        )
+        for _, taskid in pairs(v.mission_group) do
+            self.TaskCfg[taskid] = v.id
+        end
+    end
+    _G.SortList(
+        self.MissionCfg,
+        function(a)
+            return -a.display_priority
+        end
+    )
+end
+--region 子类重写
+---从服务器拉取数据
+function AcientEvilComesModel:GetDataFormServer()
+    if not self:CheckIsOpen() then
+        self:ParseData()
+        _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.AcientEvil)
+        return
+    end
+    self:GetInfo()
+end
+function AcientEvilComesModel:GetNumcollectors(id)
+    if self.collectors == nil then
+        self.collectors = {}
+
+        for key, value in pairs(_G.ConfigManager.stars_mission_cfg) do
+            local k = {}
+            for i = 1, _G.table.count(value.type_mission) - 1 do
+                _G.table.insert(k, value.type_mission[i])
+            end
+
+            self.collectors[k] = value
+        end
+    end
+    for key, value in pairs(self.collectors) do
+        if _G.table.sameByCount(id, key) then
+            return value
+        end
+    end
+    return nil
+end
+---初始化功能逻辑
+function AcientEvilComesModel:InitFunction()
+end
+---获得任务和任务页签map
+function AcientEvilComesModel:GetMissionIdByTask(taksid)
+    return self.TaskCfg[taksid]
+end
+---获得最大活跃值
+function AcientEvilComesModel:GetMaxActiveGoal()
+    return self.MaxActiveGoalValue
+end
+---获得跳转页签
+function AcientEvilComesModel:GetTitleIndex()
+    for k, v in pairs(self.MissionCfg) do
+        if self:CheckHaveGetTask(v.id) then
+            return k
+        end
+    end
+    return nil
+end
+---获取功能倒计时
+function AcientEvilComesModel:GetCountDown()
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    local day = _G.ConfigManager.discrete_cfg[TimeID][1][1]
+    local createRoleTimeSix = _G.TimeUtil.GetDayBySix(_G.PlayerModel:GetInstance().create_time)
+    return createRoleTimeSix + day * 86400 - curTime
+end
+---检测功能状态是否开启
+function AcientEvilComesModel:CheckIsOpen()
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    local day = _G.ConfigManager.discrete_cfg[TimeID][1][1]
+    local createRoleTime = _G.PlayerModel:GetInstance().create_time
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        if _G.TimeUtil.GetInterValDayByGame(curTime, createRoleTime) + 1 <= day then
+            return true
+        else
+            return false
+        end
+    else
+        return false
+    end
+end
+--region 获取Info
+function AcientEvilComesModel:GetInfo()
+    if self.Timer ~= nil then
+        self.Timer:Stop()
+        self.Timer = nil
+    end
+    require "AcientEvilNet":GetInstance():GetInfo(_G.handler(self, self.GetInfoCall))
+end
+---获取成功回调
+function AcientEvilComesModel:GetInfoCall(msg)
+    if msg.ack == 1 then
+        self.CurActiveGoal = msg.info.active_num
+        local resdata = {
+            type = {}
+        }
+        resdata.type = {_G.ResPropID.AcientEvil, 0, self.CurActiveGoal}
+
+        ---  初始化仓库 活跃度值  tips查看活跃度道具 会显示当前拥有数量
+        _G.StorageManager:GetInstance():ParseSimpleAward(resdata)
+        for k, v in pairs(self.GoalCfg) do
+            if self.CurActiveGoal >= v.value then
+                self.GoalCfg[k].state = 2
+            end
+        end
+        if msg.info.get_active_award then
+            for k, v in pairs(msg.info.get_active_award) do
+                if self.GoalCfg[v] then
+                    self.GoalCfg[v].state = 1
+                end
+            end
+        end
+    end
+    self.taskModel:Parse(msg)
+    self:ParseData()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.StarsGoalTask.id)
+    local countDown = self:GetCountDown()
+    if countDown > 0 then
+        self.Timer = _G.TimerManager:GetInstance():GetTimer(countDown, self.UpdateTime, self, true, false, true)
+        self.Timer:Start()
+    end
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.AcientEvilComesView.Name)
+    if view then
+        view:UpdateTask()
+        view:IsGetoneKey()
+    end
+end
+function AcientEvilComesModel:ResUpdata(data)
+    for _, value in pairs(data) do
+        local sid = value.type[1]
+
+        if sid == _G.ResPropID.AcientEvil then
+            local _, storageId = _G.StorageManager:GetInstance():CheckSidType(sid)
+            local activenum = _G.StorageManager:GetInstance():GetItemCountByID(storageId, _G.ResPropID.AcientEvil)
+            if activenum ~= nil then
+                self.CurActiveGoal = activenum
+                self:UpdataGoal()
+            end
+            break
+        end
+    end
+end
+function AcientEvilComesModel:UpdataGoal()
+    for k, v in pairs(self.GoalCfg) do
+        if self.CurActiveGoal >= v.value then
+            if v.state == 0 then
+                v.state = 2
+            end
+        end
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StarsGoalReward.id)
+    self:UpdataGoalView()
+end
+function AcientEvilComesModel:UpdataOnUIShow(name)
+    if name == _G.ConfigManager.ui_cfg.AcientEvilComesView.Name then
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.AcientEvilComesView.Name)
+        if view then
+            view:InitView()
+        end
+    end
+end
+function AcientEvilComesModel:UpdataGoalView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.AcientEvilComesView.Name)
+    if view then
+        view:UpdataGoalView()
+    end
+end
+function AcientEvilComesModel:UpdateTime()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.AcientEvilComesView.Name)
+    local mainview = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if view then
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            730102,
+            nil,
+            function()
+                view:Close()
+            end
+        )
+    end
+    -- if mainview then
+    --     mainview:ShowAcientEvilComesBtn()
+    -- end
+end
+---预完成添加
+function AcientEvilComesModel:Addaward_task(sid)
+    local Is = true
+    for _, value in pairs(self.starsGoals.award_task) do
+        if value == sid then
+            Is = false
+        end
+    end
+    if Is then
+        _G.table.insert(self.starsGoals.award_task, sid)
+    end
+    return Is
+end
+---预完成删除
+function AcientEvilComesModel:Disaward_task(sid)
+    local Is = false
+    local num = 0
+    for key, value in pairs(self.starsGoals.award_task) do
+        if value == sid then
+            Is = true
+            num = key
+        end
+    end
+    if Is then
+        _G.table.remove(self.starsGoals.award_task, num)
+    end
+    return Is
+end
+
+function AcientEvilComesModel:CountFinishTask(call)
+    local tb = {}
+    for key, value in pairs(self.starsGoals.award_task) do
+        _G.table.insert(tb, value)
+    end
+    require "AcientEvilNet":GetInstance():FinishTask(
+        {sid = tb, type = 1},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            for key, value in pairs(tb) do
+                self.taskModel:FinishTask(value)
+                _G.table.insert(self.starsGoals.finish_task, value)
+                self:Disaward_task(value)
+            end
+            for key, value in pairs(self.MissionCfg) do
+                require "RedPointManager":GetInstance():RefreshNode(
+                    _G.ConfigManager.redpoint_cfg.StarsGoalTask.id,
+                    value.id
+                )
+            end
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---完成任务
+function AcientEvilComesModel:FinishTask(sid, call, titleId)
+    require "AcientEvilNet":GetInstance():FinishTask(
+        {sid = {sid}, type = 1},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self.taskModel:FinishTask(sid)
+            _G.table.insert(self.starsGoals.finish_task, sid)
+
+            self:Disaward_task(sid)
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StarsGoalTask.id, titleId)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+---返回预完成列表
+function AcientEvilComesModel:GetAward_task()
+    if self.starsGoals.award_task == nil then
+        self.starsGoals.award_task = {}
+    end
+    return self.starsGoals.award_task
+end
+
+---领取满星计划进度奖励
+function AcientEvilComesModel:GetAward(sid, call)
+    require "AcientEvilNet":GetInstance():GetGoalAward(
+        sid,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self.GoalCfg[sid].state = 1
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StarsGoalReward.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+--endregion
+
+--region 任务
+
+---获取任务数据
+---@param stars_mission_cfg.id
+function AcientEvilComesModel:GetTaskDatas(index)
+    local task
+    if not self.MissionCfg[index] then
+        return nil
+    end
+    self.taskArray = {}
+    for _, v in pairs(self.MissionCfg[index].missions) do
+        task = self.taskModel.taskDatas[v]
+        _G.table.insert(self.taskArray, task)
+    end
+    self:SortTask()
+    return self.taskArray
+end
+---任务排序
+function AcientEvilComesModel:SortTask()
+    if not self.taskArray then
+        return
+    end
+    _G.SortList(
+        self.taskArray,
+        function(v)
+            local type = 0
+            if v:CheckIsCanTake() then
+                type = 99
+            elseif v:CheckIsGet() then
+                type = -99
+            end
+            return type, -v.id
+        end
+    )
+end
+---检测是否完成
+function AcientEvilComesModel:CheckIsFinish(sid)
+    return self.taskModel:CheckIsFinish(sid)
+end
+---检测是否有可领取的任务
+---@param sid number stars_mission_cfg.id
+function AcientEvilComesModel:CheckHaveGetTask(sid)
+    local Is = false
+    if self.taskModel:CheckHaveGetTask(sid) then
+        if not Is then
+            Is = true
+        end
+    end
+    return Is
+end
+---检测是否有可领取的活跃奖励
+function AcientEvilComesModel:CheckHaveGetGoal()
+    for k, v in pairs(self.GoalCfg) do
+        if v.state == 2 then
+            return true
+        end
+    end
+    return false
+end
+function AcientEvilComesModel:UpdataTask(task, num)
+    self.taskModel:UpdataTask(task, num)
+end
+--endregion
+function AcientEvilComesModel:Gettarget(id)
+    local k = {}
+    for i = 1, _G.table.count(id) - 1 do
+        _G.table.insert(k, id[i])
+    end
+    local num = 0
+    for key, value in pairs(self.starsGoals.collectors) do
+        if table.sameByCount(k, value.key) then
+            num = value.value
+        end
+        -- body
+    end
+
+    return {[1] = num}
+end
+---判断当前完成状态
+function AcientEvilComesModel:Getstate(id)
+    local tsak = _G.TaskEnum.ETaskState.Claimed
+
+    for key, value in pairs(self.starsGoals.award_task) do
+        if value == id then
+            tsak = _G.TaskEnum.ETaskState.Submited
+        end
+    end
+
+    for key, value in pairs(self.starsGoals.finish_task) do
+        if value == id then
+            tsak = _G.TaskEnum.ETaskState.Completed
+        end
+    end
+
+    return tsak
+end
+
+function AcientEvilComesModel.CheckAcientIsOpen()
+    return AcientEvilComesModel:GetInstance():CheckIsOpen()
+end
+function AcientEvilComesModel:AddRed(sid)
+    for key, value in pairs(_G.ConfigManager.stars_mission_cfg) do
+        for _, s in pairs(value.mission_group) do
+            if sid == s then
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StarsGoalTask.id, key)
+                if self.taskModel.TaskList == nil then
+                    self.taskModel.TaskList = {}
+                elseif self.taskModel.TaskList[key] == nil then
+                    self.taskModel.TaskList[key] = {}
+                end
+                if false == _G.table.indexof(self.taskModel.TaskList[key], s) then
+                    _G.table.insert(self.taskModel.TaskList[key], s)
+                end
+                break
+            end
+        end
+    end
+end
+return AcientEvilComesModel

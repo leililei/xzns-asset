@@ -1,0 +1,906 @@
+---@class SwordCasual_RoleItem : Component	剑之修行_战斗页面_角色控制逻辑
+---@field go_table SwordCasualView._trans_role_GoTable
+---@field rect SwordCasual_Rect
+---@field cfg jzxx_role_cfg
+----------------------------------------------------------------------
+---@field team number                                   @阵营id
+---@field hp number                                     @当前单位生命值
+---@field maxHp number                                  @最大单位生命值
+---@field effects table<number,SwordCasual_Effect>      @buff状态: k表示buff类型
+----------------------------------------------------------------------
+---@field modelPath string                              @当前加载的模型路径
+---@field modelNode Transform                           @当前模型
+---@field modelFlip number                              @模型朝向: -1左, 1右
+---@field modelAnimation Spine.Unity.SkeletonGraphic    @模型渲染组件
+---@field modelAnimationState number                    @模型动作: 0:idle, 1:奔跑
+---@field modelFlashState number                        @模型闪烁状态: 0:无, 1:闪烁
+----------------------------------------------------------------------
+---@field footPositionOffset number                     @脚位偏移量(y轴)
+---@field speed number                                  @移动速度
+---@field speedScale number                             @移动速度倍率
+---@field position {x:number,y:number}                  @当前位置
+---@field direction {x:number,y:number}                 @角色行进方向
+---@field swords SwordCasual_SwordItem[]                @当前持有剑实例
+---@field swordsUpdateOrderInterval number              @剑实例层级更新时间
+---@field swordsUpdateAngleInterval number              @剑实例角度更新时间, -1表示禁用
+---@field bullets SwordCasual_BulletItem[]              @当前持有子弹实例
+---@field superArmorTime number                         @霸体时间(无敌)
+---@field dizzinTime number                             @眩晕等待时间
+----------------------------------------------------------------------
+---@field onHpChange fun(role:SwordCasual_RoleItem,newValue:number,offset:number):void @生命值改变事件回调
+---@field onEffectChange fun(role:SwordCasual_MasterItem,id:SwordCasual_Effect, beforeOverlay:number,afterOverlay:number):void @事件回调
+----------------------------------------------------------------------
+---@field showHp boolean @是否显示生命值
+local SwordCasual_RoleItem = _G.BaseClass("SwordCasual_RoleItem", _G.Component)
+
+---入口函数
+function SwordCasual_RoleItem:OnCreate(trans)
+    self.go_table = _G.GetAutoGoTable(trans)
+    self.position = { x = 0, y = 0 }
+    self.direction = { x = 0, y = 0 }
+    self.speed = 5
+    self.speedScale = 1
+    self.modelFlip = 1
+    self.modelAnimationState = 0
+    self.modelFlashState = 0
+
+    self.hp = 1
+    self.maxHp = 1
+    self.swordsUpdateOrderInterval = 0
+    self.swordsUpdateAngleInterval = -1
+    self.superArmorTime = -1
+    self.dizzinTime = -1
+
+    self.effDic = {}
+    self:SetShowHp(false)
+end
+
+function SwordCasual_RoleItem:OnDestroy()
+    self:RemoveModel()
+end
+
+---物理逻辑更新
+---@param deltaTime number @时间间隔
+function SwordCasual_RoleItem:Update(deltaTime)
+    if not self:IsDizzin() and (self.direction.x ~= 0 or self.direction.y ~= 0) then
+        --更新位置信息
+        self:UpdatePosition(self:GetSpeed() * deltaTime)
+    end
+    --更新矩形信息
+    self:UpdateRect()
+
+    --更新剑逻辑
+    if self.swords and #self.swords > 0 then
+        for i = #self.swords, 1, -1 do
+            self.swords[i]:Update(deltaTime)
+        end
+
+        --间隔时间更新层级
+        self.swordsUpdateOrderInterval = self.swordsUpdateOrderInterval - deltaTime
+        if self.swordsUpdateOrderInterval <= 0 then
+            self.swordsUpdateOrderInterval = 0.1
+            self:UpdateAllSwordsOrder()
+        end
+
+        --角度重排
+        if self.swordsUpdateAngleInterval >= 0 then
+            self.swordsUpdateAngleInterval = self.swordsUpdateAngleInterval - deltaTime
+            if self.swordsUpdateAngleInterval <= 0 then
+                self.swordsUpdateAngleInterval = -1
+                self:UpdateAllSwordsAngle()
+            end
+        end
+    end
+
+    --霸体状态
+    if self.superArmorTime > 0 then
+        self.superArmorTime = self.superArmorTime - deltaTime
+        if self.superArmorTime <= 0 then
+            --霸体效果结束
+            self:SetSuperArmor(-1)
+        end
+    end
+
+    --击退状态
+    if self.dizzinTime > 0 then
+        self.dizzinTime = self.dizzinTime - deltaTime
+    end
+
+    --buff列表处理
+    if self.effects then
+        ---@type number[]
+        local removeKeys
+        for key, effect in pairs(self.effects) do
+            if effect.time >= 0 then
+                effect.time = effect.time - deltaTime
+                --如果buff状态已结束
+                if effect.time <= 0 then
+                    --移除buff实例
+                    if removeKeys then
+                        table.insert(removeKeys, key)
+                    else
+                        removeKeys = { key }
+                    end
+                    if self.onEffectChange then
+                        self.onEffectChange(self, effect, effect.overlay, 0)
+                    end
+                end
+            end
+        end
+        if removeKeys then
+            for _, v in ipairs(removeKeys) do
+                self.effects[v] = nil
+            end
+        end
+    end
+end
+
+---设置配置数据
+function SwordCasual_RoleItem:SetData(cfg)
+    self.cfg = cfg
+
+    --角色配置信息
+    self:LoadModel(self.cfg.spine_path, self.cfg.role_scale)
+    self:SetSpeed(self.cfg.move_speed)
+    self:SetHp(self.cfg.role_hp)
+    self:SetShowHp(self.cfg.hp_show)
+end
+
+---获取配置数据
+---@return jzxx_role_cfg
+function SwordCasual_RoleItem:GetData()
+    return self.cfg
+end
+
+---判断是否是指定类的实例
+---@param cls any @类定义
+---@return boolean @是否是指定类的实例
+function SwordCasual_RoleItem:instanceof(classDefine)
+    if not classDefine then
+        return false
+    end
+    --因为有lazyRequire存在, classDefine传进来可能是套壳table, 需取到原始clss
+    classDefine = classDefine.__index or classDefine
+
+    local cls = self._class_type
+    while cls do
+        if cls == classDefine then
+            return true
+        end
+        cls = cls.super
+    end
+
+    return false
+end
+
+--region ===================战斗属性相关===================
+
+---设置生命值
+---@param hp number @生命值
+function SwordCasual_RoleItem:SetHp(hp)
+    self.hp = hp
+    if not self.maxHp or hp > self.maxHp then
+        self.maxHp = hp
+    end
+    self:UpdateHpRenderer()
+end
+
+---改变生命值
+---@param deltaHp number @生命值变化量
+function SwordCasual_RoleItem:ChangeHp(offset)
+    self.hp = self.hp + offset
+    if self.hp < 0 then
+        self.hp = 0
+    elseif self.maxHp and self.hp > self.maxHp then
+        self.hp = self.maxHp
+    end
+
+    self:UpdateHpRenderer()
+    --触发生命值改变事件
+    if self.onHpChange then
+        self.onHpChange(self, self.hp, offset)
+    end
+end
+
+---获取生命值
+---@return number @生命值
+function SwordCasual_RoleItem:GetHp()
+    return self.hp
+end
+
+---设置最大生命值
+---@param maxHp number @最大生命值
+function SwordCasual_RoleItem:SetMaxHp(maxHp)
+    self.maxHp = maxHp
+    self:UpdateHpRenderer()
+end
+
+---是否死亡
+---@return boolean @是否死亡
+function SwordCasual_RoleItem:IsDeath()
+    return self.hp <= 0
+end
+
+---获取攻击值
+---@return number @攻击值
+function SwordCasual_RoleItem:GetAttack()
+    return 1
+end
+
+---设置霸体时间(闪烁)
+---@param time number @霸体时间
+function SwordCasual_RoleItem:SetSuperArmor(time)
+    self.superArmorTime = time
+    --大于0表示霸体状态(开始闪烁), 小于0表示结束
+    local state = time > 0 and 1 or 0
+    if state ~= self.modelFlashState then
+        self.modelFlashState = state
+        self:UpdateAnimationFlash(state)
+    end
+end
+
+---是否霸体状态
+---@return boolean @是否霸体状态
+function SwordCasual_RoleItem:IsSuperArmor()
+    return self.superArmorTime > 0
+end
+
+---是否眩晕状态
+---@return boolean @是否眩晕状态
+function SwordCasual_RoleItem:IsDizzin()
+    return self.dizzinTime > 0
+end
+
+---能否被击退
+---@return boolean
+function SwordCasual_RoleItem:IsBeatback()
+    return true
+end
+
+---击退动画
+---@param direction {x:number,y:number} @击退方向: -1左, 1右
+---@param distance number @击退距离
+---@param duration number @击退时间
+---@param postWaitTime? number @击退后等待时间, 默认0.3秒
+function SwordCasual_RoleItem:Beatback(direction, distance, duration, postWaitTime)
+    self.go_table.trans_role:DOKill()
+    if not direction or distance <= 0 then
+        self.dizzinTime = -1
+        return
+    end
+    local offsetX = direction.x * distance
+    local offsetY = direction.y * distance
+    self.position.x = self.position.x + offsetX
+    self.position.y = self.position.y + offsetY
+
+    --眩晕时间
+    self.dizzinTime = duration + (postWaitTime or 0.3)
+    --击退动画
+    local tweener = self.go_table.trans_role:DOBlendableLocalMoveBy(_G.Vector3(offsetX, offsetY, 0), duration)
+    tweener:SetEase(_G.CS.DG.Tweening.Ease.Linear)
+    tweener:SetTarget(self.go_table.trans_role)
+end
+
+---设置阵营id
+---@param team number @阵营id
+function SwordCasual_RoleItem:SetTeam(team)
+    self.team = team
+end
+
+---获取阵营id
+---@return number @阵营id
+function SwordCasual_RoleItem:GetTeam()
+    return self.team
+end
+
+---添加buff状态
+---@param id number @buff类型
+---@param value number @buff值
+---@param overlay? number @buff叠加值, 默认1
+---@param time? number @buff持续时间, 默认-1表示永久
+function SwordCasual_RoleItem:AddEffect(id, value, overlay, time)
+    if not overlay then
+        overlay = 1
+    end
+    if not time then
+        time = -1
+    end
+
+    if not self.effects then
+        self.effects = {}
+    end
+    local effect = self.effects[id]
+    if not effect then
+        effect = {
+            id = id,
+            value = 0,
+            overlay = 0,
+            time = 0,
+        }
+        self.effects[id] = effect
+    end
+    effect.value = value
+    effect.overlay = effect.overlay + overlay
+    effect.time = time
+    if self.onEffectChange then
+        self.onEffectChange(self, effect, effect.overlay - overlay, effect.overlay)
+    end
+end
+
+---移除buff状态
+---@param id number @buff类型
+function SwordCasual_RoleItem:RemoveEffect(id)
+    if not self.effects then
+        return
+    end
+    local effect = self.effects[id]
+    self.effects[id] = nil
+    if effect and self.onEffectChange then
+        self.onEffectChange(self, effect, effect.overlay, 0)
+    end
+end
+
+---清除所有buff状态
+function SwordCasual_RoleItem:ClearEffects()
+    local effects = self.effects
+    self.effects = nil
+
+    if effects and self.onEffectChange then
+        for _, effect in pairs(effects) do
+            self.onEffectChange(self, effect, effect.overlay, 0)
+        end
+    end
+end
+
+---获取buff状态
+---@param id number @buff类型
+---@return SwordCasual_Effect
+function SwordCasual_RoleItem:GetEffect(id)
+    if not self.effects then
+        return nil
+    end
+    return self.effects[id]
+end
+
+---获取buff叠加
+---@param id number @buff类型
+---@return number
+function SwordCasual_RoleItem:GetEffectOverlay(id)
+    local effect = self:GetEffect(id)
+    if effect then
+        return effect.overlay
+    end
+    return 0
+end
+
+---获取buff数值(包含叠层)
+---@param id number @buff类型
+---@return number
+function SwordCasual_RoleItem:GetEffectValue(id)
+    local effect = self:GetEffect(id)
+    if effect then
+        return effect.overlay * effect.value
+    end
+    return 0
+end
+
+--endregion
+
+--region ===================物理/重叠判断相关===================
+
+---更新矩形信息
+function SwordCasual_RoleItem:UpdateRect()
+    if not self.rect then
+        local w, h = self.transform:GetRectTransformWidthHeight()
+        self.rect = { x = 0, y = 0, w = w, h = h, rot = 0 } --角色不会旋转
+    end
+    self.rect.x = self.position.x
+    self.rect.y = self.position.y
+end
+
+---获取自身矩形信息
+---@return SwordCasual_Rect @矩形a
+function SwordCasual_RoleItem:GetRect()
+    if not self.rect then
+        self:UpdateRect()
+    end
+    return self.rect
+end
+
+--endregion
+
+--region ===================位置/方向/速度相关===================
+
+---设置角色方向
+---@param direction {x:number,y:number} @方向
+---@param force? boolean @是否强制更新朝向和动画
+function SwordCasual_RoleItem:SetDirection(direction, force)
+    self.direction = direction
+
+    --更新角色朝向
+    local flip = direction.x < -0.01 and -1 or direction.x > 0.01 and 1 or self.modelFlip
+    if flip ~= self.modelFlip or force then
+        self.modelFlip = flip
+        self.go_table.trans_model:SetLocalScale(self.modelFlip, 1, 1)
+    end
+
+    --更新角色动画
+    local animationState = (direction.x ~= 0 or direction.y ~= 0) and 1 or 0
+    if animationState ~= self.modelAnimationState or force then
+        self.modelAnimationState = animationState
+        self:UpdateAnimationState(animationState)
+    end
+end
+
+---设置角色移动速度
+---@param speed number @速度
+function SwordCasual_RoleItem:SetSpeed(speed)
+    self.speed = speed
+end
+
+---设置角色移动速度倍率
+---@param scale number @速度倍率
+---@param force? boolean @是否强制更新
+function SwordCasual_RoleItem:SetSpeedScale(scale, force)
+    if scale == self.speedScale and not force then
+        return
+    end
+
+    --更新角色动画速率
+    self.speedScale = scale
+    self:UpdateAnimationSpeed(scale)
+end
+
+---更新角色位置
+---@param delta number @移动距离
+function SwordCasual_RoleItem:UpdatePosition(delta)
+    local moveX = self.direction.x * delta
+    local moveY = self.direction.y * delta
+    self.position.x = self.position.x + moveX
+    self.position.y = self.position.y + moveY
+    self.transform:SetLocalPosition(self.position.x, self.position.y, 0)
+end
+
+---设置角色位置
+---@param x number @x轴坐标
+---@param y number @y轴坐标
+function SwordCasual_RoleItem:SetPosition(x, y)
+    self.position.x = x
+    self.position.y = y
+    self.transform:SetLocalPosition(self.position.x, self.position.y, 0)
+end
+
+---获取角色位置
+---@return number @x轴坐标
+---@return number @y轴坐标
+function SwordCasual_RoleItem:GetPosition()
+    return self.position.x, self.position.y
+end
+
+---获取层级排序坐标(角色脚的位置)
+---@return number @y轴坐标
+function SwordCasual_RoleItem:GetOrderPosition()
+    if not self.footPositionOffset then
+        local _, y = self.go_table.trans_model:GetLocalPosition()
+        self.footPositionOffset = y
+    end
+    return self.position.y + self.footPositionOffset
+end
+
+---获取角色移动速度
+---@param onlyBase? boolean @是否只返回基础速度
+---@return number @速度
+function SwordCasual_RoleItem:GetSpeed(onlyBase)
+    if onlyBase then
+        return self.speed
+    end
+    return self.speed * self.speedScale
+end
+
+---获取角色移动速度倍率
+---@return number @速度倍率
+function SwordCasual_RoleItem:GetSpeedScale()
+    return self.speedScale
+end
+
+--endregion
+
+--region ===================模型相关===================
+
+---加载角色模型
+---@param path string @模型路径
+---@param scale number @模型缩放
+---@param callback? function 加载完成回调
+function SwordCasual_RoleItem:LoadModel(path, scale, callback)
+    if path == self.modelPath then
+        return
+    end
+    self:RemoveModel()
+    scale = scale or 1
+
+    self.modelPath = path
+    _G.PoolsManager:GetInstance():Spawn(
+        path,
+        _G.ePoolType.Temporary,
+        self.go_table.trans_model,
+        function(trans)
+            if self.modelPath ~= path or self.modelNode then
+                _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.Temporary)
+                return
+            end
+            trans:SetLocalScaleXYZ(scale)
+            trans:SetLocalPositionToZero()
+            self.modelNode = trans
+            self.modelAnimation = trans:GetComponentInChildrenE(_G.typeof(_G.CS.Spine.Unity.SkeletonGraphic))
+            self:UpdateAnimationState(self.modelAnimationState)
+            self:UpdateAnimationSpeed(self.speedScale)
+            self:UpdateAnimationFlash(self.modelFlashState)
+
+            if callback then
+                callback()
+            end
+        end
+    )
+    if _G.AppSetting.DEBUG then
+        local s = _G.string.split(path, "/")
+        self.transform:SetName(s[#s])
+    end
+end
+
+---移除旧的模型实例
+function SwordCasual_RoleItem:RemoveModel()
+    self:UnregisterAnimationCompletedEvent(true)
+    if self.modelNode then
+        _G.PoolsManager:GetInstance():Despawn(self.modelNode, _G.ePoolType.Temporary)
+    end
+    self.modelPath = nil
+    self.modelNode = nil
+    self.modelAnimation = nil
+end
+
+---播放死亡动画
+---@param callback function 动画播放完成回调
+function SwordCasual_RoleItem:PlayDeathAnimation(callback)
+    if not self.modelAnimation then
+        if callback then
+            _G.DelayDo(1, callback)
+        end
+        return
+    end
+    local animationName = "fall_1"
+    self:UnregisterAnimationCompletedEvent()
+    if callback then
+        callback()
+        --self:RegisterAnimationCompletedEvent(animationName, callback)
+    end
+    --self.modelAnimation.AnimationState:SetAnimation(1, animationName, false)
+end
+
+---播放攻击动画
+---@param callback function 动画播放完成回调
+function SwordCasual_RoleItem:PlayAttackAnimation(callback)
+    if not self.modelAnimation then
+        if callback then
+            _G.DelayDo(1, callback)
+        end
+        return
+    end
+    local animationName = "attack_1"
+    self:UnregisterAnimationCompletedEvent()
+    if callback then
+        self:RegisterAnimationCompletedEvent(animationName, callback)
+    end
+    self.modelAnimation.AnimationState:SetAnimation(1, animationName, false)
+end
+
+---更新模型动画
+---@protected
+---@param state number @动画状态: 0:待机, 1:移动
+function SwordCasual_RoleItem:UpdateAnimationState(state)
+    if not self.modelAnimation then
+        return
+    end
+    self:UnregisterAnimationCompletedEvent()
+
+    local animationName = state == 1 and "run_1" or "stand_1"
+    self.modelAnimation.AnimationState:SetAnimation(1, animationName, true)
+end
+
+---更新模型动画速率
+---@private
+---@param scale number @动画速率倍率
+function SwordCasual_RoleItem:UpdateAnimationSpeed(scale)
+    if not self.modelAnimation then
+        return
+    end
+    --self.modelAnimation.timeScale = scale
+    self.modelAnimation.AnimationState.TimeScale = scale
+end
+
+---更新模型闪烁状态
+---@private
+---@param state number @闪烁状态: 0:无, 1:闪烁
+function SwordCasual_RoleItem:UpdateAnimationFlash(state)
+    if not self.modelAnimation then
+        return
+    end
+    self.modelAnimation:DOKill()
+    self.modelAnimation.color = _G.Color(1, 1, 1, 1)
+    if state ~= 1 then
+        return
+    end
+
+    local tweener = self.modelAnimation:DOColor(_G.Color(1, 1, 1, 0.3), 0.05)
+    tweener:SetEase(_G.CS.DG.Tweening.Ease.Linear)
+    tweener:SetLoops(-1, _G.CS.DG.Tweening.LoopType.Yoyo)
+    tweener:SetTarget(self.modelAnimation)
+end
+
+---注册模型动画事件
+---@private
+---@param animationName string @动画名称
+---@param callback function @事件回调
+function SwordCasual_RoleItem:RegisterAnimationCompletedEvent(animationName, callback)
+    if not self.modelAnimation then
+        return
+    end
+    self:UnregisterAnimationCompletedEvent()
+    self.__animationCompletedAnimationName = animationName
+    self.__animationCompletedCallback = callback
+
+    --注册事件到C#
+    if not self.__animationCompletedEvent then
+        self.__animationCompletedEvent = function(entry)
+            if not self.__animationCompletedAnimationName or not self.__animationCompletedCallback then
+                return
+            end
+            if entry.Animation.Name == self.__animationCompletedAnimationName then
+                self.__animationCompletedCallback(self)
+            end
+        end
+        self.modelAnimation.AnimationState:Complete("+", self.__animationCompletedEvent) --注册事件
+    end
+end
+
+---取消注册模型动画事件
+---@private
+---@param removeEvent? boolean @是否移除事件(默认false)
+function SwordCasual_RoleItem:UnregisterAnimationCompletedEvent(removeEvent)
+    if not self.modelAnimation then
+        return
+    end
+    self.__animationCompletedAnimationName = nil
+    self.__animationCompletedCallback = nil
+
+    if removeEvent and self.__animationCompletedEvent then
+        self.modelAnimation.AnimationState:Complete("-", self.__animationCompletedEvent) --移除事件
+        self.__animationCompletedEvent = nil
+    end
+end
+
+--endregion
+
+--region ===================武器/子弹相关===================
+
+---添加剑实例
+---@param swordItem SwordCasual_SwordItem @剑实例
+function SwordCasual_RoleItem:AddSwordItem(swordItem)
+    if not self.swords then
+        self.swords = {}
+    end
+    swordItem.gameObject:SetParentE(self.go_table.trans_sword2)
+    swordItem.gameObject:SetAnchorPosition(0, 0)
+    swordItem:SetParent(self)
+    swordItem:SetTeam(self:GetTeam())
+
+    table.insert(self.swords, swordItem)
+    if #self.swords == 1 then
+        swordItem:SetAngle(90) --右边开始
+        swordItem:UpdateRotateAnimation()
+    else
+        self:UpdateAllSwordsAngle() --立即重排角度
+    end
+    self:UpdateAllSwordsOrder()
+end
+
+---移除剑实例
+---@param swordItem SwordCasual_SwordItem @剑实例
+function SwordCasual_RoleItem:RemoveSwordItem(swordItem)
+    if not self.swords then
+        return
+    end
+    for i = #self.swords, 1, -1 do
+        if self.swords[i] == swordItem then
+            table.remove(self.swords, i)
+            self.swordsUpdateAngleInterval = 1.5 --n秒后重排角度
+            break
+        end
+    end
+end
+
+---清空所有剑实例
+function SwordCasual_RoleItem:ClearSwordItems()
+    self.swords = nil
+end
+
+---获取所有剑实例
+---@return SwordCasual_SwordItem[] @所有剑实例
+function SwordCasual_RoleItem:GetSwordItems()
+    return self.swords
+end
+
+---添加子弹实例
+---@param bulletItem SwordCasual_BulletItem @子弹实例
+function SwordCasual_RoleItem:AddBulletItem(bulletItem)
+    if not self.bullets then
+        self.bullets = {}
+    end
+    bulletItem:SetParent(self)
+    bulletItem:SetTeam(self:GetTeam())
+
+    table.insert(self.bullets, bulletItem)
+end
+
+---移除子弹实例
+---@param bulletItem SwordCasual_BulletItem @子弹实例
+function SwordCasual_RoleItem:RemoveBulletItem(bulletItem)
+    if not self.bullets then
+        return
+    end
+    for i = #self.bullets, 1, -1 do
+        if self.bullets[i] == bulletItem then
+            table.remove(self.bullets, i)
+            break
+        end
+    end
+end
+
+---清空所有子弹实例
+function SwordCasual_RoleItem:ClearBulletItems()
+    self.bullets = nil
+end
+
+---获取所有子弹实例
+---@return SwordCasual_BulletItem[] @所有子弹实例
+function SwordCasual_RoleItem:GetBulletItems()
+    return self.bullets
+end
+
+---更新所有剑实例顺序(遮挡顺序排序)
+---@private
+function SwordCasual_RoleItem:UpdateAllSwordsOrder()
+    if not self.swords then
+        return
+    end
+    for i = #self.swords, 1, -1 do
+        local angle = self.swords[i]:GetAngle()
+        local nodeIndex = angle > -90 and angle < 90 and 2 or 1
+        if self.swords[i].nodeIndex ~= nodeIndex then
+            self.swords[i].nodeIndex = nodeIndex
+            self.swords[i].gameObject:SetParentE(self.go_table["trans_sword" .. nodeIndex])
+        end
+    end
+end
+
+---更新所有剑的角度(均匀角度分布)
+---@private
+function SwordCasual_RoleItem:UpdateAllSwordsAngle()
+    if not self.swords or #self.swords <= 1 then
+        return
+    end
+
+    local firstAngle        = self.swords[1]:GetAngle()
+    local n                 = #self.swords
+    local intersectionAngle = 360 / n
+    for i = 2, n do
+        self.swords[i]:SetAngle(firstAngle + (i - 1) * intersectionAngle)
+        self.swords[i]:UpdateRotateAnimation()
+    end
+end
+
+--endregion
+
+--region ===================注册事件===================
+
+---注册生命值改变事件
+---@param callback fun(role:SwordCasual_RoleItem,newValue:number,offset:number):void @事件回调
+function SwordCasual_RoleItem:OnHpChange(callback)
+    self.onHpChange = callback
+end
+
+---注册生命值改变事件
+---@param callback fun(role:SwordCasual_MasterItem,effect:SwordCasual_Effect,beforeOverlay:number,afterOverlay:number):void @事件回调
+function SwordCasual_RoleItem:OnEffectChange(callback)
+    self.onEffectChange = callback
+end
+
+--endregion
+
+--region ===================ui表现层相关===================
+
+---设置是否显示生命值
+---@param showHp boolean @是否显示生命值
+function SwordCasual_RoleItem:SetShowHp(showHp)
+    self.showHp = showHp
+    self.go_table.trans_hpBG:SetActiveE(showHp and 1 or 0)
+    self:UpdateHpRenderer()
+end
+
+---更新生命值渲染器
+---@private
+function SwordCasual_RoleItem:UpdateHpRenderer()
+    if not self.showHp or not self.maxHp or self.maxHp <= 0 then
+        return
+    end
+    if self.hp <= 0 then
+        self.go_table.trans_hpBG:SetActiveE(0)
+        return
+    end
+
+    local val = math.max(0, math.min(1, self.hp / self.maxHp)) --限定值范围[0.0-1.0]
+    self.go_table.image_hp:SetLocalScale(val, 1, 1)
+end
+
+--endregion
+
+--region ===================播放特效===================
+
+---获得武器升级特效
+function SwordCasual_RoleItem:PlayAddSwordEff()
+    _G.AudioManager.PlayAudioByAudioCfgID(2056)
+    if not self.effDic.AddSword then
+        self.effDic.AddSword = true
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_jueseshengji_2,
+            self.go_table.obj_eff,
+            function(trans)
+                if self.go_table == nil then
+                    _G.UIUtils.RemoveEffect(trans)
+                    return
+                end
+                trans:SetLocalPosition(0, -90, 0)
+                self.effDic.AddSword = trans
+            end
+        )
+    elseif self.effDic.AddSword ~= true then
+        self.effDic.AddSword:SetActiveE(0)
+        self.effDic.AddSword:SetActiveE(1)
+    end
+end
+
+---boss血条光环特效
+function SwordCasual_RoleItem:PlayHPCircleEff()
+    if not self.effDic.HPCircle then
+        self.effDic.HPCircle = true
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_fazhen2,
+            self.go_table.obj_bgEff,
+            function(trans)
+                if self.go_table == nil then
+                    _G.UIUtils.RemoveEffect(trans)
+                    return
+                end
+                trans:SetLocalPosition(0, -65, 0)
+                trans:SetLocalScaleXYZ(0.6)
+                trans:RequireComponentE(_G.typeof(_G.CS.UIParticleOrderChange))
+                self.effDic.HPCircle = trans
+            end
+        )
+    elseif self.effDic.HPCircle ~= true then
+        self.effDic.HPCircle:SetActiveE(0)
+        self.effDic.HPCircle:SetActiveE(1)
+    end
+end
+
+---隐藏全部特效
+function SwordCasual_RoleItem:HideAllEff()
+    for k, v in pairs(self.effDic) do
+        if v ~= true then
+            v:SetActiveE(0)
+        end
+    end
+end
+
+--endregion
+
+return SwordCasual_RoleItem

@@ -1,0 +1,332 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.StorePass.Model.StorePassModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2025/08/05
+-- Description: 通行证
+-----------------------------------------------------------------------
+local StorePassNet = require("StorePassNet")
+local StorePassTaskData = require("StorePassTaskData")
+
+local base = _G.GameDataModelBase
+---@class StorePassModel : GameDataModelBase
+---@field taskList table<number, table<number, LimitBrokenTaskData>>
+local StorePassModel = _G.BaseClass("StorePassModel", base)
+
+---@return StorePassModel StorePassModel
+function StorePassModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function StorePassModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.StorePass
+    self.dailyExp = _G.ConfigManager.discrete_cfg[126403][1][1]
+    self.weeklyExp = _G.ConfigManager.discrete_cfg[126404][1][1]
+    self.lv = 0
+    self.exp = 0
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+---从服务器拉取数据
+function StorePassModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+function StorePassModel:GetInfo()
+    LogError(1,"StorePassModel:GetInfo()")
+    StorePassNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg store_pass.s2c_info
+function StorePassModel:ParseData(msg)
+    self.cycle = msg.cfg_cycle
+    LogError(msg.cfg_cycle,"msg.cfg_cycle")
+    self.cfg = _G.ConfigManager.store_passport_cfg[msg.cfg_cycle]
+    self.passCfgs = {}
+    local cfg
+    for i = 1, #self.cfg.passport_content do
+        cfg = _G.ConfigManager.store_passport_content_cfg[self.cfg.passport_content[i]]
+        self.passCfgs[cfg.level] = cfg
+    end
+
+    self.dailySid = {}
+    for _, v in pairs(self.cfg.mission_extra1) do
+        self.dailySid[v] = true
+    end
+
+    self.startTime = msg.start_time
+    self.endTime = msg.end_time
+    self.curDay = _G.TimeUtil.GetIntervalDayBySix1(self.startTime, _G.TimeUtil.GetServerUnixTime())
+    self.curWeek = self.curDay // 7 + 1
+
+    self.buyClass = msg.buy_class or 0
+    self.lv = msg.lv or 0
+    self.exp = msg.exp or 0
+
+    self.awardGetList = {
+        [0] = {},
+        [1] = {},
+        [2] = {}
+    }
+    if msg.award_list then
+        for _, v in pairs(msg.award_list) do
+            if v.sid_list then
+                for _, sid in pairs(v.sid_list) do
+                    self.awardGetList[v.buy_class][sid] = true
+                end
+            end
+        end
+    end
+    self:InitTaskData(msg)
+
+    self.super.ParseData(self)
+end
+
+function StorePassModel:InitTaskData(msg)
+    self:ClearTask()
+    self.taskList = {}
+    self.finishTaskList = {}
+    if msg.task then
+        for _, v in pairs(msg.task) do
+            self.taskList[v.sid] =
+                StorePassTaskData.New(
+                v,
+                function()
+                    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StroePassMission.id)
+                end,
+                _G.MarkTaskType.StorePass
+            )
+        end
+    end
+    if msg.finish_task then
+        local iTask
+        for _, v in pairs(msg.finish_task) do
+            iTask = {sid = v, state = _G.TaskEnum.ETaskState.Submited, target = {0}}
+            self.taskList[v] = StorePassTaskData.New(iTask, nil, _G.MarkTaskType.StorePass)
+            self.finishTaskList[v] = true
+        end
+    end
+end
+
+function StorePassModel:ClearTask()
+    if self.taskList == nil then
+        return
+    end
+    for _, v in pairs(self.taskList) do
+        v:Dispose()
+    end
+    self.taskList = nil
+    self.finishTaskList = nil
+end
+
+function StorePassModel:CalLevelByExp()
+    local level = 0
+    for lv, cfg in pairs(self.passCfgs) do
+        if self.exp >= cfg.conditions[3] then
+            level = lv
+        else
+            break
+        end
+    end
+    self.lv = level
+end
+
+---高级战令购买成功监听
+function StorePassModel:OnMallCashListener(data)
+    if _G.table.ContainsValue(self.cfg.passport_gift, data.sid) then
+        if data.sid == self.cfg.passport_gift[1] then
+            self.buyClass = 1
+        else
+            self.buyClass = 2
+        end
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StroePassReward.id)
+    end
+end
+
+function StorePassModel:GetAward(awardLis, call)
+    local pbData = {award_list = awardLis}
+    StorePassNet:GetInstance():GetAward(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            for _, v in pairs(awardLis) do
+                for _, sid in pairs(v.sid_list) do
+                    self.awardGetList[v.buy_class][sid] = true
+                end
+            end
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StroePassReward.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+function StorePassModel:FinishTask(sidLis, finishType, call)
+    local pbData = {sid = sidLis, finish_type = finishType}
+    StorePassNet:GetInstance():Finish(
+        pbData,
+        function(msg)
+            local awards = {award = {item = {}, overflow = {}}}
+            for _, v in pairs(msg.task) do
+                if v.ack == 1 then
+                    self.finishTaskList[v.new_task.sid] = true
+                    _G.table.insertto(awards.award.item, v.award.item)
+                    if v.award.overflow then
+                        _G.table.insertto(awards.award.overflow, v.award.overflow)
+                    end
+                    if self:CheckIsDaily(v.new_task.sid) then
+                        self.exp = self.exp + self.dailyExp
+                    else
+                        self.exp = self.exp + self.weeklyExp
+                    end
+                end
+            end
+            self:CalLevelByExp()
+            _G.StorageManager:GetInstance():ReceiveAwardData(awards)
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StroePassMission.id)
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StroePassReward.id)
+            if call then
+                call(msg, awards)
+            end
+        end
+    )
+end
+
+---更新任务数据
+function StorePassModel:UpdataTask(task)
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask:UpdataData(task)
+    return true
+end
+
+function StorePassModel:GetTaskByTaskid(taskid)
+    return self.taskList[taskid]
+end
+
+---任务是否完成
+function StorePassModel:CheckTaskIsFinish(sid)
+    return self.finishTaskList[sid] or false
+end
+
+function StorePassModel:CheckIsDaily(sid)
+    return self.dailySid[sid] or false
+end
+
+---通行证奖励是否领取
+function StorePassModel:CheckAwardIsGet(sid, type)
+    return self.awardGetList[type][sid] or false
+end
+
+function StorePassModel:GetTaskData()
+    return self.taskList
+end
+
+function StorePassModel:GetLevel()
+    return self.lv
+end
+
+function StorePassModel:GetExp()
+    return self.exp
+end
+
+---获取周期id(store_passport_cfg的key)
+function StorePassModel:GetCycleId()
+    return self.cycle
+end
+
+function StorePassModel:GetCycleCfg()
+    return self.cfg
+end
+
+function StorePassModel:GetBuyClass()
+    return self.buyClass
+end
+
+function StorePassModel:GetEndTime()
+    return self.endTime or 0
+end
+
+function StorePassModel:GetWeek()
+    return self.curWeek or 1
+end
+
+function StorePassModel:CheckPassRedPoint()
+    local cfg
+    for i = 1, self.lv do
+        cfg =  self.passCfgs[i]
+        if cfg then
+            for t = 0, self.buyClass do
+                if not self:CheckAwardIsGet(cfg.id, t) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function StorePassModel:CheckTaskRedPoint()
+    if not self.cfg then
+        return false
+    end
+    local submit = _G.TaskEnum.ETaskState.Submited
+    for _, sid in pairs(self.cfg.mission_extra1) do
+        if self.taskList[sid] then
+            if self.taskList[sid].i_task.state == submit and not self:CheckTaskIsFinish(sid) then
+                return true
+            end
+        end
+    end
+    for i = 1, self.curWeek do
+        for _, sid in pairs(self.cfg.mission_extra2[i]) do
+            if self.taskList[sid] then
+                if self.taskList[sid].i_task.state == submit and not self:CheckTaskIsFinish(sid) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function StorePassModel:CheckSingleWeekTaskFinish(week)
+    if week > self.curWeek then
+        return false
+    end
+    local submit = _G.TaskEnum.ETaskState.Submited
+    if week <= self.curWeek then
+        for _, sid in pairs(self.cfg.mission_extra1) do
+            if self.taskList[sid] then
+                if self.taskList[sid].i_task.state == submit and not self:CheckTaskIsFinish(sid) then
+                    return true
+                end
+            end
+        end
+    end
+    for _, sid in pairs(self.cfg.mission_extra2[week]) do
+        if self.taskList[sid] then
+            if self.taskList[sid].i_task.state == submit and not self:CheckTaskIsFinish(sid) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---销毁对象时,析构函数
+function StorePassModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+return StorePassModel

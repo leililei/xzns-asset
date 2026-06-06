@@ -1,0 +1,1064 @@
+--region ======================消息结构=========================
+
+---@class TrackData     弹幕轨道信息
+---@field pos number                                @高度位置(与屏幕上中心的距离)
+---@field ref number                                @消息计数
+---@field nextTime number                           @下一次可用的时间
+---@field tweenCallbakWithRef? fun():void           @Tween结束后回调(计数减1)
+---@field items? FloatMessagesView._obj_text_GoTable|FloatMessagesView._obj_image_GoTable[]
+
+--endregion
+
+---消息最大缓存数量
+local MessageMaxCount = 50
+local SociatyMessagesMaxCount = _G.ConfigManager.chat_cfg[3].save_msg
+
+---聊天频道标签
+---@type table<number,string>
+local MessageTags
+
+---聊天标签颜色
+---@type table<number,UnityEngine.Color>
+local MessageTagColors
+
+---聊天内容颜色
+---@type table<number,UnityEngine.Color>
+local MessageContentColors
+
+local utils = {
+    ---获取消息标签
+    ---@param msg chat.i_chat
+    ---@return string
+    getMessageTag = function(msg)
+        if not MessageTags then
+            local format = "[%s]"
+            MessageTags = {
+                --世界频道
+                [_G.ChatType.world] = string.format(format, _G.GetLangPackValue(9002060002)),
+                --本服
+                --[_G.ChatType.selfWorld] = string.format(format, _G.GetLangPackValue(9002060003)),
+                --公会丶工会战丶冥界纷争
+                [_G.ChatType.union] = string.format(format, _G.GetLangPackValue(9002060004)),
+                [_G.ChatType.unionbattle] = string.format(format, _G.GetLangPackValue(9002060004)),
+                [_G.ChatType.unionMoba] = string.format(format, _G.GetLangPackValue(9002060004)),
+                --私聊
+                [_G.ChatType.privateChat] = string.format(format, _G.GetLangPackValue(90020600025)),
+                --系统
+                [_G.ChatType.system] = string.format(format, _G.GetLangPackValue(9002060001)),
+                --队伍
+                --[_G.ChatType.team] = string.format(format, _G.GetLangPackValue(0)),
+            }
+        end
+        return MessageTags[msg.channel]
+    end,
+    ---获取消息标签颜色
+    ---@param msg chat.i_chat
+    ---@return UnityEngine.Color
+    getMessageTagColor = function(msg)
+        if not MessageTagColors then
+            MessageTagColors = {
+                --默认颜色
+                [0] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255),
+                --世界频道
+                [_G.ChatType.world] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255),
+                --本服
+                [_G.ChatType.selfWorld] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255),
+                --公会丶工会战丶冥界纷争
+                [_G.ChatType.union] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255),
+                [_G.ChatType.unionbattle] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255),
+                [_G.ChatType.unionMoba] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255),
+                --私聊
+                [_G.ChatType.privateChat] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255),
+                --系统
+                [_G.ChatType.system] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255),
+            }
+        end
+        return MessageTagColors[msg.channel] or MessageTagColors[0]
+    end,
+    ---获取消息内容
+    ---@param msg chat.i_chat
+    ---@return string
+    getMessageContent = function(msg)
+        if not msg.n_content then
+            return ""
+        end
+        if type(msg.n_content) == "string" then
+            return msg.n_content
+        end
+        return msg.n_content[2] or msg.n_content[1]
+    end,
+    ---获取消息文本颜色
+    ---@param isSelf boolean 是否为玩家自身
+    ---@return UnityEngine.Color
+    getMessageContentColor = function(isSelf)
+        if not MessageContentColors then
+            MessageContentColors = {
+                [1] = _G.Color(0xfd / 255, 0xcb / 255, 0x69 / 255), --自己的文本颜色
+                [2] = _G.Color(0xFF / 255, 0xE8 / 255, 0xBE / 255), --其他人的文本颜色
+            }
+        end
+        return MessageContentColors[isSelf and 1 or 2]
+    end,
+    ---获取聊天表情路径
+    ---@param msg chat.i_chatad
+    ---@return string
+    getMessageImagePath = function(msg)
+        local expressionId = tonumber(msg.n_content) or msg.n_content
+        local expressionCfg = require("ChatManager"):GetInstance():Phiz_Get(expressionId)
+        if expressionCfg then
+            return expressionCfg.img_path
+        end
+        return ""
+    end,
+    ---查找数据元素下标
+    ---@generic T
+    ---@param array T[]
+    ---@param item T
+    ---@return integer @-1表示元素不在此数组中
+    findIndex = function(array, item)
+        for i = 1, #array do
+            if array[i] == item then
+                return i
+            end
+        end
+        return -1
+    end
+}
+
+
+---@class FloatMessagesView : UIBaseView    全局弹幕面板
+---@field go_table FloatMessagesView_GoTable
+---@field screenWidth number                        @(常量参数)屏幕宽度
+---@field screenHeight number                       @(常量参数)屏幕高度
+---@field speed number                              @(常量参数)弹幕速度
+---@field speedRandom number                        @(常量参数)弹幕速度随机值
+---@field posRandom number                          @(常量参数)开始位置随机偏移值
+---@field trackSpacing  number                      @(常量参数)同轨道弹幕间隔距离(像素)
+---@field adjacentTrackSpacing  number              @(常量参数)临近轨道弹幕间隔距离(像素), -1表示不启用此项功能
+---@field maxContentLength  number                  @(常量参数)文本内容长度限制, -1表示不启用此项功能
+---@field time number                               @面板打开的时间(服务器时间戳)
+---@field show boolean                              @是否显示弹幕消息
+---@field enabled boolean                           @是否启用此功能
+---@field distributeTimer Timer                     @轨道已满后定时检测可用轨道
+---@field messages chat.i_chat[]                    @缓存的消息数据
+---@field trackStates table<number,TrackData>       @弹幕轨道信息
+---@field sociatymessages chat.i_chat[]                    @缓存的公会消息数据
+---@field sociatytrackStates table<number,TrackData>       @公会弹幕轨道信息
+---@field activeTextItems FloatMessagesView._obj_text_GoTable[]
+---@field releaseTextItems FloatMessagesView._obj_text_GoTable[]
+---@field activeImageItems FloatMessagesView._obj_image_GoTable[]
+---@field releaseImageItems FloatMessagesView._obj_image_GoTable[]
+---@field sociatyactiveTextItems FloatMessagesView._obj_text_GoTable[]
+---@field sociatyreleaseTextItems FloatMessagesView._obj_text_GoTable[]
+---@field sociatyctiveImageItems FloatMessagesView._obj_image_GoTable[]
+---@field sociatyreleaseImageItems FloatMessagesView._obj_image_GoTable[]
+local FloatMessagesView = _G.BaseClass("FloatMessagesView", _G.UIBaseView)
+
+local danmuType = _G.LiaotianDanMuType
+
+function FloatMessagesView:Awake()
+    self.activeTextItems = {}
+    self.releaseTextItems = {}
+    self.activeImageItems = {}
+    self.releaseImageItems = {}
+    self.sociatyactiveTextItems = {}
+    self.sociatyreleaseTextItems = {}
+    self.sociatyactiveImageItems = {}
+    self.sociatyreleaseImageItems = {}
+
+    self:AddListener(_G.eChatStatus.newChat, self.OnNewMessage)
+    self:AddListener(_G.eChatStatus.DelChat, self.OnDelMessage)
+    --self:AddListener(_G.eChatStatus.newChat, self.OnNewMessageTestAppend10) --测试重复添加此消息10条
+    self:AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnWindowChange)
+    self:AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnWindowChange)
+
+    self.time = _G.TimeUtil.GetServerUnixTime() - 5
+    --初始化屏幕参数
+    local width, height = self.transform:GetRectTransformWidthHeight()
+    self.screenWidth = width
+    self.screenHeight = height
+    --初始化轨道参数
+    self.trackStates = {}
+    self.sociatytrackStates = {}
+    -- table.insert(self.trackStates, { pos = 150, nextTime = 0, ref = 0 })
+    -- table.insert(self.trackStates, { pos = 200, nextTime = 0, ref = 0 })
+
+    --初始化弹幕丶屏幕参数
+    self.speed = 200
+    self.speedRandom = 0
+    self.posRandom = 100
+    self.trackSpacing = 100
+    self.adjacentTrackSpacing = -1
+    self.maxContentLength = -1
+
+    --读取discrete_cfg配置
+    local cfg = _G.ConfigManager.discrete_cfg[124201]
+    if cfg then
+        local traceCfg, speedCfg, speedRandomCfg, randomPosCfg, spacingCfg, adjacentSpacingCfg, maxContentCfg = table
+            .unpack(cfg)
+        if traceCfg then
+            for _, pos in ipairs(traceCfg) do
+                table.insert(self.trackStates, { pos = pos, nextTime = 0, ref = 0 })
+            end
+            for _, pos in ipairs(traceCfg) do
+                table.insert(self.sociatytrackStates, { pos = pos, nextTime = 0, ref = 0 })
+            end
+        end
+        if speedCfg and speedCfg[1] and speedCfg[1] > 0 then
+            self.speed = speedCfg[1]
+        end
+        if speedRandomCfg and speedRandomCfg[1] then
+            self.speedRandom = speedRandomCfg[1]
+        end
+        if randomPosCfg and randomPosCfg[1] then
+            self.posRandom = randomPosCfg[1]
+        end
+        if spacingCfg and spacingCfg[1] then
+            self.trackSpacing = spacingCfg[1]
+        end
+        if adjacentSpacingCfg and adjacentSpacingCfg[1] then
+            self.adjacentTrackSpacing = adjacentSpacingCfg[1]
+        end
+        if maxContentCfg and maxContentCfg[1] then
+            self.maxContentLength = maxContentCfg[1]
+        end
+    end
+
+    local chatManager = require("ChatManager"):GetInstance()
+    --功能未解锁时, 监听功能开放时间
+    local isUnlockFunction = chatManager:CheckUnlockFloatMessage()
+    if not isUnlockFunction then
+        self:AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.NewFunctionOpened)
+        self:AddListener(_G.eFunctionsStatus.NewFunction, self.NewFunctionOpened)
+    end
+    --此功能是否已启用
+    self.enabled = isUnlockFunction and chatManager:CheckFloatMessageEnabled()
+    --初始化 默认非通用功能弹幕
+    self.IsNewCommonDanmu = false
+end
+
+function FloatMessagesView:OnDestroy()
+    self:RemoveAllListener()
+    self:StopDistributeTimer()
+end
+
+function FloatMessagesView:OnEnable()
+    self:SetShow(true)
+    self:OnWindowChange()
+end
+
+function FloatMessagesView:OnDisable()
+    self:SetShow(false)
+end
+
+---设置功能开关
+---@param active boolean
+function FloatMessagesView:SetEnabled(active)
+    self.enabled = active
+    if not active then
+        self:ClearAllMessages()
+        self:StopDistributeTimer()
+    end
+end
+
+---设置显隐弹幕
+---@param active boolean
+function FloatMessagesView:SetShow(active)
+    if active then
+        if _G.table.isEmptyOrNil(self.trackStates) or _G.table.isEmptyOrNil(self.sociatytrackStates) or self.speed <= 0 then
+            active = false
+        end
+        --- 激活了在主界面或者在公会界面
+        if self.mainInAfk or self.mainInSociaty then
+            if self.IsNewCommonDanmu then
+                self.IsNewCommonDanmu = false
+                self:ClearAllMessages()
+            end
+        end
+    end
+    if not self.go_table then
+        return
+    end
+
+    self.go_table.obj_afk:SetActiveE(((active and self.mainInAfk) or self.IsNewCommonDanmu) and 1 or 0)
+
+    self.go_table.obj_sociaty:SetActiveE((active and self.mainInSociaty) and 1 or 0)
+    if not active and #self.activeTextItems > 0 and not self.IsNewCommonDanmu then
+        self:ClearAllMessages()
+        self:StopDistributeTimer()
+    end
+end
+
+--region =================消息数据处理=====================
+
+---显示一条缓存的弹幕消息
+---@param type _G.LiaotianDanMuType
+---@return void
+function FloatMessagesView:ShowNextMessage(type)
+    if type == danmuType.afk then
+        local list = self.messages
+        if self.DanmuList then
+            list = self.DanmuList
+        end
+
+        if not list or #list == 0 then
+            self:StopDistributeTimer()
+            return false
+        end
+
+        local trackData = self:GetFreeTrackData(danmuType.afk)
+        if not trackData then
+            return false
+        end
+        if self.DanmuList then
+            self:ShowMessageCommon(
+                table.remove(list, 1),
+                trackData, danmuType.afk
+            )
+        else
+            self:ShowMessage(
+                table.remove(list, 1),
+                trackData, danmuType.afk
+            )
+        end
+
+        return true
+    elseif type == danmuType.sociaty then
+        if not self.sociatymessages or #self.sociatymessages == 0 then
+            self:StopDistributeTimer()
+            return false
+        end
+
+        local trackData = self:GetFreeTrackData(danmuType.sociaty)
+        if not trackData then
+            return false
+        end
+        self:ShowMessage(
+            table.remove(self.sociatymessages, 1),
+            trackData, danmuType.sociaty
+        )
+        return true
+    end
+    return false
+end
+
+---定时器回调创建弹幕消息
+function FloatMessagesView:ShowNextMessageDistribute()
+    --一次性显示n条消息
+    local count = math.max(10, #self.trackStates)
+    while count > 0 do
+        count = count - 1
+        if not self:ShowNextMessage(danmuType.afk) then
+            break
+        end
+    end
+end
+
+---定时器回调创公会建弹幕消息
+function FloatMessagesView:ShowSociatyNextMessageDistribute()
+    --一次性显示n条消息
+    local count = math.max(10, #self.sociatytrackStates)
+    while count > 0 do
+        count = count - 1
+        if not self:ShowNextMessage(danmuType.sociaty) then
+            break
+        end
+    end
+end
+
+---显示一条弹幕消息
+---@param msg chat.i_chat
+---@param trackData TrackData|nil
+---@param Type _G.LiaotianDanMuType
+function FloatMessagesView:ShowMessage(msg, trackData, Type)
+    if not trackData then
+        trackData = self:GetFreeTrackData(Type)
+    end
+    if not trackData then
+        return
+    end
+
+    --获取弹幕文本颜色
+    local isSelf = msg.role_info and msg.role_info.uid == _G.PlayerModel:GetInstance():GetPlayerUid()
+    local contentColor = utils.getMessageContentColor(isSelf)
+
+    ---@type FloatMessagesView._obj_text_GoTable|FloatMessagesView._obj_image_GoTable
+    local item
+    if msg.type == _G.ChatInfoType.PlayerEmoji then
+        --玩家表情
+        local expressionPath = utils.getMessageImagePath(msg)
+        item = self:GetMessageImageItem(Type)
+        item.aorrawimage_image:LoadImage(expressionPath)
+    elseif type(msg.n_content) == "string" then
+        --文本消息
+        local content = utils.getMessageContent(msg)
+        if msg.type == _G.ChatInfoType.chat and self.maxContentLength > 0 and _G.string.getStringCharCount(content) > self.maxContentLength then
+            --文本长度限制(玩家聊天消息裁剪)
+            content = _G.string.utf8sub(content, 1, self.maxContentLength) .. "..."
+        end
+        item = self:GetMessageTextItem(Type)
+        item.aortext_content.text = content
+        item.aortext_content.color = contentColor
+    end
+
+    if not item then
+        return
+    end
+
+    --频道标签
+    if Type == danmuType.sociaty then
+        item.aortext_tag:SetActiveE(0)
+    else
+        local tag = utils.getMessageTag(msg)
+        item.aortext_tag:SetActiveE(tag and #tag > 0 and 1 or 0)
+        if tag then
+            item.aortext_tag.text = tag
+            item.aortext_tag.color = utils.getMessageTagColor(msg)
+        end
+    end
+    --玩家名称
+    item.aortext_name:SetActiveE(msg.role_info and 1 or 0)
+    if msg.role_info then
+        item.aortext_name.text = msg.role_info.name
+        if Type == danmuType.sociaty then
+            item.aortext_name.color = _G.ColorTools.FormatColorByString("76daf8")
+        else
+            item.aortext_name.color = contentColor
+        end
+    end
+
+    item.msg = msg
+    self:SetMessageTween(item, trackData, Type)
+end
+
+---消息播放move动画
+---@param msg chat.i_chat
+---@param item FloatMessagesView._obj_text_GoTable|FloatMessagesView._obj_image_GoTable|{msg:chat.i_chat}
+---@param trackData TrackData
+---@param type number 类型0:afk,1:Sociaty
+function FloatMessagesView:SetMessageTween(item, trackData, type)
+    --立即更新item布局, 然后获取item宽度及屏幕宽度
+    item.transform:ForceRebuildLayoutImmediate()
+    local width = item.transform:GetRectTransformSizeDelta()
+
+    --计算item初始位置和终点位置
+    local startPosX = (self.screenWidth + width) * 0.5 + self.posRandom * math.random()
+    local endPosX = (self.screenWidth + width) * -0.5
+    local speed
+    if type == danmuType.sociaty then
+        speed = _G.ConfigManager.discrete_cfg[108310][1][1] * 435
+    else
+        speed = self.speed + math.random() * self.speedRandom
+    end
+
+    --此轨道可显示下一条消息的时间
+    local spacingTime = (width + self.trackSpacing) / speed
+    --此轨道相邻轨道可显示下一条消息的时间
+    if type == danmuType.afk then
+        if self.adjacentTrackSpacing >= 0 then
+            local adjacentTime = _G.Time.time + (width + self.adjacentTrackSpacing) / speed
+            local index = utils.findIndex(self.trackStates, trackData)
+            local lastTrackData = index > 1 and self.trackStates[index - 1] or nil
+            local nextTrackData = index >= 1 and index < #self.trackStates and self.trackStates[index + 1] or nil
+            if lastTrackData and lastTrackData.nextTime < adjacentTime then
+                lastTrackData.nextTime = adjacentTime
+            end
+            if nextTrackData and nextTrackData.nextTime < adjacentTime then
+                nextTrackData.nextTime = adjacentTime
+            end
+        end
+    elseif type == danmuType.sociaty then
+        if self.adjacentTrackSpacing >= 0 then
+            local adjacentTime = _G.Time.time + (width + self.adjacentTrackSpacing) / speed
+            local index = utils.findIndex(self.sociatytrackStates, trackData)
+            local lastTrackData = index > 1 and self.sociatytrackStates[index - 1] or nil
+            local nextTrackData = index >= 1 and index < #self.sociatytrackStates and self.sociatytrackStates[index + 1] or
+                nil
+            if lastTrackData and lastTrackData.nextTime < adjacentTime then
+                lastTrackData.nextTime = adjacentTime
+            end
+            if nextTrackData and nextTrackData.nextTime < adjacentTime then
+                nextTrackData.nextTime = adjacentTime
+            end
+        end
+    end
+
+    --更新轨道信息
+    if not trackData.items then
+        trackData.items = {}
+    end
+    table.insert(trackData.items, item)
+    trackData.ref = trackData.ref + 1
+    trackData.nextTime = _G.Time.time + spacingTime --显示下一条消息的时间(此消息右边出屏幕后n秒)
+    if not trackData.tweenCallbakWithRef then
+        trackData.tweenCallbakWithRef = function()
+            if self:IsNil() then
+                return
+            end
+            if trackData.ref > 0 then
+                trackData.ref = trackData.ref - 1
+            else
+                trackData.ref = 0
+            end
+            --回收item节点
+            if trackData.items and #trackData.items > 0 then
+                local item = table.remove(trackData.items, 1) --在前面的item总是先回调?
+                if type == danmuType.afk then
+                    if item.aortext_content then
+                        self:ReleaseMessageTextItem(item, danmuType.afk)
+                    else
+                        self:ReleaseMessageImageItem(item, danmuType.afk)
+                    end
+                elseif type == danmuType.sociaty then
+                    if item.aortext_content then
+                        self:ReleaseMessageTextItem(item, danmuType.sociaty)
+                    else
+                        self:ReleaseMessageImageItem(item, danmuType.sociaty)
+                    end
+                end
+            end
+            --显示下一条消息
+            self:ShowNextMessage(type)
+        end
+    end
+
+    item.transform:SetLocalPosition(startPosX, self.screenHeight * 0.5 - trackData.pos, 0)
+    item.transform:DOKill()
+    item.transform
+        :DOLocalMoveX(endPosX, (startPosX - endPosX) / speed, trackData.tweenCallbakWithRef)
+        :SetEase(_G.CS.DG.Tweening.Ease.Linear)
+end
+
+---清理所有弹幕消息
+---@return void
+function FloatMessagesView:ClearAllMessages()
+    self.messages = nil
+    self.sociatymessages = nil
+    self.DanmuList = nil
+    --清理弹幕实例
+    self:ReleaseAllMessageTextItems()
+    self:ReleaseAllMessageImageItems()
+    --清理轨道状态
+    for _, trackData in ipairs(self.trackStates) do
+        trackData.ref = 0
+        trackData.nextTime = 0
+        trackData.items = nil
+    end
+    for _, trackData in ipairs(self.trackStates) do
+        trackData.ref = 0
+        trackData.nextTime = 0
+        trackData.items = nil
+    end
+end
+
+---获取一条空闲轨道信息
+---@param type _G.LiaotianDanMuType
+---@return TrackData
+function FloatMessagesView:GetFreeTrackData(type)
+    local trackStates
+    if type == danmuType.afk then
+        trackStates = self.trackStates
+    elseif type == danmuType.sociaty then
+        trackStates = self.sociatytrackStates
+    end
+    if not trackStates or #trackStates == 0 then
+        return nil
+    end
+    --寻找空闲轨道, 如空闲轨道不存在则寻找可使用的轨道
+    local activeTrackData
+    local nowTime = _G.Time.time
+    for _, trackData in ipairs(trackStates) do
+        if trackData.nextTime <= nowTime then
+            if trackData.ref <= 0 then
+                return trackData
+            end
+            if not activeTrackData or trackData.nextTime < activeTrackData.nextTime then
+                activeTrackData = trackData
+            end
+        end
+    end
+    return activeTrackData
+end
+
+---启动一个定时器, 检测是否有空轨道可显示新的消息
+---@param type _G.LiaotianDanMuType
+---@return void
+function FloatMessagesView:StartDistributeTimer(type)
+    if self.distributeTimer then
+        return
+    end
+    if type == danmuType.afk then
+        self.distributeTimer = _G.TimerManager:GetInstance():GetTimer(0.1, self.ShowNextMessageDistribute, self, false,
+            false)
+    elseif type == danmuType.sociaty then
+        self.distributeTimer = _G.TimerManager:GetInstance():GetTimer(0.1, self.ShowSociatyNextMessageDistribute, self,
+            false, false)
+    end
+    self.distributeTimer:Start()
+end
+
+function FloatMessagesView:StopDistributeTimer()
+    if not self.distributeTimer then
+        return
+    end
+    self.distributeTimer:Stop()
+    self.distributeTimer = nil
+end
+
+--endregion
+
+--region =================新版 通用消息=====================
+---@param IsClearAll boolean 是否需要清除之前的数据
+---@param maxCount int 加载弹幕上限
+---@param windowName string 窗口名
+---@param args table 弹幕数据
+function FloatMessagesView:GetDanmuList(args, maxCount, IsClearAll)
+    if IsClearAll then
+        self:ClearAllMessages()
+    end
+    self.IsNewCommonDanmu = true
+
+    -- 激活了在主界面或者在公会界面 触发了功能弹幕以后又打开了公会或者主界面 return掉
+    if (self.mainInAfk or self.mainInSociaty) and not IsClearAll then
+        self.IsNewCommonDanmu = false
+        self:ClearAllMessages()
+        return
+    end
+
+    for i = 1, #args do
+        self:CommonShowItem(args[i], maxCount * 10)
+    end
+end
+
+---通用弹幕消息
+function FloatMessagesView:CommonShowItem(args, maxCount)
+    --- 强制走afk的分组显示 传入时就代表着此弹幕必须显示 所有判断在外界
+    self.go_table.obj_afk:SetActiveE(1)
+
+    if not self.enabled then
+        return
+    end
+    local freeTD = self:GetFreeTrackData(danmuType.afk)
+    if freeTD then
+        --- 还用afk的type
+        self:ShowMessageCommon(args, freeTD, danmuType.afk)
+    else
+        --缓存消息数据
+        if not self.DanmuList then
+            self.DanmuList = {}
+        end
+        table.insert(self.DanmuList, args)
+        --消息数量超出上限
+        if maxCount > 1 and #self.DanmuList > maxCount then
+            table.remove(self.DanmuList, 1)
+        end
+
+        self:StartDistributeTimer(danmuType.afk)
+    end
+end
+
+---新版 显示一条弹幕消息
+--- 组装要传入的弹幕Item结构 content为数据 color为颜色 expressionPath 为表情路径 tag频道标签
+--- name为玩家名 【除了表情弹幕 其他消息一律拼好content为数据再传】
+function FloatMessagesView:ShowMessageCommon(args, trackData, Type)
+    if not trackData then
+        trackData = self:GetFreeTrackData(Type)
+    end
+    if not trackData then
+        return
+    end
+
+    local item
+    if args.expressionPath then
+        --玩家表情
+        local expressionPath = args.expressionPath
+        item = self:GetMessageImageItem(Type)
+        item.aorrawimage_image:LoadImage(expressionPath)
+        item.obj_split:SetActiveE(1)
+    elseif args.content then
+        --文本消息
+        local content = args.content
+        -- if self.maxContentLength > 0 and _G.string.getStringCharCount(content) > self.maxContentLength then
+        --     --文本长度限制
+        --     content = _G.string.utf8sub(content, 1, self.maxContentLength) .. "..."
+        -- end
+        item = self:GetMessageTextItem(Type)
+        item.aortext_content.text = args.content
+        item.aorimage_Icon:SetActiveE(0)
+        if args.atlas and args.icon then
+            item.aorimage_Icon:LoadAtlasSprite(
+                args.atlas, args.icon)
+            item.aorimage_Icon:SetActiveE(1)
+        end
+        item.obj_split:SetActiveE(0)
+    end
+
+    --频道标签
+    local tag = args.tag
+    item.aortext_tag:SetActiveE(tag and #tag > 0 and 1 or 0)
+    if tag then
+        item.aortext_tag.text = tag
+    end
+    --玩家名称
+    item.aortext_name:SetActiveE(args.name and 1 or 0)
+    if args.name then
+        item.aortext_name.text = args.name
+    end
+
+    item.msg = msg
+    self:SetMessageTween(item, trackData, Type)
+end
+
+--endregion
+
+--region =================消息数据/事件处理=====================
+
+---收到一条新消息
+---@protected
+---@param msg chat.i_chat
+function FloatMessagesView:OnNewMessage(msg)
+    if not self.enabled then
+        return
+    end
+    --限制消息类型: 玩家消息丶系统消息丶玩家表情
+    if msg.type ~= _G.ChatInfoType.chat and
+        msg.type ~= _G.ChatInfoType.system and
+        msg.type ~= _G.ChatInfoType.PlayerEmoji then
+        return
+    end
+    --限制消息时间:
+    if msg.time < self.time then
+        return
+    end
+    --- 兼容 当有消息进入时 如果有新版通用弹幕消息在播放 返回
+    if self.DanmuList then
+        return
+    end
+
+    local freeTD = self:GetFreeTrackData(danmuType.afk)
+    if freeTD then
+        self:ShowMessage(msg, freeTD, danmuType.afk)
+    else
+        --缓存消息数据
+        if not self.messages then
+            self.messages = {}
+        end
+        table.insert(self.messages, msg)
+        --消息数量超出上限
+        if MessageMaxCount > 1 and #self.messages > MessageMaxCount then
+            table.remove(self.messages, 1)
+        end
+
+        self:StartDistributeTimer(danmuType.afk)
+    end
+
+    if msg.channel == _G.ChatType.union and msg.type ~= _G.ChatInfoType.system then
+        local freeSTD = self:GetFreeTrackData(danmuType.sociaty)
+        if freeSTD then
+            self:ShowMessage(msg, freeSTD, danmuType.sociaty)
+        else
+            --缓存消息数据
+            if not self.sociatymessages then
+                self.sociatymessages = {}
+            end
+            table.insert(self.sociatymessages, msg)
+            --消息数量超出上限
+            if SociatyMessagesMaxCount > 1 and #self.sociatymessages > SociatyMessagesMaxCount then
+                table.remove(self.sociatymessages, 1)
+            end
+            self:StartDistributeTimer(danmuType.sociaty)
+        end
+    end
+end
+
+---@param msg chat.i_chat
+function FloatMessagesView:OnNewMessageTestAppend10(msg)
+    if msg.role_info and msg.role_info.uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+        ---@type chat.i_chat
+        local copy = {}
+        for k, v in pairs(msg) do
+            copy[k] = v
+        end
+        copy.role_info.uid = 0
+        msg = copy
+    end
+    for i = 1, 20 do
+        _G.DelayDo(i * 0.5, function()
+            if self:IsNil() then
+                return
+            end
+            self:OnNewMessage(msg)
+        end)
+    end
+end
+
+---删除一条新消息
+---@protected
+---@param msg chat.p2c_del_chat
+function FloatMessagesView:OnDelMessage(data)
+    --因为收到的chat.i_chat消息中没有包含chat_id信息, 因此此处只能通过channel和玩家uid进行屏蔽(将屏蔽此玩家在目标频道的所有消息)
+    --过滤缓存消息
+    if self.messages then
+        for i = #self.messages, 1, -1 do
+            local msg = self.messages[i]
+            if msg.role_info and msg.channel == data.channel and msg.role_info.uid == data.role_uid then
+                table.remove(self.messages, i)
+            end
+        end
+    end
+    --处理显示中的节点信息
+    if self.activeTextItems then
+        for i = #self.activeTextItems, 1, -1 do
+            ---@type chat.i_chat
+            local msg = self.activeTextItems[i].msg
+            if msg and msg.role_info and msg.channel == data.channel and msg.role_info.uid == data.role_uid then
+                self:ReleaseMessageTextItem(self.activeTextItems[i], danmuType.afk)
+            end
+        end
+    end
+    if self.activeImageItems then
+        for i = #self.activeImageItems, 1, -1 do
+            ---@type chat.i_chat
+            local msg = self.activeImageItems[i].msg
+            if msg and msg.role_info and msg.channel == data.channel and msg.role_info.uid == data.role_uid then
+                self:ReleaseMessageImageItem(self.activeImageItems[i], danmuType.afk)
+            end
+        end
+    end
+    if self.sociatymessages then
+        for i = #self.sociatymessages, 1, -1 do
+            local msg = self.sociatymessages[i]
+            if msg.role_info and msg.channel == data.channel and msg.role_info.uid == data.role_uid then
+                table.remove(self.sociatymessages, i)
+            end
+        end
+    end
+    --处理显示中的节点信息
+    if self.sociatyactiveTextItems then
+        for i = #self.sociatyactiveTextItems, 1, -1 do
+            ---@type chat.i_chat
+            local msg = self.sociatyactiveTextItems[i].msg
+            if msg and msg.role_info and msg.channel == data.channel and msg.role_info.uid == data.role_uid then
+                self:ReleaseMessageTextItem(self.sociatyactiveTextItems[i], danmuType.sociaty)
+            end
+        end
+    end
+    if self.sociatyactiveImageItems then
+        for i = #self.sociatyactiveImageItems, 1, -1 do
+            ---@type chat.i_chat
+            local msg = self.sociatyactiveImageItems[i].msg
+            if msg and msg.role_info and msg.channel == data.channel and msg.role_info.uid == data.role_uid then
+                self:ReleaseMessageImageItem(self.sociatyactiveImageItems[i], danmuType.sociaty)
+            end
+        end
+    end
+end
+
+---窗口变化事件
+---@protected
+---@return void
+function FloatMessagesView:OnWindowChange()
+    ---@type UIBaseView[]
+    local windows = _G.UIManager:GetInstance():GetAllWindows()
+    if not windows or _G.table.isEmptyOrNil(windows) then
+        return
+    end
+
+    --仅在战斗页面/主页面放置中显示弹幕
+    if not self.ignoreWindows then
+        local cfgs = {
+            _G.ConfigManager.ui_cfg.ShadowView,
+            _G.ConfigManager.ui_cfg.ShadowTopView,
+            _G.ConfigManager.ui_cfg.GameNetTipsView,
+            _G.ConfigManager.ui_cfg.HUDView,
+            _G.ConfigManager.ui_cfg.MainSceneView,
+            _G.ConfigManager.ui_cfg.ResLoadingView,
+            _G.ConfigManager.ui_cfg.ChatDefultRootView, --mini chat view
+            _G.ConfigManager.ui_cfg.QuickUseTipView,
+            _G.ConfigManager.ui_cfg.FloatTipsView,
+            _G.ConfigManager.ui_cfg.FloatMessagesView,
+            _G.ConfigManager.ui_cfg.BattleView,
+            _G.ConfigManager.ui_cfg.SociatyMobaGuessView,
+            _G.ConfigManager.ui_cfg.SociatyMobaBattleResultView,
+            _G.ConfigManager.ui_cfg.SociatyMobaChatView,
+            _G.ConfigManager.ui_cfg.SociatyMobaEmbattleFaceView,
+            _G.ConfigManager.ui_cfg.ScrollerView,
+        }
+        ---忽略的View列表
+        self.ignoreWindows = {}
+        for _, cfg in pairs(cfgs) do
+            if cfg then
+                self.ignoreWindows[cfg.Name] = true
+            end
+        end
+    end
+    local isShow = true
+    for _, view in pairs(windows) do
+        if not self.ignoreWindows[view.Name] and view.Active then
+            if view.Name == _G.ConfigManager.ui_cfg.MainView.Name then
+                self.mainInAfk = _G.MainManager:GetInstance():IsToggledAfkWindow(false)
+                self.mainInSociaty = _G.MainManager:GetInstance():IsToggledSociatyWindow(false)
+                isShow = self.mainInAfk or self.mainInSociaty
+            else
+                isShow = false
+            end
+            if not isShow then
+                break
+            end
+        end
+    end
+    self:SetShow(isShow)
+end
+
+---监听新功能开放
+---@protected
+---@param id number
+---@return void
+function FloatMessagesView:NewFunctionOpened(id)
+    if id ~= _G.FunctionID.FloatMessages then
+        return
+    end
+    self:RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.NewFunctionOpened)
+    self:RemoveListener(_G.eFunctionsStatus.NewFunction, self.NewFunctionOpened)
+    self.enabled = require("ChatManager"):GetInstance():CheckFloatMessageEnabled()
+end
+
+--endregion
+
+--region =================对象池=====================
+
+---获取一个文本弹幕实例
+---@param type _G.LiaotianDanMuType
+---@return FloatMessagesView._obj_text_GoTable
+function FloatMessagesView:GetMessageTextItem(type)
+    local item, releaseTextItems, activeTextItems
+    if type == danmuType.afk then
+        releaseTextItems = self.releaseTextItems
+        activeTextItems = self.activeTextItems
+    elseif type == danmuType.sociaty then
+        releaseTextItems = self.sociatyreleaseTextItems
+        activeTextItems = self.sociatyactiveTextItems
+    end
+    if #releaseTextItems > 0 then
+        item = table.remove(releaseTextItems, 1)
+    else
+        local obj
+        if type == danmuType.afk then
+            obj = _G.InstantiateObject(self.go_table.obj_text, self.go_table.obj_afk)
+        elseif type == danmuType.sociaty then
+            obj = _G.InstantiateObject(self.go_table.obj_text, self.go_table.obj_sociaty)
+        end
+        item = _G.GetAutoGoTable(obj)
+    end
+    item.gameObject:SetActiveE(1)
+    table.insert(activeTextItems, item)
+    return item
+end
+
+---回收文本弹幕实例
+---@param type _G.LiaotianDanMuType
+---@param item FloatMessagesView._obj_text_GoTable
+function FloatMessagesView:ReleaseMessageTextItem(item, type)
+    item.transform:DOKill()
+    item.gameObject:SetActiveE(0)
+    local index, activeTextItems, releaseTextItems
+    if type == danmuType.afk then
+        activeTextItems = self.activeTextItems
+        releaseTextItems = self.releaseTextItems
+    elseif type == danmuType.sociaty then
+        activeTextItems = self.sociatyactiveTextItems
+        releaseTextItems = self.sociatyreleaseTextItems
+    end
+    index = utils.findIndex(activeTextItems, item)
+    if index >= 1 then
+        table.remove(activeTextItems, index)
+    end
+    table.insert(releaseTextItems, item)
+end
+
+---回收所有文本弹幕实例
+function FloatMessagesView:ReleaseAllMessageTextItems()
+    for _, item in ipairs(self.activeTextItems) do
+        item.transform:DOKill()
+        item.gameObject:SetActiveE(0)
+        table.insert(self.releaseTextItems, item)
+    end
+    self.activeTextItems = {}
+    for _, item in ipairs(self.sociatyactiveTextItems) do
+        item.transform:DOKill()
+        item.gameObject:SetActiveE(0)
+        table.insert(self.sociatyreleaseTextItems, item)
+    end
+    self.sociatyactiveTextItems = {}
+end
+
+---获取一个表情弹幕实例
+---@param type _G.LiaotianDanMuType
+---@return FloatMessagesView._obj_image_GoTable
+function FloatMessagesView:GetMessageImageItem(type)
+    local item, releaseImageItems, activeImageItems
+    if type == danmuType.afk then
+        releaseImageItems = self.releaseImageItems
+        activeImageItems = self.activeImageItems
+    elseif type == danmuType.sociaty then
+        releaseImageItems = self.sociatyreleaseImageItems
+        activeImageItems = self.sociatyactiveImageItems
+    end
+    if #releaseImageItems > 0 then
+        item = table.remove(releaseImageItems, 1)
+    else
+        local obj
+        if type == danmuType.afk then
+            obj = _G.InstantiateObject(self.go_table.obj_image, self.go_table.obj_afk)
+        elseif type == danmuType.sociaty then
+            obj = _G.InstantiateObject(self.go_table.obj_image, self.go_table.obj_sociaty)
+        end
+        item = _G.GetAutoGoTable(obj)
+    end
+    item.gameObject:SetActiveE(1)
+    table.insert(activeImageItems, item)
+    return item
+end
+
+---回收表情弹幕实例
+---@param type _G.LiaotianDanMuType
+---@param item FloatMessagesView._obj_image_GoTable
+function FloatMessagesView:ReleaseMessageImageItem(item, type)
+    item.transform:DOKill()
+    item.gameObject:SetActiveE(0)
+
+    if type == danmuType.afk then
+        local index = utils.findIndex(self.activeImageItems, item)
+        if index >= 1 then
+            table.remove(self.activeImageItems, index)
+        end
+        table.insert(self.releaseImageItems, item)
+    elseif type == danmuType.sociaty then
+        local index = utils.findIndex(self.sociatyactiveImageItems, item)
+        if index >= 1 then
+            table.remove(self.sociatyactiveImageItems, index)
+        end
+        table.insert(self.sociatyreleaseImageItems, item)
+    end
+end
+
+---回收所有表情弹幕实例
+function FloatMessagesView:ReleaseAllMessageImageItems()
+    for _, item in ipairs(self.activeImageItems) do
+        item.transform:DOKill()
+        item.gameObject:SetActiveE(0)
+        table.insert(self.releaseImageItems, item)
+    end
+    self.activeImageItems = {}
+    for _, item in ipairs(self.sociatyactiveImageItems) do
+        item.transform:DOKill()
+        item.gameObject:SetActiveE(0)
+        table.insert(self.sociatyreleaseImageItems, item)
+    end
+    self.sociatyactiveImageItems = {}
+end
+
+--endregion
+
+
+return FloatMessagesView

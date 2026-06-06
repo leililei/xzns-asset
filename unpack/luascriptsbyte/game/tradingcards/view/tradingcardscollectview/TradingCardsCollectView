@@ -1,0 +1,287 @@
+---单个书架容纳的书本数量
+local ShelfMemberCount = 3
+
+---@class TradingCardsCollectView : UIBaseView	小浣熊集卡_图集主页面
+---@field public go_table TradingCardsCollectView_GoTable
+---@field model TradingCardsModel
+---@field albumDatas TradingCardsCollectAlbumData[]                         @图册数据
+---@field shelfItems table<any,TradingCardsCollectView._obj_item_GoTable>   @图册书架item
+---@field awardDatas number[][]                                             @奖励配置
+---@field awardState number                                                 @奖励状态: 0不可领取, 1可领取, 2已领取
+local TradingCardsCollectView = _G.BaseClass("TradingCardsCollectView", _G.UIBaseView)
+
+function TradingCardsCollectView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self.go_table.obj_item:SetActiveE(0)
+
+    self:AddListener(_G.TradingCards.UpdateAlbum, self.UpdateView)
+end
+
+---界面的入口函数
+function TradingCardsCollectView:OnCreate(albumId)
+    self.albumId = albumId
+    self.cfg = _G.ConfigManager.trading_card_album_cfg[albumId]
+    self.model = require("TradingCardsModel"):GetInstance()
+
+    self:InitView()
+    self:UpdateView()
+end
+
+function TradingCardsCollectView:OnDestroy()
+    self:RemoveAllListener()
+end
+
+---更新页面状态
+function TradingCardsCollectView:InitView()
+    self.go_table.aortext_title.text = _G.GetLangPackValue(self.cfg.Name)
+    --列表初始化
+    self.shelfItems = {}
+    self.albumDatas = self.model:GetCollectAlbums(self.albumId)
+    table.sort(self.albumDatas, function(a, b)
+        if a.cfg.quality ~= b.cfg.quality then
+            return a.cfg.quality > b.cfg.quality
+        end
+        return a.cfg.id < b.cfg.id
+    end)
+    self.go_table.scrollloopvectical_list:InitItemData(
+        math.ceil(#self.albumDatas / ShelfMemberCount),
+        _G.handler(self, self.UpdateShelfItem)
+    )
+
+    --奖励列表信息
+    self.awardState = 0
+    self.awardDatas = self.model:GetCollectAwardCfg(self.albumId) or {}
+    self.go_table.scrollloophorizontal_award:InitItemData(#self.awardDatas, _G.handler(self, self.UpdateAwardItem))
+    --全收集红点
+    local allActive = true
+    for _, album in pairs(self.albumDatas) do
+        if album then
+            if not album:IsActiveAll() then
+                allActive = false
+                break
+            end
+        end
+    end
+    self.go_table.obj_awardRedpoint:SetActiveE(allActive and 1 or 0)
+end
+
+---更新页面状态
+function TradingCardsCollectView:UpdateView()
+    --全收集状态
+    local activeNum, totalNum = 0, 0
+    for _, album in ipairs(self.albumDatas) do
+        activeNum = activeNum + album:GetActiveNumber()
+        totalNum = totalNum + #album:GetCards()
+    end
+    self.go_table.aortext_total.text = _G.GetLangPackValue(90022500702) .. _G.string.format("%s/%s", activeNum, totalNum) --_G.GetLangPackValue(0, activeNum, totalNum) --收集进度: %s/%s
+    self.go_table.obj_totalFill:SetLocalScale(activeNum / totalNum, 1, 1)
+
+    ---更新列表
+    self.go_table.scrollloopvectical_list:UpdateAllItem()
+
+    self.awardState = self.model:IsReceiveCollectAward(self.albumId) and 2 or activeNum >= totalNum and 1 or 0
+    self.go_table.scrollloophorizontal_award:UpdateAllItem()
+end
+
+---刷新书架item
+---@param index number 书架索引
+---@param go GameObject 书架item对象
+function TradingCardsCollectView:UpdateShelfItem(index, go)
+    ---@type TradingCardsCollectView._obj_item_GoTable|{__items?:_obj_item._obj_album_GoTable[]}
+    local shelfItem = self.shelfItems[go:GetInstanceIDE()]
+    if not shelfItem then
+        shelfItem = _G.GetAutoGoTable(go)
+        self.shelfItems[go:GetInstanceIDE()] = shelfItem
+    end
+
+    if not shelfItem.__items then
+        local firstItem = _G.GetAutoGoTable(shelfItem.obj_album)
+        _G.AddViewBtnClick(firstItem.gameObject, _G.handlerbind(self, self.OnClickAlbumBtn, firstItem))
+        shelfItem.__items = { firstItem }
+    end
+
+    for i = 1, ShelfMemberCount do
+        local item = shelfItem.__items[i]
+        local data = self.albumDatas[index * ShelfMemberCount + i]
+        if not data then
+            --数据队列结束
+            if item then
+                item.gameObject:SetActiveE(0)
+            end
+        else
+            --检查是否需要new节点
+            if not item then
+                local newObj = _G.InstantiateObject(shelfItem.obj_album, shelfItem.obj_albums)
+                item = _G.GetAutoGoTable(newObj)
+                _G.AddViewBtnClick(item.gameObject, _G.handlerbind(self, self.OnClickAlbumBtn, item))
+                shelfItem.__items[i] = item
+            end
+            item.gameObject:SetActiveE(1) --激活
+            --设置节点属性
+            item.data = data
+
+            --品质
+            local qualityCfg = self.model.CollectAlbumQualityImgs[data.cfg.quality]
+            item.aorimage_bg.SpriteName = qualityCfg and qualityCfg[1] or ""
+            item.aorimage_name.SpriteName = qualityCfg and qualityCfg[2] or ""
+            item.aorimage_box.SpriteName = qualityCfg and qualityCfg[4] or ""
+            item.aorimage_halo.SpriteName = qualityCfg and qualityCfg[3] or ""
+            --基础信息
+            item.aortext_name.text = _G.GetLangPackValue(data.cfg.Name)
+            item.aortext_name.color = self.model.CollectAlbumQualityColor[data.cfg.quality]
+            local params = data:GetRoleParams()
+            item.aorrawimage_role:LoadImage(data:GetRolePath(), function(img)
+                if self:IsNil() then
+                    return
+                end
+                img:SetNativeSize()
+                img:SetLocalScaleXYZ(params.size or 1)
+                if params.pos_portrait then
+                    img:SetLocalPosition(
+                        params.pos_portrait[1] or 0,
+                        params.pos_portrait[2] or 0,
+                        params.pos_portrait[3] or 0
+                    )
+                else
+                    img:SetLocalPositionToZero()
+                end
+            end)
+            --进度值
+            local num, total = data:GetActiveNumber()
+            item.obj_progressFill:SetLocalScale(num / total, 1, 1)
+            item.aortext_progressNum.text = string.format("%s/%s", num, total)
+            item.obj_received:SetActiveE(data:IsReceivedAward() and 1 or 0)
+            item.obj_redpoint:SetActiveE(0)
+            if data:IsActiveAll() and not data:IsReceivedAward() then
+                item.obj_redpoint:SetActiveE(1)
+            else
+                for _, cardId in ipairs(data:GetCards()) do
+                    if not data:IsCardActive(cardId) and data:GetCardNumber(cardId) > 0 then
+                        item.obj_redpoint:SetActiveE(1)
+                        break
+                    end
+                end
+            end
+            _G.DelayFrameDo(function()
+                _G.UIUtils.LoadEffectByCfg(
+                        _G.ConfigManager.ui_effect_cfg.ef_TradingCardsToggleView_dianji,
+                        item.obj_click_effect,
+                        function(obj)
+                            if self:IsNil() then
+                                _G.DestroyObject(obj)
+                                return
+                            end
+                        end
+                )
+            end)
+        end
+    end
+end
+
+---刷新奖励item
+---@param index number 书架索引
+---@param go GameObject 书架item对象
+function TradingCardsCollectView:UpdateAwardItem(index, go)
+    local data = self.awardDatas[index + 1]
+    local loadId = "__loadId" .. math.random()
+    go:SetLocalScaleXYZ(0.75)
+    go:ClearChildren()
+    go:SetName(loadId)
+    _G.StorageManager:GetInstance():GetItemBaseViewNew(
+        data,
+        go,
+        function(itemObj)
+            if self:IsNil() or go:GetName() ~= loadId then
+                _G.DestroyObject(itemObj.gameObject)
+                return
+            end
+            itemObj.gameObject:SetLocalPosition(0, 0, 0)
+            --itemObj.gameObject:SetLocalScaleXYZ(0.85)
+            itemObj:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+            if itemObj.SetGradeNew then
+                itemObj:SetGradeNew(false)
+            end
+            if self.awardState == 2 and itemObj.SetGou then
+                itemObj:SetGou(true)
+            end
+        end,
+        function()
+            if self.awardState == 1 then
+                self.model:GetAlbumAward(self.albumId, function(msg)
+                    if not msg or msg.ack ~= 1 then
+                        return
+                    end
+                    _G.UIUtils.ShowCommonAward(msg)
+                    --刷新奖励列表
+                    self.awardState = 2
+                    self.go_table.scrollloophorizontal_award:UpdateAllItem()
+                end)
+            else
+                require("CommonTipManager"):GetInstance():OpenTip(go, data[1])
+            end
+        end
+    )
+    if self.awardState == 1 then
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_daojukuang_cheng,
+            go,
+            function(obj)
+                if self:IsNil() or go:GetName() ~= loadId then
+                    _G.DestroyObject(obj)
+                    return
+                end
+                obj:SetLocalScaleXYZ(1.4)
+            end
+        )
+    end
+end
+
+---刷新单个书本item
+---@param item _obj_item._obj_album_GoTable|{data?:TradingCardsCollectAlbumData} 图册item对象
+function TradingCardsCollectView:OnClickAlbumBtn(_, _, item)
+    if not item or not item.data then
+        return
+    end
+    item.obj_click_effect:SetActiveE(1)
+    item.obj_click_effect:SetActiveE(0)
+    if item.data:IsActiveAll() and not item.data:IsReceivedAward() then
+        self.model:GetCollectAward(self.albumId, item.data.cfg.id, function(msg)
+            if not msg or msg.ack ~= 1 then
+                return
+            end
+            _G.UIUtils.ShowCommonAward(msg)
+
+            --刷新列表
+            self.go_table.scrollloopvectical_list:UpdateAllItem()
+        end)
+        return 
+    end
+    _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.TradingCardsCollectAlbumView.Name,
+            self.albumId,
+            item.data
+    )
+end
+
+---按钮点击事件在这里派发
+function TradingCardsCollectView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_CloseView then
+        self:Close()
+    elseif go == self.go_table.aorbtn_help then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.GamePlayDescribeView.Name,
+            227
+        )
+    elseif go == self.go_table.aorbtn_attr then
+        local attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+        for _,id in pairs(self.cfg.albums) do
+            local album = self.model.collectAlbums[id]
+            if album then
+                album:GetAttr(attribute)
+            end
+        end
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.BuildAttrShowView.Name, attribute)
+    end
+end
+
+return TradingCardsCollectView

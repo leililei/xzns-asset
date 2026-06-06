@@ -1,0 +1,547 @@
+-----------------------------------------------------------------------
+-- C:.workspace.alpha_FT.Client.Assets.Resources.LuaScripts.Game.CelebrationTrial.Model.CelebrationTrialModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/06/26
+-- Description: 庆典试炼数据管理
+-----------------------------------------------------------------------
+local ThemeActivityManager = require("ThemeActivityManager"):GetInstance()
+local CelebrationTrialNet = require("CelebrationTrialNet"):GetInstance()
+local CelebrationTrialMissionData = require("CelebrationTrialMissionData")
+
+---@class CelebrationTrialTaskData
+---@field i_task task.i_task
+---@field type number
+---@field count number
+---@field award prop.i_item[]
+
+local base = require("ThemeActivityBaseModel")
+---@class CelebrationTrialModel : ThemeActivityBaseModel
+---@field info activity_theme.i_celebration_trial 活动信息
+---@field passTime number 奖励进度
+---@field boxesInfo activity_theme.i_celebration_award[] 宝箱信息
+---@field receivedList number[] 已领取奖励id列表
+---@field finishList number[] 已完成任务id列表
+---@field delta number 阶段间隔天数
+---@field monsterGroup number 怪物组id
+---@field taskList CelebrationTrialTaskData[]
+---@return CelebrationTrialModel CelebrationTrialModel
+local CelebrationTrialModel = _G.BaseClass("CelebrationTrialModel", base)
+
+local CS = _G.CS
+local typeof = _G.typeof
+local Mathf = _G.Mathf
+local ConfigManager = _G.ConfigManager
+local UIManager = _G.UIManager
+local TimeUtil = _G.TimeUtil
+
+---@return CelebrationTrialModel CelebrationTrialModel
+function CelebrationTrialModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---类的构造函数
+function CelebrationTrialModel:__init()
+end
+
+---初始化数据
+---@param msg activity_theme.i_celebration_trial
+function CelebrationTrialModel:InitData(msg)
+    self.info = msg
+    self.passTime = msg.all_pass_times
+    self.boxesInfo = msg.cfg_award
+    self.damage = msg.day_high_dps
+    _G.SortList(
+        self.boxesInfo,
+        function(a)
+            return -a.condition
+        end
+    )
+    self.receivedList = msg.times_award or {}
+    self.finishList = msg.finish or {}
+    local curTaskValue = msg.curr or {}
+    self.curTaskValue = {}
+    for _, v in pairs(curTaskValue) do
+        if v.k == 2 then
+            self.curTaskValue[v.k] = Mathf.Floor(v.v / 1000)
+        else
+            self.curTaskValue[v.k] = v.v
+        end
+    end
+    self:InitTask(msg.cfg_list)
+    self.delta = msg.day_change_list
+    self.monsterGroup = msg.monster_id
+end
+
+---进入活动
+function CelebrationTrialModel:EnterActivity()
+    UIManager:GetInstance():OpenWindow(ConfigManager.ui_cfg.CelebrationTrialView.Name)
+end
+
+---@private
+---@param taskData activity_theme.i_celebration_task[]
+function CelebrationTrialModel:InitTask(taskData)
+    self.taskList = {}
+    _G.SortList(
+        taskData,
+        function(a)
+            return a.condition[1], a.condition[2]
+        end
+    )
+    local item
+    local task
+    for _, v in pairs(taskData) do
+        item = {}
+        item.type = v.condition[1]
+        item.count = v.condition[2]
+        item.award = v.award
+        task = {}
+        task.sid = v.sid
+        task.target = {self.curTaskValue[task.sid] or 0}
+        task.time = 0
+        task.state = self:GetTaskState(task.sid, item.count, task.target[1])
+        item.i_task = task
+        _G.table.insert(self.taskList, item)
+    end
+end
+
+---@private
+function CelebrationTrialModel:GetTaskState(sid, target, cur)
+    if _G.table.ContainsValue(self.finishList, sid) then
+        return _G.TaskEnum.ETaskState.Completed
+    elseif cur >= target then
+        return _G.TaskEnum.ETaskState.Submited
+    else
+        return _G.TaskEnum.ETaskState.Claimed
+    end
+end
+
+---解析战斗结果（任务用）
+---@param data fight.s2c_fight_result
+function CelebrationTrialModel:ParseFightResult(data)
+    if data.ack == 1 then
+        for _, v in pairs(self.taskList) do
+            if v.i_task.state ~= _G.TaskEnum.ETaskState.Completed then
+                if v.i_task.sid == 1 then
+                    v.i_task.target[1] = v.i_task.target[1] + 1
+                elseif v.i_task.sid == 2 then
+                    if v.i_task.target[1] < data.args[1] / 1000 then
+                        v.i_task.target[1] = Mathf.Floor(data.args[1] / 1000)
+                    end
+                elseif v.i_task.sid == 3 then
+                    if v.i_task.target[1] < data.atk_dps then
+                        v.i_task.target[1] = data.atk_dps
+                    end
+                end
+                if v.i_task.target[1] >= v.count and v.i_task.state == _G.TaskEnum.ETaskState.Claimed then
+                    v.i_task.state = _G.TaskEnum.ETaskState.Submited
+                end
+            end
+        end
+    end
+end
+
+---获取当前阶段
+function CelebrationTrialModel:GetCurStage()
+    local startTime = ThemeActivityManager:GetStartTime()
+    local timeShow = {}
+    local now = TimeUtil.GetServerUnixTime()
+    local stageIdx = now > startTime and 1 or 0
+    local stage = startTime
+    for i = 1, 3 do
+        timeShow[i] = stage - now
+        stage = stage + self.delta[i] * 86400
+        if now > stage then
+            stageIdx = i + 1
+        end
+    end
+    if timeShow[stageIdx] then
+        timeShow[stageIdx] = timeShow[stageIdx] + self.delta[stageIdx] * 86400
+    end
+    return stageIdx, timeShow
+end
+
+---检查宝箱状态 1.未解锁 2.可领取 3.已领取
+function CelebrationTrialModel:CheckBoxState(index)
+    if _G.table.ContainsValue(self.receivedList, self.boxesInfo[index].sid) then
+        return 3
+    elseif self.boxesInfo[index].condition <= self.passTime then
+        return 2
+    else
+        return 1
+    end
+end
+
+---领取阶段奖励
+function CelebrationTrialModel:GetAward(id, activityId, callback,index)
+    if not self.coinSid then
+        self.coinSid = require"ThemeActivityManager":GetInstance():GetCoinSid()
+    end
+    local pbData = {activity_id = activityId, id = id}
+    CelebrationTrialNet:GetAward(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            for k,v in pairs(self.boxesInfo[index].award) do
+                if v.sid == self.coinSid then
+                    local itemData = {type = {v.sid,v.num}}
+                    _G.table.insert(data.award.item,itemData)
+                end
+            end
+            _G.table.insert(self.receivedList, id)
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+            self:RefreshRedPoint()
+            if callback then
+                callback(data)
+            end
+        end
+    )
+end
+
+---完成任务
+function CelebrationTrialModel:FinishTask(sid, award, callback)
+    local activityId = ThemeActivityManager:GetActivityID()
+    local pbData = {activity_id = activityId, sid = sid}
+    CelebrationTrialNet:FinishTask(
+        pbData,
+        function(data)
+            local coinSid = require("ThemeActivityManager"):GetInstance():GetCoinSid()
+            for _, v in pairs(award) do
+                if v.sid == coinSid then
+                    local type = {type = {v.sid, v.num}}
+                    _G.table.insert(data.award.item, type)
+                end
+            end
+            _G.table.insert(self.finishList, sid)
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            if callback then
+                callback(data)
+            end
+            self:RefreshRedPoint()
+        end
+    )
+end
+
+---获取排行榜数据
+function CelebrationTrialModel:GetRank(callback)
+    local pbData = {page = 1, id = ThemeActivityManager:GetActivityID()}
+    CelebrationTrialNet:GetRank(
+        pbData,
+        function(data)
+            if callback then
+                callback(data)
+            end
+        end
+    )
+end
+
+---获取玩家个人名次
+function CelebrationTrialModel:GetPlayerRank(callback)
+    local pbData = {type = ThemeActivityManager:GetActivityID()}
+    CelebrationTrialNet:GetPlayerRank(
+        pbData,
+        function(data)
+            self.playerRank = data
+            if callback then
+                callback(data)
+            end
+        end
+    )
+end
+
+--- 挑战
+function CelebrationTrialModel:OnChallenge()
+    if not ThemeActivityManager:CheckThemeActivityIsOpen() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(620105)
+        return
+    end
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require "EmbattleController":GetInstance():OpenEmbattle(
+        _G.EmbattleType.CelebrationTrial,
+        _G.EmbattleSaveType.server,
+        true,
+        _G.EmbattleControllerItemType.CelebrationTrial,
+        _G.handler(self, self.OnExitFight),
+        _G.handler(self, self.OnFight),
+        self.monsterGroup
+    )
+end
+
+---退出布阵
+function CelebrationTrialModel:OnExitFight()
+    self:ReturnPanel()
+end
+
+---进入战斗
+function CelebrationTrialModel:OnFight()
+    self.isChallenge = true
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.CelebrationTrial)
+end
+
+---监听界面打开
+---@param name string 界面名称
+function CelebrationTrialModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        _G.UIManager:GetInstance():HideWindow(ThemeActivityManager.curActitity:OnGetMainViewName())
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.CelebrationTrialView.Name)
+    -- local embattleView = _G.UIManager:GetInstance():GetWindowCtrl(name)
+    -- if self.autoFight then
+    --     embattleView:SetAutoBattle()
+    -- end
+    -- embattleView:SetInitDoneCall(
+    --     function()
+
+    --     end
+    -- )
+    end
+end
+
+function CelebrationTrialModel:ReEnterFight()
+    self.isChallenge = true
+    require "EmbattleController":GetInstance():OpenEmbattle(
+        _G.EmbattleType.CelebrationTrial,
+        _G.EmbattleSaveType.server,
+        true,
+        _G.EmbattleControllerItemType.CelebrationTrial,
+        _G.handler(self, self.OnExitFight),
+        _G.handler(self, self.OnFight),
+        self.monsterGroup
+    )
+end
+
+---更换界面
+function CelebrationTrialModel:ReturnPanel(isWin)
+    self.isChallenge = false
+    _G.UIManager:GetInstance():ShowWindow(ThemeActivityManager.curActitity:OnGetMainViewName())
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.CelebrationTrialView.Name)
+    if not ThemeActivityManager:CheckThemeActivityIsOpen() then
+        if
+            _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.CelebrationTrialRankView.Name) and
+                _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name)
+         then
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name)
+        end
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.CelebrationTrialView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.CelebrationTrialRankView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.CelebrationTrialTaskView.Name)
+        _G.UIManager:GetInstance():CloseWindow(ThemeActivityManager.curActitity:OnGetMainViewName())
+    else
+        if isWin then
+            local index = 2
+            ---@type monster_group_cfg
+            local monster_group = _G.ConfigManager.monster_group_cfg[self.monsterGroup]
+            local cfgs = _G.ConfigManager.monster_cfg
+            ---@type monster_cfg
+            local monsterCfg
+            for _, v in ipairs(monster_group.DefaultDefenserSids[1]) do
+                monsterCfg = cfgs[v]
+                if monsterCfg and monsterCfg.MonsterType == 5 then
+                    break
+                end
+            end
+            local card_cfg = _G.ConfigManager.card_cfg[monsterCfg.CardID]
+            local data = {
+                rankDatas = {},
+                playerRankData = {},
+                name = _G.GetLangPackValue(monsterCfg.Name),
+                icon = card_cfg.Portrait,
+                type = _G.FightBossWinType.CelebrationTrial,
+                cardId = monsterCfg.CardID,
+            }
+            local showView = function()
+                index = index - 1
+                if index <= 0 then
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.FightBossWinView.Name, data)
+                end
+            end
+
+            require("DungonesModel"):GetInstance():GetRanKInfo(
+                {type = 80},
+                function()
+                    ---@type FightBossWinView_Params
+
+                    local rankDatas = require("DungonesModel"):GetInstance().rank_all_player or {}
+                    if rankDatas then
+                        for i = 1, #rankDatas do
+                            data.rankDatas[i] = {
+                                rank = i,
+                                role = rankDatas[i]:GetRole(),
+                                value = rankDatas[i]:GetDamage()
+                            }
+                        end
+                    end
+                    showView()
+                end
+            )
+
+            require "CelebrationTrialModel":GetInstance():GetPlayerRank(
+                function(msg)
+                    data.playerRankData = {rank = msg.index}
+                    showView()
+                end
+            )
+        end
+    end
+end
+
+function CelebrationTrialModel:FightEnd()
+end
+
+function CelebrationTrialModel:OnSettlement()
+    if not self.isChallenge then
+        if
+            _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.CelebrationTrialRankView.Name) and
+                _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name)
+         then
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name)
+        end
+        if
+            _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.CelebrationTrialView.Name) and
+                _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+         then
+            ---@type EmbattleNewView
+            local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+            ctrl:QuitEmbattle()
+        end
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.CelebrationTrialView.Name)
+
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.CelebrationTrialTaskView.Name)
+
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.CelebrationTrialRankView.Name)
+    end
+end
+
+---初始化红点树{{id,lua,child}} id 红点id ,lua 红点脚本需继承RedPointBaseThemeActivity,child 子功能红点id,第一个红点必须id为1
+function CelebrationTrialModel:InitRedTree()
+    self.redTree = {{1, "RedPointCelebrationTrial", {}}}
+end
+
+---检查红点
+function CelebrationTrialModel:CheckRedPoint(param)
+    if not ThemeActivityManager:CheckThemeActivityIsOpen() then
+        return false
+    end
+    if param == 1 then
+        return self:CheckTaskRedPoint()
+    end
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    local key = uid .. ConfigManager.ui_cfg.CelebrationTrialView.Name .. ThemeActivityManager:GetActivityID()
+    local stageIdx, timeShow = self:GetCurStage()
+    if 0 < stageIdx and stageIdx < 4 and not _G.PlayerPrefsManager.HasKey(key .. stageIdx) then
+        return true
+    end
+    for k, v in pairs(self.boxesInfo) do
+        if self:CheckBoxState(k) == 2 then
+            return true
+        end
+    end
+    return self:CheckTaskRedPoint()
+end
+
+---@private
+function CelebrationTrialModel:CheckTaskRedPoint()
+    for k, v in pairs(self.taskList) do
+        if v.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            return true
+        end
+    end
+    return false
+end
+
+function CelebrationTrialModel:RefreshRedPoint()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(self:GetRedPointId())
+end
+
+function CelebrationTrialModel:PlayRankHuiFang(rankid, playeruid)
+    local msg = {}
+    msg.type = rankid
+    msg.uid = playeruid
+    require "LingRankNet":GetInstance():GetRankReport(
+        msg,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.fight_arg = msg.arg
+            self:UpdateData1(_G.BattleManager:GetInstance():GetStatisticsRecord(msg.arg))
+        end
+    )
+end
+
+function CelebrationTrialModel:UpdateData1(data)
+    if not data then
+        _G.PopWindowManager:GetInstance():ShowAllTips(540302)
+        return
+    end
+    self.maxCountRank = _G.table.count(data.FighterInfo)
+    self.PveData = {}
+    local damage, win = _G.GameUtil.ShowStatisticsView(data)
+    self.PveData = damage
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name,
+        self.PveData,
+        win,
+        function()
+            local ThemeActivitySecView =
+                _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ThemeActivitySecView.Name)
+            if ThemeActivitySecView then
+                ThemeActivitySecView.View:Show()
+            end
+            local CelebrationTrialView =
+                _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CelebrationTrialView.Name)
+            if CelebrationTrialView then
+                CelebrationTrialView.View:Show()
+            end
+            local CelebrationTrialRankView =
+                _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CelebrationTrialRankView.Name)
+            if CelebrationTrialRankView then
+                CelebrationTrialRankView.View:Show()
+            end
+        end,
+        nil,
+        self.otherPlayer,
+        1,
+        true,
+        self.fight_arg
+    )
+end
+
+---获取伤害
+function CelebrationTrialModel:GetDamage()
+    return self.damage
+end
+
+---更新伤害
+function CelebrationTrialModel:UpdateDamage(damage)
+    if self.damage then
+        if self.damage < damage then
+            self.damage = damage
+        end
+    else
+        self.damage = damage
+    end
+end
+
+---获取排行榜奖励
+function CelebrationTrialModel:GetRankAwards()
+    return self.info.rank_list
+end
+
+---获取每日进度增长区间
+function CelebrationTrialModel:GetInterval()
+    return self.info.interval
+end
+
+---获取buff组
+function CelebrationTrialModel:GetBuffList()
+    return self.info.buff_list
+end
+
+---类的析构函数
+function CelebrationTrialModel:Dispose()
+end
+
+return CelebrationTrialModel

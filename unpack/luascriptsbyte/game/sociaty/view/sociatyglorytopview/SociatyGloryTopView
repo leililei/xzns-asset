@@ -1,0 +1,1022 @@
+local ELocationEnum = require("MemberEnum").ELocationEnum
+local CardInfoManager = require("CardInfoManager")
+
+local function NONE()
+end
+
+---@class SociatyGloryTopView : UIBaseView	公会职位一览视图
+---@field go_table SociatyGloryTopView_GoTable
+---@field fameCount number                                          @名人堂人数配置
+---@field masterData SociatyMemberBase                              @会长玩家数据
+---@field masterPlayerData any                                      @会长角色数据
+---@field scale number                                              @模型缩放倍率
+---@field titleScale number                                         @称号缩放倍率
+---@field famePlayerItems SociatyGloryTopView._obj_player_GoTable[]     @名人堂Player节点
+---@field activePlayerItems SociatyGloryTopView._obj_player_GoTable[]   @使用中的Player节点
+---@field releasePlayerItems SociatyGloryTopView._obj_player_GoTable[]  @未使用的Player节点
+
+local SociatyGloryTopView = _G.BaseClass("SociatyGloryTopView", _G.UIBaseView)
+
+function SociatyGloryTopView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+
+    ---计算基准缩放倍率
+    self.scale = 0.8
+    if _G.CS.Launcher.Inst.UIScaler.matchWidthOrHeight < 0.5 then --适配宽 分辨率比例小于 16：9
+        local screenSize = _G.CS.Launcher.Inst.ScreenSize
+        self.scale = self.scale * _G.AppSetting.CONFIG_SCREEN_HEIGHT / screenSize.y
+    end
+
+    self.titleScale = _G.ConfigManager.discrete_cfg[103902][1][1] * 0.0035
+    self.RoleTitle = {
+        [1] = self.go_table.obj_roleTitle1,
+        [2] = self.go_table.obj_roleTitle2,
+        [3] = self.go_table.obj_roleTitle3,
+        [4] = self.go_table.obj_roleTitle4,
+        [5] = self.go_table.obj_roleTitle5
+    }
+    local discrete_cfg = _G.ConfigManager.discrete_cfg
+    self.roleParams = {
+        moveX = discrete_cfg[101698][1],    --成员移动X轴
+        moveArea = { -6, 6 },               --成员移动Z轴
+        idleTime = discrete_cfg[101692][1], --成员驻足时间区间
+        moveTime = discrete_cfg[101693][1], --成员移动时间区间
+        speed = discrete_cfg[101695][1][1], --移动速度(z值变化/秒)
+        scale = discrete_cfg[101696][1][1], --缩放
+        startTime = discrete_cfg[101699][1] --缩放
+    }
+
+    self:AddListener(_G.eSociatyEvent.BeKicked, self.OnBeKicked)
+    self:AddListener(_G.eSociatyEvent.MemberLocationRefresh, self.OnMemberRefresh)
+end
+
+function SociatyGloryTopView:OnDisable()
+    if self.sceneTrans then
+        self.sceneTrans:SetActiveE(0)
+    end
+end
+
+function SociatyGloryTopView:OnEnable()
+    if self.sceneTrans then
+        self.sceneTrans:SetActiveE(1)
+    end
+end
+
+function SociatyGloryTopView:OnDestroy()
+    self:RemoveAllListener()
+end
+
+function SociatyGloryTopView:OnCreate()
+    _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.SociatyGloryView, self.go_table)
+    local model = require("SociatyModel"):GetInstance()
+
+    self.go_table.obj_player:SetActiveE(0)
+    self:InitMemebers()
+
+    local masterData = model:GetChairman()
+    self:SetMasterData(masterData)
+    self:SetMasterPlayerData(masterData)
+    self:SetSelfData(model:GetSelfMember())
+
+    self:UpdateMasterModel()
+
+    self:UpdateButtonStates()
+
+    --获取名人堂成员(有职位的不算)
+    require("SociatyModel"):GetInstance():GetFameMembers(_G.handler(self, self.InitFameMembers))
+
+    self:AddListener(_G.eSociatyEvent.ExchangeNotice, self.RefreshPanel)
+    self:AddListener(_G.eSociatyEvent.ExchangeName, self.RefreshPanel)
+    self:AddListener(_G.eSociatyEvent.ExchangeIcon, self.RefreshPanel)
+    self:RefreshPanel()
+    self:InitScene()
+end
+
+---监听被踢出公会
+function SociatyGloryTopView:OnBeKicked()
+    self:Close()
+end
+
+---监听成员状态刷新
+function SociatyGloryTopView:OnMemberRefresh()
+    self:InitMemebers()
+    self:InitFameMembers()
+end
+
+---初始化公会职位信息: 副会长/长老/名人堂
+function SociatyGloryTopView:InitMemebers()
+    self:ReleaseAllPlayerItems()
+
+    local model = require("SociatyModel"):GetInstance()
+    local cfg = _G.ConfigManager.guild_level_cfg[model:GetMasterBuildLevel()]
+    if not cfg then
+        return
+    end
+    --副会长/长老: 通过配置
+    for index, jobs in ipairs(cfg.num_position) do
+        local position, num = table.unpack(jobs)
+        local memebers = model:GetMembersByPosition(position)
+        --按照目前的美术图工会长老只放得下2个
+        local maxNum = 2 --model:GetMaxLocationNum(position)
+        for j = 1, maxNum do
+            local item = self:GetPlayerItem(self.go_table["obj_type" .. index])
+            item.location = position
+            item.isFame = false
+            item.index = j
+            if j > num then
+                item.lock = true
+            end
+            self:SetMemeberData(item, memebers and memebers[j] or nil)
+        end
+    end
+    --名人堂(战力最高的n位玩家, 有职位的不算)
+    self.famePlayerItems = {}
+    for j = 1, model:GetFameCount() do
+        local item = self:GetPlayerItem(self.go_table.obj_type3)
+        item.location = ELocationEnum.Member
+        item.isFame = true
+        item.index = j
+        table.insert(self.famePlayerItems, item)
+        self:SetMemeberData(item, nil)
+    end
+end
+
+---加载模型
+function SociatyGloryTopView:LoadModels(tb, uid, isChairman, datas)
+    if uid then
+        ---@type card_cfg 获取角色配置
+        local cfg = require "CardCommentManager":GetInstance():CardData(uid, false)
+        local cardsid = cfg.card and cfg.card or cfg.id
+        ---@type card_cfg
+        local cfg_show = require("CardInfoManager").GetCardSkin_ShowCfg(nil, uid)
+        local scale = cfg_show.size2 or 1
+        -- 清空目标节点
+        tb:ClearChildren()
+        if not isChairman then
+            _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.SociatyGloryView .. "Member", _G.GetAutoGoTable(tb:GetParent()))
+        end
+        local path = _G.UIUtils.GetBattleSpine(cfg, _G.UseBattleSpine.SociatyGloryView)
+        -- 加载模型
+        _G.PoolsManager:GetInstance():Spawn(
+            path,
+            _G.ePoolType.Temporary,
+            tb,
+            function(trans)
+                if trans == nil then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("角色无法加载 path:" .. cfg.ModelPathHi .. "    CardInfoView LoadRoleScene")
+                    end
+                    return
+                end
+                if self.go_table == nil then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                trans:SetParentE(tb)
+                trans:SetLocalPosition(0, 0, 0)
+                if _G.UIUtils.IsUseBattleSpine(_G.UseBattleSpine.SociatyGloryView) then
+                    trans:SetLocalScaleXYZ(cfg.size4)
+                else
+                    trans:SetLocalScale(scale, scale, scale)
+                end
+                local rolePoint = trans:GetComponentE(_G.typeof(_G.CS.RolePoint))
+                if rolePoint == nil then
+                    rolePoint = trans:AddComponentE(_G.typeof(_G.CS.RolePoint))
+                end
+                --- 只有星座女神有神环
+                if _G.AppSetting.IsXzns then
+                    local godHaloID = _G.PlayerModel:GetInstance():IsCardWearGodHalo(cardsid)
+                    if godHaloID ~= 0 then
+                        local effCfg = _G.ConfigManager.god_halo_cfg[godHaloID].ui_effect_cfg
+                        --- 神环路径，父级路径(加载角色的下面)
+                        _G.UIUtils.LoadGodHalo(effCfg, trans, godHaloID)
+                    end
+                    _G.UIUtils.LoadArtifacteffect(trans,cardsid,nil,nil)
+                end
+            end
+        )
+    end
+end
+
+---初始化名人堂信息
+---@param roles role.i_role[]
+function SociatyGloryTopView:InitFameMembers(roles)
+    local model = require("SociatyModel"):GetInstance()
+
+    if self.famePlayerItems then
+        for i = 1, #self.famePlayerItems do
+            local uid = roles and roles[i] and roles[i].uid or 0
+            local data = uid ~= 0 and model:GetMemberByUid(uid) or nil
+            self:SetMemeberData(self.famePlayerItems[i], data and data.Location == ELocationEnum.Member and data or nil)
+        end
+    end
+
+    --更新自己的信息
+    self:SetSelfData(model:GetSelfMember())
+end
+
+---设置公会会长状态
+function SociatyGloryTopView:SetMasterData(data)
+    self.masterData = data
+    --会长模型
+    local styleUid = (self.masterData and self.masterData.Style) and self.masterData.Style or 112020000
+    _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.SociatyGloryView .. "Chairman", self.go_table)
+    self:LoadModels(self.go_table.trans_roleTop, styleUid, true, self.masterData)
+    self.go_table.aortext_masterName.text = data and data.Name or _G.GetLangPackValue(90021800512)
+end
+
+---获取公会会长角色状态
+function SociatyGloryTopView:SetMasterPlayerData(data)
+    self.masterPlayerData = nil
+    if not data then
+        return
+    end
+    --如果自己就是会长, 则直接使用本地数据
+    if data.Uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+    else
+    end
+    require("SystemSettingNet"):GetInstance():GetPlayerInfo(
+        { uid = data.Uid },
+        function(msg)
+            self.masterPlayerData = msg.info
+            self:UpdateMasterModel()
+        end
+    )
+end
+
+---设置自己的状态
+function SociatyGloryTopView:SetSelfData(data)
+    self.go_table.aortext_name.text = data.Name
+    self.go_table.aortext_power.text = _G.UIUtils.NumberToUnitStr_CardFightNum(data.Power)
+    _G.UIUtils.SetPlayerHeadItemNew(self.go_table.obj_HeadItemBase, data, 0.65, true, false, true, NONE)
+
+    local model = require("SociatyModel"):GetInstance()
+    --是否为名人堂玩家
+    local isFame = model:IsFameMember(data)
+    --职位信息
+    self.go_table.aortext_job.text =
+        isFame and _G.GetLangPackValue(91300001707) or _G.GetLangPackValue(model:GetLocationLanguage(data.Location))
+
+    if isFame then
+        self.go_table.obj_jobBG1:SetActiveE(0)
+        self.go_table.obj_jobBG2:SetActiveE(0)
+        self.go_table.obj_jobBG3:SetActiveE(0)
+        self.go_table.obj_jobBG9:SetActiveE(0)
+        self.go_table.obj_jobBG4:SetActiveE(1)
+    else
+        self.go_table.obj_jobBG1:SetActiveE(data.Location == ELocationEnum.Chairman and 1 or 0)
+        self.go_table.obj_jobBG2:SetActiveE(data.Location == ELocationEnum.CoChairman and 1 or 0)
+        self.go_table.obj_jobBG3:SetActiveE(data.Location == ELocationEnum.Elder and 1 or 0)
+        self.go_table.obj_jobBG9:SetActiveE(data.Location == ELocationEnum.Member and 1 or 0)
+        self.go_table.obj_jobBG4:SetActiveE(0)
+    end
+end
+
+---更新按钮状态
+---@return void
+function SociatyGloryTopView:UpdateButtonStates()
+    --今日是否已领取工资
+    local isGet = require("SociatyModel"):GetInstance():IsGetReward()
+
+    --self.go_table.obj_rewardState1:SetActiveE(isGet and 0 or 1)
+    self.go_table.obj_rewardState2:SetActiveE(isGet and 1 or 0)
+end
+
+---设置公会成员状态
+---@param item SociatyGloryTopView._obj_player_GoTable
+---@param data SociatyMemberBase 公会成员信息
+function SociatyGloryTopView:SetMemeberData(item, data)
+    local model = require("SociatyModel"):GetInstance()
+    item.gameObject:SetAsFirstSiblingE()
+    item.data = data
+
+    local visable = data and 1 or 0
+    --item.obj_head:SetActiveE(visable)
+    --item.obj_powerFlag:SetActiveE(visable)
+    item.aortext_name:SetActiveE(visable)
+    --item.aortext_power:SetActiveE(visable)
+    --item.aorbtn_empty:SetActiveE(data and 0 or 1)
+    item.aorrawimage_empty:SetActiveE(data and 0 or 1)
+    item.aorbtn_mask:SetActiveE(item.lock and 1 or 0)
+    item.aortext_condition:SetActiveE(item.lock and 1 or 0)
+    if data then
+        --item.aortext_power.text = _G.UIUtils.NumberToUnitStr_CardFightNum(data.Power)
+        --[[        _G.UIUtils.SetPlayerHeadItemNew(
+            item.obj_HeadItemBase,
+            data,
+            0.65,
+            true,
+            false,
+            true,
+            _G.handlerbind(self, self.OnMemberClickBtn, 0, item) --传参填充0占位
+        )]]
+        item.aortext_name.text = data.Name
+        --模型
+        local styleUid = item.data.Style or 112020000
+        self:LoadModels(item.trans_role1, styleUid, nil, data)
+    else
+        _G.UIUtils.RemoveChildren(item.trans_role1)
+    end
+    if item.lock then
+        item.aortext_condition.text =
+            _G.GetLangPackValue(90021800465, model:GetUnlockLocationNumLv(item.location, item.index))
+    end
+end
+
+---刷新界面
+function SociatyGloryTopView:RefreshPanel()
+    local data = require("SociatyModel"):GetInstance().SociatySelf
+    self:Refresh(data)
+end
+
+---更新公会详细信息
+function SociatyGloryTopView:Refresh(data)
+    self.go_table.aorrawimage_SociatyIcon:LoadImage(_G.ConfigManager.guild_portrait_cfg[data.Banner].portrait)
+    local member =
+        self.isRank and data.num .. "/" .. _G.ConfigManager.guild_level_cfg[data.level].num_player or
+        data.SociatyMemberModule:GetMemberDesc()
+    self.go_table.aortext_Member.text = member
+
+    local level = data:GetMasterBuildLevel()
+    local exp, needExp = data:GetBuildExp(data:GetMasterBuildId())
+
+    self.go_table.aortext_SociatyLv.text = tostring(level)
+    if needExp == 0 then
+        self.go_table.aortext_Ex.text = _G.GetLangPackValue(9002050021)
+    else
+        self.go_table.aortext_Ex.text = _G.string.format("%s/%s", exp, needExp > 0 and needExp or exp)
+    end
+    self.go_table.slider_progress.value = needExp > 0 and exp / needExp or 1
+
+    local notice =
+        self.isRank and (data.provate_notice ~= "" and data.provate_notice or _G.LangUtil.GetLangPackValue(90021800022)) or
+        data.Declaration
+    self.go_table.input_Declaration.text = notice
+    self.go_table.input_Declaration.enabled = false
+
+    local name = data.Name
+    self.go_table.aortext_sociatyName.text = name
+end
+
+--region -----------------场景模型相关---------------------
+
+---刷新会长角色模型
+---@return void
+function SociatyGloryTopView:UpdateMasterModel()
+    if self.sceneTrans and self.masterPlayerData then
+        --self.go_table.obj_shadow:SetActiveE(1)
+        ---@type card_cfg
+        local cfg = require "CardCommentManager":GetInstance():CardData(self.masterPlayerData.city_style_id, false)
+        self:LoadRoleModel(cfg.ModelPathHi, 1, self.scale * cfg.Size1)
+    else
+        --self.go_table.obj_shadow:SetActiveE(0)
+    end
+end
+
+---刷新会长光环
+---@return void
+function SociatyGloryTopView:UpdateMasterHalo(rolePoint)
+    if self.halo then
+        _G.PoolsManager:GetInstance():Despawn(self.halo, _G.ePoolType.Temporary)
+        self.halo = nil
+    end
+    local haloId = self.masterPlayerData and self.masterPlayerData.halo and self.masterPlayerData.halo.sid
+    if not haloId or haloId <= 0 then
+        return
+    end
+
+    local parent = self.roleTrans
+    ---@type player_halo_effect_cfg
+    local cfg = _G.ConfigManager.player_halo_effect_cfg[haloId]
+    _G.PoolsManager:GetInstance():Spawn(
+        cfg.halo,
+        _G.ePoolType.Temporary,
+        parent,
+        function(trans)
+            if _G.IsNil(parent) then
+                _G.DestroyObject(trans)
+                return
+            end
+            self.halo = trans
+            if cfg.type_halo == 2 then
+                self.halo:SetParentE(rolePoint.Point_Chest)
+            else
+                local scale = self.halo:GetParent():GetLocalScale()
+                local rate = self.scale
+                self.halo:SetLocalScaleXYZ(rate * _G.ConfigManager.discrete_cfg[103901][1][1] / scale)
+            end
+            self.halo:GetChildE(0):SetActiveE(1)
+            self.halo:SetEulerAngles(0, 0, 0)
+            self.halo:SetLocalPositionToZero()
+        end
+    )
+end
+
+---刷新会长称号
+---@return void
+function SociatyGloryTopView:UpdateMasterTitle(rolePoint)
+    local titleId = self.masterPlayerData and self.masterPlayerData.title and self.masterPlayerData.title.sid
+
+    local parent = self.roleTrans
+    if not self.title or _G.IsNil(self.title.gameObject) then
+        if not titleId or titleId <= 0 then
+            return
+        end
+        _G.PoolsManager:GetInstance():Spawn(
+            "CommonPrefab/World/Common_TitleWithDesignation",
+            _G.ePoolType.Temporary,
+            parent,
+            function(trans)
+                if (_G.IsNil(parent)) then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                local go_table = _G.GetAutoGoTable(trans)
+                trans:AddComponentE(_G.typeof(_G.CS.UnityEngine.Canvas))
+                self.title = go_table
+                self:SetTitlePos(self.title, rolePoint)
+                go_table.aortext_TextName.text = ""
+
+                ---@type player_title_effect_cfg
+                local cfg = _G.ConfigManager.player_title_effect_cfg[titleId]
+                if cfg then
+                    if cfg.type_title == 1 then
+                        go_table.aorrawimage_Title:LoadImage(
+                            cfg.icon,
+                            function()
+                                go_table.aorrawimage_Title:SetNativeSize()
+                                go_table.aorrawimage_Title:SetLocalScaleXYZ(self.titleScale * self.scale)
+                            end
+                        )
+                        if self.title.item then
+                            _G.DestroyObject(self.title.item)
+                            self.title.item = nil
+                        end
+                        self.title.aorrawimage_Title:SetActiveE(1)
+                    else
+                        self.title.aorrawimage_Title:SetActiveE(0)
+                        if self.title.item then
+                            _G.DestroyObject(self.title.item)
+                            self.title.item = nil
+                        end
+                        _G.UIUtils.LoadEffectTitleOrFrame(
+                            cfg.title,
+                            self.title.gameObject,
+                            function(trans)
+                                if self:IsNil() then
+                                    _G.DestroyObject(trans)
+                                    return
+                                end
+                                trans:SetLayerAndChild(30)
+                                self.title.item = trans
+                                local x, y, z = self.title.aorrawimage_Title:GetPosition()
+                                trans:SetPosition(x, y + 0.2, z)
+                                self.title.item:SetLocalScaleXYZ(self.titleScale * self.scale)
+                                trans:SetActiveE(1)
+                            end
+                        )
+                    end
+                end
+            end
+        )
+    elseif self.title then
+        if self.title.item then
+            _G.DestroyObject(self.title.item)
+            self.title.item = nil
+        end
+        if not titleId or titleId <= 0 then
+            self.title.aorrawimage_Title:SetActiveE(0)
+            return
+        end
+        ---@type player_title_effect_cfg
+        local cfg = _G.ConfigManager.player_title_effect_cfg[titleId]
+        if cfg.type_title == 1 then
+            self.title.aorrawimage_Title:LoadImage(
+                cfg.icon,
+                function()
+                    self.title.aorrawimage_Title:SetNativeSize()
+                    self.title.aorrawimage_Title:SetLocalScaleXYZ(self.titleScale * self.scale)
+                end
+            )
+            self.title.aorrawimage_Title:SetActiveE(1)
+        else
+            _G.UIUtils.LoadEffectTitleOrFrame(
+                cfg.title,
+                self.title.gameObject,
+                function(trans)
+                    if self:IsNil() then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    trans:SetLayerAndChild(30)
+                    self.title.item = trans
+                    local x, y, z = self.title.aorrawimage_Title:GetPosition()
+                    trans:SetPosition(x, y + 0.2, z)
+                    self.title.item:SetLocalScaleXYZ(self.titleScale * self.scale)
+                    trans:SetActiveE(1)
+                end
+            )
+            self.title.aorrawimage_Title:SetActiveE(0)
+        end
+    end
+end
+
+---初始化头顶名称位置
+---@param deltaY number Y轴便宜值
+function SociatyGloryTopView:SetTitlePos(title, rolePoint)
+    _G.DelayFrameDo(
+        function()
+            if self:IsNil() then
+                return
+            end
+            if title and not _G.IsNil(title.gameObject) then
+                local x, y, z = rolePoint.Point_Head:GetPosition()
+                if x then
+                    local parent = self.roleTrans
+                    if parent == nil then ---快速切换角色时gameObj可能被置位nil
+                        return
+                    end
+                    local position = {}
+                    position.x = x
+                    position.z = z
+                    position.y = y - 0.19
+                    local scale = parent:GetLocalScale()
+                    local rate = self.scale
+                    title.gameObject:SetLocalScaleXYZ(rate * 0.8 / scale)
+                    title.transform:SetLocalPositionToZero()
+                    title.transform:SetPosition(position.x, position.y, position.z)
+                    local lookAt = title.transform:GetComponentE(_G.typeof(_G.CS.LookAtTarget))
+                    if _G.IsNil(lookAt) then
+                        lookAt = title.transform:AddComponentE(_G.typeof(_G.CS.LookAtTarget))
+                    end
+                    lookAt:SetData(self.camera.transform, parent)
+                end
+            end
+        end
+    )
+end
+
+---加载单个角色
+---@param view table 视图
+---@param rolepath string 模型路径
+---@param posType number 摆放的位置
+function SociatyGloryTopView:LoadRoleModel(rolepath, posIndex, scale)
+    _G.PoolsManager:GetInstance():Spawn(
+        rolepath,
+        _G.ePoolType.Temporary,
+        nil,
+        function(trans)
+            if trans == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("角色无法加载 path:" .. rolepath .. "    CardInfoView LoadRoleScene")
+                end
+                return
+            end
+            if self:IsNil() or not self.rankTrans then
+                _G.DestroyObject(trans)
+                return
+            end
+            self.roleTrans = trans
+            trans:SetParentE(self.rankTrans:GetChildE(posIndex - 1))
+            trans:SetLocalPosition(0, 0, 0)
+            trans:SetLocalScaleXYZ(scale)
+            local rolePoint = trans:GetComponentE(_G.typeof(_G.CS.RolePoint))
+            if rolePoint == nil then
+                rolePoint = trans:AddComponentE(_G.typeof(_G.CS.RolePoint))
+            end
+
+            -- self:UpdateMasterHalo(rolePoint)
+            -- self:UpdateMasterTitle(rolePoint)
+            --- 只有星座女神有神环
+        end
+    )
+end
+
+---清除场景中的角色模型
+function SociatyGloryTopView:ClearRoleModel()
+    if not self.rankTrans then
+        return
+    end
+    if self.halo then
+        _G.PoolsManager:GetInstance():Despawn(self.halo, _G.ePoolType.Temporary)
+        self.halo = nil
+    end
+    if self.title then
+        _G.PoolsManager:GetInstance():Despawn(self.title.gameObject, _G.ePoolType.Temporary)
+        self.title = nil
+    end
+
+    local roleCount = self.rankTrans:GetChildCountE()
+    for i = 1, roleCount do
+        local temp = self.rankTrans:GetChildE(i - 1)
+        local tempCount = temp:GetChildCountE()
+        if tempCount > 0 then
+            _G.PoolsManager:GetInstance():Despawn(temp:GetChildE(0), _G.ePoolType.Temporary)
+        end
+    end
+end
+
+--endregion
+
+--region -----------------对象池相关-----------------------
+
+---回收所有State节点
+---@return void
+function SociatyGloryTopView:ReleaseAllPlayerItems()
+    if not self.activePlayerItems then
+        return
+    end
+    if not self.releasePlayerItems then
+        self.releasePlayerItems = {}
+    end
+    for _, state in pairs(self.activePlayerItems) do
+        table.insert(self.releasePlayerItems, state)
+        state.transform:SetParentE(self.go_table.obj_player:GetParent())
+        state.gameObject:SetActiveE(0)
+    end
+    self.activePlayerItems = nil
+end
+
+---获取一个State节点
+---@param parent Transform|GameObject 父节点
+---@return SociatyGloryTopView._obj_player_GoTable
+function SociatyGloryTopView:GetPlayerItem(parent)
+    ---@type SociatyGloryTopView._obj_player_GoTable
+    local state
+    if self.releasePlayerItems and #self.releasePlayerItems > 0 then
+        state = table.remove(self.releasePlayerItems, 1)
+    end
+    if not state then
+        if AppSetting.IsXzns then
+            state = _G.GetAutoGoTable(_G.InstantiateObject(self.go_table.obj_player2,
+                self.go_table.obj_player:GetParent()))
+            UIUtils.IsNeedChangeUI(IsNeedChangeUI.SociatyGloryTopViewRoleNode, state)
+        else
+            state = _G.GetAutoGoTable(_G.InstantiateObject(self.go_table.obj_player, self.go_table.obj_player:GetParent()))
+        end
+        _G.AddViewBtnClick(state.gameObject, _G.handlerbind(self, self.OnMemberClickBtn, state))
+    end
+
+    if not self.activePlayerItems then
+        self.activePlayerItems = {}
+    end
+    table.insert(self.activePlayerItems, state)
+    state.gameObject:SetActiveE(1)
+    if parent then
+        state.transform:SetParentE(parent)
+        state.transform:SetAsLastSiblingE()
+    end
+    return state
+end
+
+--endregion
+
+---处理成员点击事件
+function SociatyGloryTopView:OnMemberClickBtn(_, _, item)
+    if item.lock then
+        return
+    end
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.SociatyGloryPreviewView.Name,
+        item.data,
+        item.isFame,
+        item.location
+    )
+    -- if item.location == ELocationEnum.Member then
+    --     _G.PopWindowManager:GetInstance():ShowAllTips(250154)
+    -- end
+end
+
+function SociatyGloryTopView:InitScene()
+    self.Role = {}
+    self.RoleAni = {}
+    self.sceneRoot = _G.GameObject("SociatyGloryTopRoot")
+    local path = "Scenes/Mingrentang/prefabs/Mingrentang"
+    --_G.UIManager:GetInstance():SetWorldSceneHideTimes(1)
+    _G.PoolsManager:GetInstance():Spawn(
+        path,
+        _G.ePoolType.Static,
+        self.sceneRoot,
+        function(trans)
+            if _G.IsNil(self.sceneRoot) then
+                _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.Static)
+                return
+            end
+            trans:ChangeCameraAdaption()
+            self.curSceneTrans = trans
+            trans:SetLocalPositionToZero()
+            _G.TimerManager:GetInstance():GetTimer(1, self.InitRoleModel, self, true, true):Start()
+            _G.GraphicsManager.Instance:UpdateMainCameraPosImmediate()
+            --相机高度降低固定值
+            self.camera =
+                self.curSceneTrans:FindE("Environment/Parent/Main Camera"):GetComponentE(
+                    _G.typeof(_G.CS.FrameWork.Graphic.VisualCamera)
+                )
+        end
+    )
+end
+
+---初始化场景模型
+function SociatyGloryTopView:InitRoleModel()
+    local SociatySelf = require("SociatyModel"):GetInstance().SociatySelf
+    local memberModel = SociatySelf.GetMemberModule()
+    self.memberList =
+        _G.table.chooseToArray(
+            memberModel.Member,
+            function(_, a)
+                return a.Location == ELocationEnum.Member
+            end
+        )
+    _G.SortList(
+        self.memberList,
+        function(a)
+            return a.OfflineTime == 0 and 1 or 0, a.Power
+        end
+    )
+    self.angle = self:GetCameraAngleX()
+    self.curMemIndex = {}
+    self.startTime = {}
+    self:CreateRoleModel(1)
+end
+
+function SociatyGloryTopView:CreateRoleModel(index)
+    if index > 5 then
+        return
+    end
+    local sid, name, god_halo
+    if self.memberList[index] then
+        sid = self.memberList[index].Style
+        name = self.memberList[index].Name
+        god_halo = self.memberList[index].god_halo
+    end
+    if sid == nil then
+        return
+    end
+    local path = CardInfoManager.GetBattleModelPath(sid, true)
+    CardInfoManager.GetRole(
+        path,
+        _G.ePoolType.Static,
+        self.sceneRoot,
+        _G.RoleEffTypeEnum.Fight,
+        function(role)
+            if self:IsNil() then
+                _G.DestroyObject(role)
+            end
+            self.curMemIndex[index] = index
+            local line = (index + 1) // 2
+            local area = self.roleParams.moveX[line]
+            local isRight = index % 2 == 1
+            role:SetPosition(area, 0, isRight and -5 or 5)
+            role:SetLocalScaleXYZ(self.roleParams.scale)
+            self.Role[index] = role
+            self.RoleAni[index] = _G.RoleAnimatorController.GetOrCreateAnimatorController(role)
+            local head = self:FindModelPoint(role)
+            local x, y = _G.CS.UIUtils.WorldPointToLocalPointInRect(head, self.go_table.rect_moveRoot)
+            self.RoleTitle[index]:SetActiveE(1)
+            self.RoleTitle[index]:SetLocalPosition(x, y + 50, 0)
+            local tb = _G.GetAutoGoTable(self.RoleTitle[index])
+            tb.aortext_name.text = name
+            local model = require("SociatyModel"):GetInstance()
+            --是否为名人堂玩家
+            local isFame = model:IsFameMember(self.memberList[index])
+
+            if isFame then
+                tb.aorimage_title:SetActiveE(1)
+            else
+                tb.aorimage_title:SetActiveE(0)
+            end
+            self:SetToward(index, isRight)
+            if self.startTime[line] == nil then
+                self.startTime[line] = self:Random(self.roleParams.startTime[1], self.roleParams.startTime[2])
+            end
+            _G.DelayDo(self.startTime[line], _G.handlerbind(self, self.PlayMove, index, isRight))
+            -- self:PlayMove(index, isRight)
+            self:CreateRoleModel(index + 1, false)
+            --- 只有星座女神有神环
+            if _G.AppSetting.IsXzns then
+                --- 此处模型有问题 需要再看
+                -- local godHaloID = god_halo
+                -- local cfg = _G.ConfigManager.card_cfg[sid]
+                -- if godHaloID ~= 0 then
+                --     local effCfg = _G.ConfigManager.god_halo_cfg[godHaloID].ui_effect_cfg
+                --     --- 神环路径，父级路径(加载角色的下面)
+                --     _G.UIUtils.LoadGodHalo(effCfg, role, cfg.god_halo_set)
+                -- end
+                if not table.isEmptyOrNil(self.memberList[index].artifact_skin) then
+                    _G.CS.BattleManager.Utils.UpdateArtifact(role,self.memberList[index].artifact_skin[1],self.memberList[index].artifact_skin[2])
+                end
+            end
+        end
+    )
+end
+
+function SociatyGloryTopView:PlayMove(index, isRight)
+    if self:IsNil() then
+        return
+    end
+    self.RoleAni[index]:Play("run_1", true)
+    local moveTime = self:Random(self.roleParams.moveTime[1], self.roleParams.moveTime[2])
+    local moveDis = moveTime * self.roleParams.speed
+    self:DoMoving(index, isRight, moveDis)
+end
+
+function SociatyGloryTopView:DoMoving(index, isRight, lastDis)
+    if self:IsNil() then
+        return
+    end
+    local role = self.Role[index]
+    local x, y, z = role:GetPosition()
+    local z1 = isRight and self.roleParams.moveArea[2] or self.roleParams.moveArea[1]
+    local dis = _G.math.abs(z1 - z)
+    if lastDis > dis then --一次走不完，需调头
+        local time = dis / self.roleParams.speed
+        local xt, yt = _G.CS.UIUtils.WorldPointToLocalPointInRect(x, y, z1, self.go_table.rect_moveRoot)
+        role:DOLocalMoveZ(z1, time):SetEase(_G.CS.DG.Tweening.Ease.Linear):OnComplete(
+            function()
+                self:UpdateRoleModel(index, not isRight, lastDis - dis)
+                -- self:SetToward(index, not isRight)
+                -- self:DoMoving(index, not isRight, lastDis - dis)
+            end
+        )
+        self.RoleTitle[index]:DOLocalMoveX(xt, time):SetEase(_G.CS.DG.Tweening.Ease.Linear)
+    else
+        local z2 = isRight and z + lastDis or z - lastDis
+        local time = lastDis / self.roleParams.speed
+        local xt, yt = _G.CS.UIUtils.WorldPointToLocalPointInRect(x, y, z2, self.go_table.rect_moveRoot)
+        role:DOLocalMoveZ(z2, time):SetEase(_G.CS.DG.Tweening.Ease.Linear):OnComplete(
+            function()
+                self:PlayIdle(index, isRight)
+            end
+        )
+        self.RoleTitle[index]:DOLocalMoveX(xt, time):SetEase(_G.CS.DG.Tweening.Ease.Linear)
+    end
+end
+
+function SociatyGloryTopView:PlayIdle(index, isRight)
+    if self:IsNil() then
+        return
+    end
+    self.RoleAni[index]:Play("idle_1", true)
+    local idleTime = self:Random(self.roleParams.idleTime[1], self.roleParams.idleTime[2])
+    _G.DelayDo(idleTime, _G.handlerbind(self, self.PlayMove, index, isRight))
+end
+
+function SociatyGloryTopView:Random(a, b)
+    return a + (b - a) * _G.math.random()
+end
+
+function SociatyGloryTopView:SetToward(index, isRight)
+    if isRight then
+        self.Role[index]:SetLocalEulerAngles(0, 0, self.angle)
+    else
+        self.Role[index]:SetLocalEulerAngles(0, 180, -self.angle)
+    end
+end
+
+---销毁/创建新模型
+function SociatyGloryTopView:UpdateRoleModel(index, isRight, lastDis)
+    if self:IsNil() then
+        return
+    end
+    local memIndex = self:GetNextMemberIndex(index)
+    if memIndex == index then --无可更换
+        self:SetToward(index, isRight)
+        self:DoMoving(index, isRight, lastDis)
+        return
+    end
+    _G.DestroyObject(self.Role[index])
+    self.Role[index] = nil
+    local sid = self.memberList[memIndex].Style
+    local name = self.memberList[memIndex].Name
+    local path = CardInfoManager.GetBattleModelPath(sid, true)
+    self.curMemIndex[index] = memIndex
+    CardInfoManager.GetRole(
+        path,
+        _G.ePoolType.Static,
+        self.sceneRoot,
+        _G.RoleEffTypeEnum.Fight,
+        function(role)
+            if self:IsNil() then
+                _G.DestroyObject(role)
+            end
+            local line = (index + 1) // 2
+            local area = self.roleParams.moveX[line]
+            role:SetPosition(area, 0, isRight and self.roleParams.moveArea[1] or self.roleParams.moveArea[2])
+            role:SetLocalScaleXYZ(self.roleParams.scale)
+            self.Role[index] = role
+            self.RoleAni[index] = _G.RoleAnimatorController.GetOrCreateAnimatorController(role)
+            local head = self:FindModelPoint(role)
+            local x, y = _G.CS.UIUtils.WorldPointToLocalPointInRect(head, self.go_table.rect_moveRoot)
+            self.RoleTitle[index]:SetActiveE(1)
+            self.RoleTitle[index]:SetLocalPosition(x, y + 50, 0)
+            local tb = _G.GetAutoGoTable(self.RoleTitle[index])
+            tb.aortext_name.text = name
+            local model = require("SociatyModel"):GetInstance()
+            --是否为名人堂玩家
+            local isFame = model:IsFameMember(self.memberList[index])
+
+            if isFame then
+                tb.aorimage_title:SetActiveE(1)
+            else
+                tb.aorimage_title:SetActiveE(0)
+            end
+            self:SetToward(index, isRight)
+            self:PlayMove(index, isRight)
+        end
+    )
+end
+
+function SociatyGloryTopView:GetNextMemberIndex(index)
+    local sum = #self.memberList
+    if sum <= 5 then
+        return index
+    end
+    local ready = {}
+    local num = 0
+    for i = 1, sum do
+        if not _G.table.ContainsValue(self.curMemIndex, i) then
+            _G.table.insert(ready, i)
+            num = num + 1
+        end
+    end
+    return ready[_G.math.random(1, num)]
+end
+
+function SociatyGloryTopView:GetCameraAngleX()
+    ---@type UnityEngine.Camera
+    local mainCamera
+    if _G.CS.FrameWork.Graphic.GraphicsManager.Instance then
+        mainCamera = _G.CS.FrameWork.Graphic.GraphicsManager.Instance.MainCamera
+    end
+    return _G.CS.CameraUtils.GetCameraAngleX(mainCamera)
+end
+
+function SociatyGloryTopView:FindModelPoint(trans, forceUpdate)
+    local rp = trans:GetComponentInChildrenE(_G.typeof(_G.CS.SkeletonBoneReferences))
+    if not rp then
+        return nil
+    end
+    local node = rp:Get("Point_Hp")
+    if not _G.IsNil(node) then
+        rp:ForceUpdate(1) --立即同步一次骨骼位置
+        return node
+    end
+    local node = rp:Get("Point_Head")
+    if not _G.IsNil(node) then
+        rp:ForceUpdate(1) --立即同步一次骨骼位置
+        return node
+    end
+    return nil
+end
+
+---处理按钮事件
+function SociatyGloryTopView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_close or go == self.go_table.aorbtn_CloseView then
+        self:Close()
+    elseif go == self.go_table.aorbtn_clickSociatyIcon then
+        local SociatyData = require("SociatyModel"):GetInstance().SociatySelf
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.SociatyExchangeIconView.Name,
+            SociatyData,
+            true,
+            SociatyData.Banner,
+            function(data)
+                if data and data.ID ~= SociatyData.Banner then
+                    ---@type guild.c2s_guild_set_banner
+                    local msg = {}
+                    msg.banner = data.ID
+                    local SociatyNet = require("SociatyNet")
+                    SociatyNet:GetInstance():SetBanner(
+                        msg,
+                        function()
+                            require("SociatyModel"):GetInstance().SociatySelf.Banner = data.ID
+                            _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.ExchangeIcon, data.ID)
+                            _G.PopWindowManager:GetInstance():ShowAllTips(200116)
+                        end
+                    )
+                end
+            end
+        )
+    elseif go == self.go_table.aorbtn_reward then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyGloryRewardView.Name)
+    elseif go == self.go_table.aorbtn_socmain then
+        self:Close()
+        ---公会大厅
+        --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyLobbyView.Name)
+        local smv = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+        if smv then
+            smv:DoOpenWindow(_G.ConfigManager.ui_cfg.SociatyLobbyView.Name)
+        end
+    elseif go == self.go_table.aorbtn_help then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 128)
+    end
+end
+
+function SociatyGloryTopView:OnDestroy()
+    if self.curSceneTrans then
+        _G.PoolsManager:GetInstance():Despawn(self.curSceneTrans, _G.ePoolType.Static)
+    end
+    self.sceneRoot:Dispose()
+end
+
+return SociatyGloryTopView

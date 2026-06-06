@@ -1,0 +1,211 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie.alpha_JT.Client.Assets.Resources.LuaScripts.Game.ThemeTurntable.Model.ThemeTurntableModel	(修改路径必须修正此项!)
+-- Created by huangbaiying
+-- DateTime: 2024/01/09
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+local base = require "ThemeActivityBaseModel"
+---@class ThemeTurntableModel : ThemeActivityBaseModel	中文描述
+---@field coinNum number 代币数量
+---@field takenAwardIndex number 已领取的进度奖励
+---@field point number 抽奖积分
+---@field awardList table 积分奖励列表
+---@field drawScore number 每次抽奖获得的积分
+---@field turntableItemList table 转盘物品列表
+---@field drawCost number 抽奖消耗
+---@field nextScore number 下次领奖所需次数
+local ThemeTurntableModel = _G.BaseClass("ThemeTurntableModel", base)
+local CS = _G.CS
+local typeof = _G.typeof
+---@return ThemeTurntableModel ThemeTurntableModel
+function ThemeTurntableModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---初始化数据
+function ThemeTurntableModel:InitData(msg)
+    self.coinCount = msg.coin_num
+    self.takenAwardIndex = msg.award_index and #msg.award_index or 0
+    self.point = msg.num
+    self.awardList = msg.turntable_cfg.award_list
+    self.drawScore = msg.turntable_cfg.cost_award_num
+    self.turntableItemList = msg.turntable_cfg.draw_list
+    for _, v in pairs(self.turntableItemList) do
+        if v.index == 1 then
+            self.bigAward = v
+            break 
+        end
+    end
+    self.drawCost = msg.turntable_cfg.cost
+    self.showList = {}
+    self.nextScore = -1
+    ---每日魂玉已抽取次数
+    self.diamond_times = msg.diamond_times or 0
+    ---已累计抽卡次数
+    self.draw_num = msg.draw_num or 0
+    ---[单抽魂玉消耗,十连魂玉消耗,折扣(除以10000),魂玉每日抽取上限]
+    self.rmb_draw_info = msg.turntable_cfg.rmb_draw_info
+    ---保底次数
+    self.init_times = msg.turntable_cfg.init_times or 0
+    ---首次保底次数
+    self.first_time = msg.turntable_cfg.first_time or 0
+    ---当前实际保底次数
+    self.now_init_num = msg.now_init_num or 0
+    _G.SortList(self.awardList,function(a)
+        return -a.index
+    end)
+    self.sid = require("ThemeActivityManager"):GetInstance():GetActivityID()
+    require "DrawActivityModel":GetInstance():SetCoinNum(self.coinCount)
+    self.coinSid = require "ThemeActivityManager":GetInstance():GetCoinSid()
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata,self.CoinChange,self)
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ThemeTurntableView.Name)
+    if window and window.View then
+        window.View:InitDiamondTimes()
+        window.View:InitConsumesInfos()
+    end
+end
+
+---获取实际保底次数
+function ThemeTurntableModel:GetInitTimes()
+    if self.now_init_num == 0 or self.now_init_num == self.first_time then
+       return self.first_time
+    end
+
+    return _G.ConfigManager.discrete_cfg[115503][1][1]
+end
+
+---进入活动
+function ThemeTurntableModel:EnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ThemeTurntableView.Name)
+end
+
+---初始化红点树{{id,lua,child}} id 红点id ,lua 红点脚本需继承RedPointBaseThemeActivity,child 子功能红点id,第一个红点必须id为1
+function ThemeTurntableModel:InitRedTree()
+    self.redTree = { { 1, "RedPointThemeTurntable", {} } }
+end
+
+---获取红点数
+function ThemeTurntableModel:GetRedPointTree()
+    return self.redTree
+end
+
+---抽奖
+---@param drawNum number 抽奖次数
+---@param consumeType number  消耗 1:活动代币  2:魂玉
+function ThemeTurntableModel:Draw(drawNum, consumeType, callback)
+    local pbdata = {
+        activity_id = self.sid,
+        draw_num = drawNum,
+        consume_type = consumeType
+    }
+    require("ThemeTurntableNet"):GetInstance():Draw(pbdata, function(data)
+        if data.ack ~= 1 then
+            return
+        end
+        self:DrawSucceessCall(consumeType, drawNum, data, callback)
+    end)
+end
+
+function ThemeTurntableModel:DrawSucceessCall(consumeType, drawNum, data, callback)
+    if consumeType == _G.DrawConsumeType.token then
+        require "DrawActivityModel":GetInstance():RedCoinNum(drawNum * self.drawCost)
+    elseif consumeType == _G.DrawConsumeType.diamond then
+        --消耗魂玉
+        local consumeNum = 0
+        if drawNum == 1 then
+            consumeNum = self.rmb_draw_info[1]
+        else
+            consumeNum = self.rmb_draw_info[2]
+        end
+        self.diamond_times = self.diamond_times + drawNum
+        _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, 0, consumeNum)
+    end
+
+    self.point = self.point + drawNum
+    if (self.now_init_num == 0 or self.now_init_num == self.first_time) and self.draw_num + drawNum >= self.first_time then
+        ---重置当前的保底次数
+       self.now_init_num = _G.ConfigManager.discrete_cfg[115503][1][1]
+    end
+    ---判断是否抽到大奖
+    if data.award.item then
+        for i = 1, #data.award.item do
+            local info = data.award.item[i]
+            if self.bigAward.sid == info.type[1] then
+                self.draw_num = 0
+            else
+                self.draw_num = self.draw_num + 1
+            end
+        end
+    end
+
+    if callback then
+        callback(data)
+    end
+end
+
+---领奖
+function ThemeTurntableModel:GetAward(callback)
+    local pbdata = {activity_id = self.sid}
+    require("ThemeTurntableNet"):GetInstance():GetAward(pbdata,function(data)
+        self.takenAwardIndex = self.takenAwardIndex + #data.award_index
+        self:RefreshRedPoint()
+        callback(data)
+    end)
+end
+
+---获取转盘物品
+function ThemeTurntableModel:GetTurntableList()
+    return self.turntableItemList
+end
+
+---获取奖励列表
+function ThemeTurntableModel:GetAwardList()
+    return self.awardList
+end
+
+---获取鸿运值
+function ThemeTurntableModel:GetPoint()
+    return self.point
+end
+
+---获取最高获取积分奖励下标
+function ThemeTurntableModel:GetTakenIndex()
+    return self.takenAwardIndex
+end
+
+---获取抽卡消耗
+function ThemeTurntableModel:GetDrawCost()
+    return self.drawCost
+end
+
+function ThemeTurntableModel:CheckRedPoint()
+    local coinCount = require "DrawActivityModel":GetInstance():GetCoinNum()
+    if coinCount > self.drawCost then
+        return 1
+    end
+    for k,v in pairs(self.awardList) do
+        if v.condition <= self.point and v.index > self.takenAwardIndex then
+            return 1
+        end
+    end
+    return 0
+end
+
+function ThemeTurntableModel:CoinChange(data)
+    if not _G.table.isEmptyOrNil(data) and data[1].type[1] == self.coinSid then
+        self:RefreshRedPoint()
+    end
+end
+
+function ThemeTurntableModel:RefreshRedPoint()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(self:GetRedPointId())
+end
+
+---增加已使用魂玉召唤次数
+---@param num number 次数
+function ThemeTurntableModel:AddDiamondTimes(num)
+    self.diamond_times = self.diamond_times + num
+end
+
+return ThemeTurntableModel

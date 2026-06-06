@@ -1,0 +1,1913 @@
+--------------------------------------------------------------------------
+-- D:.Game.Client.Assets.Resources.LuaScripts.Game.ActivityTournament.Model.ActivityTournamentModel	(修改路径必须修正此项!)
+-- Created by cy
+-- DateTime: 2025/12/12
+-- Description 跨服争锋
+-----------------------------------------------------------------------
+local ActivitySynManager = require "ActivitySynManager"
+local RankUtils = require "RankUtils"
+local ActivityTournamentNet = require("ActivityTournamentNet")
+local ActivityTourGuessTaskData = require("ActivityTourGuessTaskData")
+---@class ActivityTournamentModel : GameDataModelBase
+---@field stage number 阶段：1:预选赛阶段2.预选赛结算时间,3淘汰赛阶段  、4冠军赛阶段和5膜拜阶段
+---@field stageEndTime number 阶段截止时间
+---@field fight number 出击次数
+---@field coins table<number,number> 代币(数组){代币展示id,数量}
+---@field round number 第几轮(1淘汰轮|2冠军轮)
+---@field roundIndex number 第几回合
+---@field branch_state number 分支状态 1064,1032 ,1016|108,104,102
+---@field fight_time number 分支开始战斗时间
+---@field group_index number 所在组下标(默认1)
+---@field rank_award_state number 领奖状态
+---@field predict number 预测的目标
+---@field predict_state number 预测领奖状态(0未领奖 1领奖)
+---@field worship_award_state number 膜拜奖励状态
+---@field worship_award number 膜拜奖励 |未设置为空
+local ActivityTournamentModel = _G.BaseClass("ActivityTournamentModel", _G.GameDataModelBase)
+
+local roundIndex = {
+    [1] = { 1, 1, 1 },
+    [2] = { 1, 1, 1 },
+    [3] = { 2, 1, 1 },
+    [4] = { 2, 1, 1 },
+    [5] = { 3, 2, 1 },
+    [6] = { 3, 2, 1 },
+    [7] = { 4, 2, 1 },
+    [8] = { 4, 2, 1 },
+}
+
+---@return ActivityTournamentModel ActivityTournamentModel
+function ActivityTournamentModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function ActivityTournamentModel:__init()
+    _G.Events:GetInstance():AddListener(_G.eArena.SetDrawUp, self.AddCoins, self)
+    _G.Events:GetInstance():AddListener(_G.eYKNetEvent.ReconnectSuccess, self.OnReconnectSuccess, self)
+    _G.Events:GetInstance():AddListener(_G.TaskModuleEvent.EnumValueTable.TaskNumberUpdate, self.OnRefreshRed, self)
+
+    self.views = {
+        [1] = _G.ConfigManager.ui_cfg.ActivityTournamentView.Name,
+    }
+    self.timeLogCache = 300
+end
+
+---获取阶段信息
+function ActivityTournamentModel:GetStateInfo()
+    return self.stage, self.stageEndTime
+end
+
+---获取阶段信息
+function ActivityTournamentModel:GetStateData()
+    return self.stageInfo
+end
+
+---获取战斗时间
+function ActivityTournamentModel:GetCfg()
+    return self.cfg
+end
+
+---获取积分
+function ActivityTournamentModel:GetScore()
+    return self.score
+end
+
+---获取第几轮(1淘汰轮|2冠军轮)
+function ActivityTournamentModel:GetRound()
+    return self.round
+end
+
+---获取第几回合
+function ActivityTournamentModel:GetRoundIndex()
+    return self.roundIndex
+end
+
+---获取分支状态 1064,1032 ,1016|108,104,102
+function ActivityTournamentModel:GetBranchState()
+    return self.branch_state
+end
+
+---获取分支开始战斗时间
+function ActivityTournamentModel:GetFightTime()
+    return self.fight_time
+end
+
+---获取所在组下标(默认1)
+function ActivityTournamentModel:GetGroupIndex()
+    return self.group_index or 0
+end
+
+---获取几强领奖状态
+function ActivityTournamentModel:GetRankAwardState()
+    return self.rank_award_state
+end
+
+---获取预测的目标
+function ActivityTournamentModel:GetPredict()
+    return self.predict
+end
+
+---获取预测领奖状态(0未领奖 1领奖)
+function ActivityTournamentModel:GetPredictState()
+    return self.predict_state or 0
+end
+
+---获取膜拜奖励状态
+function ActivityTournamentModel:GetWorshipAwardState()
+    return self.worship_award_state
+end
+
+---获取膜拜奖励 |未设置为空
+function ActivityTournamentModel:GetWorshipAward()
+    return self.worship_award
+end
+
+---获取赛季
+function ActivityTournamentModel:GetSeason()
+    return self.season
+end
+
+---获取活动
+function ActivityTournamentModel:GetActivity()
+    return self.curActivityClass
+end
+
+---
+---@protected
+function ActivityTournamentModel:GetFightNum()
+    return self.fight
+end
+
+---解析简要信息
+---@param msg activity_dispatch.i_activity_dispatch_brief
+function ActivityTournamentModel:ParseSimpleData(msg, activity)
+    self.stage = msg.stage
+    if self.stage == 0 then
+        self.stage = 1
+    end
+    self.stageEndTime = msg.end_time
+    self.season = msg.season
+    self.coins = {}
+    self.GroupInfo = {}
+    self.historyDetails = {}
+    local list = { msg.cfg.coin }
+    for i, v in ipairs(list) do
+        self.coins[v] = 0
+    end
+    if msg.coins then
+        for i, v in ipairs(msg.coins) do
+            self.coins[v.key] = v.value
+        end
+    end
+    ---@type activity_tournament.activity_tournament_cfg
+    self.cfg = msg.cfg
+    if self.stage == 5 then
+        self:GetHistoryDetails(self.season)
+    end
+    self:ParseData(msg)
+    if activity ~= nil then
+        ---@type ActivityTournamentSynModel
+        self.curActivityClass = activity
+    else
+        _G.Events:GetInstance():Broadcast(_G.eActivityTournament.StageChange)
+        --self.curActivityClass.typeClass:UpdateRedpoint(2)
+    end
+    self.rankAwardCfg = msg.cfg.rank_award_cfg
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.stage < 5 then
+        self:SetTimer()
+    end
+    if self.stage == 5 then
+        ActivityTournamentNet:GetInstance():GetStageInfo({ activity_id = self.curActivityClass.activityID, stage = 4 }, _G.handlerbind(self, self.ParseData))
+    end
+    if self.stage == 4 or self.stage == 5 then
+        ActivityTournamentNet:GetInstance():GetStageInfo({ activity_id = self.curActivityClass.activityID, stage = 3 }, function(msg)
+            if msg.eliminate_info.self_round ~= 0 then
+                self.group_index = msg.eliminate_info.group_index
+            end
+        end)
+    end
+    if self.stage > 1 then
+        self:SetTimer2()
+    end
+    self.curActivityClass.typeClass:UpdateRedpoint(2)
+    self.curActivityClass.typeClass:UpdateRedpoint(3)
+end
+
+---解析详细信息
+---@param msg activity_tournament.activity_tournament_preselect
+function ActivityTournamentModel:ParseData(msg)
+    if msg.preselect_info then
+        self.score = msg.preselect_info.score
+        self.fight = msg.preselect_info.count
+        if not require "EmbattleModel":GetInstance():CheckEmbattleData(msg.preselect_info.garrays[1].id) then
+            require "EmbattleModel":GetInstance():ParseData(msg.preselect_info.garrays or {})
+        end
+    end
+    if msg.eliminate_info then
+        self.round = msg.eliminate_info.round
+        self.roundIndex = math.ceil(((_G.TimeUtil.GetServerUnixTime() - (self.stageEndTime - self.cfg.eliminate_time)) / 86400))
+        self.branch_state = msg.eliminate_info.branch_state
+        self.fight_time = msg.eliminate_info.start_time
+        self.self_round = msg.eliminate_info.self_round
+        if self.self_round ~= 0 then
+            self.group_index = msg.eliminate_info.group_index
+        end
+        self.day_guess_state = msg.eliminate_info.day_guess_state
+        self.rank_award_state = msg.eliminate_info.rank_award_state
+        self.guess_num = msg.eliminate_info.guess_num
+        self:SetGroupInfo(msg.eliminate_info.group_info, 1, msg.eliminate_info.group_info.group_index)
+    end
+    if msg.champion_info then
+        self.round = msg.champion_info.round
+        self.roundIndex = math.ceil(((_G.TimeUtil.GetServerUnixTime() - (self.stageEndTime - self.cfg.champion_time)) / 86400))
+        self.branch_state = msg.champion_info.branch_state
+        self.fight_time = msg.champion_info.start_time
+        self.self_round = msg.champion_info.self_round
+        self.day_guess_state = msg.champion_info.day_guess_state
+        self.rank_award_state = msg.champion_info.rank_award_state
+        self.predict = msg.champion_info.predict
+        self.predict_state = msg.champion_info.predict_state
+        self:SetGroupInfo(msg.champion_info.group_info, 2, msg.champion_info.group_info.group_index)
+    end
+    if self.stage == 5 then
+        self.round = 2
+        self.roundIndex = 3
+    end
+    if msg.worship_info then
+        self.predict = msg.worship_info.predict
+        self.predict_state = msg.worship_info.predict_state
+        self.worship_award_state = msg.worship_info.award_state
+        self.worship_award = msg.worship_info.award
+    end
+end
+
+---赛程数据
+---@protected
+function ActivityTournamentModel:SetGroupInfo(data, type, index)
+    local timeKey = _G.ConfigManager.discrete_cfg[138008][#_G.ConfigManager.discrete_cfg[138008]][2]
+    if self.GroupInfo[type] == nil then
+        self.GroupInfo[type] = {}
+    end
+    if self.GroupInfo[type][index] == nil then
+        self.GroupInfo[type][index] = {}
+    end
+    if data == nil or data.competitor == nil or #data.competitor == 0 then
+        return
+    end
+    local list = self.GroupInfo[type][data.group_index]
+    for k, v in ipairs(data.competitor) do
+        list[v.index] = { role_info = v.role_info }
+        if v.result then
+            for k2, v2 in ipairs(v.result) do
+                if type == v2.round then
+                    local isHide = (self.stage == 3 or self.stage == 4) and (_G.TimeUtil.GetSecondsOfDay() < timeKey) and v2.round == self.round and v2.index == self.roundIndex
+                    --if v2.index == v.group_round then
+                    --    if (_G.TimeUtil.GetSecondsOfDay() < timeKey) and v2.round == self.round and v2.index == self.roundIndex then
+                    --    else
+                    --        list[v.index].result = v2
+                    --    end
+                    --end
+                    if v2.result == 1 then
+                        local add = roundIndex[v.index][v2.index]
+                        local index = 0
+                        if v2.index == 1 then
+                            index = 8 + add
+                        elseif v2.index == 2 then
+                            index = 12 + add
+                        elseif v2.index == 3 then
+                            index = 15
+                        end
+                        if isHide == true then
+                        else
+                            if list[index] == nil then
+                                list[index] = { role_info = v.role_info }
+                            end
+                        end
+                    end
+                    if v2.index == 1 then
+                        if isHide == true then
+                        else
+                            list[v.index].result = v2
+                        end
+                    else
+                        if isHide == true then
+                        else
+                            local curIndex = v2.index - 1
+                            local add = roundIndex[v.index][curIndex]
+                            local index = 0
+                            if curIndex == 1 then
+                                index = 8 + add
+                            elseif curIndex == 2 then
+                                index = 12 + add
+                            elseif curIndex == 3 then
+                                index = 15
+                            end
+                            if list[index] == nil then
+                                list[index] = { role_info = v.role_info }
+                            end
+                            list[index].result = v2
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+function ActivityTournamentModel:OnReconnectSuccess()
+end
+
+---自身活动代币增加
+function ActivityTournamentModel:SetCoin(coins)
+    if coins then
+        for k, v in pairs(coins) do
+            if self.coins[k] then
+                self.coins[k] = self.coins[k] + v
+                if k == 74 and v > 0 then
+                    self.hisCoinNum = self.hisCoinNum + v
+                end
+                local tmp = {}
+                _G.table.insert(tmp, k)
+                _G.table.insert(tmp, v)
+                _G.table.insert(tmp, self.coins[k])
+                _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, { { type = tmp } })
+            end
+        end
+    end
+end
+
+function ActivityTournamentModel:AddCoins(data)
+    if self.coins and self.coins[data[1]] then
+        local coin = {}
+        coin[data[1]] = data[2]
+        self:SetCoin(coin)
+    end
+end
+
+---获取代币
+function ActivityTournamentModel:GetCoinNum(id)
+    return self.coins[id] or 0
+end
+
+---
+---@protected
+function ActivityTournamentModel:SetTimer()
+    if not self.timer then
+        if self.stageEndTime > _G.TimeUtil.GetServerUnixTime() then
+            self.timer = _G.TimerManager:GetInstance():GetTimer(self.stageEndTime - _G.TimeUtil.GetServerUnixTime(), self.ChangeStage, self, true, false, true)
+            self.timer:Start()
+        end
+    end
+end
+
+---
+---@protected
+function ActivityTournamentModel:SetTimer2()
+    local timeKey = _G.ConfigManager.discrete_cfg[138008][#_G.ConfigManager.discrete_cfg[138008]]
+    local curTime = _G.TimeUtil.GetSecondsOfDay()
+    if not self.timer2 and curTime < timeKey[2] then
+        local delayTime
+        if curTime < timeKey[1] then
+            delayTime = timeKey[1] - curTime
+        else
+            delayTime = timeKey[2] - curTime
+        end
+        self.timer2 = _G.TimerManager:GetInstance():GetTimer(delayTime, self.ChangeStage2, self, true, false, true)
+        self.timer2:Start()
+    end
+end
+
+---阶段转换
+function ActivityTournamentModel:ChangeStage()
+    require "ActivitySynNet":GetInstance():InitActivity(self.curActivityClass.activityID, function(msg)
+        self:ParseSimpleData(msg.activity[1].self_info.activity_tournament_brief)
+    end)
+end
+
+---阶段转换
+function ActivityTournamentModel:ChangeStage2()
+    if self.timer2 then
+        self.timer2:Stop()
+        self.timer2 = nil
+    end
+    local timeKey = _G.ConfigManager.discrete_cfg[138008][#_G.ConfigManager.discrete_cfg[138008]]
+    local curTime = _G.TimeUtil.GetSecondsOfDay()
+    if self.stage == 5 then
+        if curTime >= timeKey[2] then
+            if self.worship_award == nil then
+                self.worship_award = {}
+                self.curActivityClass.typeClass:UpdateRedpoint(4)
+                self.curActivityClass.typeClass:UpdateRedpoint(5)
+                self.curActivityClass.typeClass:UpdateRedpoint(6)
+            end
+        end
+    elseif self.stage == 3 or self.stage == 4 then
+        if curTime >= timeKey[2] then
+            local type = self.stage == 3 and 1 or 2
+            self.GroupInfo[type] = nil
+            _G.Events:GetInstance():Broadcast(_G.eActivityTournament.GroupInfoChange)
+        end
+        self:RefreshActivityBtnTips()
+    end
+    if curTime < timeKey[2] then
+        self:SetTimer2()
+    end
+end
+
+---打开界面
+function ActivityTournamentModel:OpenView()
+    if self.stage == 2 then
+        --预选赛结算时间飘字
+        _G.PopWindowManager:GetInstance():ShowAllTips(1080603)
+        return
+    end
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActivityTournamentView.Name)
+    if view then
+        view:SetRank()
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ActivityTournamentView.Name)
+    end
+end
+
+function ActivityTournamentModel:CloseView()
+    for i, v in ipairs(self.views) do
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(v)
+        if view then
+            view:Close()
+        end
+    end
+    self.curActivityClass = nil
+end
+
+---检测能否进入匹配界面
+function ActivityTournamentModel:CheckEnterMatch()
+    ---@type EmbattleType[]
+    local tb = {}
+    local teamNum = self:GetCurTeamNum()
+    local embattleTypeName = self:GetCurEmbattleTypeName()
+    for tnIndex = 1, teamNum do
+        table.insert(tb, _G.EmbattleType[embattleTypeName .. tnIndex])
+    end
+    for i = 1, #tb do
+        local data = require("EmbattleModel"):GetInstance():GetEmbattleData(tb[i])
+        local canMatch = false
+        for j = 1, #data do
+            if data[j] > 0 then
+                canMatch = true
+                break
+            end
+        end
+        if not canMatch then
+            return false, i
+        end
+    end
+    return true
+end
+
+---匹配
+function ActivityTournamentModel:Match(call)
+    ActivityTournamentNet:GetInstance():Match(
+        { activity_id = self.curActivityClass.activityID },
+        _G.handlerbind(self, self.MatchCall, call))
+end
+
+---匹配回调
+function ActivityTournamentModel:MatchCall(msg, callback)
+    if msg.ack == 1 then
+        self:GetEnemyGarray(
+            msg.role_info.uid,
+            msg,
+            callback
+        )
+    end
+end
+
+---获取对手的详细阵容信息
+---@param join_type number
+---@param player_uid number
+---@param player_type number
+---@param arena_layer_match arena_layer.s2c_arena_layer_match
+function ActivityTournamentModel:GetEnemyGarray(player_uid, arena_layer_match, call)
+    local tb = {}
+    local teamNum = self:GetCurTeamNum()
+    local embattleTypeName = self:GetCurEmbattleTypeName()
+    for tnIndex = 1, teamNum do
+        table.insert(tb, _G.EmbattleType[embattleTypeName .. tnIndex])
+    end
+    local pb = {
+        activity_id = self.curActivityClass.activityID,
+        uid = player_uid,
+        ids = tb
+    }
+    ActivityTournamentNet:GetInstance():GetArrays(
+        pb,
+        _G.handlerbind(self, self.GetEnemyGarrayCall, call, arena_layer_match)
+    )
+end
+
+function ActivityTournamentModel:GetHistoricalLineupData(player_uid, arena_layer_match, call)
+    local tb = {}
+    local teamNum = self:GetCurTeamNum()
+    local embattleTypeName = self:GetCurEmbattleTypeName()
+    for tnIndex = 1, teamNum do
+        table.insert(tb, _G.EmbattleType[embattleTypeName .. tnIndex])
+    end
+    local pb = {
+        activity_id = self.curActivityClass.activityID,
+        uid = player_uid,
+        ids = tb
+    }
+    ActivityTournamentNet:GetInstance():GetHistoricalLineupData(
+        pb,
+        _G.handlerbind(self, self.GetEnemyGarrayCall, call, arena_layer_match)
+    )
+end
+
+---获取对手的详细阵容信息回调
+---@param msg arena_layer.s2c_arena_layer_enemy_array
+---@param arena_layer_match arena_layer.s2c_arena_layer_match
+function ActivityTournamentModel:GetEnemyGarrayCall(msg, callback, arena_layer_match)
+    if msg.ack == 1 then
+        if callback then
+            callback(msg, arena_layer_match)
+        end
+    end
+end
+
+---
+---@protected
+function ActivityTournamentModel:GetCurTeamNum()
+    return self.stage == 1 and 3 or 5
+end
+
+---
+---@protected
+function ActivityTournamentModel:GetCurEmbattleTypeName()
+    return self.stage == 1 and "ActivityTournamentPrepare" or "ActivityTournamentEliminate"
+end
+
+---打开防守布阵
+function ActivityTournamentModel:OpenEmbattleDefence()
+    --_G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleOpened, self)
+    ---@type EmbattleType[]
+    local tb, reserveEmbattleTypes = {}, {}
+    local teamNum = self:GetCurTeamNum()
+    local embattleTypeName = self:GetCurEmbattleTypeName()
+    for tnIndex = 1, teamNum do
+        table.insert(tb, _G.EmbattleType[embattleTypeName .. tnIndex])
+    end
+    for tnIndex = teamNum + 1, 5 do
+        table.insert(reserveEmbattleTypes, _G.EmbattleType["ActivityTournamentPrepare" .. tnIndex])
+    end
+
+    --require("EmbattleController"):GetInstance():OpenEmbattle(
+    --    tb,
+    --    _G.EmbattleSaveType.server,
+    --    false,
+    --    _G.EmbattleControllerItemType.ActivityTournament,
+    --    _G.handler(self, self.ExitEmbattle),
+    --    _G.handler(self, self.ExitEmbattle),
+    --    500000001
+    --)
+
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ActivityTournamentEmbattleNewView.Name,
+        tb,
+        _G.EmbattleControllerItemType.ActivityTournament,
+        _G.handler(self, self.ExitEmbattle),
+        _G.handler(self, self.ExitEmbattle))
+end
+
+---退出布阵
+function ActivityTournamentModel:ExitEmbattle()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ActivityTournamentView.Name)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+    if not _G.ConfigManager.ui_cfg.ActivityTournamentView.HideWorld then
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+    end
+
+    if self.stage == 1 then
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActivityTournamentView.Name)
+        if view then
+            view.go_table["toggle_tag" .. 1].isOn = true
+        end
+    end
+end
+
+function ActivityTournamentModel:OnEmbattleOpened(name)
+    if name ~= _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        return
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleOpened, self)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActivityTournamentView.Name)
+    if view then
+        view:Hide()
+    end
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(false, true)
+end
+
+---挑战
+function ActivityTournamentModel:Fight(arena_layer_enemy_array, arena_layer_match, skipBattle)
+    local teamNum = self:GetCurTeamNum()
+    local embattleTypeName = self:GetCurEmbattleTypeName()
+    --打开调整界面
+    local embattleDatas = {}
+    for tnIndex = 1, teamNum do
+        ---@type EmbattleType
+        local embattleType = _G.EmbattleType[embattleTypeName .. tnIndex]
+        table.insert(embattleDatas, require("EmbattleModel"):GetInstance():GetEmbattleData(embattleType))
+    end
+
+    for i = 1, #embattleDatas do
+        for j = 1, #embattleDatas[i] do
+            if embattleDatas[i][j] > 0 then
+                local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, embattleDatas[i][j])
+                if card then
+                    embattleDatas[i][j] = {
+                        uid = card.uid,
+                        sid = card.sid,
+                        star = card:GetStar(),
+                        level = card:GetLevel(),
+                        soulLink_lv = card.soulLink_lv,
+                        power = card:GetPower(),
+                        soulLink_IsActivate = card.soulLink_IsActivate,
+                        open_inborn = card.open_inborn,
+                        tag = 0
+                    }
+                else
+                    embattleDatas[i][j] = {
+                        uid = 0,
+                        sid = 0,
+                        star = 0,
+                        level = 1,
+                        soulLink_lv = 0,
+                        power = 0,
+                        soulLink_IsActivate = 0,
+                        open_inborn = 0,
+                        tag = 0
+                    }
+                end
+            else
+                embattleDatas[i][j] = {
+                    uid = 0,
+                    sid = 0,
+                    star = 0,
+                    level = 1,
+                    soulLink_lv = 0,
+                    power = 0,
+                    soulLink_IsActivate = 0,
+                    open_inborn = 0,
+                    tag = 0
+                }
+            end
+        end
+    end
+
+    local datas = {}
+    if arena_layer_enemy_array.arrays ~= nil then
+        for m = 1, #arena_layer_enemy_array.arrays do
+            local data = { false }
+            datas[m] = data
+            local emptyTag = true
+            local teams = arena_layer_enemy_array.arrays[m]
+            if teams.team then
+                for i = 1, #teams.team do
+                    data[i] = {
+                        uid = teams.team[i].sid,
+                        sid = teams.team[i].sid,
+                        level = teams.team[i].level or 0,
+                        star = teams.team[i].star or 0,
+                        power = teams.team[i].power,
+                        soulLink_lv = teams.team[i].soul_lv or 0,
+                        soulLink_IsActivate = teams.team[i].soul_state or 0,
+                        artifact = teams.team[i].artifact or {},
+                        open_inborn = teams.team[i].born_skill_num or 0
+                    }
+                    if emptyTag and teams.team[i].sid > 0 then
+                        emptyTag = false
+                    end
+                end
+            end
+            if teams.power then
+                data.power = teams.power
+            end
+        end
+    end
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ActivityTournamentSettlementView.Name,
+        nil,
+        3,
+        arena_layer_match,
+        embattleDatas,
+        datas
+    )
+end
+
+---进入战斗
+---@param joinType number 加入的竞技场类型
+---@param skipBattle boolean 是否跳过战斗
+function ActivityTournamentModel:EnterFight(enemyHeadInfo, skipBattle)
+    ActivityTournamentNet:GetInstance():Fight({ activity_id = self.curActivityClass.activityID },
+        _G.handlerbind(self, self.OnFightCall, false, enemyHeadInfo, skipBattle))
+end
+
+---进入战斗回调
+---@param msg arena_layer.s2c_arena_layer_fight
+---@param joinType number 加入的竞技场类型
+---@param isEmptyEnemy boolean 单场的战斗敌方阵容是否为空
+---@param skipBattle boolean 是否跳过战斗
+function ActivityTournamentModel:OnFightCall(msg, isEmptyEnemy, enemyHeadInfo, skipBattle)
+    if msg.ack ~= 1 then
+        self:ExitEmbattle()
+        return
+    end
+    if msg.fight_result ~= nil then
+        _G.SortList(
+            msg.fight_result,
+            function(a)
+                return -a.index
+            end
+        )
+        self.fight = self.fight + 1
+        --_G.Events:GetInstance():Broadcast(_G.SpiritualRealmEvents.FightTimeChange)
+        ActivityTournamentNet:GetInstance():FightResult({ activity_id = self.curActivityClass.activityID },
+            _G.handlerbind(self, self.OnFightResultCall, msg, isEmptyEnemy, skipBattle)
+        )
+        _G.DelayDo(1, function()
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActivityTournamentBattleAnimation.Name)
+            if view then
+                view:SetEnd(msg)
+            end
+        end)
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ActivityTournamentBattleAnimation.Name, enemyHeadInfo)
+    end
+end
+
+---进入战斗回调
+---@param msg arena_layer.s2c_arena_layer_result
+---@param arena_layer_fight arena_layer.s2c_arena_layer_fight
+---@param joinType number 加入的竞技场类型
+---@param isEmptyEnemy boolean 单场的战斗敌方阵容是否为空
+---@param skipBattle boolean 是否跳过战斗
+function ActivityTournamentModel:OnFightResultCall(msg, arena_layer_fight, isEmptyEnemy, skipBattle)
+    if msg.ack ~= 1 then
+        self:ExitEmbattle2()
+        return
+    end
+    self:ScoreChange(msg.args[2] - msg.args[1])
+    --结算
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActivityTournamentSettlementView.Name)
+    if view then
+        local hp = arena_layer_fight.hp
+        for i, v in ipairs(arena_layer_fight.fight_result) do
+            v.data.cardsShow = hp[v.index].cards
+            v.data.defender_cardsShow = hp[v.index].defender_cards
+        end
+        view:AdjustToResult(arena_layer_fight.fight_result, msg.report, msg.args)
+    end
+end
+
+function ActivityTournamentModel:ScoreChange(changeScore)
+    if changeScore == 0 then
+        return
+    else
+        self.score = self.score + changeScore
+        _G.Events:GetInstance():Broadcast(_G.eActivityTournament.ScoreChange)
+    end
+end
+
+---获取赛程数据
+---@protected
+function ActivityTournamentModel:GetGroupInfo(type, index, call)
+    if self.GroupInfo[type] ~= nil and self.GroupInfo[type][index] ~= nil then
+        if call then
+            call(self.GroupInfo[type][index])
+        end
+    else
+        local pbData = { activity_id = self.curActivityClass.activityID, round = type, group_index = index }
+        ActivityTournamentNet:GetInstance():GetGroupInfo(pbData, function(msg)
+            self:SetGroupInfo(msg.group_info, type, index)
+            if call then
+                call(self.GroupInfo[type][index])
+            end
+        end)
+    end
+end
+
+---领几强奖
+function ActivityTournamentModel:GetIndexAward(index, call)
+    ActivityTournamentNet:GetInstance():GetIndexAward(
+        { activity_id = self.curActivityClass.activityID, index = index },
+        function(msg)
+            if msg.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                if self.rank_award_state ~= nil then
+                    for i, v in ipairs(index) do
+                        _G.table.insert(self.rank_award_state, v)
+                    end
+                else
+                    self.rank_award_state = index
+                end
+                self.curActivityClass.typeClass:UpdateRedpoint(3)
+            end
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---预测
+---@protected
+function ActivityTournamentModel:ChampionGuess(target, call)
+    ActivityTournamentNet:GetInstance():ChampionGuess(
+        { activity_id = self.curActivityClass.activityID, target = target },
+        function(msg)
+            if msg.ack == 1 then
+                self.predict = target
+            end
+            self.curActivityClass.typeClass:UpdateRedpoint(4)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---预测领奖
+function ActivityTournamentModel:GetChampionGuessAward(call)
+    ActivityTournamentNet:GetInstance():GetChampionGuessAward(
+        { activity_id = self.curActivityClass.activityID },
+        function(msg)
+            if msg.ack == 1 then
+                self.predict_state = 1
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                self.curActivityClass.typeClass:UpdateRedpoint(4)
+            end
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---
+---@protected
+function ActivityTournamentModel:WorshipChange()
+    ActivityTournamentNet:GetInstance():GetStageInfo({ activity_id = self.curActivityClass.activityID, stage = 5 }, function(msg)
+        self.worship_award = msg.worship_info.award
+        self.curActivityClass.typeClass:UpdateRedpoint(6)
+        _G.Events:GetInstance():Broadcast(_G.eActivityTournament.WorshipStageChange)
+    end)
+end
+
+---
+---@protected
+function ActivityTournamentModel:P2CFightCall(msg)
+    self:OnFightCall(msg, false, false)
+end
+
+---
+---@protected
+function ActivityTournamentModel:Attacked(data)
+    if data.ack == 1 then
+        self.score = data.score
+        ---@type CrossServiceCompPerson
+        local RankData = require("RecordRankModel"):GetInstance():GetRankData(RankUtils.RankType.CrossServiceCompPerson)
+        if RankData then
+            RankData:RefreshRankData()
+        end
+        if data.report.winner[1] == 1 then
+            if self.logRed == nil then
+                self.logRed = true
+            end
+            self.curActivityClass.typeClass:UpdateRedpoint(2)
+        end
+        _G.Events:GetInstance():Broadcast(_G.eActivityTournament.ScoreChange)
+    end
+end
+
+---
+---@protected
+function ActivityTournamentModel:ChangeLogRedStage()
+    if self.logRed ~= nil then
+        self.logRed = nil
+    end
+    self.curActivityClass.typeClass:UpdateRedpoint(2)
+end
+
+---选择膜拜奖励
+function ActivityTournamentModel:ChooseChampionAward(list, call)
+    ActivityTournamentNet:GetInstance():ChooseChampionAward(
+        { activity_id = self.curActivityClass.activityID, data = list },
+        function(msg)
+            if msg.ack == 1 then
+                self.worship_award = {}
+                self.curActivityClass.typeClass:UpdateRedpoint(5)
+                self:WorshipChange()
+                if call then
+                    call(msg)
+                end
+            end
+        end
+    )
+end
+
+---获取膜拜奖励
+function ActivityTournamentModel:GetChampionAward(call)
+    ActivityTournamentNet:GetInstance():GetChampionAward(
+        { activity_id = self.curActivityClass.activityID },
+        function(msg)
+            if msg.ack == 1 then
+                self.worship_award_state = 1
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                self.curActivityClass.typeClass:UpdateRedpoint(6)
+            end
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---膜拜日志
+function ActivityTournamentModel:GetChampionAwardLog(call)
+    ActivityTournamentNet:GetInstance():GetChampionAwardLog(
+        { activity_id = self.curActivityClass.activityID },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---冠军殿堂详情
+function ActivityTournamentModel:GetHistoryDetails(index, call)
+    if self.historyDetails[index] ~= nil then
+        if call then
+            call(self.historyDetails[index])
+        end
+    else
+        if index == self.season and self.stage < 5 then
+            local model = require("RecordRankModel"):GetInstance()
+            local RankUtils = require("RankUtils")
+            model = require("RecordRankModel"):GetInstance()
+            model:GetListInfo(RankUtils.RankType.CrossServiceCompAlliance, function()
+                local rankData = model:GetRankData(RankUtils.RankType.CrossServiceCompAlliance)
+                local list = {}
+                local num = #rankData.listRankDatas
+                for i = 1, 10 do
+                    if i <= num then
+                        local data = rankData.listRankDatas[num - i + 1]
+                        _G.table.insert(list, data.role_info)
+                    end
+                end
+                self.historyDetails[index] = list
+                if call then
+                    call(self.historyDetails[index])
+                end
+            end)
+        else
+            ActivityTournamentNet:GetInstance():GetHistoryDetails(
+                { season = index },
+                function(msg)
+                    if msg.ack == 1 then
+                        self.historyDetails[index] = msg.role
+                        if call then
+                            call(self.historyDetails[index])
+                        end
+                    end
+                end
+            )
+        end
+    end
+end
+
+---获取配置排名奖励id范围
+---@param rankType number 96全服 97部落 98联盟
+function ActivityTournamentModel:GetRankAwardCfgIdScope()
+    local Scope = {
+        min = math.maxinteger,
+        max = 0,
+    }
+    local count = #self.cfg.rank_info
+    for i = 1, count do
+        local id = self.cfg.rank_info[i]
+        if id > Scope.max then
+            Scope.max = id
+        end
+        if id < Scope.min then
+            Scope.min = id
+        end
+    end
+    return Scope
+end
+
+---获取公共战报
+function ActivityTournamentModel:GetReportEliminate(round, index, uid, back)
+    ActivityTournamentNet:GetInstance():GetReportEliminate(
+        { activity_id = self.curActivityClass.activityID, round = round, index = index, target_uid = uid },
+        function(msg)
+            if msg.ack == 1 then
+                if back then
+                    self.GuessReport = msg
+                    back(msg)
+                end
+                local list = msg.reports
+                if list ~= nil then
+                    self:Playback(list[1], round, index)
+                end
+            end
+        end
+    )
+end
+
+---
+---@protected
+function ActivityTournamentModel:Playback(data, round, index)
+    ActivityTournamentNet:GetInstance():Playback({ activity_id = self.curActivityClass.activityID, playback_uid = data.playback_uid }, _G.handlerbind(self, self.OnReplayReportCall, data, round, index))
+end
+
+function ActivityTournamentModel:OnReplayReportCall(msg, data, round, index)
+    if msg.ack ~= 1 then
+        return
+    end
+    if #msg.data > 1 then
+        local timeKey = _G.ConfigManager.discrete_cfg[138008][#_G.ConfigManager.discrete_cfg[138008]][1]
+        local showNum = (self.stage ~= 5 and self.round == round and self.roundIndex == index) and math.floor((_G.TimeUtil.GetSecondsOfDay() - timeKey) / self.timeLogCache) or #msg.data
+        local fightArgs = {}
+
+        local hp = msg.hp
+        for k, v in ipairs(msg.data) do
+            v.cardsShow = hp[k].cards
+            v.defender_cardsShow = hp[k].defender_cards
+            _G.table.insert(fightArgs,
+                { data = v, index = k, winner = (v.winner and v.winner[1]) and 1 or 0, playbackUid = data.playback_uid })
+            if k >= showNum then
+                break
+            end
+        end
+        local hide = showNum < #msg.data and true or nil
+        local PlayerHeadInfo = {}
+        PlayerHeadInfo.level = _G.PlayerModel:GetInstance():GetLevel()
+        PlayerHeadInfo.name = _G.PlayerModel:GetInstance():GetName()
+        PlayerHeadInfo.frame = _G.PlayerModel:GetInstance():GetCurFrame()
+        PlayerHeadInfo.style = _G.PlayerModel:GetInstance():GetRoleStyle()
+        local leftRole = data.left and data.left or (data.report_type == 0 and PlayerHeadInfo or data.role)
+        local rightRole = data.right and data.right or (data.report_type == 0 and data.role or PlayerHeadInfo)
+        ---@type ActivityTournamentSettlementView
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.ActivityTournamentSettlementView.Name,
+            nil,
+            2,
+            fightArgs,
+            rightRole,
+            leftRole,
+            hide
+        )
+    end
+end
+
+---@param data table 伤害数据
+function ActivityTournamentModel:UpdateData(data)
+    if not data then
+        _G.PopWindowManager:GetInstance():ShowAllTips(540302)
+        return
+    end
+    self.maxCount = _G.table.count(data.FighterInfo)
+    self.PveData = self:InitData(data)
+
+    --获取对战双方的名称
+    local leftName, rightName = _G.PlayerModel:GetInstance():GetName(),
+    self.otherPlayer and self.otherPlayer.name or ""
+    if self.fight_arg.def_uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+        --当前玩家为防守方(防守战报), 交换名称
+        local tempName = leftName
+        leftName = rightName
+        rightName = tempName
+    end
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name,
+        self.PveData,
+        self.winnertable,
+        nil,
+        nil,
+        self.otherPlayer,
+        1,
+        true,
+        self.fight_arg,
+        nil,
+        { self.playback_uid },
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        { leftName, rightName } --reportParams
+    )
+end
+
+function ActivityTournamentModel:InitData(data)
+    local tb = {}
+    for i = 1, self.maxCount do
+        local tempData = data.FighterInfo[i]
+        local temp = {}
+        temp.AtkUid = data.AtkUid
+        temp.DefUid = data.DefUid
+        temp.statisticsMax = { DmgOut = 1, DmgIn = 1, HpRecover = 1, CreateGuard = 1 }
+        temp.statisticsData = tempData
+        for j = 1, #tempData.Attacker do
+            if temp.statisticsMax.DmgOut < tempData.Attacker[j].DmgOut then
+                temp.statisticsMax.DmgOut = tempData.Attacker[j].DmgOut
+            end
+
+            if temp.statisticsMax.DmgIn < tempData.Attacker[j].DmgIn then
+                temp.statisticsMax.DmgIn = tempData.Attacker[j].DmgIn
+            end
+
+            if temp.statisticsMax.HpRecover < tempData.Attacker[j].HpRecover then
+                temp.statisticsMax.HpRecover = tempData.Attacker[j].HpRecover
+            end
+            if temp.statisticsMax.CreateGuard < tempData.Attacker[j].CreateGuard then
+                temp.statisticsMax.CreateGuard = tempData.Attacker[j].CreateGuard
+            end
+        end
+        for j = 1, #tempData.Defender do
+            if temp.statisticsMax.DmgOut < tempData.Defender[j].DmgOut then
+                temp.statisticsMax.DmgOut = tempData.Defender[j].DmgOut
+            end
+
+            if temp.statisticsMax.DmgIn < tempData.Defender[j].DmgIn then
+                temp.statisticsMax.DmgIn = tempData.Defender[j].DmgIn
+            end
+
+            if temp.statisticsMax.HpRecover < tempData.Defender[j].HpRecover then
+                temp.statisticsMax.HpRecover = tempData.Defender[j].HpRecover
+            end
+            if temp.statisticsMax.CreateGuard < tempData.Defender[j].CreateGuard then
+                temp.statisticsMax.CreateGuard = tempData.Defender[j].CreateGuard
+            end
+        end
+        temp.CombMax = { DmgOut = 1, CreateGuard = 1, HpRecover = 1 }
+        for j = 1, #tempData.AtkCombineSkills[1] do
+            if temp.CombMax.DmgOut < tempData.AtkCombineSkills[1][j].DmgOut then
+                temp.CombMax.DmgOut = tempData.AtkCombineSkills[1][j].DmgOut
+            end
+
+            if temp.CombMax.CreateGuard < tempData.AtkCombineSkills[1][j].CreateGuard then
+                temp.CombMax.CreateGuard = tempData.AtkCombineSkills[1][j].CreateGuard
+            end
+
+            if temp.CombMax.HpRecover < tempData.AtkCombineSkills[1][j].HpRecover then
+                temp.CombMax.HpRecover = tempData.AtkCombineSkills[1][j].HpRecover
+            end
+        end
+        for j = 1, #tempData.DefCombineSkills[1] do
+            if temp.CombMax.DmgOut < tempData.DefCombineSkills[1][j].DmgOut then
+                temp.CombMax.DmgOut = tempData.DefCombineSkills[1][j].DmgOut
+            end
+
+            if temp.CombMax.CreateGuard < tempData.DefCombineSkills[1][j].CreateGuard then
+                temp.CombMax.CreateGuard = tempData.DefCombineSkills[1][j].CreateGuard
+            end
+
+            if temp.CombMax.HpRecover < tempData.DefCombineSkills[1][j].HpRecover then
+                temp.CombMax.HpRecover = tempData.DefCombineSkills[1][j].HpRecover
+            end
+        end
+        temp.PetMax = { DmgOut = 1, CreateGuard = 1, HpRecover = 1 }
+        for j = 1, #tempData.AtkPetSkills[1] do
+            if temp.PetMax.DmgOut < tempData.AtkPetSkills[1][j].DmgOut then
+                temp.PetMax.DmgOut = tempData.AtkPetSkills[1][j].DmgOut
+            end
+
+            if temp.PetMax.CreateGuard < tempData.AtkPetSkills[1][j].CreateGuard then
+                temp.PetMax.CreateGuard = tempData.AtkPetSkills[1][j].CreateGuard
+            end
+
+            if temp.PetMax.HpRecover < tempData.AtkPetSkills[1][j].HpRecover then
+                temp.PetMax.HpRecover = tempData.AtkPetSkills[1][j].HpRecover
+            end
+        end
+        for j = 1, #tempData.DefPetSkills[1] do
+            if temp.PetMax.DmgOut < tempData.DefPetSkills[1][j].DmgOut then
+                temp.PetMax.DmgOut = tempData.DefPetSkills[1][j].DmgOut
+            end
+
+            if temp.PetMax.CreateGuard < tempData.DefPetSkills[1][j].CreateGuard then
+                temp.PetMax.CreateGuard = tempData.DefPetSkills[1][j].CreateGuard
+            end
+
+            if temp.PetMax.HpRecover < tempData.DefPetSkills[1][j].HpRecover then
+                temp.PetMax.HpRecover = tempData.DefPetSkills[1][j].HpRecover
+            end
+        end
+        temp.TeamIndex = tempData.TeamIndex
+        _G.table.insert(tb, temp)
+    end
+    return tb
+end
+
+---
+---@protected
+function ActivityTournamentModel:CheckBattleLog()
+    if self.stage == 1 then
+        return self.logRed ~= nil
+    end
+    return false
+end
+
+---
+---@protected
+function ActivityTournamentModel:CheckIndexAward()
+    if self.stage == 3 or self.stage == 4 then
+        local index = self.round == 1 and self.roundIndex or (self.roundIndex + 3)
+        for i = 1, index do
+            if not _G.table.ContainsValue(self.rank_award_state, i) then
+                return true
+            end
+        end
+    else
+        return false
+    end
+end
+
+---
+---@protected
+function ActivityTournamentModel:CheckChooseChampionAward()
+    if self.stage == 5 then
+        local isTop = self.historyDetails[self.season][1].uid == _G.PlayerModel:GetInstance():GetPlayerUid()
+        if isTop and self:GetWorshipAward() == nil then
+            return true
+        end
+        return false
+    else
+        return false
+    end
+end
+
+function ActivityTournamentModel:CheckChampionAward()
+    if self.stage == 5 then
+        if self:GetWorshipAward() ~= nil and self:GetWorshipAwardState() == 0 then
+            return true
+        end
+    end
+    return false
+end
+
+function ActivityTournamentModel:CheckChampionGuess()
+    local timeKey = _G.ConfigManager.discrete_cfg[138008][#_G.ConfigManager.discrete_cfg[138008]][2]
+    if self.stage == 4 then
+        if self.predict == 0 and self.roundIndex == 1 and _G.TimeUtil.GetSecondsOfDay() < timeKey then
+            return true
+        end
+    end
+    if (self.stage == 4 and self.roundIndex == 3 and _G.TimeUtil.GetSecondsOfDay() >= timeKey) or self.stage == 5 then
+        if self.predict ~= nil and self.predict ~= 0 and self.predict_state == 0 then
+            return true
+        end
+    end
+    return false
+end
+
+function ActivityTournamentModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eArena.SetDrawUp, self.AddCoins, self)
+    _G.Events:GetInstance():RemoveListener(_G.eYKNetEvent.ReconnectSuccess, self.OnReconnectSuccess, self)
+end
+
+--获取竞猜数据
+function ActivityTournamentModel:GetGuessData(call, rounds)
+    if self.isGetDataIng and self.isGetDataIng == true then
+        if self.GetDataCall == nil then
+            self.GetDataCall = {}
+        end
+        table.insert(self.GetDataCall, call)
+        return
+    end
+    local msg = {
+        activity_id = self.curActivityClass.activityID,
+        round = {  }
+    }
+    for i = 1, self.round do
+        _G.table.insert(msg.round, i)
+    end
+    if rounds then
+        msg.round = rounds
+    end
+
+    self.isGetDataIng = true
+    ActivityTournamentNet:GetInstance():GetGuessData(
+        msg,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type activity_tournament.s2c_activity_tournament_guess_list
+            self.GuessData = msg
+            if call then
+                call(msg)
+            end
+            if self.GetDataCall then
+                for i = 1, #self.GetDataCall do
+                    self.GetDataCall[i](msg)
+                end
+                self.GetDataCall = nil
+            end
+            self.isGetDataIng = false
+        end
+    )
+end
+
+--获取竞猜战报
+function ActivityTournamentModel:GetGuessReport(leftuid, rightuid, call)
+    ActivityTournamentNet:GetInstance():GetGuessReport(
+        {
+            activity_id = self.curActivityClass.activityID,
+            left_role = leftuid,
+            right_rile = rightuid,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type s2c_activity_tournament_eliminate_report
+            self.GuessReport = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+--获取单队竞猜战报数据
+function ActivityTournamentModel:GetUnitGuessReport(playback_uid, call)
+    ActivityTournamentNet:GetInstance():GetUnitGuessReport(
+        {
+            activity_id = self.curActivityClass.activityID,
+            playback_uid = playback_uid,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type s2c_activity_tournament_eliminate_report
+            --self.GuessReport = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+--竞猜
+function ActivityTournamentModel:TakeGuess(target, num, call)
+    ActivityTournamentNet:GetInstance():TakeGuessss(
+        {
+            activity_id = self.curActivityClass.activityID,
+            target = target,
+            num = num,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type s2c_activity_tournament_eliminate_report
+            --self.GuessReport = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+--获取阵容
+function ActivityTournamentModel:GetArray(uid, call)
+    ActivityTournamentNet:GetInstance():GetArrays(
+        {
+            activity_id = self.curActivityClass.activityID,
+            uid = uid
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type s2c_activity_tournament_eliminate_report
+            --self.GuessReport = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---获取任务奖励
+function ActivityTournamentModel:GetTaskRewards(task_sid, finish_type, call, activityID)
+    ActivityTournamentNet:GetInstance():GetTaskRewards(
+        {
+            activity_id = activityID and activityID or self.curActivityClass.activityID,
+            task_sid = task_sid,
+            finish_type = finish_type,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type s2c_activity_tournament_eliminate_report
+            --self.GuessReport = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+----@class ActivityTournamentModel.taskData
+---@field dict table<number,ActivityTourGuessTaskData>
+---@field ActivityTourGuessTaskData[]
+---@field finish_task table<number,boolean>
+
+---获取任务数据
+function ActivityTournamentModel:GetTaskData(call, stage)
+    if stage == nil then
+        stage = self.stage
+    end
+    ActivityTournamentNet:GetInstance():GetTaskData(
+        {
+            activity_id = self.curActivityClass.activityID,
+            stage = stage,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type activity_tournament.s2c_activity_tournament_info
+            self.StageData = msg
+            ---@type ActivityTournamentModel.taskData[]
+            self.taskData = {}
+            self:RefreshTakeData(1, msg.preselect_info)
+            self:RefreshTakeData(3, msg.eliminate_info)
+            self:RefreshTakeData(4, msg.champion_info)
+            self:RefreshTakeData(5, msg.worship_info)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---@param data
+function ActivityTournamentModel:RefreshTakeData(stage, data)
+    if self.taskData[stage] == nil then
+        self.taskData[stage] = {}
+        self.taskData[stage].dict = {}
+        self.taskData[stage].finish_task = {}
+        if data then
+            if data.task then
+                for i = 1, #data.task do
+                    self:CreatTaskData(data.task[i], self.taskData[stage])
+                end
+            end
+            if data.finish_task then
+                for i = 1, #data.finish_task do
+                    if self.taskData[stage].dict[data.finish_task[i]] == nil then
+                        local cfg = _G.ConfigManager.mission_extra_cfg[data.finish_task[i]]
+                        self:CreatTaskData({
+                            sid = data.finish_task[i],
+                            state = _G.TaskEnum.ETaskState.Submited,
+                            target = {
+                                cfg.count
+                            }
+                        }, self.taskData[stage])
+                    end
+                    self.taskData[stage].finish_task[data.finish_task[i]] = true
+                end
+            end
+        end
+    else
+        if data then
+            if data.task then
+                for i = 1, #data.task do
+                    if self.taskData[stage].dict[data.task[i].sid] then
+                        self.taskData[stage].dict[data.task[i].sid]:ParseData(data.task[i])
+                    else
+                        self:CreatTaskData(data.task[i], self.taskData[stage])
+                    end
+                end
+            end
+            if data.finish_task then
+                for i = 1, #data.finish_task do
+                    local cfg = _G.ConfigManager.mission_cfg[data.finish_task[i]]
+                    self:CreatTaskData({
+                        sid = data.finish_task[i],
+                        state = _G.TaskEnum.ETaskState.Submited,
+                        target = {
+                            cfg.count
+                        }
+                    }, self.taskData[stage])
+                    self.taskData[stage].finish_task[data.finish_task[i]] = true
+                end
+            end
+        end
+    end
+end
+
+---@param data task.i_task
+function ActivityTournamentModel:CreatTaskData(data, tab)
+    ---@type ActivityTourGuessTaskData
+    local taskData = ActivityTourGuessTaskData.New(data)
+    taskData:RefreshCompDict(tab.finish_task)
+    table.insert(tab, taskData)
+    tab.dict[taskData.i_task.sid] = taskData
+end
+
+---获取任务进度奖励
+function ActivityTournamentModel:GetTaskProcessAward(index, call)
+    ActivityTournamentNet:GetInstance():GetTaskProcessAward(
+        {
+            activity_id = self.curActivityClass.activityID,
+            index = index,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type s2c_activity_tournament_info
+            --self.StageData = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+--获取每日竞猜币奖励
+function ActivityTournamentModel:GetGuessReward(call)
+    ActivityTournamentNet:GetInstance():GetGuessReward(
+        {
+            activity_id = self.curActivityClass.activityID,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type s2c_activity_tournament_into
+            --self.StageData = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---@param 获取战报
+function ActivityTournamentModel:GetBattleData(call)
+    ActivityTournamentNet:GetInstance():GetReport_CrossServiceComp(
+        {
+            activity_id = self.curActivityClass.activityID,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            ---@type s2c_activity_tournament_into
+            --self.StageData = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+
+--完成任务
+function ActivityTournamentModel:CompTask(task_sid, finish_type, call)
+    ActivityTournamentNet:GetInstance():GetTaskRewards(
+        {
+            activity_id = self.curActivityClass.activityID,
+            task_sid = task_sid,
+            finish_type = finish_type,
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            --_G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            --if msg.award then
+            --    local value= msg.award.item[1]
+            --    self:SetCoin({[value.type[3]] = value.type[4]})
+            --end
+            if self.taskData then
+                for i = 1, #task_sid do
+                    local sid = task_sid[i]
+                    local taskData = self.taskData[self.stage]
+                    if taskData.dict[sid] then
+                        local data = taskData.dict[sid]
+                        data.i_task.target[1] = data.Cfg.count
+                        data.i_task.state = _G.TaskEnum.ETaskState.Submited
+                    end
+                    if taskData.finish_task then
+                        taskData.finish_task[sid] = true
+                    end
+                end
+            end
+
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+function ActivityTournamentModel:OpenBattlePVEView(PlayBackId)
+    self:GetUnitGuessReport(PlayBackId, function(msg)
+        --self:GetGuessReport()
+
+        local leftName = msg.data[1].attacker_team[1].name
+        local rightName = msg.data[1].defender_team[1].name
+        local isWin = msg.data[1].winner
+        local data = msg.data[1]
+        _G.BattleManager:GetInstance():SetArgData(data)
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name,
+            _G.BattleManager:GetInstance():ParseStatistics(),
+            isWin and { 0 } or { 1 },
+            function()
+                --self.onBtnClick = false
+                --self:StartTimer()
+            end,
+            nil,
+            nil,
+            1,
+            true,
+            data,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            { leftName, rightName } --reportParams
+        )
+    end)
+end
+
+---@return ActivityTourGuessTaskData[]
+function ActivityTournamentModel:GetCurShowTaskData(isPropReward)
+    local taskDatas = self.taskData[self.stage]
+    local showIds = self.cfg.preselect_task
+    if self.stage >= 3 or isPropReward then
+        showIds = self.cfg.champion_task
+    end
+
+    ---@type ActivityTourGuessTaskData[]
+    local showData = {}
+    if taskDatas then
+        for i = 1, #showIds do
+            if taskDatas.dict[showIds[i]] then
+                table.insert(showData, taskDatas.dict[showIds[i]])
+                --else
+                --    self:CreatTaskData({
+                --        sid = showIds[i],
+                --        state = _G.TaskEnum.ETaskState.Executing,
+                --        target = {
+                --            0
+                --        }
+                --    }, taskDatas)
+                --    table.insert(showData,taskDatas.dict[showIds[i]])
+            end
+        end
+    end
+    return showData
+end
+
+---获取当前拍脸图显示id
+function ActivityTournamentModel:CheckPopView()
+    if self.curActivityClass == nil then
+        return false
+    end
+    local time = _G.PlayerPrefsManager.GetInt("ActivityTournamentPopView" .. self.curActivityClass.activityID)
+    if time == 0 or _G.PlayerPrefsManager.GetInt("ActivityTournamentPopView" .. self.curActivityClass.activityID) ~= _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime()) then
+        return true
+    end
+    return false
+end
+
+function ActivityTournamentModel:CheckPreparePopView()
+    if self.curActivityClass == nil then
+        return false
+    end
+    local time = _G.PlayerPrefsManager.GetInt("ActivityTournamentPreparePopView" .. self.curActivityClass.activityID)
+    if time == 0 or _G.PlayerPrefsManager.GetInt("ActivityTournamentPreparePopView" .. self.curActivityClass.activityID) ~= _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime()) then
+        return true
+    end
+    return false
+end
+
+function ActivityTournamentModel:CheckChampionPopView()
+    if self.curActivityClass == nil then
+        return false
+    end
+    local time = _G.PlayerPrefsManager.GetInt("ActivityTournamentChampionPopView" .. self.curActivityClass.activityID)
+    if time == 0 or _G.PlayerPrefsManager.GetInt("ActivityTournamentChampionPopView" .. self.curActivityClass.activityID) ~= _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime()) then
+        return true
+    end
+    return false
+end
+---
+---@protected
+function ActivityTournamentModel:RefreshActivityBtnTips()
+    local isShow = false
+    if self.stage == 3 or self.stage == 4 then
+        local timeKey = _G.ConfigManager.discrete_cfg[138008][#_G.ConfigManager.discrete_cfg[138008]]
+        local curTime = _G.TimeUtil.GetSecondsOfDay()
+        if curTime >= timeKey[1] and curTime < timeKey[2] then
+            isShow = true
+        end
+    end
+    self.curActivityClass.typeClass:SetTipTbActive(isShow)
+end
+
+---@param taskinfo task.i_task
+function ActivityTournamentModel:UpdataTask(taskinfo)
+    --local curRaskData = self:GetCurShowTaskData()
+    local takeData = self.taskData[self.stage]
+    if takeData and takeData.dict[taskinfo.sid] then
+        takeData.dict[taskinfo.sid]:ParseData(taskinfo)
+    end
+end
+
+function ActivityTournamentModel:GetGuessWinCount(back)
+    local role_dict = {}
+    local winCount = 0
+    for i = 1, #self.GuessData.guess_role do
+        local data = self.GuessData.guess_role[i]
+        if role_dict[i] == nil then
+            role_dict[i] = {}
+        end
+        if data.info then
+            for j = 1, #data.info do
+                role_dict[i][data.info[j].target] = true
+            end
+        end
+    end
+
+    if self.round == 2 then
+        self:GetGroupInfo(2, 1, function(data)
+            local roleData = data
+            for i = 1, #self.GuessData.guess_pub do
+                local data = self.GuessData.guess_pub[i]
+                if role_dict[i] and data.info and data.round == 1 then
+                    if data.info.result == 1 and data.info.left and role_dict[i][data.info.left.uid] then
+                        winCount = winCount + 1
+                    elseif data.info.result == 2 and data.info.right and role_dict[i][data.info.right.uid] then
+                        winCount = winCount + 1
+                    end
+                end
+            end
+
+            for i = 1, self.roundIndex do
+                --当前轮次
+                local curRound = i
+                local starId, endId, groupCount = self:GetTeamScope(curRound)
+                --队伍数据
+                local roleRoundData = {}
+                for j = 1, groupCount do
+                    roleRoundData[j] = {
+                        left = roleData[starId + (j - 1) * 2],
+                        right = roleData[starId + (j - 1) * 2 + 1],
+                    }
+                end
+                role_dict = {}
+                if self.GuessData and self.GuessData.guess_role then
+                    for j = 1, #self.GuessData.guess_role do
+                        local guess_role = self.GuessData.guess_role[j]
+                        if guess_role.index == curRound and guess_role.info and guess_role.info[1] and guess_role.round == 2 then
+                            local uid = guess_role.info[1].target
+                            role_dict[uid] = true
+                        end
+                    end
+                end
+                for j = 1, groupCount do
+                    local leftRoleData = self:GetRoleData(roleRoundData, j, true)
+                    local RightRoleData = self:GetRoleData(roleRoundData, j, false)
+                    local leftUid = leftRoleData and leftRoleData.uid or nil
+                    local rightUid = RightRoleData and RightRoleData.uid or nil
+                    if role_dict[leftUid] then
+                        if self:GetIsWin(roleRoundData, j, true) then
+                            winCount = winCount + 1
+                        end
+                    elseif role_dict[rightUid] then
+                        if self:GetIsWin(roleRoundData, j, false) then
+                            winCount = winCount + 1
+                        end
+                    end
+                end
+            end
+            if back then
+                back(winCount)
+            end
+        end)
+    else
+        for i = 1, #self.GuessData.guess_pub do
+            local data = self.GuessData.guess_pub[i]
+            if role_dict[i] and data.info then
+                if data.info.result == 1 and data.info.left and role_dict[i][data.info.left.uid] then
+                    winCount = winCount + 1
+                elseif data.info.result == 2 and data.info.right and role_dict[i][data.info.right.uid] then
+                    winCount = winCount + 1
+                end
+            end
+        end
+        if back then
+            back(winCount)
+        end
+    end
+end
+
+function ActivityTournamentModel:GetTeamScope(roundIndex)
+    if roundIndex == 1 then
+        return 1, 8, 4
+    elseif roundIndex == 2 then
+        return 9, 12, 2
+    elseif roundIndex == 3 then
+        return 13, 14, 1
+    end
+end
+
+function ActivityTournamentModel:GetIsWin(data, curSelectRound, isleft)
+    ---@type activity_tournament.tournament_competitor_result
+    local leftData = data[curSelectRound].left.result
+    local rightData = data[curSelectRound].right.result
+    if isleft then
+        if leftData then
+            return leftData.result == 1
+        end
+        return false
+    else
+        if rightData then
+            return rightData.result == 1
+        end
+        return false
+    end
+end
+
+---@return role.i_role
+function ActivityTournamentModel:GetRoleData(data, curSelectRound, isleft)
+    if self.round == 2 then
+        local leftData = data[curSelectRound].left.role_info
+        local rightData = data[curSelectRound].right.role_info
+        if isleft then
+            return leftData
+        else
+            return rightData
+        end
+    else
+        local guess_pub = self.GuessData.guess_pub[curSelectRound]
+        local leftData = guess_pub.info.left
+        local rightData = guess_pub.info.right
+        if isleft then
+            return leftData
+        else
+            return rightData
+        end
+    end
+end
+
+function ActivityTournamentModel:OnRefreshRed()
+
+end
+
+return ActivityTournamentModel

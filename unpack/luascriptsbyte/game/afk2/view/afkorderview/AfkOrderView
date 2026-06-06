@@ -1,0 +1,235 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.Afk2.View.AfkOrderView	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/10/09
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+---@type Afk2Model
+local Afk2Model = require("Afk2Model")
+---@class AfkOrderView : UIBaseView	中文描述
+---@field public go_table AfkOrderView_GoTable GoTable
+
+local AfkOrderView = _G.BaseClass("AfkOrderView", _G.UIBaseView)
+
+function AfkOrderView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+---界面的入口函数
+function AfkOrderView:OnCreate()
+    self.buildConfig = {}
+    self.orderItemList = {}
+    self.orderStatus = Afk2Model:GetInstance():GetOrderStatusEnum()
+    for _, v in pairs(_G.ConfigManager.afk2_building_cfg) do
+        if not v.open_level or v.open_level >= 0 then
+            _G.table.insert(self.buildConfig, v)
+        end
+    end
+    self:SortList()
+    self.go_table.scrollloopvectical_OrderList:InitItemData(#self.buildConfig, _G.handler(self, self.RefreshItem))
+    self:OrderTimer()
+    self:AddListener(_G.eAfk2Events.BuildLevelChange, self.OnBuildLevelChange)
+end
+
+function AfkOrderView:OnBuildLevelChange(id)
+    local data = Afk2Model:GetInstance():GetBuildData(id)
+    if data and data.level >= data.maxLevel then
+        self:SortList()
+        self.go_table.scrollloopvectical_OrderList:UpdateAllItem()
+    end
+end
+
+function AfkOrderView:SortList()
+    _G.SortList(
+        self.buildConfig,
+        function(data)
+            local isUnlock = Afk2Model:GetInstance():CheckOrderIsUnlock(data.id, data)
+            local index = 1
+            if isUnlock then
+                local status = Afk2Model:GetInstance():GetOrderStatus(data.id)
+                if status == self.orderStatus.Finished then
+                    index = 4
+                elseif status == self.orderStatus.NotStart then
+                    index = 3
+                elseif status == self.orderStatus.Running then
+                    index = 2
+                end
+            end
+            return index, -data.id
+        end
+    )
+end
+
+function AfkOrderView:RefreshItem(index, obj)
+    local config = self.buildConfig[index + 1]
+    local tb = _G.GetAutoGoTable(obj, _G.handlerbind(self, self.OnClickItem, config))
+    tb.config = config
+    self.orderItemList[config.id] = tb
+    tb.aorrawimage_icon:LoadImage(
+        config.icon,
+        function(image)
+            image:SetNativeSize()
+        end
+    )
+    tb.aortext_Name.text = _G.GetLangPackValue(config.exchange_name)
+    --加载奖励
+    tb.obj_award:ClearChildren()
+    _G.StorageManager:GetInstance():GetItemBaseViewNew(
+        config.exchange_reward,
+        tb.obj_award,
+        function(item)
+            --如果父节点被销毁或异步加载被覆盖
+            if _G.IsNil(tb.obj_award) or config ~= tb.config then
+                _G.DestroyObject(item)
+                return
+            end
+            item:ShowEffect(true)
+        end
+    )
+    local isUnlock = Afk2Model:GetInstance():CheckOrderIsUnlock(config.id, config)
+    tb.obj_baseInfo:SetActiveE(isUnlock and 1 or 0)
+    tb.aortext_lockTip:SetActiveE(isUnlock and 0 or 1)
+    tb.aorbtn_levelUp:SetActiveE(isUnlock and 0 or 1)
+    tb.status = self.orderStatus.NotStart
+    if isUnlock then
+        tb.aortext_num.text = _G.GetLangPackValue(90000011452, config.exchange_reward[2])
+        local status = Afk2Model:GetInstance():GetOrderStatus(config.id)
+        tb.status = status
+        if status == self.orderStatus.NotStart then
+            local cost = config.exchange_cost
+            if not _G.StorageManager:GetInstance():CheckItem(cost[1], cost[2]) then
+                tb.aortext_orderNum.text = "<color=#c95f00>" .. cost[2] .. "</color>"
+            else
+                tb.aortext_orderNum.text = "<color=#4E5278>" .. cost[2] .. "</color>"
+            end
+            tb.aorrawimage_orderIcon:LoadImage(
+                _G.StorageManager:GetInstance():GetItemIcon(cost[1])
+            )
+        end
+        local serverTime = _G.TimeUtil.GetServerUnixTime()
+        if status == self.orderStatus.NotStart then
+            tb.aortext_taskTime.text = _G.GetLangPackValue(
+                90000011453,
+                _G.TimeUtil.TimeToString(config.exchange_time * 60, 1)
+            )
+        else
+            local buildData = Afk2Model:GetInstance():GetBuildData(config.id)
+            local orderTime = buildData and buildData.order_time
+            if orderTime - serverTime > 0 then
+                tb.aortext_taskTime.text = _G.GetLangPackValue(
+                    90000011453,
+                    _G.TimeUtil.TimeToString(orderTime - serverTime, 1)
+                )
+            else
+                tb.aortext_taskTime.text = _G.GetLangPackValue(90000011465)
+            end
+        end
+    else
+        tb.aortext_taskTime.text = ""
+        tb.aortext_num.text = ""
+        ---订单解锁条件
+        tb.aortext_lockTip.text = _G.GetLangPackValue(90000011456, config.open_level)
+    end
+    tb.aorbtn_order:SetActiveE(isUnlock and tb.status == self.orderStatus.NotStart and 1 or 0)
+    tb.aorbtn_getAward:SetActiveE(isUnlock and tb.status == self.orderStatus.Finished and 1 or 0)
+    tb.aortext_Delivery:SetActiveE(isUnlock and tb.status == self.orderStatus.Running and 1 or 0)
+end
+
+---订单计时器
+function AfkOrderView:OrderTimer()
+    if self.orderTimer then
+        self.orderTimer:Stop()
+        self.orderTimer = nil
+    end
+    self.orderTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false)
+    self.orderTimer:Start()
+end
+
+function AfkOrderView:UpdateTime()
+    for _, v in pairs(self.orderItemList) do
+        if v.status and v.status == self.orderStatus.Running then
+            local buildData = Afk2Model:GetInstance():GetBuildData(v.config.id)
+            local serverTime = _G.TimeUtil.GetServerUnixTime()
+            local orderTime = buildData and buildData.order_time or serverTime
+            if orderTime - serverTime >= 0 then
+                v.aortext_taskTime.text = _G.GetLangPackValue(
+                    90000011453,
+                    _G.TimeUtil.TimeToString(orderTime - serverTime, 1)
+                )
+            else
+                v.status = self.orderStatus.Finished
+                self.go_table.scrollloopvectical_OrderList:UpdateAllItem()
+                require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Order.id)
+            end
+        end
+    end
+end
+
+function AfkOrderView:OnClickItem(go, _, config)
+    local name = go:GetName()
+    if name == "@_aorbtn_getAward" then
+        ---收件
+        Afk2Model:GetInstance():GetOrderAward(config.id, 2, function()
+            self:SortList()
+            self.go_table.scrollloopvectical_OrderList:UpdateAllItem()
+        end)
+    elseif name == "@_aorbtn_levelUp" then
+        ---升级
+        local buildData = Afk2Model:GetInstance():GetBuildData(config.id)
+        if buildData and buildData.level >= 1 then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AfkBuildingInfoView.Name, config.id, function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AfkBuildingLevelUpView.Name, config.id)
+            end)
+        else
+            local cfg = _G.ConfigManager.afk2_cfg[config.condition[1]]
+            _G.PopWindowManager:GetInstance():ShowAllTips(970101, nil, nil, nil, nil, nil, cfg.number)
+        end
+    elseif name == "@_aorbtn_order" then
+        ---下单
+        local cost = config.exchange_cost
+        local reward = config.exchange_reward
+        if not _G.StorageManager:GetInstance():CheckItemNew(cost[1], cost[2]) then
+            return
+        end
+        _G.PopWindowManager:GetInstance():ShowBtnWindowByToggle(
+            970105,
+            function()
+                Afk2Model:GetInstance():StartOrder(config.id, function()
+                    _G.PopWindowManager:GetInstance():ShowAllTips(970111)
+                    self:SortList()
+                    self.go_table.scrollloopvectical_OrderList:UpdateAllItem()
+                end)
+            end,
+            nil,
+            function()
+                Afk2Model:GetInstance():StartOrder(config.id, function()
+                    _G.PopWindowManager:GetInstance():ShowAllTips(970111)
+                    self:SortList()
+                    self.go_table.scrollloopvectical_OrderList:UpdateAllItem()
+                end)
+            end,
+            nil,
+            cost[2] .. _G.StorageManager:GetInstance():GetItemName(cost[1]),
+            _G.TimeUtil.TranslateSecondForStrSixVsSix(config.exchange_time * 60),
+            reward[2] .. _G.StorageManager:GetInstance():GetItemName(reward[1])
+        )
+    end
+end
+
+---界面的销毁函数
+function AfkOrderView:OnDestroy()
+    if self.orderTimer then
+        self.orderTimer:Stop()
+        self.orderTimer = nil
+    end
+    self:RemoveAllListener()
+end
+
+---按钮点击事件在这里派发
+function AfkOrderView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_colse or go == self.go_table.aorbtn_close then
+        self:Close()
+    end
+end
+
+return AfkOrderView

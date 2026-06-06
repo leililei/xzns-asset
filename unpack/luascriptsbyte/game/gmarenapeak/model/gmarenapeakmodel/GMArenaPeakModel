@@ -1,0 +1,1931 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.ArenaPeak.Model.GMArenaPeakModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/08/01
+-- Description: 巅峰演武数据类
+-----------------------------------------------------------------------
+local GMArenaPeakNet = require("GMArenaPeakNet")
+
+---@class GMArenaPeakModel : GameDataModelBase
+---@field monsterGroup number 场景配置ID
+---@field dayOpenCfg discrete_cfg 每日开启时间配置
+---@field waitFriday boolean 是否需要等到周五（首次周五开启）
+---@field kingID number 王者段位id（放内存里，避免反复查表计算）
+---@field masterID number 大师段位id（放内存里，避免反复查表计算）
+---@field seasonID number 赛季ID
+---@field seasonStartTime number 当前赛季开始时间
+---@field seasonState number 赛季状态(0等待，1开放)
+---@field score number 玩家积分
+---@field isKing number 玩家是否为王者(大师段位前x名为王者)
+---@field hisDan number 玩家历史最高段位id
+---@field danID number 玩家段位id
+---@field danCfg number 玩家段位配置
+---@field rankNum number 玩家排名
+---@field rankTimes number 玩家今日已挑战次数
+---@field totalNum number 玩家排位塞总场次
+---@field winNum number 玩家排位赛总胜场
+---@field supportList number[] 支援卡牌id列表
+---@field supportCards CardData[] 支援卡牌对象列表
+---@field taskInfoId number[] 任务id列表
+---@field taskInfo arena_peak.i_task_info 任务数据
+---@field fightItem number 挑战消耗道具id
+local GMArenaPeakModel = _G.BaseClass("GMArenaPeakModel", _G.GameDataModelBase)
+
+---@return GMArenaPeakModel GMArenaPeakModel
+function GMArenaPeakModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---BanPick阶段
+GMArenaPeakModel.Step = {
+    Choose1 = 1, --A1 先手玩家选1个角色(先1/6)
+    Choose2 = 2, --B2 后手玩家选2个角色(后2/6)
+    Choose3 = 3, --A2 先手玩家选2个角色(先3/6)
+    Choose4 = 4, --B2 后手玩家选2个角色(后4/6)
+    Choose5 = 5, --A2 先手玩家选2个角色(先5/6)
+    Choose6 = 6, --B2 后手玩家选2个角色(后6/6)
+    Choose7 = 7, --A1 先手玩家选1个角色(先6/6)
+    Ban = 8,     --Ban人阶段 同时Ban对方1个角色
+    Array = 9,   --站位调整阶段
+    Ready = 10   --战前倒计时
+}
+
+local discreteID = {
+    support = 108122, --支援魂将
+    double = 108126
+}
+
+local stateName = {
+    "选人阶段",
+    "战斗阶段"
+}
+
+local ConfigManager = _G.ConfigManager
+local TimeUtil = _G.TimeUtil
+local UIManager = _G.UIManager
+
+---任务表
+local arena_peak_task_cfg = ConfigManager.arena_peak_task_cfg
+local arena_peak_cfg = ConfigManager.arena_peak_cfg
+local arena_peak_tier_cfg = ConfigManager.arena_peak_tier_cfg
+local combineType = _G.ActiveTaskEnum.ConditionEnum.Combine.count
+
+---创建对象时,入口构造函数
+function GMArenaPeakModel:__init()
+    self.fightItem = _G.ConfigManager.discrete_cfg[108137][1][1]
+    self.ArenaStatus = {
+        close = 0,
+        sign = 1,
+        fight = 2,
+        idle = 3,
+        settle = 4,
+        eggTime = 5
+    }
+    self.monsterGroup = 500000003
+    self.dayOpenCfg = ConfigManager.discrete_cfg[108132]
+    self.waitFriday = false
+    ---@type arena_peak_league_cfg[]
+    local leagueCfg = ConfigManager.arena_peak_league_cfg
+    self.kingID = 1
+    self.masterID = 0
+    for i = 1, #leagueCfg do
+        if leagueCfg[i].id > self.kingID then
+            self.kingID = leagueCfg[i].id
+            self.masterID = leagueCfg[i - 1].id
+        end
+    end
+    local EventsIns = _G.Events:GetInstance()
+    local net_map = _G.ConfigManager.net_map
+    --EventsIns:AddListener(net_map.arena_peak_task_curr.Cmd, self.OnMatchSuccessCall, self)
+    _G.Events:GetInstance():AddListener(_G.eCardStorage.AddCardData, self.AddCardCount, self)
+    _G.Events:GetInstance():AddListener(_G.eCardStorage.RemoveCardData, self.ReduceCardCount, self)
+    _G.Events:GetInstance():AddListener(_G.eArena.SetGMArenaPeak, self.SetCoin, self)
+end
+
+---从服务器拉取数据
+function GMArenaPeakModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---获取基本信息
+function GMArenaPeakModel:GetInfo()
+    GMArenaPeakNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+--更改活动状态和下一个时间节点
+function GMArenaPeakModel:ChangeStatusAndNextTimeLine()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local fightHour = self.dayOpenCfg
+    if serverTime >= self.open_time and serverTime <= self.enroll_time then
+        self.status = self.ArenaStatus.sign
+        self.nextTime = self.enroll_time
+    elseif serverTime > self.enroll_time and serverTime < self.fight_time then
+        --serverTime为本地时区的服务器时间戳, 转为服务器时区
+        --下方调用_G.TimeUtil.timeReverse转回本地时区
+        local zeroTime = _G.TimeUtil.GetDayBySix(serverTime)
+        local fightStartTime = zeroTime + (fightHour[1][1] * 3600) + (fightHour[1][2] * 60)
+        local fightEndTime = zeroTime + (fightHour[2][1] * 3600) + (fightHour[2][2] * 60)
+        local timetable = _G.TimeUtil.date("*t", serverTime)
+        if serverTime >= fightStartTime and serverTime < fightEndTime then
+            self.status = self.ArenaStatus.fight
+            timetable.hour = fightHour[2][1]
+            timetable.min = fightHour[2][2]
+            timetable.sec = 0
+            self.nextTime = _G.TimeUtil.timeReverse(timetable)
+        elseif serverTime < fightStartTime then
+            self.status = self.ArenaStatus.idle
+            timetable.hour = fightHour[1][1]
+            timetable.min = 0
+            timetable.sec = 0
+            self.nextTime = _G.TimeUtil.timeReverse(timetable)
+        elseif serverTime >= fightEndTime then
+            self.status = self.ArenaStatus.idle
+            timetable.hour = fightHour[1][1]
+            timetable.min = 0
+            timetable.sec = 0
+            self.nextTime = _G.TimeUtil.timeReverse(timetable) + 86400
+        end
+    elseif serverTime >= self.fight_time and serverTime <= self.end_time then
+        self.status = self.ArenaStatus.settle
+        self.nextTime = self.end_time
+    elseif serverTime > self.end_time and serverTime <= self.close_time then
+        self.status = self.ArenaStatus.eggTime
+        self.nextTime = self.close_time
+    else
+        self.status = self.ArenaStatus.close
+    end
+    --_G.Events:GetInstance():Broadcast(_G.eRelicTeam.RelicTeamChangeStatus, self.status, self.nextTime)
+    local ctrl = UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+    if ctrl then 
+        ctrl:UpdateView()
+    end
+    local ctrl2 = UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.GMArenaPeakSignUpView.Name)
+    if ctrl2 and self.status ~= self.ArenaStatus.sign then 
+        if not self:CheckSign() then 
+            GMArenaPeakModel:Sign(function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+                ctrl2:Close()
+            end)
+        else
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+            ctrl2:Close()
+        end
+    end
+    return self.status, self.nextTime
+end
+
+--获取活动状态和下一个时间节点
+function GMArenaPeakModel:GetStatusAndNextTimeLine()
+    return self.status, self.nextTime
+end
+
+--获取活动状态和下一个阶段时间节点
+function GMArenaPeakModel:GetStatusAndNextStatusTimeLine()
+    if self.status == self.ArenaStatus.sign then 
+        return self.status, self.enroll_time, 90049800034
+    elseif self.status == self.ArenaStatus.fight then 
+        return self.status, self.nextTime, 90049800025
+    elseif self.status == self.ArenaStatus.idle then
+        return self.status, self.nextTime, 90049800026
+    elseif self.status == self.ArenaStatus.settle then 
+        return self.status, self.end_time, 90049800033
+    end
+end
+
+---解析基本信息
+---@param msg arena_peak.s2c_arena_peak_info
+function GMArenaPeakModel:ParseData(msg)
+    self.waitFriday = false
+    if msg.is_open then
+        self.waitFriday = true
+        self:TryToDestroyRoom()
+    elseif msg.ack == 1 then 
+        self.hisDan = 1
+        self.curActivityClass = require "ActivitySynManager":GetInstance():GetActivityWithTypeId(10082)
+        self.serverOpenTime = msg.open_time or _G.PlayerModel:GetInstance().open_time
+        local sInfo = msg.info or {}
+        self.seasonID = sInfo.season_id
+        self.seasonStartTime = sInfo.open_time
+        self.open_time = sInfo.open_time
+        self.enroll_time = sInfo.open_time + sInfo.enroll_time
+        self.fight_time = sInfo.open_time + sInfo.fight_time
+        self.end_time = sInfo.open_time + sInfo.end_time
+        self.close_time = sInfo.close_time
+        self:ChangeStatusAndNextTimeLine()
+        self:SetState(0)
+        if self.status and self.status ~= 0 then
+            self.activityTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateActivityTimer, self, false, false,
+                true)
+            self.activityTimer:Start()
+            self:UpdateActivityTimer()
+            --require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RelicTeamFullEnergy.id)
+        end
+        self.supportList = sInfo.season_support or {} --周免支援角色
+        self.taskInfoId = {}
+        --self:InitSupportCards()
+        local info = msg.role_info or {}
+        self.hisCoinNum = info.his_coin_num or 0
+        self.EggAwardFlag = info.easter_egg
+        self.EggEndTime = self.close_time
+        self.pre_pick = info.pre_pick or {}
+        self.pre_ban = info.pre_ban or {0, 0, 0, 0, 0, 0}
+        self.score = info.score or 0
+        self.signTime = info.enroll_time
+        self.rankNum = info.rank_num or 0
+        self.rankTimes = info.rank_times
+        self.isKing = info.is_king
+        self.isKing = self:CheckKingCondition()
+        self.danCfg = self:GetDanCfgByScoreAndKing(self.score, self.isKing) or self:GetMinDanCfg()
+        self.danID = self.danCfg.id or 0
+        if not info.fights then 
+            info.fights = {0, 0}
+        end
+        self.totalNum = info.fights[1] or 0
+        self.winNum = info.fights[2] or 0
+        self.hisDan = info.his_dan
+        self.coin = info.coin
+        self.coins = info.coins or {{key = 19, value = 0}}
+        self.fightTimes = info.fight_times
+        self.taskInfo = info.task_info
+        self.roomID = info.room_uid
+        if info.room_uid then --对局中，则重连回房间
+            local embattleItem = require("EmbattleController"):GetInstance():GetCurEmbattleItem()
+            local peakView = UIManager:GetInstance():GetWindowCtrl(ConfigManager.ui_cfg.GMArenaPeakView.Name)
+            if embattleItem then
+                -- GMArenaPeakNet:GetInstance():GetRoomInfo({room_uid = self.roomID},
+                --     function(data)
+                --         if data.ack == 1 then
+                --             local ctrl =
+                --                 UIManager:GetInstance():GetWindowCtrl(ConfigManager.ui_cfg.GMArenaPeakBPView.Name)
+                --             if ctrl then
+                --                 ctrl:InitView(data.room_info)
+                --             end
+                --         end
+                --     end
+                -- )
+            elseif peakView then
+                self:UpdateAllSupportAttr()
+                GMArenaPeakNet:GetInstance():GetRoomInfo({room_uid = self.roomID},
+                    function(data)
+                        if data.ack == 1 then
+                            peakView:CloseOtherView()
+                            self:OnChallenge(data.room_info)
+                        end
+                    end
+                )
+            else
+                --_G.Events:GetInstance():AddListener(_G.eScene.EnterWorldOver, self.OnWorldLoadOver, self)
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                GMArenaPeakNet:GetInstance():GetRoomInfo({room_uid = self.roomID},
+                        function(data)
+                            if data.ack == 1 then
+                                self:OnChallenge(data.room_info)
+                            end
+                        end
+                    )
+                end
+                _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.GMArenaPeakFight)
+            end
+        else --正常状态
+            self:TryToDestroyRoom()
+        end
+        local ctrl = UIManager:GetInstance():GetWindowCtrl(ConfigManager.ui_cfg.GMArenaPeakView.Name)
+        if ctrl then --断线重连主页面处理
+            ctrl:CancelMatch()
+            ctrl:InitView()
+        end
+        -- self:ArenaPeakTask()
+        -- ctrl = UIManager:GetInstance():GetWindowCtrl(ConfigManager.ui_cfg.ArenaPeakTaskView.Name)
+        -- if ctrl then --断线重连任务界面处理
+        --     ctrl:ItemNew()
+        -- end
+        if self.timer then
+            self.timer:Stop()
+            self.timer = nil
+        end
+        local settleStartTime = self:GetSettlementStartTime() - TimeUtil.GetServerUnixTime()
+        if settleStartTime > 0 then
+            self.timer =
+                _G.TimerManager:GetInstance():GetTimer(
+                settleStartTime,
+                self.EnterSettlement,
+                self,
+                true,
+                false,
+                true
+            )
+            self.timer:Start()
+        end
+        self:InitSupportCards()
+        --self:CreateMainViewTimer()
+        --require "ShopModel":GetInstance():GetShopInServer(_G.ShopID.ArenaPeak)
+    end
+    self:RefreshAllRedPoint()
+    self.isOpen = self:CheckIsOpen()
+    self.super.ParseData(self)
+end
+
+---获取结算后全服奖励
+function GMArenaPeakModel:GetEggAward(callback)
+    require "ActivitySynNet":GetInstance():GetAward(
+        self.curActivityClass:GetActivityID(),
+        {},
+        function(msg)
+            if msg.ack == 1 then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                self.EggAwardFlag = true
+                self.curActivityClass.typeClass:RefreshRedPoint()
+                if callback then
+                    callback()
+                end
+            end 
+        end
+    )
+end
+
+function GMArenaPeakModel:CheckInEggAwrdStatus()
+    local nowTime = _G.TimeUtil.GetServerUnixTime()
+    if self.EggEndTime and self.end_time < nowTime and self.EggEndTime > nowTime then 
+        return true
+    end
+    return false 
+end
+
+---获取代币历史最大值
+function GMArenaPeakModel:GetHisCoinNum()
+    return self.hisCoinNum or 0
+end
+
+--region ------------- 助战卡牌 -------------
+
+---初始化支援卡牌
+function GMArenaPeakModel:InitSupportCards()
+    local professionSort = {
+        [_G.CardProfType.Tank] = 1,
+        [_G.CardProfType.Warrior] = 2,
+        [_G.CardProfType.Ranger] = 3,
+        [_G.CardProfType.Master] = 4,
+        [_G.CardProfType.Support] = 5
+    }
+    local card_cfg = ConfigManager.card_cfg
+    _G.table.sort(self.supportList, function(a, b)
+        local pa = professionSort[card_cfg[a].Professional]
+        local pb = professionSort[card_cfg[b].Professional]
+        if pa ~= pb then
+            return pa < pb
+        end
+        return a < b
+    end)
+    -- self.supportList = ConfigManager.arena_peak_cfg[self.seasonID].support
+    ---@type CardData[]
+    self.supportCards = {}
+    local attId = ConfigManager.arena_peak_cfg[self.seasonID].att_equity
+    ---@type att_equity_cfg
+    local attCfg = ConfigManager.att_equity_cfg[attId]
+    local inbornNum, isActive, soulLinkLv = self:GetInbornAndSoulChain()
+    local spiritualSid = 256000000 + attCfg.spiritual_grade * 100000 + 100
+    local sid, cardCfg, decoration, msg, spiritualMsg
+    for i = 1, #self.supportList do
+        sid = self.supportList[i]
+        cardCfg = ConfigManager.card_cfg[sid]
+
+        decoration = ConfigManager.illustrations_card_cfg[sid].decoration
+        msg = {
+            sid = sid,
+            uid = sid,
+            lv = attCfg.level,
+            star = attCfg.star,
+            skin = 0,
+            soul_chain_lv = soulLinkLv,
+            soul_state = isActive,
+            inborn_num = 0,
+            open_inborn = self:CalOpenInborn(cardCfg.talent, inbornNum),
+            decoration = {
+                {
+                    level = attCfg.decoration_stren,
+                    sid = 251000000 + decoration * 10000 + 100 + attCfg.decoration_grade,
+                    uid = 0
+                },
+                {
+                    level = attCfg.decoration_stren,
+                    sid = 251000000 + decoration * 10000 + 200 + attCfg.decoration_grade,
+                    uid = 0
+                },
+                {
+                    level = attCfg.decoration_stren,
+                    sid = 251000000 + decoration * 10000 + 300 + attCfg.decoration_grade,
+                    uid = 0
+                },
+                {
+                    level = attCfg.decoration_stren,
+                    sid = 251000000 + decoration * 10000 + 400 + attCfg.decoration_grade,
+                    uid = 0
+                }
+            },
+            equipments = {
+                {
+                    sid = 201000000 + cardCfg.EquipmentType * 1000 + 100 + attCfg.equip_grade,
+                    uid = 0,
+                    num = 1,
+                    streng = attCfg.equip_stren,
+                    element = attCfg.equip_ele == 0 and 0 or cardCfg.Elements
+                },
+                {
+                    sid = 201000000 + cardCfg.EquipmentType * 1000 + 200 + attCfg.equip_grade,
+                    uid = 0,
+                    num = 1,
+                    streng = attCfg.equip_stren,
+                    element = attCfg.equip_ele == 0 and 0 or cardCfg.Elements
+                },
+                {
+                    sid = 201000000 + cardCfg.EquipmentType * 1000 + 400 + attCfg.equip_grade,
+                    uid = 0,
+                    num = 1,
+                    streng = attCfg.equip_stren,
+                    element = attCfg.equip_ele == 0 and 0 or cardCfg.Elements
+                },
+                {
+                    sid = 201000000 + cardCfg.EquipmentType * 1000 + 500 + attCfg.equip_grade,
+                    uid = 0,
+                    num = 1,
+                    streng = attCfg.equip_stren,
+                    element = attCfg.equip_ele == 0 and 0 or cardCfg.Elements
+                }
+            },
+            artifact = {
+                {
+                    sid = 255000000 + attCfg.artifact_grade * 100000 + cardCfg.Professional * 10000 + 100,
+                    uid = 0,
+                    num = 1,
+                    level = attCfg.artifact_level,
+                    star = attCfg.artifact_star,
+                    awaken = 0,
+                }
+            },
+            spiritual = {
+            }
+        }
+
+        for j = 1, attCfg.spiritual_num do
+            spiritualMsg = {
+                sid = spiritualSid,
+                uid = 0,
+                level = attCfg.spiritual_level,
+                star = attCfg.spiritual_star,
+                index = j
+            }
+            _G.table.insert(msg.spiritual, spiritualMsg)
+        end
+
+        local cardData = require("ArenaPeakSupCardData").New()
+        cardData:Parse(msg)
+        _G.table.insert(self.supportCards, cardData)
+    end
+end
+
+---查找背包卡牌最大天赋点，最大魂链等级（规则修改为读配置，此方法停用）
+---@return number,number,number 最大天赋数量，魂链是否有卡牌解锁，最大魂链等级
+function GMArenaPeakModel:FindMaxInbornAndSoulChain()
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local inbornNum = 0
+    local isActive = 0
+    local soulLinkLv = 0
+    for _, card in pairs(cards) do
+        if #card.open_inborn > inbornNum then
+            inbornNum = #card.open_inborn
+        end
+        if card.soulLink_IsActivate > isActive then
+            isActive = card.soulLink_IsActivate
+        end
+        if card.soulLink_lv > soulLinkLv then
+            soulLinkLv = card.soulLink_lv
+        end
+    end
+    return inbornNum, isActive, soulLinkLv
+end
+
+---根据配置读取天赋和魂链
+---@return number,boolean,number 最大天赋数量，魂链是否有卡牌解锁，最大魂链等级
+function GMArenaPeakModel:GetInbornAndSoulChain()
+    if self.danID == nil then
+        return 0, 0, 0
+    end
+    local inbornNum, soulLinkLv = 0, 0
+    local cfg = ConfigManager.discrete_cfg[discreteID.support]
+    for _, v in pairs(cfg) do
+        if self.danID >= v[1] then
+            inbornNum = v[3]
+            soulLinkLv = v[2]
+        end
+    end
+    return inbornNum, 1, soulLinkLv
+end
+
+---计算解锁的天赋列表
+---@param inbornList number[] 天赋配置列表
+---@param inbornNum number 激活天赋数量
+---@return number[] 已激活的天赋列表
+function GMArenaPeakModel:CalOpenInborn(inbornList, inbornNum)
+    local inborn = {}
+    for i = 1, #inbornList do
+        if inbornNum == 0 then
+            break
+        end
+        for j = 1, #inbornList[i] do
+            if inbornNum == 0 then
+                break
+            end
+            _G.table.insert(inborn, inbornList[i][j])
+            inbornNum = inbornNum - 1
+        end
+    end
+    return inborn
+end
+
+---更新所有助战卡牌属性
+function GMArenaPeakModel:UpdateAllSupportAttr()
+    local inbornNum, isActive, soulLinkLv = self:GetInbornAndSoulChain()
+    local inbornList
+    for _, card in pairs(self.supportCards) do
+        inbornList = ConfigManager.card_cfg[card.sid].talent
+        card.inborn_num = inbornNum
+        card.open_inborn = self:CalOpenInborn(inbornList, inbornNum)
+        card.soulLink_IsActivate = isActive
+        card.soulLink_lv = soulLinkLv
+        card:CalcNowSumProp()
+    end
+end
+
+---获取助战卡牌
+---@return CardData[]
+function GMArenaPeakModel:GetSupportCards()
+    return self.supportCards or {}
+end
+
+--endregion ----------- 助战卡牌 end -----------
+
+--region ------------- 玩家数据 -------------
+
+---获取积分
+---@return number 当前积分
+function GMArenaPeakModel:GetScore()
+    return self.score
+end
+
+---获取胜场
+---@return number 胜场次数
+function GMArenaPeakModel:GetWinNum()
+    return self.winNum
+end
+
+---获取总场次
+---@return number 总对局次数
+function GMArenaPeakModel:GetTotalNum()
+    return self.totalNum
+end
+
+---获取排名
+---@return number 当前排名
+function GMArenaPeakModel:GetRankNum()
+    return self.rankNum
+end
+
+---获取今日已挑战次数
+---@return number 已挑战次数
+function GMArenaPeakModel:GetTodayTimes()
+    return self.rankTimes
+end
+
+---获取今日剩余免费挑战次数
+---@return number 剩余挑战次数
+function GMArenaPeakModel:GetTodayLastTimes()
+    return self.fightTimes - self.rankTimes
+end
+
+---战后增加荣誉勋章
+---@param msg arena_peak.s2c_arena_peak_fight
+function GMArenaPeakModel:AddCoins(msg)
+    -- if self.coin == nil then --理论上不会为nil,这里容错预防
+    --     self.coin = 0
+    --     if _G.AppSetting.DEBUG then
+    --         _G.LogError("请检查巅峰演武货币为何没初始化！")
+    --     end
+    -- end
+    if msg.award and msg.award.item then
+        for _, v in pairs(msg.award.item) do
+            if v.type[1] == 19 then
+                --self.coin = self.coin + v.type[2]
+                self:SetCoin({{key = 19, value = v.type[2]}})
+            end
+        end
+    end
+end
+
+function GMArenaPeakModel:GetCoinID()
+    return 19
+end
+
+---自身活动代币增加（如锻造豪礼）
+function GMArenaPeakModel:SetCoin(coins)
+    if coins then
+        for k, v in pairs(coins) do
+            for key, value in pairs(self.coins) do 
+                if value.key == v.key then 
+                    if v.key == 19 and v.value > 0 then 
+                        self.hisCoinNum = self.hisCoinNum + v.value
+                    end
+                    self.coins[key].value = self.coins[key].value + v.value
+                    local tmp = {}
+                    _G.table.insert(tmp, value.key)
+                    _G.table.insert(tmp, v.value)
+                    _G.table.insert(tmp, value.value)
+                    _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, { { type = tmp } })
+                end
+            end
+        end
+    end
+end
+
+---获取代币
+function GMArenaPeakModel:GetCoinNum(id)
+    id = id or 19
+    for k, v in pairs(self.coins or {}) do 
+        if id == v.key then 
+            return v.value
+        end
+    end
+    return 0
+end
+
+--endregion ----------- 玩家数据 end -----------
+
+--region ------------- 段位相关 -------------
+
+---根据积分获取段位配置
+---@param score number 积分
+---@return arena_peak_league_cfg 段位配置
+function GMArenaPeakModel:GetDanCfgByScore(score)
+    for key, cfg in pairs(ConfigManager.arena_peak_league_cfg) do
+        if score >= cfg.min_score and score <= cfg.max_score then
+            return cfg
+        end
+    end
+    return nil
+end
+
+---根据积分获取段位配置（做王者判断）
+---@param score number 积分
+---@return arena_peak_league_cfg 段位配置
+function GMArenaPeakModel:GetDanCfgByScoreAndKing(score, isKing)
+    if isKing then
+        return ConfigManager.arena_peak_league_cfg[self.kingID]
+    end
+    for key, cfg in pairs(ConfigManager.arena_peak_league_cfg) do
+        if score >= cfg.min_score and score <= cfg.max_score then
+            if cfg.id == self.kingID then
+                return ConfigManager.arena_peak_league_cfg[self.masterID]
+            end
+            return cfg
+        end
+    end
+    return nil
+end
+
+function GMArenaPeakModel:GetMinDanCfg()
+    local minScore, minCfg
+    for key, cfg in pairs(ConfigManager.arena_peak_league_cfg) do
+        minScore = minScore or cfg.min_score
+        minCfg = minCfg or cfg
+        if cfg.min_score < minScore then 
+            minScore = cfg.min_score
+            minCfg = cfg
+        end
+    end
+    return minCfg
+end
+
+---根据段位id获取段位配置
+---@param id number 段位id
+---@return arena_peak_league_cfg 段位配置
+function GMArenaPeakModel:GetDanCfgByID(id)
+    return ConfigManager.arena_peak_league_cfg[id]
+end
+
+---获取当前段位配置
+---@return arena_peak_league_cfg 当前段位配置
+function GMArenaPeakModel:GetCurDanCfg()
+    return self:GetDanCfgByID(self.danID)
+end
+
+---获取下一段位配置
+---@return arena_peak_league_cfg 下一段位配置
+function GMArenaPeakModel:GetNextDanCfg()
+    return self:GetDanCfgByID(self.danID + 1)
+end
+
+---获取当前段位和下一段位的奖励
+---@return number[][],number[][]
+function GMArenaPeakModel:GetCurAndNextDanAward()
+    local cfg = self:GetCfg()
+    local rewards = cfg.reward_season
+    local curID, nextID
+    for _, v in pairs(rewards) do
+        if v[1] == self.danID then
+            curID = v[2]
+        elseif v[1] == self.danID + 1 then
+            nextID = v[2]
+        end
+    end
+    local curAwards = arena_peak_tier_cfg[curID].reward_season
+    local nextAwards
+    if nextID then
+        nextAwards = arena_peak_tier_cfg[nextID].reward_season
+    end
+    return curAwards, nextAwards
+end
+
+function GMArenaPeakModel:GetRankAwardCfgList()
+    local cfg = self:GetCfg()
+    return cfg.reward_rank
+end
+
+function GMArenaPeakModel:GetDanAwardCfgList()
+    local cfg = self:GetCfg()
+    return cfg.reward_season
+end
+
+function GMArenaPeakModel:GetDanAwardCfgByIndex(id)
+    local cfg = self:GetCfg()
+    for k, v in pairs(cfg.reward_season) do 
+        if v[1] == id then 
+            return v[2]
+        end 
+    end
+end
+
+---检查该段位id是否为王者
+---@return boolean 是否是王者
+function GMArenaPeakModel:CheckDanIsKing(danID)
+    return danID == self.kingID
+end
+
+---是否达到指定段位，并返回指定段位配置
+---@return boolean,arena_peak_league_cfg 是否达到，指定段位配置
+function GMArenaPeakModel:GetAchieveDan(danID)
+    if self.hisDan == nil then
+        self.hisDan = 0
+    end
+    local achieve = self.hisDan >= danID and true or false
+    return achieve, ConfigManager.arena_peak_league_cfg[danID]
+end
+
+---根据积分返回星星数量、图片
+---@return number,string 段位星数，段位星图标
+function GMArenaPeakModel:GetStarByScore(score)
+    for key, cfg in pairs(ConfigManager.arena_peak_league_cfg) do
+        if score >= cfg.min_score and score <= cfg.max_score then
+            local art = cfg.art == "" and self:GetDefaultStarImage() or cfg.art
+            return cfg.quantity, art
+        end
+    end
+    return nil, nil
+end
+
+---获取默认星星图片
+---@return string 默认星星图片（黑）
+function GMArenaPeakModel:GetDefaultStarImage()
+    return "ui_dfyw_xingxing_weidianliang"
+end
+
+
+---展示段位（配置只有新手和王者段位只显示大图标，其它段位则只显示星星）
+---@param obj _obj_my._obj_dan_GoTable 巅峰演武相关界面段位展示obj
+---@param score number 积分
+---@param always boolean 是否始终展示大图标
+---@param isKing boolean 是否是王者
+---@param dan boolean 段位（可选）
+function GMArenaPeakModel:ShowDan(obj, score, always, isKing, dan)
+    local cfg
+    if dan then
+        cfg = ConfigManager.arena_peak_league_cfg[dan]
+    else
+        cfg = self:GetDanCfgByScoreAndKing(score, isKing)
+    end
+    if not cfg then
+        return
+    end
+    local tb = _G.GetAutoGoTable(obj)
+    for i = 1, 3 do
+        if i <= cfg.quantity then
+            tb["aorimage_star" .. i].SpriteName = cfg.art
+        else
+            tb["aorimage_star" .. i].SpriteName = self:GetDefaultStarImage()
+        end
+    end
+    local special = cfg.quantity <= 0 and cfg.id ~= 1
+    if always or special then
+        tb.aorrawimage_dan:LoadImage(
+                cfg.icon,
+                function(trans)
+                    trans.Alpha = 1
+                end
+        )
+    end
+
+    tb.obj_star:SetActiveE(special and 0 or 1)
+end
+
+
+--endregion ----------- 段位相关 end -----------
+
+--region ------------- 赛季相关 -------------
+
+---商店数据初始化
+---@return arena_peak_cfg 赛季配置
+function GMArenaPeakModel:GetCfg()
+    return arena_peak_cfg[self.seasonID]
+end
+
+---获取当前赛季ID
+---@return number 赛季ID
+function GMArenaPeakModel:GetCurSeasonID()
+    return self.seasonID or 0
+end
+
+---获取本赛季结束时间
+---@return number 赛季结束时间
+function GMArenaPeakModel:GetEndTime()
+    return self.close_time
+end
+
+---获取结算开始时间（什么时候开始结算）
+---@return number 结算开始时间（具体日期时间戳）
+function GMArenaPeakModel:GetSettlementStartTime()
+    return self.end_time
+end
+
+---获取距离开始结算还有多少时间（倒计时）
+---@return number 距离结算开始的时间（若功能未开放则为0）
+function GMArenaPeakModel:GetStartSettlementTime()
+    if self:CheckSeasonIsOpen() then
+        return self.end_time - TimeUtil.GetServerUnixTime()
+    end
+    return 0
+end
+
+---赛季是否进行中(含结算期)
+---@return boolean 赛季是否正在进行
+function GMArenaPeakModel:CheckSeasonIsOpen()
+    return self.status ~= self.ArenaStatus.close
+end
+
+--endregion ----------- 赛季相关 end -----------
+
+--region ------------- 功能开启 -------------
+
+---卡牌数量增加事件监听
+function GMArenaPeakModel:AddCardCount()
+    if self.isOpen or self.do1 then
+        return
+    end
+    self.do1 =
+    _G.DelayFrameDo(
+            function()
+                self.do1 = nil
+                if self:CheckIsOpen() then
+                    self.isOpen = true
+                    self:RefreshRedPoint()
+                    self:RefreshRedPointArenaQuest()
+                end
+            end
+    )
+end
+
+---卡牌数量减少事件监听
+function GMArenaPeakModel:ReduceCardCount()
+    if not self.isOpen or self.do2 then
+        return
+    end
+    self.do2 =
+    _G.DelayFrameDo(
+            function()
+                self.do2 = nil
+                if not self:CheckIsOpen() then
+                    self.isOpen = false
+                    self:RefreshRedPoint()
+                    self:RefreshRedPointArenaQuest()
+                end
+            end
+    )
+end
+
+---是否需要等到周五开启
+function GMArenaPeakModel:IsWaitFriday()
+    return self.waitFriday
+end
+
+---获取开启时间文本
+function GMArenaPeakModel:GetOpenTimeStr()
+    local str
+    local kingCfg = ConfigManager.discrete_cfg[108131][1]
+    if self.danID == kingCfg[1] then
+        str = _G.string.format("%02d:00~%02d:00", kingCfg[2], kingCfg[3])
+    else
+        str = _G.string.format("%02d:%02d", self.dayOpenCfg[1][1], 0)
+        str = str .. _G.string.format("~%02d:%02d", self.dayOpenCfg[1][2], 0)
+    end
+    return str
+end
+
+---获取每日开始和结束时间
+function GMArenaPeakModel:GetDayStartTimeAndEndTime()
+    local startT = self.dayOpenCfg[1][1]
+    local endT = self.dayOpenCfg[1][2]
+    local startTime = startT * 3600
+    local endTime = endT * 3600
+    return startTime, endTime
+end
+
+---获取每日开启时间段
+function GMArenaPeakModel:GetDayOpenTimeArray()
+    local timeArray = {}
+    local time
+    for i = 1, 2 do
+        time = self.dayOpenCfg[1][i]
+        _G.table.insert(timeArray, time * 3600)
+    end
+    return timeArray
+end
+
+---检测当前是否在挑战时间内/能否挑战
+---@return number 注0.开放时间内，-1.赛季关闭，1.未开始，2.已休战
+function GMArenaPeakModel:CheckInOpenTime()
+    if self.ArenaStatus.fight == self.status then 
+        return 0, nil
+    elseif self.ArenaStatus.settle == self.status then 
+        return 2, 1080503
+    end 
+    return 2, 880102
+end
+
+---检测是否满足王者时间
+---@return boolean, boolean 满足段位，满足时间
+function GMArenaPeakModel:CheckInKingOpenTime()
+    local cfg = ConfigManager.discrete_cfg[108131][1]
+    if self.danID == cfg[1] then
+        local now = TimeUtil.GetSecondsOfDay()
+        if now >= cfg[2] * 3600 and now < cfg[3] * 3600 then
+            return true, true
+        end
+        return true, false
+    end
+    return false, false
+end
+
+---检查不重复的卡牌数量是否满足条件
+---@return boolean 绝卡是否满足12张
+function GMArenaPeakModel:CheckCardNum()
+    local sids = {}
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    for _, v in pairs(cards) do
+        if v.cfg.Order >= 3 then
+            sids[v.sid] = true
+        end
+        if _G.table.count(sids) >= 12 then
+            return true
+        end
+    end
+    return false
+end
+
+---检测功能是否开放
+---@param showTip boolean 是否弹出Tips
+function GMArenaPeakModel:CheckIsOpen(showTip)
+    local activity = require "ActivitySynManager":GetInstance():GetActivityByType(10082)
+    if activity then 
+        return true
+    end
+    if showTip then
+        _G.PopWindowManager:GetInstance():ShowAllTips(880101)
+    end
+    return false
+end
+
+--endregion ----------- 功能开启 end -----------
+
+--region ------------- 战斗相关及数据刷新 -------------
+
+---开始对局
+---@param roomInfo arena_peak.i_room 房间信息
+function GMArenaPeakModel:OnChallenge(roomInfo)
+    self:SetUseSupport(false)
+    roomInfo.step = roomInfo.step or 1
+    if roomInfo.role_info_a.role_info.name ~= _G.PlayerModel:GetInstance():GetName() then 
+        self:SetFightName(roomInfo.role_info_a.role_info.name)
+    else 
+        self:SetFightName(roomInfo.role_info_b.role_info.name)
+    end
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require "EmbattleController":GetInstance():OpenGMPeakEmbattle(
+        _G.EmbattleType.ArenaPeak,
+        _G.EmbattleSaveType.temporary,
+        true,
+        _G.EmbattleControllerItemType.GMArenaPeak,
+        _G.handler(self, self.OnExitFight),
+        _G.handler(self, self.OnFight),
+        roomInfo,
+        self.monsterGroup
+    )
+end
+
+---已挑战次数增加（创建房间后）
+function GMArenaPeakModel:AddTodayTimes()
+    if self.rankTimes < ConfigManager.discrete_cfg[108112][1][1] then
+        self.rankTimes = self.rankTimes + 1
+    end
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView then
+        mainView:UpdateView()
+    end
+end
+
+---开始战斗执行
+---@private
+function GMArenaPeakModel:SetFightName(name)
+    self.fightName = name
+end
+
+function GMArenaPeakModel:GetFightName(name)
+    return self.fightName
+end
+function GMArenaPeakModel:OnFight()
+    self.isChallenge = true
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.GMArenaPeak)
+end
+
+---退出战斗执行
+---@private
+function GMArenaPeakModel:OnExitFight()
+end
+
+---处理战斗结果(敌我投降也会走进来）
+---@param reports arena_peak.s2c_arena_peak_fight|arena_peak.s2c_arena_peak_give_up|arena_peak.p2c_arena_peak_give_up
+function GMArenaPeakModel:FightHandler(msg)
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    self:AddCoins(msg)
+    local reports = msg.reports
+    
+    self:AddTodayTimes()
+    --self:BroadcastTaskEnum(_G.ActiveTaskEnum.ConditionEnum.ArenaPeak.FightNum) --后台推送了，下同
+    self.totalNum = self.totalNum + 1
+    local oldCfg = self:GetDanCfgByScore(self.score)
+    self.score = reports.new_score
+    local newCfg = self:GetDanCfgByScore(self.score)
+    if newCfg.id ~= self.kingID then  --王者段位的情况要拉排行判定
+        if newCfg.id ~= oldCfg.id then
+            self.showDanUp = true
+            self.danCfg = newCfg
+            self.danID = newCfg.id
+            self:UpdateHistoryMaxDanID()
+        end
+    end
+    self.win = reports.winner
+    if self.win then
+        self.winNum = self.winNum + 1
+        --self:BroadcastTaskEnum(_G.ActiveTaskEnum.ConditionEnum.ArenaPeak.WinNum)
+    end
+    -- local newCfg = self:GetDanCfgByScoreAndKing(self.score, self.isKing)
+    -- if newCfg.id > self.danID then
+    --     self.showDanUp = true
+    -- end
+    -- self.danCfg = newCfg
+    -- self.danID = newCfg.id
+    -- self.isKing = self.danID == self.kingID
+    -- self:UpdateHistoryMaxDanID()
+    --if self.useSupport then
+    --    self:BroadcastTaskEnum(_G.ActiveTaskEnum.ConditionEnum.ArenaPeak.SupportNum)
+    --end
+    --_G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.BPArenaPeak)
+end
+
+---返回主界面
+function GMArenaPeakModel:ReturnPanel(isAuto, nextBol)
+    _G.BattleManager:GetInstance():DestroyBattle()
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+    if ctrl then
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+    end
+    if not self.backing then 
+        self:RefreshRankNum(function()
+            if self.showDanUp then
+                _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.GMArenaPeakPromotionView.Name,
+                    self.score,
+                    self.isKing
+                )
+                self.showDanUp = false
+            end
+        end)
+    else 
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+    end
+    
+    if nextBol then 
+        _G.Events:GetInstance():Broadcast(_G.eArenaPeak.AutoNext)
+        return 
+    end
+    if isAuto and self.hosting then
+        _G.Events:GetInstance():Broadcast(_G.eArenaPeak.AutoNext)
+    end
+end
+
+---刷新排名
+---@param callback function 回调
+function GMArenaPeakModel:RefreshRankNum(callback)
+    GMArenaPeakNet:GetInstance():GetRankNum(
+        function(msg)
+            if msg.ack == 1 then 
+                local beforeKingFlag, afterKingFlag
+                beforeKingFlag = self:CheckKingCondition()
+                if msg.index and msg.index > 0 then 
+                    self.rankNum = msg.index
+                else 
+                    self.rankNum = 0
+                end 
+                --XZNS-7269 这个接口给的分是错的，不用这个分数覆盖
+                --if msg.value and msg.value > 0 then 
+                --    self.score = msg.value
+                --end
+                afterKingFlag = self:CheckKingCondition()
+                self.isKing = afterKingFlag
+                if not beforeKingFlag and afterKingFlag then 
+                    self.showDanUp = true
+                    self.danCfg = self:GetDanCfgByScore(self.score)
+                    self.danID = self.danCfg.id
+                    self:UpdateHistoryMaxDanID()
+                end
+                local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+                if ctrl then
+                    ctrl:UpdateView(true)
+                end
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+function GMArenaPeakModel:CheckKingCondition(rankNum, score)
+    rankNum = rankNum or self.rankNum
+    score = score or self.score
+    if rankNum ~= 0 then 
+        local cfg = self:GetDanCfgByScore(score)
+        if cfg and cfg.id == self.kingID then 
+            if cfg.rank_con ~= 0 then 
+                return rankNum <= cfg.rank_con
+            else 
+                return true
+            end
+        end
+    end
+    return false 
+end
+
+function GMArenaPeakModel:CheckScoreIsKing(score)
+    score = score or self.score
+    return score >= ConfigManager.arena_peak_league_cfg[self.kingID].min_score
+end
+
+---刷新历史最高段位
+function GMArenaPeakModel:UpdateHistoryMaxDanID()
+    if self.danID > self.hisDan then
+        self.hisDan = self.danID
+    end
+end
+
+---布阵界面打开事件监听
+---@private
+---@param name string 界面名称
+function GMArenaPeakModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.GMArenaPeakBPView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ArenaPanelView.Name)
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.GMArenaPeakView.Name)
+    end
+end
+
+--endregion ----------- 战斗相关及数据刷新 end -----------
+
+--region ------------- 红点相关 -------------
+
+---刷新功能红点
+function GMArenaPeakModel:RefreshRedPoint()
+end
+
+---刷新任务红点
+function GMArenaPeakModel:RefreshRedPointArenaQuest()
+end
+
+---刷新全部红点
+function GMArenaPeakModel:RefreshAllRedPoint()
+end
+
+---进入赛季结算
+function GMArenaPeakModel:EnterSettlement()
+    self:RefreshAllRedPoint()
+end
+
+---检测功能红点
+---@return boolean 红点状态
+function GMArenaPeakModel:CheckRedPoint()
+    return false
+end
+
+--endregion ----------- 红点相关 end -----------
+
+--region ------------- 主界面按钮相关 -------------
+
+---检查是否显示主界面按钮
+---@return boolean 主界面是否显示巅峰演武按钮
+function GMArenaPeakModel:CheckShowMainViewBtn()
+    return false
+end
+
+---创建主界面刷新计时器
+function GMArenaPeakModel:CreateMainViewTimer()
+    if self.mainTimer then
+        self.mainTimer:Stop()
+        self.mainTimer = nil
+    end
+    local timeArray = self:GetDayOpenTimeArray()
+    local now = TimeUtil.GetSecondsOfDay()
+    _G.table.insert(timeArray, 86400)
+    self.stepPoint = 1
+    for i = 1, #timeArray do
+        if now < timeArray[i] then
+            self.stepPoint = i
+            break
+        end
+    end
+    self.mainTimer = _G.TimerManager:GetInstance():GetTimer(timeArray[self.stepPoint] - now + 1, self.UpdateMainView, self, true, false, true)
+    self.mainTimer:Start()
+end
+
+---刷新主界面
+function GMArenaPeakModel:UpdateMainView()
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView then
+        mainView:UpdateView()
+    end
+    if self.mainTimer then
+        self.mainTimer:Stop()
+        self.mainTimer = nil
+    end
+    local timeArray = self:GetDayOpenTimeArray()
+    local now = TimeUtil.GetSecondsOfDay()
+    if self.stepPoint < #timeArray then
+        self.stepPoint = self.stepPoint + 1
+        self.mainTimer = _G.TimerManager:GetInstance():GetTimer(timeArray[self.stepPoint] - now + 1, self.UpdateMainView, self, true, false, true)
+        self.mainTimer:Start()
+    end
+end
+
+--endregion ----------- 主界面按钮相关 end -----------
+
+--region ------------- 断线重连相关 -------------
+
+---断线重连
+---@param endCall function 完成回调
+function GMArenaPeakModel:ReConnect(endCall)
+    self:InitData(endCall)
+end
+
+---断线重登 世界加载完成事件监听
+---@private
+function GMArenaPeakModel:OnWorldLoadOver()
+    _G.Events:GetInstance():RemoveListener(_G.eScene.EnterWorldOver, self.OnWorldLoadOver, self)
+    local ctrl = UIManager:GetInstance():GetWindowCtrl(ConfigManager.ui_cfg.LoadingView.Name)
+    if ctrl then
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed, self)
+    else
+        self:UpdateAllSupportAttr()
+        GMArenaPeakNet:GetInstance():GetRoomInfo({room_uid = self.roomID},
+                function(data)
+                    if data.ack == 1 then
+                        self:OnChallenge(data.room_info)
+                    end
+                end
+        )
+    end
+end
+
+---登录加载界面关闭事件监听
+---@private
+---@param name string 界面名称
+function GMArenaPeakModel:OnUIClosed(name)
+    if name == ConfigManager.ui_cfg.LoadingView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed, self)
+        self:UpdateAllSupportAttr()
+        GMArenaPeakNet:GetInstance():GetRoomInfo({room_uid = self.roomID},
+                function(data)
+                    if data.ack == 1 then
+                        self:OnChallenge(data.room_info)
+                    end
+                end
+        )
+    end
+end
+
+---尝试销毁房间
+function GMArenaPeakModel:TryToDestroyRoom()
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.ArenaPeakBattleStartView.Name)
+    local ctrl = UIManager:GetInstance():GetWindowCtrl(ConfigManager.ui_cfg.GMArenaPeakBPView.Name)
+    if ctrl then
+        ctrl:QuitEmbattle()
+        ctrl:Close()
+        UIManager:GetInstance():ShowWindow(ConfigManager.ui_cfg.ArenaPanelView.Name)
+        UIManager:GetInstance():ShowWindow(ConfigManager.ui_cfg.ArenaPeakView.Name)
+    end
+end
+
+--endregion ----------- 断线重连相关 end -----------
+
+--region ------------- 任务相关 -------------
+
+function GMArenaPeakModel:OnMatchSuccessCall(msg)
+    if self.taskInfo.day_curr == nil then
+        self.taskInfo.day_curr = {}
+    end
+    if msg.day_curr then
+        for key, value in pairs(msg.day_curr) do
+            local bool = true
+            for k, v in pairs(self.taskInfo.day_curr) do
+                if _G.table.sameByCount(value.t_key, v.t_key) then
+                    self.taskInfo.day_curr[k] = value
+                    bool = false
+                end
+            end
+            if bool then
+                _G.table.insert(self.taskInfo.day_curr, value)
+            end
+            self:OnDayCurr(value)
+        end
+    end
+    if self.taskInfo.season_curr == nil then
+        self.taskInfo.season_curr = {}
+    end
+    if msg.season_curr then
+        for key, value in pairs(msg.season_curr) do
+            local bool = true
+            for k, v in pairs(self.taskInfo.season_curr) do
+                if _G.table.sameByCount(value.t_key, v.t_key) then
+                    self.taskInfo.season_curr[k] = value
+                    bool = false
+                end
+            end
+            if bool then
+                _G.table.insert(self.taskInfo.season_curr, value)
+            end
+            self:OnSeasonCurr(value)
+        end
+    end
+    --self:RefreshRedPointArenaQuest()
+end
+---每日任务刷新
+function GMArenaPeakModel:OnDayCurr(data)
+    for key, value in pairs(self.taskOne) do
+        if _G.table.sameByCount(data.t_key, value.idList) then
+            value:CheckTaskTarget()
+            value:CheckTaskState()
+        end
+    end
+end
+
+---赛季成就刷新
+function GMArenaPeakModel:OnSeasonCurr(data)
+    for key, value in pairs(self.taskTwo) do
+        if _G.table.sameByCount(data.t_key, value.idList) then
+            value:CheckTaskTarget()
+            value:CheckTaskState()
+        end
+    end
+end
+function GMArenaPeakModel:ListTask(list, id)
+    for key, value in pairs(list) do
+        if _G.table.sameByCount(id, value.idList) then
+            return key
+        end
+    end
+    return false
+end
+
+function GMArenaPeakModel:TaskID()
+    local task = {}
+    for key, value in pairs(self.taskTwo) do
+        local data = self:ListTask(task, value.idList)
+        if data then
+            if task[data].id > value.id then
+                if not self:GetFinish_taskTask(value.id) then
+                    task[data] = value
+                end
+            else
+                if self:GetFinish_taskTask(task[data].id) then
+                    task[data] = value
+                end
+            end
+        else
+            _G.table.insert(task, value)
+        end
+    end
+    local tasks = {}
+    for key, value in pairs(task) do
+        _G.table.insert(tasks, value)
+    end
+
+    return tasks
+end
+
+function GMArenaPeakModel:DayID()
+    local task = {}
+    for key, value in pairs(self.taskOne) do
+        local data = self:ListTask(task, value.idList)
+        if data then
+            if task[data].id > value.id and not self:GetFinish_taskTask(value.id) then
+                task[data] = value
+            end
+        else
+            _G.table.insert(task, value)
+        end
+    end
+    local tasks = {}
+    for key, value in pairs(task) do
+        _G.table.insert(tasks, value)
+    end
+
+    return tasks
+end
+
+---初始化任务
+function GMArenaPeakModel:ArenaPeakTask()
+    self.taskOne = {}
+    self.taskTwo = {}
+
+    for key, value in pairs(arena_peak_task_cfg) do
+        local states = _G.TaskEnum.ETaskState.Claimed
+
+        local target
+        if self:GetFinish_taskTask(value.id) then
+            states = _G.TaskEnum.ETaskState.Completed
+        end
+
+        if value.type_mission == 1 then
+            local data = {}
+            for k, v in pairs(value.condition[1]) do
+                if k < _G.table.count(value.condition[1]) then
+                    _G.table.insert(data, v)
+                end
+            end
+            target = self:IsWeek_curr(data)
+
+            local taskDatas =
+            require "ArenaPeakTaskData".New(
+                    {
+                        sid = value.id,
+                        target = {target},
+                        state = states,
+                        cfg = value,
+                        id = data,
+                        Type = 1
+                    }
+            )
+            _G.table.insert(self.taskOne, taskDatas)
+        elseif value.type_mission == 2 then
+            local data = {}
+            for k, v in pairs(value.condition[1]) do
+                if k < _G.table.count(value.condition[1]) then
+                    _G.table.insert(data, v)
+                end
+            end
+            target = self:IsSeason_curr(data)
+
+            local taskDatas =
+            require "ArenaPeakTaskData".New(
+                    {
+                        sid = value.id,
+                        target = {target},
+                        state = states,
+                        cfg = value,
+                        id = data,
+                        Type = 2
+                    }
+            )
+            _G.table.insert(self.taskTwo, taskDatas)
+        end
+    end
+end
+
+---查询周任务采集信息
+function GMArenaPeakModel:IsWeek_curr(Id)
+    if self.taskInfo == nil or self.taskInfo.day_curr == nil then
+        return 0
+    end
+
+    for _, value in pairs(self.taskInfo.day_curr) do
+        if _G.table.sameByCount(Id, value.t_key) then
+            return value.t_value
+        end
+    end
+    return 0
+end
+---查询赛季采集信息
+function GMArenaPeakModel:IsSeason_curr(Id)
+    if self.taskInfo == nil or self.taskInfo.season_curr == nil then
+        return 0
+    end
+
+    for _, value in pairs(self.taskInfo.season_curr) do
+        if _G.table.sameByCount(Id, value.t_key) then
+            return value.t_value
+        end
+    end
+    return 0
+end
+
+---查询当前id是否已领取奖励
+---@param id number 任务id
+function GMArenaPeakModel:GetFinish_taskTask(id)
+    if self.taskInfo == nil or self.taskInfo.finish_task == nil then
+        return false
+    end
+    for key, value in pairs(self.taskInfo.finish_task) do
+        if id == value then
+            return true
+        end
+    end
+    return false
+end
+
+---已完成任务添加
+---@param id number 任务id
+function GMArenaPeakModel:IsFinishTask(id)
+    if self.taskInfo == nil then
+        self.taskInfo = {}
+        self.taskInfo.finish_task = {}
+    elseif self.taskInfo.finish_task == nil then
+        self.taskInfo.finish_task = {}
+    end
+
+    _G.table.insert(self.taskInfo.finish_task, id)
+
+    for key, value in pairs(self.taskOne) do
+        if value.id == id then
+            value.i_task.state = _G.TaskEnum.ETaskState.Completed
+        end
+    end
+    for key, value in pairs(self.taskTwo) do
+        if value.id == id then
+            value.i_task.state = _G.TaskEnum.ETaskState.Completed
+        end
+    end
+end
+
+---预完成添加
+---@param id number 任务id
+function GMArenaPeakModel:IsUidTask(id)
+    for key, value in pairs(self.taskInfoId) do
+        if value == id then
+            return
+        end
+    end
+    if self.taskInfo and self.taskInfo.finish_task then
+        for key, value in pairs(self.taskInfo.finish_task) do
+            if value == id then
+                return
+            end
+        end
+    end
+
+    _G.table.insert(self.taskInfoId, id)
+end
+
+---完成任务
+---@param id number 任务id
+---@param call function 完成回调
+function GMArenaPeakModel:ChessAward(id, call)
+    local data = {}
+    data.t_id = id
+    if #id < 1 then
+        if call ~= nil then
+            call()
+        end
+        return
+    end
+    require "GMArenaPeakNet":GetInstance():TaskFinish(
+            data,
+            function(msg)
+                if _G.table.count(id) > 1 then
+                    for key, value in pairs(id) do
+                        self:IsFinishTask(value)
+                    end
+                    self.taskInfoId = {}
+                else
+                    for key, value in pairs(id) do
+                        local num
+                        for k, v in pairs(self.taskInfoId) do
+                            if v == value then
+                                num = k
+                            end
+                        end
+                        if num then
+                            table.remove(self.taskInfoId, num)
+                        end
+                        self:IsFinishTask(value)
+                    end
+                end
+
+                if msg.ack ~= 1 then
+                    return
+                end
+
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                self:RefreshRedPointArenaQuest()
+
+                if call ~= nil then
+                    call()
+                end
+            end
+    )
+end
+
+---@private
+function GMArenaPeakModel:BroadcastTaskEnum(enum)
+    ---进行X次巅峰演武战斗
+    if enum == 0 or enum == _G.ActiveTaskEnum.ConditionEnum.ArenaPeak.FightNum then
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            { _G.ActiveTaskEnum.ConditionEnum.ArenaPeak.FightNum },
+            1
+        )
+    end
+    ---巅峰演武获胜X场
+    if enum == 0 or enum == _G.ActiveTaskEnum.ConditionEnum.ArenaPeak.WinNum then
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            { _G.ActiveTaskEnum.ConditionEnum.ArenaPeak.WinNum },
+            1
+        )
+    end
+    ---使用支援角色进行X次巅峰演武战斗
+    if enum == 0 or enum == _G.ActiveTaskEnum.ConditionEnum.ArenaPeak.SupportNum then
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            { _G.ActiveTaskEnum.ConditionEnum.ArenaPeak.SupportNum },
+            1
+        )
+    end
+end
+
+---设置是否使用支援魂将
+---@param isUse boolean 是否使用
+function GMArenaPeakModel:SetUseSupport(isUse)
+	self.useSupport = isUse
+end
+
+--endregion ----------- 任务相关 end -----------
+
+---item_way_cfg 跳转方法
+function GMArenaPeakModel.OpenPeakMainView()
+end
+
+---销毁对象时,析构函数
+function GMArenaPeakModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.mainTimer then
+        self.mainTimer:Stop()
+        self.mainTimer = nil
+    end
+    if self.activityTimer then
+        self.activityTimer:Stop()
+        self.activityTimer = nil
+    end
+    if self.do1 then
+        _G.coroutine.stopwaiting(self.do1)
+        self.do1 = nil
+    end
+    if self.do2 then
+        _G.coroutine.stopwaiting(self.do2)
+        self.do2 = nil
+    end
+    _G.Events:GetInstance():RemoveListener(
+            _G.ConfigManager.net_map.arena_peak_request_sparring.Cmd,
+            self.OnRequestSparring,
+            self
+    )
+    _G.Events:GetInstance():RemoveListener(_G.eCardStorage.AddCardData, self.AddCardCount, self)
+    _G.Events:GetInstance():RemoveListener(_G.eCardStorage.RemoveCardData, self.ReduceCardCount, self)
+    _G.Events:GetInstance():RemoveListener(_G.eArena.SetGMArenaPeak, self.SetCoin, self)
+    self.super.Dispose(self)
+end
+
+---判断是否弹出巅峰演武新赛季
+function GMArenaPeakModel:NewSeasonFrame()
+    return false
+end
+
+---检查能否挑战
+function GMArenaPeakModel:IsCoinLimit()
+    if self.fightTimes > 0 then 
+        return false
+    end
+    if _G.StorageManager:GetInstance():GetItemCountBySid(self.fightItem) >= _G.ConfigManager.discrete_cfg[108137][1][2] then 
+        return false
+    end
+    return true
+end
+
+function GMArenaPeakModel:SetHosting(isHosting)
+    self.hosting = isHosting
+end
+
+function GMArenaPeakModel:GetHosting()
+    return self.hosting
+end
+
+function GMArenaPeakModel:GetPrePick()
+    return _G.DeepCopy(self.pre_pick) 
+end
+
+function GMArenaPeakModel:GetPreBan()
+    return _G.DeepCopy(self.pre_ban)  
+end
+
+function GMArenaPeakModel:PreSet(pb, call)
+    GMArenaPeakNet:GetInstance():PreSet(pb, function(msg)
+        if msg.ack == 1 then 
+            self.pre_pick = pb.pre_pick
+            self.pre_ban = pb.pre_ban
+            if call then 
+                call(msg)
+            end
+        end
+    end)
+end
+
+---根据下次时间结点刷新计时器
+function GMArenaPeakModel:UpdateActivityTimer()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if serverTime >= self.nextTime then
+        self:ChangeStatusAndNextTimeLine()
+    end
+    if serverTime > self.end_time then
+        if self.activityTimer then
+            self.activityTimer:Stop()
+            self.activityTimer = nil
+        end
+    end
+end
+
+function GMArenaPeakModel:GetNextAward()
+    local activity = require("ActivitySynManager"):GetInstance():GetChildAcitivity(10007,
+        self.curActivityClass:GetJumpType(self.curActivityClass.activityID))
+    if activity then
+        local list = activity.typeClass:GetTaskListByPage(1)
+        _G.table.sort(list, function(a, b)
+            return a.Cfg.count < b.Cfg.count
+        end)
+        for _, v in ipairs(list) do
+            if v.Cfg.page == 1 and self.totalNum < v.Cfg.count then
+                return v, activity
+            end
+        end
+        return list[#list], activity
+    end
+end
+
+function GMArenaPeakModel:GetHisFightNum()
+    return self.totalNum or 0
+end
+
+function GMArenaPeakModel:GetActivity()
+    return self.curActivityClass
+end
+
+-- function GMArenaPeakModel:GetSkinData()
+--     return {cardID = 116140000, skinID = 116140006}
+-- end
+
+---获取当前拍脸图显示id
+function GMArenaPeakModel:CheckPopView()
+    if self.curActivityClass == nil then
+        return false
+    end
+    local time = _G.PlayerPrefsManager.GetInt("GMArenaPeakPopView" .. self.curActivityClass.activityID)
+    if time == 0 or _G.PlayerPrefsManager.GetInt("GMArenaPeakPopView" .. self.curActivityClass.activityID) ~= _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime()) then
+        if not self:CheckInEggAwrdStatus() then 
+            return true
+        end
+    end
+    return false
+end
+
+---增加战报数量
+---@param msg guild_fight.p2c_guild_fight_send_log
+function GMArenaPeakModel:AddLog(msg)
+    for _, v in pairs(msg.log or {}) do
+        --- 跑马灯
+        local tab = self:FormatLogChat(v)
+        _G.PopWindowManager:GetInstance():ShowAllTips(33, tab)
+    end
+end
+function GMArenaPeakModel:FormatLogChat(log)
+    return log.type == 1 and _G.GetLangPackValue(90033404041, log.args[1], log.args[3]) or _G.GetLangPackValue(90033404042, log.args[1], log.args[2])
+end
+
+function GMArenaPeakModel:Sign(callBack)
+    if not self:CheckSign() then 
+        GMArenaPeakNet:GetInstance():Sign(function(msg)
+            if msg.ack == 1 then 
+                self.signTime = _G.TimeUtil.GetServerUnixTime()
+                self.pre_pick = msg.pre_pick or {}
+                _G.PopWindowManager:GetInstance():ShowAllTips(880130)
+                if callBack then 
+                    callBack()
+                end
+            end
+        end)
+    end
+end
+
+function GMArenaPeakModel:CheckSign()
+    if self.signTime and self.signTime ~= 0 then 
+        return true
+    end
+    return false 
+end
+
+function GMArenaPeakModel:JumpGift()
+     --打开礼包界面
+    local GMArenaPeakModel = require "GMArenaPeakModel":GetInstance()
+    local activity = require "ActivitySynManager":GetInstance():GetChildAcitivity(10014,
+    GMArenaPeakModel.curActivityClass:GetJumpType())
+    if activity then 
+        GMArenaPeakModel.curActivityClass.typeClass:OnEnterActivity()
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GiftPackGMCommonView.Name, activity, 2)
+    end
+end
+
+function GMArenaPeakModel:SetBackIng(bol)
+    self.backing = bol
+    self:ShowNowStateInMain()
+end
+
+function GMArenaPeakModel:GetBackIng()
+    return false 
+    --return self.backing
+end
+
+function GMArenaPeakModel:SetFightIng(bol)
+    self:SetState(bol and 2 or 0)
+    self.fighting = bol
+end
+
+function GMArenaPeakModel:GetFightIng()
+    return self.fighting
+end
+
+function GMArenaPeakModel:SetState(num)
+    self.state = num
+    self:ShowNowStateInMain()
+end
+
+function GMArenaPeakModel:GetState()
+    return self.state
+end
+
+function GMArenaPeakModel:ShowNowStateInMain()
+    local btn = _G.FindObject(tostring(self.curActivityClass.activityID))
+    if btn then 
+        local goTable = _G.GetAutoGoTable(btn)
+        if self.backing and self.state and self.state ~= 0 then 
+            goTable.aortext_time:SetActiveE(1)
+            goTable.aortext_time.text = stateName[self.state or 1]
+        else 
+            goTable.aortext_time:SetActiveE(0)
+        end
+    end
+end
+
+function GMArenaPeakModel:GetServerOpenTime()
+    return self.serverOpenTime or _G.PlayerModel:GetInstance().open_time
+end
+
+return GMArenaPeakModel

@@ -1,0 +1,537 @@
+--------------------------------------------------------------------------
+-- Created by 此处填写你的名字
+-- DateTime: 2020/09/18
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+---@class eCommentType
+---@field CommentLook number    @1.查看任意角色评论
+---@field Comment number        @2.评论任意角色
+---@field CommentAgree number   @3.点赞任意角色评论
+---@type eCommentType
+local eCommentType = {
+    CommentLook = 1,
+    Comment = 2,
+    CommentAgree = 3
+}
+
+---@class CommentView : UIBaseView 角色评论
+---@field public go_table CommentView_GoTable GoTable
+local CommentView = _G.BaseClass("CommentView", _G.UIBaseView)
+local CardCommentManager = require "CardCommentManager"
+
+local CS = _G.CS
+local typeof = _G.typeof
+local agreeIcon = {agree = "ui_jsjm_pltc_dzanl", disagree = "ui_jsjm_pltc_dzan"}
+local commentGetPath = "api/card/%s/comment" --获取武将评论
+local commentAddPath = "api/card/%s/comment/add" --新增评论
+local commentAgreePath = "api/card/%s/comment/agree" --评论点赞
+local commentCancelPath = "api/card/%s/comment/cancel/agree" --评论撤销点赞
+local agreeNumPath = "api/card/agree/num" --获取剩余点赞数量
+local commentNumPath = "api/card/comment/num" --获取剩余评论数量
+local reportPath = "api/card/comment/report" --评论举报
+local numLimit = 100509
+local portraitCfg = _G.ConfigManager.player_portrait_cfg
+local frameCfg = _G.ConfigManager.player_frame_cfg
+local UIUtils = _G.UIUtils
+local PlayerModel
+--local CommonWebRequestIns = _G.CS.CommonWebRequest.Inst
+function CommentView:Awake()
+    PlayerModel = _G.PlayerModel:GetInstance()
+    self.uid = PlayerModel:GetPlayerUid()
+    self.report = _G.GetAutoGoTable(self.go_table.obj_report, _G.handler(self, self.ClickReportBtn))
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self.go_table.scrollloopvectical_CommentList:InitItemData(0, _G.handler(self, self.RefreshItem))
+    _G.GameUtil.InputFieldCharacterLimitNew(self.go_table.input_Name, _G.ConfigManager.discrete_cfg[numLimit][1][1])
+    _G.GameUtil.InputFieldCharacterLimitNew(self.report.input_Name, 100)
+    self.ItemLua = {}
+    self.canclick = true
+
+    --发送事件事件
+    local Events = _G.Events:GetInstance()
+    Events:Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.Comment.count,
+            eCommentType.CommentLook
+        },
+        1
+    )
+    Events:Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.Comment.count,
+            eCommentType.Comment
+        },
+        1
+    )
+    Events:Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.Comment.count,
+            eCommentType.CommentAgree
+        },
+        1
+    )
+end
+
+---界面的入口函数
+---@param  Data params_CommentView
+---@param  sid params_CommentView -- 引导使用
+function CommentView:OnCreate(sid)
+    self.curType = 2
+    self.CardId = sid
+    self.curCardCommentNum = 0
+    self.cardCommentManager = CardCommentManager:GetInstance()
+    self:GetToken()
+end
+
+---前端测试使用
+function CommentView:GetToken()
+    self.cardCommentManager:GetToken(_G.handler(self, self.Init))
+end
+
+function CommentView:Init()
+    if _G.IsNil(self.gameObject) then
+        return
+    end
+    self:GetCommentCount()
+end
+
+---获取武将评论信息
+function CommentView:GetCardCommentData(sid)
+    if sid then
+        self.CardId = sid
+    end
+    self.cardCommentManager:Get(string.format(commentGetPath, self.CardId), _G.handler(self, self.OnGetCardComment))
+end
+
+---获取评论次数
+function CommentView:GetCommentCount()
+    self.cardCommentManager:Get(commentNumPath, _G.handler(self, self.OnGetCommentCountSuccessed))
+end
+
+---获取评论次数完成回调
+function CommentView:OnGetCommentCountSuccessed(arg)
+    local result = _G.Json2Table(arg)
+    if result.success == true then
+        if _G.AppSetting.DEBUG then
+            _G.Log("获取评论次数成功")
+        end
+        self.curCardCommentNum = result.data
+    end
+    self:GetCardCommentData()
+end
+
+---添加评论
+function CommentView:AddComment(sid, callback)
+    local jsonData =
+        _G.json.encode(
+        {
+            cardId = tostring(sid),
+            commentContext = self.go_table.input_Name.text,
+            userHead = PlayerModel:GetRoleStyle(),
+            userHeadFrame = PlayerModel:GetCurFrame(),
+            userName = PlayerModel:GetName()
+        }
+    )
+    if self.timer then
+        self.timer:Stop()
+    end
+    self.timer = _G.TimerManager:GetInstance():GetTimer(2, self.OnTimeOut, self, true, true)
+    self.timer:Start()
+    self.cardCommentManager:Post(
+        string.format(commentAddPath, self.CardId),
+        jsonData,
+        _G.handlerbind(self, self.OnAddSuccessed, callback)
+    )
+end
+
+function CommentView:OnTimeOut()
+    self.canclick = true
+end
+
+---评论完成回调
+function CommentView:OnAddSuccessed(arg, callback)
+    local result = _G.Json2Table(arg)
+    if result.success == true then
+        _G.PopWindowManager:GetInstance():ShowAllTips(320119)
+        if callback ~= nil then
+            callback()
+        end
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(320119, result.msg)
+    end
+    if self.timer then
+        self.timer:Stop()
+    end
+    self.canclick = true
+    self.go_table.input_Name.text = ""
+end
+
+---点赞
+function CommentView:AgreeComment(id, callback)
+    self.cardCommentManager:Get(
+        string.format(commentAgreePath, id),
+        _G.handlerbind(self, self.OnAgreeSuccessed, callback)
+    )
+end
+
+---点赞完成回调
+function CommentView:OnAgreeSuccessed(arg, callback)
+    local result = _G.Json2Table(arg)
+    if result.success == true then
+        _G.PopWindowManager:GetInstance():ShowAllTips(320126)
+    end
+    if callback ~= nil then
+        callback()
+    end
+end
+
+---评论撤销点赞
+function CommentView:CancelAgreeComment(id, callback)
+    self.cardCommentManager:Get(
+        string.format(commentCancelPath, id),
+        _G.handlerbind(self, self.OnCancelAgreeSuccessed, callback)
+    )
+end
+
+---评论撤销点赞完成回调
+function CommentView:OnCancelAgreeSuccessed(arg, callback)
+    local result = _G.Json2Table(arg)
+    if result.success == true then
+        _G.PopWindowManager:GetInstance():ShowAllTips(320118)
+    end
+    if callback ~= nil then
+        callback()
+    end
+end
+
+---向数据中心请求卡牌评论
+function CommentView:OnGetCardComment(arg)
+    local result = _G.Json2Table(arg)
+    if result.success == true then
+        self.HotComments = result.data.hotComments
+        self.NewComments = result.data.newComments
+        if self.curType == 1 then
+            self.CurData = self.HotComments
+        else
+            self.CurData = self.NewComments
+        end
+        for k, v in pairs(self.CurData) do
+            v.style = v.userHead
+            v.userHead = nil
+            v.frame = v.userHeadFrame
+            v.userHeadFrame = nil
+            v.uid = v.userId
+            v.userId = nil
+        end
+        self:InitView()
+    end
+end
+
+function CommentView:InitView()
+    -- self.go_table.obj_toggle1:SetActiveE(#self.CurData > 0 and 1 or 0)
+    self.go_table.aortext_ShowTips:SetActiveE(#self.CurData > 0 and 0 or 1)
+
+    self:InitList()
+end
+
+function CommentView:InitList()
+    if not self.CurData then
+        return
+    end
+    if self.listCount ~= #self.CurData then
+        self.go_table.scrollloopvectical_CommentList:UpdateCount(#self.CurData)
+        self.listCount = #self.CurData
+    else
+        self.go_table.scrollloopvectical_CommentList:UpdateAllItem()
+    end
+end
+
+function CommentView:RefreshItem(index, obj)
+    if index < 0 then
+        return
+    end
+    local x = index + 1
+    obj:SetName(x)
+    local item = _G.GetAutoGoTable(obj, _G.handlerbind(self, self.ClickItemBtn, x))
+    -- if not self.ItemLua[x] then
+    self.ItemLua[x] = item
+    --end
+    local data = self.CurData[x]
+    item.aortext_name.text = data.userName
+    item.aortext_comment.text = data.commentContext
+    if tonumber(data.uid) == self.uid then
+        data.style = PlayerModel:GetRoleStyle()
+        data.frame = PlayerModel:GetCurFrame()
+    end
+    UIUtils.SetPlayerHeadItemNew(
+        item.obj_HeadItemBase,
+        data,
+        1,
+        true,
+        false,
+        false,
+        function()
+            local uid = tonumber(data.uid)
+            if data.flag > 0 then
+                _G.SystemSettingManager:GetInstance():OpenCommentRobotInfo(uid, data, 600)
+            else
+                if uid and uid > 0 then
+                    if uid == PlayerModel:GetPlayerUid() then
+                        _G.PopWindowManager:GetInstance():ShowAllTips(620109)
+                    else
+                        _G.SystemSettingManager:GetInstance():OpenView(uid, 600)
+                    end
+                end
+            end
+        end
+    )
+    -- local head
+    -- if not data.userHead or data.userHead == 0 or not portraitCfg[data.userHead] then
+    --     head = portraitCfg[101].portrait1
+    -- else
+    --     head = portraitCfg[data.userHead].portrait1
+    -- end
+    -- item.aorimage_portrait.SpriteName = head
+    -- if data.userHeadFrame and data.userHeadFrame > 0 and frameCfg[data.userHeadFrame] then
+    --     item.aorrawimage_frame:LoadImage(frameCfg[data.userHeadFrame].frame)
+    -- end
+    local str = data.agreeNum
+    if str > 999 then
+        str = "999" .. "+"
+    end
+    item.aortext_agreeCount.text = str
+    item.aorbtn_agree:GetComponentE(typeof(CS.AorImage)).SpriteName =
+        data.agree and agreeIcon.agree or agreeIcon.disagree
+end
+
+function CommentView:ClickItemBtn(go, isOn, index)
+    local data = self.CurData[index]
+    local tb = self.ItemLua[index]
+    if not data then
+        return
+    end
+    local name = go:GetName()
+    if name == "@_aorbtn_HeadClick" then
+        local uid = tonumber(data.userId)
+        if data.flag > 0 then
+            _G.SystemSettingManager:GetInstance():OpenCommentRobotInfo(uid, data, 600)
+        else
+            if uid and uid > 0 then
+                if uid == PlayerModel:GetPlayerUid() then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(620109)
+                else
+                    _G.SystemSettingManager:GetInstance():OpenView(uid, 600)
+                end
+            end
+        end
+    elseif name == "@_aorbtn_agree" then
+        if not data.agree then
+            self:AgreeComment(
+                data.id,
+                function()
+                    data.agree = true
+                    data.agreeNum = data.agreeNum + 1
+                    local str = data.agreeNum
+                    if str > 999 then
+                        str = "999+"
+                    end
+                    tb.aortext_agreeCount.text = str
+                    tb.aorbtn_agree:GetComponentE(typeof(CS.AorImage)).SpriteName =
+                        data.agree and agreeIcon.agree or agreeIcon.disagree
+                    --发送事件
+                    _G.Events:GetInstance():Broadcast(
+                        _G.ePlayAactionEvent.PlayAaction,
+                        {
+                            _G.ActiveTaskEnum.ConditionEnum.Comment.count,
+                            eCommentType.CommentAgree
+                        },
+                        1
+                    )
+                end
+            )
+        elseif data.agree then
+            self:CancelAgreeComment(
+                data.id,
+                function()
+                    data.agree = false
+                    data.agreeNum = data.agreeNum - 1
+                    local str = data.agreeNum
+                    if str > 999 then
+                        str = "999+"
+                    end
+                    tb.aortext_agreeCount.text = str
+                    tb.aorbtn_agree:GetComponentE(typeof(CS.AorImage)).SpriteName =
+                        data.agree and agreeIcon.agree or agreeIcon.disagree
+                end
+            )
+        end
+    elseif name == "@_aorbtn_report" then
+        if tonumber(data.userId) == self.uid then
+            ---无法举报自己
+            _G.PopWindowManager:GetInstance():ShowAllTips(320124)
+        else
+            self:InitReportView(data)
+        end
+    end
+end
+
+function CommentView:InitReportView(data)
+    self.curReportData = data
+    _G.GameUtil.SetActiveByCondition(self.report.gameObject, true)
+end
+
+function CommentView:ClickReportBtn(go)
+    -- _G.AudioManager.PlayAudioByAudioCfgID(_G.AudioClipTypeEnum.clickAuido)
+    local name = go:GetName()
+    if name == "@_aorbtn_close" then
+        self.report.gameObject:SetActiveE(0)
+        self.report.input_Name.text = nil
+    elseif name == "@_aorbtn_anyCloseReport" then
+        self.report.gameObject:SetActiveE(0)
+        self.report.input_Name.text = nil
+    elseif name == "@_aorbtn_enter" then
+        local content = self.report.input_Name.text
+        if _G.string.IsNullOrEmpty(content) then
+            _G.PopWindowManager:GetInstance():ShowAllTips(160107)
+            return
+        else
+            --end
+            --检测非法敏感文字
+            -- local isIllegal = _G.CS.DenyWordModel.Instance:IsIllegal(content)
+            -- if isIllegal then
+            --     _G.PopWindowManager:GetInstance():ShowAllTips(320125)
+            -- else
+            self:Report(
+                content,
+                function()
+                    self.report.gameObject:SetActiveE(0)
+                end
+            )
+        end
+    end
+end
+
+---举报
+function CommentView:Report(content, callback)
+    local jsonData =
+        _G.json.encode(
+        {
+            commentId = self.curReportData.id,
+            reportContext = content,
+            userName = PlayerModel:GetName()
+        }
+    )
+    self.cardCommentManager:Post(reportPath, jsonData, _G.handlerbind(self, self.OnReportSuccessed, callback))
+end
+
+---举报完成回调
+function CommentView:OnReportSuccessed(arg, callback)
+    local result = _G.Json2Table(arg)
+    if result.success == true then
+        _G.PopWindowManager:GetInstance():ShowAllTips(320120)
+        if callback ~= nil then
+            callback()
+        end
+    elseif result.success == false then
+        if result.code == 403 then
+            _G.PopWindowManager:GetInstance():ShowAllTips(320121)
+        end
+    end
+end
+
+--region 热评 最新 切换
+--toggle切换效果
+---@param type number 1热评 2最新
+function CommentView:OnToogleSet(go, isOn, type)
+    local goTable = _G.GetAutoGoTable(go)
+    goTable.aortext_togDesc2:SetActiveE(1)
+    _G.GameUtil.SetActiveByCondition(goTable.aorimage_isOff, not isOn)
+    _G.GameUtil.SetActiveByCondition(goTable.aorimage_isOn, isOn)
+    if not isOn then
+        return
+    end
+    self:GetCardCommentData(self.CardId)
+    self.curType = type
+end
+
+---热评
+function CommentView:OnToogleHot(go, isOn, type)
+    self:OnToogleSet(go, isOn, type)
+end
+
+---最新
+function CommentView:OnToogleNew(go, isOn, type)
+    self:OnToogleSet(go, isOn, type)
+end
+
+function CommentView:OnClickBtn(go, isOn)
+    local name = go:GetName()
+    if name == "@_aorbtn_close" or name == "@_aorbtn_Close" then
+        self:Close()
+    elseif name == "$_toggle_hot" then
+        _G.AudioManager.PlayAudioByAudioCfgID(_G.AudioClipTypeEnum.clickAuido)
+        self:OnToogleHot(go, isOn, 1)
+    elseif name == "$_toggle_new" then
+        _G.AudioManager.PlayAudioByAudioCfgID(_G.AudioClipTypeEnum.clickAuido)
+        self:OnToogleNew(go, isOn, 2)
+    elseif name == "@_aorbtn_enter" then
+        local content = self.go_table.input_Name.text
+        if _G.string.IsNullOrEmpty(content) then
+            _G.PopWindowManager:GetInstance():ShowAllTips(160107)
+            return
+        else
+            --local isIllegal = _G.CS.DenyWordModel.Instance:IsIllegal(content)
+            if self.curCardCommentNum <= 0 then
+                -- elseif isIllegal then
+                --     _G.PopWindowManager:GetInstance():ShowAllTips(320125)
+                --     return
+                _G.PopWindowManager:GetInstance():ShowAllTips(320123)
+                return
+            else
+                if self.canclick == false then
+                    return
+                else
+                    self.canclick = false
+                end
+                _G.GameUtil.SecCheck(content, "3",function()
+                    self:AddComment(
+                            self.CardID,
+                            function()
+                                self.curCardCommentNum = self.curCardCommentNum - 1
+                                self:GetCardCommentData(self.CardId)
+                                --发送事件
+                                _G.Events:GetInstance():Broadcast(
+                                        _G.ePlayAactionEvent.PlayAaction,
+                                        {
+                                            _G.ActiveTaskEnum.ConditionEnum.Comment.count,
+                                            eCommentType.Comment
+                                        },
+                                        1
+                                )
+                            end
+                    )
+                end)
+            end
+        end
+    end
+end
+
+function CommentView:OnDestroy()
+    self.cardCommentManager:Clear()
+    self.curType = nil
+    self.CardID = nil
+    self.ItemLua = nil
+    if self.initCo then
+        _G.coroutine.stopwaiting(self.initCo)
+        self.initCo = nil
+    end
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+
+return CommentView

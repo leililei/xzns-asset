@@ -1,0 +1,2362 @@
+-----------------------------------------------------------------------
+-- Created by szs 2020.3.17
+--
+-- @Description MainManager 主界面管理器
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+---@class MainManager : Singleton
+---@field GetInstance fun():MainManager
+---@field mainView MainView 主界面显示对象
+---@field functionQueue table 非主界面新功能开放添加到队列延迟处理
+---@field isInMainView boolean 是否在主界面
+---@field private addNewCardMainFunQueue boolean 获取新卡牌时: 是否已加入弹窗队列
+---@field private addNewCardMainFunQueueTime number :获取新卡牌时: 下一次弹窗检测时间
+---@field private newCardAutoDevelop number 获取新卡牌时: 是否等待自动合并中
+local MainManager = _G.BaseClass("MainManager", _G.Singleton)
+_G.MainManager = MainManager
+local SprintRankUtils = require("SprintRankUtils")
+
+function MainManager:__init()
+    -- self.miniMapCamera = _G.FindObject("MiniMapCamera")
+    self.isInMainView = false
+    self.fullUINameList = {}
+    self.nowtansuo = 0
+    self.AcceptBtn = {}
+    self.chatViews = {}
+    self.lastChat = {}
+    self.lastSociatyChat = {}
+    ---左侧任务视图    <objid ,table >  任务临时数据 显示用   是新任务则显示特效
+    self.TaskViewShowDic = {}
+    ---当前是否显示任务栏  用表  以保持引用   [is]=true
+    self.IsShowTakeShrink = { is = true }
+
+    ---是否显示主界面 副本内暂停按钮
+    self.isShowMainViewStopicon = true
+    --- 主界面打开其他界面函数队列（当只有主界面的时候触发）
+    --- {[CheckFun,OpenFun],,,}  [检测函数,打开界面 函数]
+
+    ---@type MainOpenViewFunItem[]
+    self.MainOpenViewFunQueue = {}
+    local ui_cfg = _G.ConfigManager.ui_cfg
+    --- 忽略判断的界面
+    self.ignoreViewDic = {
+        [ui_cfg.MainView.Name] = true,
+        [ui_cfg.HUDView.Name] = true,
+        [ui_cfg.ShadowTopView.Name] = true,
+        [ui_cfg.ShadowView.Name] = true,
+        [ui_cfg.GameNetTipsView.Name] = true,
+        [ui_cfg.ScrollerView.Name] = true,
+        [ui_cfg.QuickUseTipView.Name] = true,
+        [ui_cfg.FloatMessagesView.Name] = true,
+    }
+    --- 新手引导用  是否在主界面有显示队列  true 主界面正在显示其他界面
+    self.HasMainDisplayQueue = false
+    --- 主界面中央按钮显示数组
+    self.MainFloatFuncBtn = {}
+    ---@type main_prompt_cfgItem main_prompt_cfg
+    self.MainQuickFuncCfg = {}
+    ---主界面中央按钮区域是否需要监听功能开放
+    self.NeedListenFuncOpen = false
+    self:InitMainPrompt()
+    --- 复用
+    self.mMainView_Task = nil
+    self.mMainView_Task_OldParent = nil
+    self.isForceShowGodSpecialGift = false
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.StartOpenUI, self.OnUIOpened, self)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.StartCloseUI, self.StartCloseUI, self)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed, self)
+    _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.NewFunction, self.FunOpen, self)
+    _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.FunctionOpen, self)
+    _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.FunctionForbidden, self.FunctionForbidden, self)
+    -- _G.Events:GetInstance():AddListener(_G.eChatStatus.MainNewChat, self.OnAddMinChatItem, self)
+    _G.Events:GetInstance():AddListener(_G.eChatStatus.DelChat, self.OnClearMinChatItem, self)
+    _G.Events:GetInstance():AddListener(_G.eSociatyBattle.SociatyBattleLog, self.OnAddUnionBattleChatItem, self)
+    _G.Events:GetInstance():AddListener(
+            _G.eSociatyBattleLeague.SociatyBattleLogLeague,
+            self.OnAddUnionBattleLeagueChatItem,
+            self
+    )
+    _G.Events:GetInstance():AddListener(_G.eCardStorage.AddCardData, self.OnNewCard, self)
+end
+
+function MainManager:InitMainPrompt()
+    for k, v in pairs(_G.ConfigManager.main_prompt_cfg) do
+        if not self.MainQuickFuncCfg[v.id] then
+            self.MainQuickFuncCfg[v.order] = {}
+            self.MainQuickFuncCfg[v.order].id = v.id
+            self.MainQuickFuncCfg[v.order].funcOpen = v.function_id
+            self.MainQuickFuncCfg[v.order].checkFunc = v.method_call
+            self.MainQuickFuncCfg[v.order].icon = v.icon
+            self.MainQuickFuncCfg[v.order].openFunc = v.openfunc
+            self.MainQuickFuncCfg[v.order].order = v.orders
+        end
+    end
+end
+
+function MainManager:GetQuickBtn()
+    self.MainFloatFuncBtn = {}
+    if _G.table.isEmptyOrNil(self.MainQuickFuncCfg) then
+        return nil
+    end
+    local checkfunc, openfunc, lua
+    for i = 1, #self.MainQuickFuncCfg do
+        checkfunc = self.MainQuickFuncCfg[i].checkFunc
+        openfunc = self.MainQuickFuncCfg[i].openFunc
+        if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.MainQuickFuncCfg[i].funcOpen) then
+            if not _G.table.isEmptyOrNil(checkfunc) then
+                lua = _G[checkfunc[1]]
+                if lua == nil then
+                    lua = require(checkfunc[1])
+                end
+                if #checkfunc == 2 then
+                    if lua[checkfunc[2]]() then
+                        _G.table.insert(
+                                self.MainFloatFuncBtn,
+                                {
+                                    id = self.MainQuickFuncCfg[i].id,
+                                    icon = self.MainQuickFuncCfg[i].icon,
+                                    openFunc = openfunc
+                                }
+                        )
+                    end
+                elseif #checkfunc == 3 then
+                    if lua[checkfunc[2]](tonumber(checkfunc[3])) then
+                        _G.table.insert(
+                                self.MainFloatFuncBtn,
+                                {
+                                    id = self.MainQuickFuncCfg[i].id,
+                                    sicon = self.MainQuickFuncCfg[i].icon,
+                                    openFunc = openfunc
+                                }
+                        )
+                    end
+                end
+            end
+        end
+    end
+    return self.MainFloatFuncBtn
+end
+
+function MainManager:Dispose()
+    if self.OpenAwardTimer then
+        self.OpenAwardTimer:Stop()
+        self.OpenAwardTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.StartOpenUI, self.OnUIOpened, self)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.StartCloseUI, self.StartCloseUI, self)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.NewFunction, self.FunOpen, self)
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.FunctionOpen, self)
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.FunctionForbidden, self.FunctionForbidden, self)
+    -- _G.Events:GetInstance():RemoveListener(_G.eChatStatus.MainNewChat, self.OnAddMinChatItem, self)
+    _G.Events:GetInstance():RemoveListener(_G.eChatStatus.DelChat, self.OnClearMinChatItem, self)
+    _G.Events:GetInstance():RemoveListener(_G.eChatStatus.SociatyBattleLog, self.OnAddUnionBattleChatItem, self)
+    _G.Events:GetInstance():RemoveListener(
+            _G.eSociatyBattleLeague.SociatyBattleLogLeague,
+            self.OnAddUnionBattleLeagueChatItem,
+            self
+    )
+    _G.Events:GetInstance():RemoveListener(_G.eCardStorage.AddCardData, self.OnNewCard, self)
+    self.MainOpenViewFunQueue = {}
+    self.isInMainView = false
+    self.InitInitial = nil
+    self.addNewCardMainFunQueue = false
+    self.douyinFeedSubscribe = false
+    self.isShowGmBigView = nil
+    self:RemoveListener()
+    self:StopTimerCheckOpen()
+end
+
+function MainManager:OnMainViewEnable()
+    self:AddListener()
+
+    if self.InitInitial == nil then
+        if require("InitialManager"):GetInstance():TanChuPanDuan() then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.InitialView.Name)
+                --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.PopUpGiftBagView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.OnePay)
+            --self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.PopUpGiftBag)
+            self.InitInitial = true
+        end
+    end
+
+    -- --七日粉将/七日神兵
+    -- if not self.initMaterialGiftTypes then
+    --     ---@type number[] 礼包类型
+    --     self.initMaterialGiftTypes = {}
+    --     for _, v in pairs(_G.ConfigManager.store_target_cfg) do
+    --         table.insert(self.initMaterialGiftTypes, v.type)
+    --     end
+    -- end
+    -- if self.initMaterialGiftTypes and #self.initMaterialGiftTypes > 0 then
+    --     local model = require("MaterialGiftModel"):GetInstance()
+    --     for i = #self.initMaterialGiftTypes, 1, -1 do
+    --         if model:CheckIsOpen(self.initMaterialGiftTypes[i]) then
+    --             local type = self.initMaterialGiftTypes[i]
+    --             table.remove(self.initMaterialGiftTypes, i) --已加入展示列表
+    --             ---@type MainOpenViewFunItem
+    --             local MainOpenViewFunItem = {}
+    --             MainOpenViewFunItem.OpenViewFun = function()
+    --                 if not model:CheckIsOpen(type) then
+    --                     --展示下一个窗口
+    --                     self:MainQueueFun_Check2()
+    --                     return
+    --                 end
+    --                 model:OpenWindow(type)
+    --             end
+    --             self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.MaterialGift)
+    --         end
+    --     end
+    -- end
+
+    ---新材料礼包（七日礼包）
+    if self.SevenGift == nil then
+        local SevenGiftModel = require("SevenGiftModel"):GetInstance()
+        if SevenGiftModel:CheckOneOpen() then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                if _G.AppSetting.IsXzns then
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SevenGiftView.Name, true, true)
+                else
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SevenGiftView.Name, true)
+                end
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.SevenGift)
+        end
+        self.SevenGift = true
+    end
+
+    if self.SeasonMaterialGift == nil then
+        local SeasonModel = require("SeasonModel"):GetInstance()
+        if SeasonModel:CheckSeasonIsOpen() and SeasonModel:CheckSeasonFucntionIsOpen(_G.FunctionID.SeasonMaterialGift) then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                require("SeasonModel"):GetInstance():OpenView(_G.FunctionID.SeasonMaterialGift)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.HolidayPackView)
+            self.SeasonMaterialGift = true
+        end
+    end
+
+    --
+    if self.HolidayPackView == nil then
+        local act = require "ActivitySynManager":GetInstance():GetActivityWithTypeId(10041)
+        if act and act.typeClass:CheckCanBuyItem() and act.cfg.info.front.is_reveal ~= 0 then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.HolidayPackView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.HolidayPackView)
+            self.HolidayPackView = true
+        end
+    end
+    ---限时招募-新增角色拍脸图
+    if self.DrawUpPeakNewView == nil then
+        if require "DrawUpMainModel":GetInstance():GetIdRde() ~= 0 then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem2 = {}
+            MainOpenViewFunItem2.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DrawUpPeakNewView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.DrawUpPeakNewView)
+            self.DrawUpPeakNewView = true
+        end
+    end
+
+    ---每周奖励-新增拍脸图
+    if self.WeekBattlePassView == nil then
+        local act = require "ActivitySynManager":GetInstance():GetActivityWithTypeId(10079)
+        if act and act.typeClass:GetShowPLT() == 1 then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem2 = {}
+            MainOpenViewFunItem2.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.WeekBattlePassView.Name, act)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.WeekBattlePassView)
+            self.WeekBattlePassView = true
+        end
+    end
+
+    ---天下联赛拍脸图
+    if self.SociatyBattleLeagueShowView == nil then
+        if require "SociatyBattleLeagueModel":GetInstance():ShowPopView() then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyBattleLeagueShowView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.SociatyBattleLeagueShowView)
+            self.SociatyBattleLeagueShowView = true
+        end
+    end
+
+    ---每日累充礼包活动
+    if self.DayTTUView == nil then
+        local activitys = require "ActivitySynManager":GetInstance():GetActivityByType(10051)
+        for i = 1, #activitys do
+            local activity = activitys[i]
+            if activity and activity.typeClass.Info.main_type == 1 and activity.typeClass:CheckPopView() then
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(
+                            _G.ConfigManager.ui_cfg.DayTotalTopUpView.Name,
+                            activity.typeClass.Info.main_type
+                    )
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.DayTTUView)
+                self.DayTTUView = true
+            end
+        end
+    end
+
+    ---主题活动-新增角色拍脸图
+    if self.InitThemeActivityView == nil then
+        if require "ThemeActivityManager":GetInstance():CheckThemeActivityOpenView() == true then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ThemePeakView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.InitThemeActivityView)
+            self.InitThemeActivityView = true
+        end
+    end
+
+    ---五行招募-新增角色拍脸图
+    if self.DrawFLORView == nil then
+        local class = require "DrawModel":GetInstance():GetFiveLinesOfRecruitment()
+        if class and class:GetIdRde() ~= 0 then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem2 = {}
+            MainOpenViewFunItem2.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DrawFLORView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.DrawFLORView)
+            self.DrawFLORView = true
+        end
+    end
+
+    ---神器限时招募拍脸图
+    if self.ArtifactDrawUpShowView == nil then
+        local class = require "ArtifactDrawUpMainModel":GetInstance():GetShowData()
+        if not _G.table.isEmptyOrNil(class) then
+            for i = 1, #class do
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem2 = {}
+                MainOpenViewFunItem2.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArtifactDrawUpShowView.Name, class[i])
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.ArtifactDrawUpShowView)
+                self.ArtifactDrawUpShowView = true
+            end
+        end
+    end
+
+    ---月度目标
+    -- if self.InitMonthlyGoals == nil and require("MonthlyGoalsModel"):GetInstance():CheckRoleCreateTime() then
+    --     if not require("MonthlyGoalsModel"):GetInstance().isAkfPass then --防止通关后弹2次
+    --         if require "AfkModel":GetInstance():CheckSectionIsPass(_G.ConfigManager.discrete_cfg[100125][1][1]) then
+    --             if
+    --                 _G.PlayerPrefsManager.GetInt("MonthlyGoals") ~=
+    --                     _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime())
+    --              then
+    --                 ---@type MainOpenViewFunItem
+    --                 local MainOpenViewFunItem1 = {}
+    --                 MainOpenViewFunItem1.OpenViewFun = function()
+    --                     _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MonthlyGoalsView.Name)
+    --                     --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.PopUpGiftBagView.Name)
+    --                 end
+    --                 self:AddMainFunQueue(MainOpenViewFunItem1, _G.MainViewShowOrder.MonthlyGoals)
+    --                 self.InitMonthlyGoals = true
+    --             end
+    --         end
+    --     end
+    -- end
+    ---巅峰演武新赛季
+    if self.InitArenaPeakNewSeason == nil then
+        if require "ArenaPeakModel":GetInstance():NewSeasonFrame() then
+            if
+            _G.PlayerPrefsManager.GetInt("ArenaPeakNewSeason") ~=
+                    _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime())
+            then
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem2 = {}
+                MainOpenViewFunItem2.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArenaPeakNewSeasonView.Name)
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.ArenaPeakNewSeason)
+                self.InitArenaPeakNewSeason = true
+            end
+        end
+    end
+    ---降神特惠礼包
+    if self.InitGodSpecialGiftView == nil then
+        if _G.FunctionManager:GetInstance():CheckMainFunctionCfgUnlock(_G.MainFunctionItems.GodSpecialGift) then
+            if require "TrainSuperValuModel".CheckGodSpecialGiftView() then
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem2 = {}
+                MainOpenViewFunItem2.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GodSpecialGiftView.Name)
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.GodSpecialGift)
+                self.InitGodSpecialGiftView = true
+            end
+        end
+    end
+
+    ---降神特惠礼包
+    if self.VoucherDiscountPopView == nil then
+        local VoucherDiscount = require("VoucherDiscountModel"):GetInstance():GetVoucherDiscountData()
+        if VoucherDiscount ~= nil then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem2 = {}
+            MainOpenViewFunItem2.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.VoucherDiscountPopView.Name, VoucherDiscount)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.VoucherDiscountPopView)
+            self.VoucherDiscountPopView = true
+        end
+    end
+
+    ---好评功能
+    if nil == self.FiveStarPraiseTips then
+        local sdkPlatformTrue = true
+        if _G.CS.Launcher.Inst.IsSDK then
+            sdkPlatformTrue = false
+            local channelId = _G.tonumber(_G.ServerManager:GetInstance().AppInfo.Platform)
+            if _G.AppSetting.DEBUG then
+                _G.Log(channelId, "当前渠道id是>>>>>>")
+            end
+            local cfg = _G.ConfigManager.function_block_cfg
+            if cfg[channelId] and not _G.string.IsNullOrEmpty(cfg[channelId].good_rating) then
+                sdkPlatformTrue = true
+            end
+        end
+        local funOpen = require "ActivitySynManager":GetInstance():CheckConditionParams(
+                _G.ConfigManager.activity_info_cfg[1013701].condition_display
+        )
+
+        local show
+        local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "FiveStarPraiseTips"
+        if _G.PlayerPrefsManager.GetInt(key, 0) == 0 then
+            show = true
+        else
+            show = false
+        end
+
+        local isGet = false
+        local curActivityClass
+        if funOpen then
+            curActivityClass = require "ActivitySynManager":GetInstance():GetActivityClass(1013701)
+
+            if curActivityClass then
+                isGet = curActivityClass.typeClass.IsAward == 1
+            end
+        end
+
+        ---功能开启，首次弹出，没有领取奖励
+        if funOpen and show and not isGet and sdkPlatformTrue then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem2 = {}
+            MainOpenViewFunItem2.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.FiveStarPraiseTipsView.Name,
+                        curActivityClass)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.FiveStarPraise)
+            self.FiveStarPraiseTips = true
+        end
+    end
+
+    ---战歌争锋
+    if self.ActivityDispatchPop == nil then
+        local isPop = require "ActivityDispatchModel":GetInstance():CheckPopView()
+        local isAwardPop = require "ActivityDispatchModel":GetInstance():CheckAwardPopView()
+        if isPop == true or isAwardPop == true then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                if isAwardPop == true then
+                    require "ActivityDispatchModel":GetInstance():OpenView()
+                else
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ActivityDispatchPopView.Name)
+                end
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.ActivityDispatchPop)
+            self.ActivityDispatchPop = true
+        end
+    end
+
+    ---噬渊对决
+    if self.ActivityTournamentPop == nil then
+        local isPop = require "ActivityTournamentModel":GetInstance():CheckPopView()
+        if isPop == true then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ActivityTournamentPopView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.ActivityTournamentPop)
+            self.ActivityTournamentPop = true
+        end
+    end
+
+    ---GM巅峰演武拍脸
+    if self.GMArenaPeakPop == nil then
+        local isPop = require "GMArenaPeakModel":GetInstance():CheckPopView()
+        --local isAwardPop = require "GMArenaPeakModel":GetInstance():CheckAwardPopView()
+        if isPop == true then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                -- if isAwardPop == true then
+                --     require "GMArenaPeakModel":GetInstance():OpenView()
+                -- else
+                --     _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GMArenaPeakPopView.Name)
+                -- end
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GMArenaPeakPopView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.GMArenaPeakPop)
+            self.GMArenaPeakPop = true
+        end
+    end
+
+    ---千抽开关
+    if _G.FunctionManager:GetInstance():CheckMainFunctionCfgUnlock(_G.MainFunctionItems.LuckyTriads) then
+        local ok = true
+        local cfg = _G.ConfigManager.discrete_cfg[100140]
+        if cfg then
+            --获取开服时间, 1表示在此时间之后开启, 2表示此时间后关闭
+            if _G.PlayerModel:GetInstance():CheckCreateRole() then
+                local openTime = _G.PlayerModel:GetInstance():GetServerOpenTime()
+                for _, v in pairs(cfg) do
+                    if v[1] == 1 and openTime < v[2] or v[1] == 2 and openTime > v[2] then
+                        ok = false
+                    end
+                end
+            end
+        end
+        if ok then
+            if require "LuckyTriadsModel":GetInstance():CheckLuckyTriadsViewPop() then
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LuckyTriadsView.Name)
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.LuckyTriads)
+            end
+        end
+    end
+    --pvp目标推送
+    --角色未创建时, 无法正常获取服务器时间(抛出异常!!!), 因此首次创建角色必然无法弹出
+    if not self.InitPvpPublicity and _G.PlayerModel and _G.PlayerModel:GetInstance():CheckCreateRole() then
+        self.InitPvpPublicity = true
+        ---是否展示目标窗口(检查今日是否继续提示)
+        ---@param d PvpPublicityData
+        local function isShow(d)
+            return _G.PlayerPrefsManager.GetInt(
+                    "PvpPublicity_" .. tostring(_G.PlayerModel:GetInstance().role_uid) .. "_" .. d.id
+            ) ~= _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime())
+        end
+        local PvpPublicityModel = require("PvpPublicityModel"):GetInstance()
+
+        --竞技场/问鼎灵域/公会战/巅峰演武
+        --统一加入展示队列, 在实际展示之前判断是否符合条件, 这样跨天时可自动切换展示
+        ---@type PvpPublicityData[]
+        for _, d in ipairs(PvpPublicityModel:GetConfigure() or {}) do
+            if d and isShow(d) and not PvpPublicityModel:IsExpired(d) then
+                local function open()
+                    --检查是否满足开启条件
+                    if not PvpPublicityModel:IsOpening(d) then
+                        --展示下一个窗口
+                        self:MainQueueFun_Check2()
+                        return
+                    end
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.PvpPublicityView.Name, d)
+                end
+                self:AddMainFunQueue({ OpenViewFun = open }, _G.MainViewShowOrder.PvpPublicity)
+            end
+        end
+    end
+    --游戏圈拍脸图
+    -- if not self.InitYXQpailian and require("PlayerCircleModel"):GetInstance():CheckShowYxqBtn() then
+    --     local rolid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    --     local savetime = _G.PlayerPrefsManager.GetInt("GameCirclePaiLian" .. rolid)
+    --     local nowtime = _G.TimeUtil.GetServerUnixTime()
+    --     local todayTime = _G.TimeUtil.GetDayBegin(nowtime)
+    --     local isChoose = savetime == todayTime
+    --     if not isChoose then
+    --         local MainOpenViewFunItem = {}
+    --         MainOpenViewFunItem.OpenViewFun = function()
+    --             _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GameCirclePaiLianView.Name)
+    --         end
+    --         self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.GameCirclePaiLianView)
+    --         self.InitYXQpailian = true
+    --     end
+    -- end
+
+    ---组队副本
+    if self.RelicTeamChampion == nil then
+        local relicTeamModel = require("RelicTeamModel"):GetInstance()
+        if relicTeamModel:CheckInEggAwrdStatus() then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                local act = require "ActivitySynManager":GetInstance():GetActivityWithTypeId(10058)
+                if act then
+                    act:EnterActivity()
+                end
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.RelicTeamChampion)
+        end
+        self.RelicTeamChampion = true
+    end
+
+    ---七日礼包GM活动
+    if self.SevenGiftGM == nil then
+        local SevenGiftGMModel = require("SevenGiftGMSynModel"):GetInstance()
+        if SevenGiftGMModel:CheckOneOpen() then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SevenGiftGMView.Name, true)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.SevenGiftGM)
+        end
+        self.SevenGiftGM = true
+    end
+
+    ---晋升堡垒全服奖励
+    if self.ArenaGlobalChampion == nil then
+        local ArenaGlobalModel = require("ArenaGlobalModel"):GetInstance()
+        if ArenaGlobalModel:CheckInEggAwrdStatus() and not ArenaGlobalModel.EggAwardFlag then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                local act = require "ActivitySynManager":GetInstance():GetActivityWithTypeId(10063)
+                if act then
+                    act:EnterActivity()
+                end
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.ArenaGlobalChampion)
+        end
+        self.ArenaGlobalChampion = true
+    end
+
+    ---转端有礼
+    if not self.TurnTerminal then
+        if require("TurnTerminalModel"):GetInstance():CheckOneOpen() then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.TurnTerminalPopUpView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.ArenaGlobalChampion)
+        end
+        self.TurnTerminal = true
+    end
+    if not _G.AppSetting.IsXzns then
+        ---矿山自动领取界面
+        if self.MineAuto == nil then
+            local flagTime = _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.HeroicMinePrivilegeDailyAuto, 0)
+            local now = _G.TimeUtil.GetServerUnixTime()
+            local HeroicIconModel = require("HeroicIconModel"):GetInstance()
+            if HeroicIconModel:CheckCanAutoGet() and flagTime ~= 0 and _G.TimeUtil.GetIntervalDayBySix1(flagTime, now) > 0 then
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    HeroicIconModel:AutoHangupAward()
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.MineAuto)
+            end
+            self.MineAuto = true
+        end
+    end
+    if not _G.SDKManager:GetInstance():CheckRusChannel() then
+        ---海外绑定账号，需求：每次回到主界面都需要弹出该弹窗
+        if not self.bindAccount then
+            if require("BindAccountModel"):GetInstance():CheckOpen() then
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    require("BindAccountModel"):GetInstance():OpenView()
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.BindAccountView)
+            end
+            self.bindAccount = true
+        end
+    end
+
+    ---拍脸图(俄罗斯渠道的，通过SDK打开界面, 界面开关也是对面控制的)
+    if not self.RusChanelFaceView then
+        if _G.SDKManager:GetInstance():CheckRusChannel() then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.SDKManager:GetInstance():OpenWebPage()
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.RusChannelFaceView)
+        end
+        self.RusChanelFaceView = true
+    end
+
+    ---酒馆派对活动
+    if self.TavernParty == nil then
+        local activitys = require "ActivitySynManager":GetInstance():GetActivityByType(10043)
+        for i = 1, #activitys do
+            local activity = activitys[i]
+            if activity and activity.typeClass.type == 11 then
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(
+                            _G.ConfigManager.ui_cfg.TavernPartyToggleView.Name,
+                            activity, activity:GetJumpType()
+                    )
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.TavernParty)
+                self.TavernParty = true
+            elseif activity.typeClass.type == 14 then
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(
+                            _G.ConfigManager.ui_cfg.SpringFestivalTavernPartyToggleView.Name,
+                            activity, activity:GetJumpType()
+                    )
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.TavernParty)
+                self.TavernParty = true
+            elseif activity.typeClass.type == 23 then
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(
+                            _G.ConfigManager.ui_cfg.BathhouseGiftToggleView.Name,
+                            activity, activity:GetJumpType()
+                    )
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.TavernParty)
+                self.TavernParty = true
+            end
+        end
+    end
+
+    ---酒馆派对活动
+    if self.WishTemple == nil then
+        local activitys = require "ActivitySynManager":GetInstance():GetActivityByType(10043)
+        for i = 1, #activitys do
+            local activity = activitys[i]
+            if activity and activity.typeClass.type == 14 then
+                ---@type MainOpenViewFunItem
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    _G.UIManager:GetInstance():OpenWindow(
+                            _G.ConfigManager.ui_cfg.WishTempleToggleView.Name,
+                            activity, activity:GetJumpType()
+                    )
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.WishTemple)
+                self.WishTemple = true
+            end
+        end
+    end
+
+    ---抖音直流
+    if not self.douyinFeedSubscribe then
+        if _G.AppSetting.IsDouYin then
+            require("DouyinModel"):GetInstance():AddMainFunQuene()
+        end
+    end
+
+    if self.NewSeverSpecialOffView == nil then
+        local model = require("NewSeverSpecialOffModel"):GetInstance()
+        if model:CheckIsOpen() and _G.PlayerPrefsManager.GetInt("NewSeverSpecialOffView" .. model:GetToday(), 0) == 0 then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.NewSeverSpecialOffView.Name, true)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.NewSeverSpecialOff)
+        end
+        self.NewSeverSpecialOffView = true
+    end
+
+    if self.OptionalGiftView==nil then
+        local activitys = require "ActivitySynManager":GetInstance():GetActivityByType(10096)
+        if not table.isEmptyOrNil(activitys) and not activitys[1].typeClass.model:CheckAllGiftIsSellOut() then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                activitys[1].typeClass:EnterActivity()
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.OptionGiftView)
+        end
+        self.OptionalGiftView = true
+    end
+    
+    if self.LabourDayGameBigPrizeShow == nil then
+        ---@type LabourDayGameModel
+        local model = require "LabourDayGameModel":GetInstance()
+        if model.activity and model.activity.typeClass and model:CheckToDayIsShowBigPrize() then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LabourDayGameBigPrizeShowView.Name, model.activity)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.LabourDayGameBigPrize)
+        end
+        self.LabourDayGameBigPrizeShow = true
+    end
+    
+    if self.isShowGmBigView == nil then
+        local activitys = require "ActivitySynManager":GetInstance():GetActivityByType(10093)
+        if not table.isEmptyOrNil(activitys) then
+            for i = 1, #activitys do
+                local activity = activitys[i]
+                if activity then
+                    local MainOpenViewFunItem = {}
+                    MainOpenViewFunItem.OpenViewFun = function()
+                        if activity then
+                            activity.typeClass:EnterActivity()
+                        end
+                    end
+                    self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.GMBigChallenge)
+                end
+            end
+        end
+        self.isShowGmBigView = true
+    end
+    
+    ---核心千抽首次开放时打开一次界面
+    if _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.FunctionFistOpen .. "CoreDraw", 0) == 0 then
+        if require("CoreDrawModel"):GetInstance():CheckOpen() then
+            _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.FunctionFistOpen .. "CoreDraw", 1)
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CoreDrawView.Name, true)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.CoreDrawView)
+        end
+    end
+    
+    ---千抽自选首次开放时打开一次界面
+    if _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.FunctionFistOpen .. "LuckyTriads", 0) == 0 then
+        if require("LuckyTriadsModel").ShowTheBtn() and _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(254) then
+            _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.FunctionFistOpen .. "LuckyTriads", 1)
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LuckyTriadsView.Name)
+            end
+            self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.LuckyTriadsView)
+        end
+    end
+
+    if self.isSprintRankFaceView == nil then
+        if SprintRankUtils.GetIsShowPopover("_SprintRankFaceViewKey")then
+            local activitys = require "ActivitySynManager":GetInstance():GetActivityByType(10105)
+            if not table.isEmptyOrNil(activitys) then
+                local MainOpenViewFunItem = {}
+                MainOpenViewFunItem.OpenViewFun = function()
+                    local activitys = require "ActivitySynManager":GetInstance():GetActivityByType(10105)
+                    if activitys[1] then
+                        for i = 1, #activitys do
+                            ---@type SprintRankLoopSynModel
+                            local data = activitys[i]:GetActivityTypeCls()
+                            if data:IsShowBtn() and data:IsRunIng() then
+                                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SprintRankFaceView.Name,data)
+                            end
+                        end
+                    end
+                end
+                self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.SprintRankFace)
+            end
+        end
+        self.isSprintRankFaceView = true
+    end
+    ---通用GM礼包活动拍脸 10014
+    if self.ConmmonGiftPackShow == nil then
+        local activitys = require "ActivitySynManager":GetInstance():GetActivityByType(10014)
+        if not _G.table.isEmptyOrNil(activitys) then
+            for i = 1, #activitys do
+                local expend=activitys[i].cfg.info.front.expend or {}
+                if not table.isEmptyOrNil(expend)  then
+                    local uiname=""
+                    for i = 1, #expend do
+                        if expend[i].name=="uiname" then
+                            uiname=expend[i].value
+                        end
+                    end
+                    if not string.IsNullOrEmpty(uiname) then
+                        local lastTime=tonumber(_G.PlayerPrefsManager.GetString(activitys[i].activityID)) or 0
+                        if _G.TimeUtil.GetIntervalDayBySix1(lastTime,_G.TimeUtil.GetServerUnixTime()) > 0 then
+                            ---@type MainOpenViewFunItem
+                            local MainOpenViewFunItem2 = {}
+                            MainOpenViewFunItem2.OpenViewFun = function()
+                                _G.UIManager:GetInstance():OpenWindow(uiname, activitys[i])
+                            end
+                            self:AddMainFunQueue(MainOpenViewFunItem2, _G.MainViewShowOrder.ConmmonGiftPackShow)
+                        end
+                    end
+                end
+            end
+        end
+        self.ConmmonGiftPackShow = true
+    end
+
+    ---- loading 加载完 才检测是否在主界面
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.LoadingView.Name)
+    if view == nil or view.gameObject == nil then
+        self:UpdataInMainView(false)
+    end
+
+    self:UpdateQueue()
+end
+
+---检测队列还有没有，及时刷新数据
+function MainManager:UpdateQueue()
+    if self:IsMainQueueFun() then
+        local fun, id = self:PopMainFunQueue(true)
+        if fun then
+            self.HasMainDisplayQueue = true
+            return
+        end
+    end
+
+    self.HasMainDisplayQueue = false
+end
+
+---当前挂机时间=最大挂机时间时，有红点提示
+function MainManager:CheckAfkBoxTime()
+    local time = _G.TimeUtil.GetServerUnixTime() - require "AfkModel":GetInstance():GetAfkTime()
+    local vipTime = require "PrivilegeManager":GetInstance():GetPrivilegeDataNew({ 1 })
+    local Time = 0
+    if not _G.table.isEmptyOrNil(vipTime) then
+        Time = vipTime[1][2]
+    end
+    local MaxTime = _G.ConfigManager.discrete_cfg[101103][1][1] + Time
+    return time >= MaxTime
+end
+
+---当玩家免费快速挂机次数大于0时，显示红点
+function MainManager:CheckAfkQuickTime()
+    return require "AfkModel":GetInstance():GetFreeRewardTime() > 0
+end
+
+----  每次主界面开关 会将监听增删
+function MainManager:AddListener()
+    local eventsIns = _G.Events:GetInstance()
+    eventsIns:AddListener(_G.ePlayerStatus.PlayerChangeExp, self.PlayerChangeExp, self)
+    eventsIns:AddListener(_G.ePlayerStatus.PlayerUpLevel, self.PlayerUpLevel, self)
+    eventsIns:AddListener(_G.eDownloadPlay.HideDownloadBtn, self.HideDownloadBtn, self)
+    --eventsIns:AddListener(_G.eChatStatus.MainNewChat, self.OnAddMinChatItem, self)
+    -- _G.TaskModule:GetInstance():AddListener(
+    --     _G.TaskModuleEvent,
+    --     _G.TaskModuleEvent.EnumValueTable.CheckNowNpcHaveTask,
+    --     self.OnTaskCheckNowNpc,
+    --     self
+    -- )
+end
+
+function MainManager:RemoveListener()
+    local eventsIns = _G.Events:GetInstance()
+    eventsIns:RemoveListener(_G.ePlayerStatus.PlayerChangeExp, self.PlayerChangeExp, self)
+    eventsIns:RemoveListener(_G.ePlayerStatus.PlayerUpLevel, self.PlayerUpLevel, self)
+    eventsIns:RemoveListener(_G.eDownloadPlay.HideDownloadBtn, self.HideDownloadBtn, self)
+    --eventsIns:RemoveListener(_G.eChatStatus.MainNewChat, self.OnAddMinChatItem, self)
+    -- _G.TaskModule:GetInstance():RemoveListener(
+    --     _G.TaskModuleEvent,
+    --     _G.TaskModuleEvent.EnumValueTable.CheckNowNpcHaveTask,
+    --     self.OnTaskCheckNowNpc,
+    --     self
+    -- )
+end
+
+--region 放置
+---获取放置快速奖励
+function MainManager:ShowGetRewardView()
+    -- _G.UIManager:GetInstance():SwitchSceneCloseWindows()
+    -- _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.QuickGetRewardView.Name,
+            function(itemList, closeFun)
+                _G.MainManager:GetInstance():ShowGetAwardEff(
+                        itemList,
+                        function()
+                            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                                    _G.ConfigManager.redpoint_cfg.AfkQuick.id
+                            )
+                            if closeFun ~= nil then
+                                closeFun()
+                            end
+                        end
+                )
+            end
+    )
+end
+
+---获取放置奖励
+function MainManager:GetAfkAward()
+    -- _G.UIManager:GetInstance():SwitchSceneCloseWindows()
+    -- _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    require "AfkModel":GetInstance():CheckAfkAward(
+            function(time, data)
+                _G.UIManager:GetInstance():OpenWindow(
+                        _G.ConfigManager.ui_cfg.GetawardView.Name,
+                        time,
+                        data,
+                        function(itemList)
+                            local Coin
+                            for _, value in pairs(itemList) do
+                                if value.data.sid == _G.ResPropID.Coin then
+                                    Coin = value.data.Count
+                                end
+                            end
+                        end
+                )
+            end
+    )
+end
+
+function MainManager:IsMain()
+    local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    if view and view.gameObject then
+        if view.View.go_table.obj_fort:GetActiveSelf() == 1 then
+            return true
+        end
+    end
+    return false
+end
+
+function MainManager:ExistMainView()
+    local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    if view and view.gameObject then
+        return true
+    end
+    return false
+end
+
+--endregion
+---检测是否需要显示关卡提示
+function MainManager:CheckSectioninfo()
+    local tChapterRoomManager = _G.ChapterRoomManager:GetInstance()
+    if tChapterRoomManager:GetisShowSectioninfo() == true then
+        return
+    end
+    local ChapterModel = require("ChapterModel"):GetInstance()
+    local sectionCfg = ChapterModel:GetCurChooseSectionCfg()
+    if not sectionCfg then
+        return
+    end
+    local sectionName = ""
+    if sectionCfg ~= nil then
+        --打开关卡banner描述
+        sectionName = sectionCfg.Openbanner
+    end
+
+    local curRoomCfg = tChapterRoomManager:GetCurRoomCfg()
+    if curRoomCfg == nil then
+        return
+    end
+    --如果 当前房间不是关卡 第一个房间
+    if _G.ConfigManager.main_room_cfg[sectionCfg.rooms[1]].id ~= curRoomCfg.id then
+        return
+    end
+
+    local chapterData = ChapterModel:GetCurChapterData()
+    if chapterData == nil then
+        return
+    end
+    local chapterDataName = ""
+    if chapterData ~= nil then
+        chapterDataName = chapterData.Name
+    end
+    tChapterRoomManager:SetisShowSectioninfo(true)
+    self.mainView:ShowChapterTips(chapterDataName, sectionName)
+end
+
+function MainManager:OnCreate()
+    self.nowtansuo = 0
+end
+
+function MainManager:GetCurPassRoomCount()
+    return self.PassRoomCount
+end
+
+---有新聊天信息
+---@param data chat.i_chat PB数据
+function MainManager:OnAddMinChatItem(data)
+    if data.type == _G.ChatInfoType.time then
+        return
+    end
+
+    local isshow = require("ChatManager"):GetInstance():GetMainHasPindao(data.channel)
+    local isUnlock = require("ChatManager"):GetInstance():IsUnLock(data.channel)
+    if isshow and isUnlock then
+        ---拉黑后不显示消息
+        if require("FriendManager"):GetInstance():CheckInBlackList(data.role_info.uid) then
+            return
+        end
+
+        local pindao = data.channel
+        local content = ""
+
+        if data.type == 3 then
+            local datafx = _G.Json2Table(data.n_Maincontent)
+            if datafx.shareType == 1 then
+                ---公会
+                content = self:NameAddColor(data.role_info.name) .. _G.GetLangPackValue(90000001051)
+            elseif datafx.shareType == 2 then
+                --战报
+                content = self:NameAddColor(data.role_info.name) .. _G.GetLangPackValue(90000001054)
+            elseif datafx.shareType == 3 then
+                --卡片
+                content = self:NameAddColor(data.role_info.name) .. _G.GetLangPackValue(90000001053)
+            elseif datafx.shareType == 4 then
+                --阵容
+                content = self:NameAddColor(data.role_info.name) .. _G.GetLangPackValue(90000001052)
+            end
+        elseif data.type == _G.ChatInfoType.Push then
+            --分享
+            content = _G.GetLangPackValue(9002060029)
+            pindao = 5
+        elseif data.type == _G.ChatInfoType.ShowCultivationPride then
+            content = self:NameAddColor(data.role_info.name) .. _G.GetLangPackValue(9002060025)
+        elseif data.type == _G.ChatInfoType.PlayerEmoji then
+            local str = _G.ConfigManager.expression_cfg[_G.tonumber(data.n_content)]
+            if str then
+                content = self:NameAddColor(data.role_info.name) .. str.key
+            else
+                content = self:NameAddColor(data.role_info.name) .. _G.string.removeRichTextSpecal(data.n_content)
+            end
+        elseif data.type == _G.ChatInfoType.StrategyStation then
+            content = _G.GetLangPackValue(90000011768)
+        elseif data.type == _G.ChatInfoType.MaidAcademy then
+            content = "女仆分享信息，需要加语言表"
+        elseif data.type == _G.ChatInfoType.ActivityDispatch then
+
+            content = _G.GetLangPackValue(90033400121)
+        elseif data.type == _G.ChatInfoType.GuildImpeach then
+            local tpchdata = _G.Json2Table(data.n_content)
+            content = _G.GetLangPackValue(90021800544, tpchdata.curImpeachNum, tpchdata.needImpeachNum)
+        elseif data.type == _G.ChatInfoType.GuildMoba then
+            content = _G.GetLangPackValue(90031700306)
+        elseif data.type == _G.ChatInfoType.RelicTeam then
+            content = data.role_info.name .. ":" .. _G.GetLangPackValue(90033500229)
+        elseif data.type == _G.ChatInfoType.system then
+            if data.channel == _G.ChatType.activityTournament then
+                content = data.n_content
+            else
+                content = self:NameAddColor(data.role_info.name) .. data.n_content
+            end
+        else
+            content = self:NameAddColor(data.role_info.name) .. _G.string.removeRichTextSpecal(data.n_content)
+        end
+        self.ChatTypeId = pindao
+        self.lastChat[1] = pindao
+        self.lastChat[2] = content
+        self.lastChat[3] = data
+        if pindao == _G.ChatType.union then
+            self.lastSociatyChat[1] = pindao
+            self.lastSociatyChat[2] = content
+            self.lastSociatyChat[3] = data
+        end
+        if data.time == nil then
+            self.mainTime = _G.TimeUtil.GetServerUnixTime()
+            self.mainType = pindao
+        elseif self.mainTime == nil then
+            self.mainTime = data.time
+            self.mainType = pindao
+        elseif self.mainTime < data.time then
+            self.mainTime = data.time
+            self.mainType = pindao
+        else
+            return
+        end
+
+        if self.mainView then
+            ---是否显示该频道消息
+            self.mainView:AddMinChatItem(pindao, content, data.channel)
+        end
+        if self.afkView then
+            self.afkView:AddMinChatItem(pindao, content, data.channel)
+        end
+        local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+        if mainView and mainView.panelInit.sociaty and pindao == _G.ChatType.union then
+            if mainView.panelLua.sociaty then
+                mainView.panelLua.sociaty:AddMinChatItem(pindao, content, data.channel)
+            end
+        end
+    end
+end
+
+---@param data chat.p2c_del_chat
+function MainManager:OnClearMinChatItem(data)
+    --镇魂街ZHJ-27879 Alpha_JT BUG合集ZHJ-33780
+    --【公会战】极低概率会出现报错
+    if nil == self.mainView then
+        return
+    end
+    if self.lastChat[3] then
+        local lastData = self.lastChat[3]
+        if lastData.chat_id == data.chat_id or lastData.role_info.uid == data.role_uid then
+            if data.role_uid ~= _G.PlayerModel:GetInstance():GetPlayerUid() then
+                self.mainView:AddMinChatItem(self.lastChat[1], "")
+                if self.afkView then
+                    self.afkView:AddMinChatItem(self.lastChat[1], "")
+                end
+            end
+        end
+    end
+end
+
+--- 工会战新消息
+function MainManager:OnAddUnionBattleChatItem(data)
+    --镇魂街ZHJ-27879 Alpha_JT BUG合集ZHJ-33780
+    --【公会战】极低概率会出现报错
+    if nil == self.mainView then
+        return
+    end
+    local log = require "SociatyBattleModel":GetInstance():FormatLogChat(data)
+    local content = log.n_content
+    local pindao = 9
+    self.ChatTypeId = pindao
+    self.lastChat[1] = pindao
+    self.lastChat[2] = content
+    self.mainTime = log.time
+    self.mainType = pindao
+    self.mainView:AddMinChatItem(pindao, content)
+    if self.afkView then
+        self.afkView:AddMinChatItem(pindao, content)
+    end
+end
+
+--- 公会联赛新消息
+function MainManager:OnAddUnionBattleLeagueChatItem(data)
+    if nil == self.mainView then
+        return
+    end
+    local log = require "SociatyBattleLeagueModel":GetInstance():FormatLogChat(data)
+    local content = log.n_content
+    local pindao = _G.ChatType.unionbattleleague
+    self.ChatTypeId = pindao
+    self.lastChat[1] = pindao
+    self.lastChat[2] = content
+    self.mainTime = log.time
+    self.mainType = pindao
+    self.mainView:AddMinChatItem(pindao, content)
+    if self.afkView then
+        self.afkView:AddMinChatItem(pindao, content)
+    end
+end
+
+---给名字加上颜色
+function MainManager:NameAddColor(str)
+    return "<color=#85b7e6>" .. str .. "：</color>"
+end
+
+---经验变化
+function MainManager:PlayerChangeExp()
+    -- self.mainView:UpdateExp()
+end
+
+---玩家升级更新玩家数据
+---@param oldLevel number       @升级前的等级
+---@param newLevel number       @升级后的等级(如果一次性升几级, 只会发送一次事件)
+function MainManager:PlayerUpLevel(oldLevel, newLevel)
+    -- self.mainView:UpdateLevel()
+    self.mainView:RefreshAfkBoxTip()
+    ---主角身上播放 3D 升级特效 弹出升级后等级特效
+    -- self:ShowLvUPEffect()
+
+    --上报角色数据(下一次登录需要时需要准备"边玩边下", 判断条件为等级>=10)
+    if newLevel >= 10 and oldLevel < 10 then
+        _G.LoginManager:GetInstance():UploadUserToSDK(false)
+    end
+end
+
+---监听下载完成领奖完成事件 隐藏主界面按钮
+function MainManager:HideDownloadBtn(isShow)
+    if not self.mainView or not self.mainView.HideDownloadBtn then
+        return
+    end
+    self.mainView:HideDownloadBtn(isShow)
+end
+
+---播放玩家放置效率改变
+function MainManager:ShowEfficientChanged()
+    if not self.mainView or not self.mainView.ShowEfficientChanged then
+        return
+    end
+    self.mainView:ShowEfficientChanged()
+end
+
+---播放玩家放置效率改变
+function MainManager:RefreshAfkBoxTip()
+    if not self.mainView or not self.mainView.RefreshAfkBoxTip then
+        return
+    end
+    self.mainView:RefreshAfkBoxTip()
+end
+
+--是否存在后台战斗实例
+---@param showTip boolean? 显示tip
+---@return boolean
+function MainManager:IsFighting(showTip)
+    if _G.DeadsoulTowerManager:GetInstance():IsFighting() or require("AfkBattleManager"):GetInstance():IsFighting()
+            or require("GMArenaPeakModel"):GetInstance():GetBackIng() or require("SecretRealmModel"):GetInstance():IsFighting() then
+        if showTip then
+            _G.PopWindowManager:GetInstance():ShowAllTips(46)
+        end
+        return true
+    end
+    return false
+end
+
+---切换并显示野外窗口
+---@return void
+function MainManager:ShowWildWindow()
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return
+    end
+
+    --切换至afk页面
+    if not mainView:IsToggled("wild") then
+        mainView:GotoToggle("wild")
+    else
+        mainView:OnWild(true)
+    end
+end
+
+---刷新野外窗口
+---@return void
+function MainManager:RefreshWildWindow()
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView and mainView:IsToggled("wild") then
+        mainView:OnWild(true)
+    end
+end
+
+---刷新主页面军衔信息
+function MainManager:RefreshMainHellInfos()
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return
+    end
+
+    if mainView:IsToggled("fort") then
+        ---@type MainPanel
+        local panel = mainView:GetToggledWindow("fort")
+        if panel then
+            panel:UpdateHell()
+        end
+    end
+    if mainView:IsToggled("afk") then
+        ---@type MainAfkPanel
+        local panel = mainView:GetToggledWindow("fort")
+        if panel then
+            panel:UpdateHell()
+        end
+    end
+end
+
+---是否选中Afk选项卡
+---@param checkActive boolean   检查MainView窗口是否已激活
+---@return boolean
+function MainManager:IsToggledWildWindow(checkActive)
+    if checkActive and not _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name) then
+        return false
+    end
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return false
+    end
+    return mainView:IsToggled("wild")
+end
+
+---切换并显示Afk窗口
+---@return void
+function MainManager:ShowAfkWindow()
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return
+    end
+
+    --切换至afk页面
+    if not mainView:IsToggled("afk") then
+        mainView:GotoToggle("afk")
+    else
+        if _G.AppSetting.IsXzns then
+            mainView:OnAfk(true, nil, true)
+        else
+            mainView:OnAfk(true)
+        end
+    end
+end
+
+---刷新Afk窗口
+---@return void
+function MainManager:RefreshAfkWindow()
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView and mainView:IsToggled("afk") then
+        if _G.AppSetting.IsXzns then
+            mainView:OnAfk(true, nil, true)
+        else
+            mainView:OnAfk(true)
+        end
+    end
+end
+
+---刷新Afk toggle特效状态
+---@return void
+function MainManager:RefreshAfkToggleEffect()
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView then
+        mainView:UpdateAfkIdelEffect()
+        mainView:UpdateAfkFightingEffect()
+    end
+end
+
+---是否选中Afk选项卡
+---@param checkActive boolean   检查MainView窗口是否已激活
+---@return boolean
+function MainManager:IsToggledAfkWindow(checkActive)
+    if checkActive and not _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name) then
+        return false
+    end
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return false
+    end
+    return mainView:IsToggled("afk")
+end
+
+---是否选中福利选项卡
+---@param checkActive boolean   检查MainView窗口是否已激活
+---@return boolean
+function MainManager:IsToggledBenefitWindow(checkActive)
+    if checkActive and not _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name) then
+        return false
+    end
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return false
+    end
+    return mainView:IsToggled("benefit")
+end
+
+---是否选中公会选项卡
+---@param checkActive boolean   检查MainView窗口是否已激活
+---@return boolean
+function MainManager:IsToggledSociatyWindow(checkActive)
+    if checkActive and not _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name) then
+        return false
+    end
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return false
+    end
+    return mainView:IsToggled("sociaty")
+end
+
+---带判断条件的玩家播放效率改变
+function MainManager:ShowEfficientChangedByCondition()
+    local AfkModel = require "AfkModel":GetInstance()
+    if AfkModel:GetHasShowTips() then
+        if _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name) then
+            local storyId = _G.WorldManager:GetInstance():CheckAfkAfterAwardStoryID()
+            local isHaveFunOpenView = _G.FunctionManager:GetInstance():IsHaveFunOpenView()
+            if not (storyId or isHaveFunOpenView) and AfkModel:GetCurSection() > 101003 then
+                self:ShowEfficientChanged()
+                AfkModel:SetHasShowTips(false)
+            end
+        end
+    end
+end
+
+---播放玩家升级特效
+function MainManager:ShowLvUPEffect()
+    local effectCfg = _G.ConfigManager.ui_effect_cfg["fx_h_shengji_effect"]
+    _G.UIUtils.LoadEffectByCfg(effectCfg, _G.WorldManager:GetInstance():GetCurWorldPlayer().Transform)
+end
+
+--region UI开关设置是否在主界面
+---打开UI
+function MainManager:OnUIOpened(name)
+    self:SetShadowTopView(name)
+    if require "TreasureMapModel":GetInstance():GetRunning() and name == "ChatView" then
+        self:SetInMainView(name, true)
+    else
+        if not self.ignoreViewDic[name] then
+            --- 打开界面 不在触发寻路
+            _G.Events:GetInstance():Broadcast(_G.eNav.NavInterruptMove, _G.PlayerModel:GetInstance().role_uid)
+            self:SetInMainView(name, true)
+        end
+    end
+end
+
+function MainManager:SetShadowTopView(name, isColse)
+    ----@type ui_cfg_Item
+    local uicfg = _G.ConfigManager.ui_cfg[name]
+    if uicfg == nil or uicfg.Delay_Click == 0 then
+        return
+    end
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(name)
+    if view == nil then
+        return
+    end
+    if isColse == true then
+        if view.ShadowTimer ~= nil then
+            view.ShadowTimer:Stop()
+            view.ShadowTimer = nil
+            _G.PoolsManager:GetInstance():Despawn(view.ShadowTrans, _G.ePoolType.UIItem)
+        end
+        return
+    end
+
+    _G.PoolsManager:GetInstance():Spawn(
+            _G.ConfigManager.ui_cfg.ShadowTopView.PrefabPath,
+            _G.ePoolType.UIItem,
+            view,
+            function(trans)
+                if view.ShadowTimer ~= nil then
+                    view.ShadowTimer:Reset()
+                else
+                    view.ShadowTrans = trans
+                    view.ShadowTimer = _G.TimerManager:GetInstance():GetTimer(
+                            uicfg.Delay_Click,
+                            self.GetTimerCallBack,
+                            self,
+                            true,
+                            false,
+                            true,
+                            trans
+                    )
+                    view.ShadowTimer:Start()
+                end
+                -- body
+            end
+    )
+end
+
+function MainManager:GetTimerCallBack(trans)
+    _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.UIItem)
+end
+
+---先刷新逻辑数据
+function MainManager:StartCloseUI(name)
+    self:SetInMainView(name, false)
+end
+
+---关闭UI
+function MainManager:OnUIClosed(name)
+    self:SetShadowTopView(name, true)
+end
+
+---理论上是没有用的函数
+function MainManager:FunOpen(mainFunid)
+    if mainFunid == nil then
+        return
+    end
+    self:DelayUpdateMainView()
+
+    if type(mainFunid) ~= "number" then
+        mainFunid = tonumber(mainFunid)
+    end
+    --神器解锁, 刷新神器红点
+    if mainFunid == 145 then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Artifact.id)
+    end
+    require("StrengthGuideModel"):GetInstance():FunOpen(mainFunid)
+    require("MonthlyModel"):GetInstance():FunOpen(mainFunid)
+end
+
+---功能开放事件处理
+function MainManager:FunctionOpen(openFunid)
+    if openFunid == nil then
+        return
+    end
+    self:DelayUpdateMainView()
+
+    if type(openFunid) ~= "number" then
+        openFunid = tonumber(openFunid)
+    end
+    --神器解锁, 刷新神器红点
+    if openFunid == 145 then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Artifact.id)
+    elseif openFunid == 272 then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SpiritualDrawGiftPack.id)
+    end
+    require("StrengthGuideModel"):GetInstance():FunOpen(openFunid)
+    local fp = _G.ConfigManager.function_open_cfg[openFunid]
+    if nil == fp then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(openFunid, "打开的功能id必须是function_open_cfg表的id，错误id是")
+        end
+        return
+    end
+
+    if #fp.reward <= 0 then
+        if _G.AppSetting.DEBUG then
+            _G.Log(openFunid, "当前开放功能没有奖励可拿")
+        end
+        return
+    end
+
+    if _G.AppSetting.DEBUG then
+        if not _G.GlobalConditionManager.CheckConditionByArray(fp.condition_type) then
+            _G.LogError(openFunid, "功能未开放触发开放奖励错误id")
+            return
+        end
+    end
+
+    if nil == self.OpenAwardTimer then
+        self.OpenAwardTimer = _G.TimerManager:GetInstance():GetTimer(0.1, self.OpenAwardTimerFunc, self, true, false,
+                true)
+        self.OpenAwardTimer:Start()
+        self.OpenAwardMsg = {}
+        self.OpenAwardMsg.function_ids = {}
+    end
+    table.insert(self.OpenAwardMsg.function_ids, openFunid)
+end
+
+---功能禁用事件
+---@param functionId number 功能id
+function MainManager:FunctionForbidden(functionId)
+    if not functionId then
+        return
+    end
+    self:DelayUpdateMainView()
+
+    if type(functionId) ~= "number" then
+        functionId = tonumber(functionId)
+    end
+
+    --TODO: 处理红点相关逻辑
+end
+
+function MainManager:OpenAwardTimerFunc()
+    require "QuestionAnswerNet":GetInstance():OpenAward(
+            self.OpenAwardMsg,
+            function(msg)
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            end
+    )
+    self.OpenAwardTimer = nil
+end
+
+---延迟刷新主页面状态(将多次同步调用合并为一次延迟调用)
+function MainManager:DelayUpdateMainView()
+    if self.delayUpdateMainViewTimer then
+        return
+    end
+    self.delayUpdateMainViewTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnUpdateMainViewCallback, self, true,
+            true, true)
+    self.delayUpdateMainViewTimer:Start()
+end
+
+---更新页面回调
+function MainManager:OnUpdateMainViewCallback()
+    self.delayUpdateMainViewTimer = nil
+    if _G.IsNil(self.mainView) then
+        return
+    end
+    self.mainView:UpdateView()
+end
+
+---设置左侧信息面板是否显示（任务/组队）
+---@param isShow boolean true 显示
+function MainManager:ShowTagShrink(isShow)
+    if _G.IsNil(self.mMainView_Task) then
+        return
+    end
+    self.mMainView_Task:ShowTagShrink(isShow)
+end
+
+---目标奖励 刷新
+function MainManager:UpdataChapterRaward()
+    if _G.IsNil(self.mainView) then
+        return
+    end
+    self.mainView:InitChapterRaward()
+end
+
+---刷新七日礼包icon
+function MainManager:UpdateSevenGiftIcon()
+    if _G.IsNil(self.mainView) then
+        return
+    end
+    self.mainView:UpdateSevenGiftIcon()
+end
+
+---刷新七日礼包GM活动icon
+function MainManager:UpdateSevenGiftGMIcon()
+    if _G.IsNil(self.mainView) then
+        return
+    end
+    self.mainView:UpdateSevenGiftGMIcon()
+end
+
+function MainManager:SetShowTouch(isShow)
+    if _G.IsNil(self.mainView) then
+        return
+    end
+    _G.GameUtil.SetActiveByCondition(self.mainView.go_table.obj_Touch, isShow)
+end
+
+---显示获取奖励动画
+---@param itemList table {Pos,data}
+function MainManager:ShowGetAwardEff(itemList, call)
+    if _G.IsNil(self.mainView) then
+        if call then
+            call()
+        end
+        return
+    end
+    self.mainView:ShowGetAwardEff(itemList, call)
+end
+
+---得到线路
+function MainManager:GetXianlu()
+    local xianlu = require("ServerLineManager"):GetInstance():GetCurServerLine()
+    if xianlu then
+        return xianlu
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log("mainview获取线路为空")
+        end
+    end
+end
+
+function MainManager:SetXianlu()
+    local xianlu = self:GetXianlu()
+    if xianlu ~= nil then
+        self.mainView:SetXianlu(xianlu)
+    end
+end
+
+---设置显示副本界面 暂停按钮
+function MainManager:ShowFightStopIcon(isShow)
+    self.isShowMainViewStopicon = isShow
+    if _G.IsNil(self.mainView) then
+        return
+    end
+    self.mainView:ShowFightStopIcon(isShow)
+end
+
+function MainManager:InitFunctions()
+    if _G.IsNil(self.mainView) then
+        return
+    end
+    self.mainView:InitFunctions()
+end
+
+---设置是否在主界面的判断
+function MainManager:SetInMainView(name, isOpenUI)
+    if self.mainView == nil or self.mainView.gameObject == nil then
+        return
+    end
+    if self.ignoreViewDic[name] then
+        return
+    end
+    if isOpenUI then
+        local index = _G.table.indexof(self.fullUINameList, name)
+        local target = _G.UIManager:GetInstance():GetWindow(name)
+        if target and target.Full == 1 and false == index then
+            _G.table.insert(self.fullUINameList, name)
+        end
+    else
+        local index = _G.table.indexof(self.fullUINameList, name)
+        if false ~= index then
+            _G.table.remove(self.fullUINameList, index)
+        end
+    end
+    self:UpdataInMainView(isOpenUI)
+end
+
+---刷新是否在主界面的判断
+function MainManager:UpdataInMainView(isOpenUI)
+    self.isInMainView = #self.fullUINameList <= 0 and self.mainView.gameObject:GetctiveInHierarchy() == 1
+    if isOpenUI == false and self.isInMainView == true then
+        self.CurPop = nil
+        self:MainQueueFun_Check()
+    end
+end
+
+--endregion
+
+
+---@class MainOpenViewFunItem
+---@field checkFun function 检测函数  nil 或 return True  执行OpenViewFun
+---@field OpenViewFun function 打开界面函数
+---@field DelFun function true就删除本条 (Open条件不满足了 不再执行)
+---@field CallFun function 执行完成回调(剧情在用)
+---@field StoryID number 剧情ID，剧情用来判断是不是已经有一个相同的id存在了
+
+---添加 一个将要打开的界面
+---@param parmas MainOpenViewFunItem table<checkFun = 检测函数，OpenViewFun =执行函数>
+---@param ShowOrder MainViewShowOrder 显示优先级
+function MainManager:AddMainFunQueue(parmas, ShowOrder)
+    if _G.AppSetting.IsArraigned then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("提审模式中，无法开启主界面队列，本条为打印")
+        end
+        return
+    end
+    if self.MainOpenViewFunQueue == nil then
+        self.MainOpenViewFunQueue = {}
+    end
+    if self.MainOpenViewFunQueue[ShowOrder] == nil then
+        self.MainOpenViewFunQueue[ShowOrder] = {}
+    end
+    table.insert(self.MainOpenViewFunQueue[ShowOrder], parmas)
+
+    self:MainQueueFun_Check()
+end
+
+---指定弹出玩家升级弹窗
+function MainManager:PopLevelUpView()
+    if self.MainOpenViewFunQueue == nil then
+        return
+    end
+    local view = self.MainOpenViewFunQueue[_G.MainViewShowOrder.lvUp]
+    if view then
+        for _, value in pairs(view) do
+            local checkFun = value.checkFun
+            if checkFun == nil or checkFun() then
+                value.OpenViewFun()
+            end
+            self.MainOpenViewFunQueue[_G.MainViewShowOrder.lvUp] = nil
+            return
+        end
+    end
+end
+
+---剧情专属
+function MainManager:HasMainFunQueueByStoryID(ShowOrder, storyId)
+    local mainQueue = self.MainOpenViewFunQueue[ShowOrder]
+    if mainQueue then
+        for _, value in pairs(mainQueue) do
+            if value.StoryID == storyId then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---获取一个 可执行函数
+---@param 变量名 boolean true仅检测是否有可执行函数 (true 返回可执行函数 不删除)
+function MainManager:PopMainFunQueue(isCheck)
+    local fun = nil
+    local id = 0
+    local count = _G.MainViewShowOrder.End
+
+    local checkFun, DelFun
+    ---要删除的索引 (open的 及 del的)
+    local delIndexArr = {}
+    local insert = _G.table.insert
+    local remove = _G.table.remove
+    for i = 1, count do
+        if self.MainOpenViewFunQueue[i] then
+            for index, value in pairs(self.MainOpenViewFunQueue[i]) do
+                if value.DelFun and value.DelFun() == true then
+                    insert(delIndexArr, index)
+                else
+                    checkFun = value.checkFun
+                    if checkFun == nil or checkFun() then
+                        fun = value.OpenViewFun
+                        id = i
+                        if isCheck == true then
+                            --不处理 仅返回函数
+                        else
+                            insert(delIndexArr, index)
+                        end
+                    end
+                end
+                for k = #delIndexArr, 1, -1 do
+                    remove(self.MainOpenViewFunQueue[i], delIndexArr[k])
+                end
+                --赋空 防止IsMainQueueFun误判
+                if #self.MainOpenViewFunQueue[i] == 0 then
+                    self.MainOpenViewFunQueue[i] = nil
+                end
+                if fun then
+                    return fun, id
+                end
+            end
+        end
+    end
+
+    return fun, id
+end
+
+---检测是否有队列
+function MainManager:IsMainQueueFun()
+    return not _G.table.isEmptyOrNil(self.MainOpenViewFunQueue)
+end
+
+---检测是否有可执行
+function MainManager:IsHaveOpenMainQueueFun()
+    local fun, id = self:PopMainFunQueue(true)
+    return fun ~= nil
+end
+
+function MainManager:MainQueueFun_Check()
+    if self.TimerCheckOpen or self.isInMainView == false or self.CurPop ~= nil then
+        return
+    end
+    if _G.AppSetting.DEBUG then
+        _G.Log("<color=blue><size=20>" .. "当前队列检测，检测开始" .. "</size></color>")
+    end
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+    --self.mainView:HideMask(true)
+    ---延迟帧 防止队列中 跳转新界面（close界面（此时只剩主界面） 再open新界面） 之间错误弹出
+    self.TimerCheckOpen = _G.TimerManager:GetInstance():GetTimer(3, self.TimerFunc, self, true, true, true)
+    --_G.DelayDo(0.1, _G.handler(self,self.TimerFunc))
+    self.TimerCheckOpen:Start()
+end
+
+function MainManager:TimerFunc()
+    if _G.AppSetting.DEBUG then
+        _G.Log("<color=blue><size=20>" .. "当前队列检测，延迟检测开始" .. "</size></color>")
+    end
+    self:MainQueueFun_Check2()
+    self:ChapterTaskSubmitCheck()
+    self:StopTimerCheckOpen()
+    --self.TimerCheckOpen = false
+end
+
+function MainManager:StopTimerCheckOpen()
+    if self.TimerCheckOpen then
+        self.TimerCheckOpen:Stop()
+        self.TimerCheckOpen = nil
+    end
+end
+
+function MainManager:ChapterTaskSubmitCheck()
+    ---在剧本时 检测是否有提交任务后剧情
+    local fun
+    if self.mainView.isSection then
+        if self:IsMainQueueFun() then
+            if self.MainOpenViewFunQueue[_G.MainViewShowOrder.mainOthen] then
+                for k, value in pairs(self.MainOpenViewFunQueue[_G.MainViewShowOrder.mainOthen]) do
+                    fun = value.OpenViewFun
+                    break
+                end
+                self.MainOpenViewFunQueue[_G.MainViewShowOrder.mainOthen] = nil
+                if fun then
+                    self.HasMainDisplayQueue = true
+                    fun()
+                    return
+                end
+                self.HasMainDisplayQueue = false
+            end
+        end
+    end
+end
+
+function MainManager:MainQueueFun_Check2()
+    ---在剧本时 主界面打开 但不检测队列
+    if self.isInMainView and not self.mainView.isSection then
+        if self:IsMainQueueFun() then
+            local fun, id = self:PopMainFunQueue(true)
+            if fun then
+                ---强制引导中或者失败引导中
+                if
+                _G.GuideManager:GetInstance().IsGuideing and
+                        (_G.GuideManager:GetInstance().CurGuideModelCfg.not_force == false or
+                                _G.GuideManager:GetInstance().CurGuideModelCfg.id ==
+                                        _G.ConfigManager.discrete_cfg[102103][1][1])
+                then
+                    if id < _G.MainViewShowOrder.SelectSectionViewOpen then
+                        fun, id = self:PopMainFunQueue()
+                        self.HasMainDisplayQueue = true
+                        self.CurPop = id
+                        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+                        fun()
+                        return
+                    else
+                        if _G.AppSetting.DEBUG then
+                            _G.Log("<color=blue><size=20>" .. "当前队列检测，引导优化插队" .. "</size></color>")
+                        end
+                    end
+                else
+                    fun, id = self:PopMainFunQueue()
+                    self.HasMainDisplayQueue = true
+                    self.CurPop = id
+                    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+                    fun()
+                    return
+                end
+            else
+                if _G.AppSetting.DEBUG then
+                    _G.Log("<color=blue><size=20>" .. "当前队列检测，队列id为" .. id .. "的队列函数为空" .. "</size></color>")
+                end
+            end
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log("<color=blue><size=20>" .. "当前队列检测，队列为空" .. "</size></color>")
+            end
+        end
+        self.HasMainDisplayQueue = false
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=blue><size=20>" .. "当前队列检测不在主界面，不能触发队列" .. "</size></color>")
+            for i = 1, #self.fullUINameList do
+                _G.Log(
+                        "<color=blue><size=20>" .. "当前队列检测不在主界面，" .. tostring(self.fullUINameList[i]) .. "</size></color>"
+                )
+            end
+            _G.Log(
+                    "<color=blue><size=20>" ..
+                            "当前队列检测不在主界面，" .. tostring(self.mainView.gameObject:GetctiveInHierarchy()) .. "</size></color>"
+            )
+        end
+    end
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+end
+
+function MainManager:GetMainView_Task(View, call)
+    if self.mMainView_Task == nil then
+        _G.PoolsManager:GetInstance():Spawn(
+                "UI/MainView/MainView_Task",
+                _G.ePoolType.Static,
+                View.gameObject,
+                function(trans)
+                    local mMainView_Task = View:AddComponent(trans.gameObject, require("MainView_Task").New(trans.gameObject))
+                    ---@type MainView_Task
+                    self.mMainView_Task = mMainView_Task
+                    call(self.mMainView_Task)
+                end
+        )
+    else
+        self.mMainView_Task.gameObject:SetParentE(View.gameObject)
+        call(self.mMainView_Task)
+    end
+end
+
+function MainManager:InitSectionTaskInfo(View, call)
+    local ChapterView_Task = View:AddComponent(
+            self.mainView.minTaskView.gameObject,
+            require("ChapterView_Task").New(self.mainView.minTaskView.gameObject)
+    )
+    ---@type ChapterView_Task
+    self.ChapterView_Task = ChapterView_Task
+    call(self.ChapterView_Task)
+end
+
+---获取最后一条信息
+---@return number,string 频道 内容
+function MainManager:GetLastChat()
+    return self.lastChat[1], self.lastChat[2]
+end
+
+---获取最后一条公会信息
+---@return number,string 频道 内容
+function MainManager:GetLastSociatyChat()
+    return self.lastSociatyChat[1], self.lastSociatyChat[2]
+end
+
+--region 活动按钮展示
+---获取所有展示活动按钮
+---@return 变量类型 中文描述
+function MainManager:GetAllActivitySynBtnsInfo()
+    return self.activitySynBtnsInfoTab
+end
+
+---新增一个活动按钮
+---@param tag string 按钮标签
+---@param icon string 按钮icon名字
+---@param click function 按钮点击方法
+---@param pos number 展示位置
+---@param index number 排序
+---@param name string 按钮显示名称
+---@param eff ui_effect_cfg 按钮特效
+---@param redpointID number 按钮红点ID
+---@param redpointParam number 按钮红点参数
+function MainManager:AddActivitySynBtn(
+        tag,
+        icon,
+        click,
+        pos,
+        index,
+        name,
+        eff,
+        redpointID,
+        redpointParam,
+        isBanner,
+        ftype,
+        typeid)
+    if ftype and ftype < 0 then
+        ---类型小于0的不应该在主界面
+        return
+    end
+    if not self.activitySynBtnsInfoTab then
+        self.activitySynBtnsInfoTab = {}
+    end
+    local item = {
+        tag = tag,
+        icon = icon,
+        click = click,
+        pos = pos,
+        index = index,
+        name = name,
+        eff = eff,
+        redpointID = redpointID,
+        redpointParam = redpointParam,
+        isBanner = isBanner,
+        ftype = ftype,
+        typeid = typeid
+    }
+    if #self.activitySynBtnsInfoTab > 0 then
+        local btn
+        local insert = _G.table.insert
+        for i = 1, #self.activitySynBtnsInfoTab do
+            btn = self.activitySynBtnsInfoTab[i]
+            if index <= btn.pos and index < btn.index then
+                insert(self.activitySynBtnsInfoTab, i, item)
+                break
+            end
+            if i == #self.activitySynBtnsInfoTab then
+                insert(self.activitySynBtnsInfoTab, i + 1, item)
+            end
+        end
+    else
+        self.activitySynBtnsInfoTab[1] = item
+    end
+    if self.mainView then
+        --TODO:计算展示位置
+        local tab, sortV
+        sortV = 0
+        for i = 1, #self.activitySynBtnsInfoTab do
+            tab = self.activitySynBtnsInfoTab[i]
+            if tab.pos == pos then
+                if tab.tag == tag then
+                    break
+                else
+                    sortV = sortV + 1
+                end
+            end
+        end
+        self.mainView:AddActivitySynBtn(item, tab.index)
+    end
+end
+
+---移除一个活动按钮
+---@param tag number 活动按钮ID
+function MainManager:RemoveActivitySynBtn(tag, type1, sorting, isBanner, ftype)
+    if self.activitySynBtnsInfoTab == nil then
+        self.activitySynBtnsInfoTab = {}
+    end
+    for i = 1, #self.activitySynBtnsInfoTab do
+        if self.activitySynBtnsInfoTab[i].tag == tag then
+            if self.mainView then
+                self.mainView:RemoveActivitySynBtn(tag, type1, sorting, ftype)
+            end
+            _G.table.remove(self.activitySynBtnsInfoTab, i)
+            break
+        end
+    end
+end
+
+---按钮点击
+---@param 变量名 变量类型 中文描述
+function MainManager:OnActivityBtnClick(tag)
+    for i = 1, #self.activitySynBtnsInfoTab do
+        if self.activitySynBtnsInfoTab[i].tag == tag then
+            self.activitySynBtnsInfoTab[i].click(tag)
+            break
+        end
+    end
+end
+
+--endregion
+---是否显示主界面挂机宝箱小人头像
+---@return boolean 是否显示
+---@return table<mHeads,eHeads> AfkModel.GetLastAfkSectionGroupHeads
+function MainManager:ShowAfkBattleGroup()
+    local group = require "AfkModel":GetInstance():GetLastAfkSectionGroupHeads()
+    if not group then
+        return false, nil
+    else
+        return true, group
+    end
+end
+
+---刷新野外广告飞艇
+function MainManager:RefreshWildPlane()
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return
+    end
+
+    if mainView:IsToggled("wild") then
+        ---@type MainPanel
+        local panel = mainView:GetToggledWindow("wild")
+        if panel then
+            panel:ShowPlane()
+        end
+    end
+end
+
+function MainManager:SetForShowGodSpecialGift(isShow)
+    local ret = self.isForceShowGodSpecialGift
+    self.isForceShowGodSpecialGift = isShow
+    return ret
+end
+
+function MainManager:GetForceShowGodSpecialGift()
+    return self.isForceShowGodSpecialGift
+end
+
+function MainManager:OpenMainViewToggle(key, call)
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if ctrl then
+        ctrl:SetToggleOn(key, call)
+    end
+end
+
+---@private 监听新卡牌事件
+function MainManager:OnNewCard(card)
+    if not self.addNewCardMainFunQueue then
+    end
+    local cardManager = require("CardInfoManager"):GetInstance()
+    if cardManager:CheckAutoCardDevelopToggle() and not self.newCardAutoDevelop then
+        self.newCardAutoDevelop = true
+        _G.DelayFrameDo(_G.handlerbind(self, self.OnNewCardAutoCardDevelop))
+    end
+
+    if not self.addNewCardMainFunQueueTime or self.addNewCardMainFunQueueTime < _G.Time.time then
+        self.addNewCardMainFunQueueTime = _G.Time.time + 5 --间隔检测时间x秒
+        _G.DelayFrameDo(_G.handlerbind(self, self.OnNewCardAddMainFunQueue))
+    end
+end
+
+---@private 获得新卡牌时, 自动卡牌升星
+function MainManager:OnNewCardAutoCardDevelop()
+    local cardManager = require("CardInfoManager"):GetInstance()
+    cardManager:AutoCardDevelopRecursive(function(ok, msg)
+        self.newCardAutoDevelop = false
+        if ok and msg then
+            _G.UIUtils.ShowCommonAward(msg)
+        end
+    end)
+end
+
+---@private 获得新卡牌时, 添加检测弹窗队列
+function MainManager:OnNewCardAddMainFunQueue()
+    if self.addNewCardMainFunQueue then
+        return
+    end
+
+    --检查背包容量是否充足
+    local function checkSize()
+        local cfg = _G.ConfigManager.discrete_cfg[119010]
+        local minSize = cfg and cfg[1][1] or 10
+        if minSize < 0 then
+            return true --禁用此功能
+        end
+        return _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Card, minSize)
+    end
+    if checkSize() then
+        return
+    end
+    self.addNewCardMainFunQueue = true
+
+    ---@type MainOpenViewFunItem
+    local MainOpenViewFunItem = {}
+    MainOpenViewFunItem.OpenViewFun = function(callback)
+        self.addNewCardMainFunQueue = false
+        local function nextPopWindow()
+            if callback then
+                _G.DelayFrameDo(callback)
+            end
+        end
+        --检查背包容量是否小于x个
+        if checkSize() then
+            nextPopWindow()
+            return
+        end
+
+        local cardManager = require("CardInfoManager"):GetInstance()
+        --检测是否开启自动升星
+        -- if cardManager:CheckAutoCardDevelopToggle() and cardManager:CheckAutoCardDevelop() then
+        --     nextPopWindow()
+        --     return
+        -- end
+
+        --弹窗卡牌: 自动升星
+        if not cardManager:CheckAutoCardDevelopToggle() and cardManager:CheckAutoCardDevelop() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                    1006,
+                    nil,
+                    function(isChoose)
+                        cardManager:SetAutoCardDevelopToggle(isChoose)
+                        cardManager:AutoCardDevelopRecursive(function(ok, msg)
+                            nextPopWindow()
+                            if ok and msg then
+                                _G.UIUtils.ShowCommonAward(msg)
+                            end
+                        end)
+                    end,
+                    function(isChoose)
+                        cardManager:SetAutoCardDevelopToggle(isChoose)
+                        nextPopWindow()
+                    end,
+                    cardManager:CheckAutoCardDevelopToggle()
+            )
+            return
+        end
+
+        --弹窗提示: 扩容
+        local maxCapacityTimes = _G.ConfigManager.storage_cfg[_G.StorageID.Card].extension_limit
+        local capacityTimes = _G.StorageManager:GetInstance():GetStorageCapacityTimes(_G.StorageID.Card) or 0
+        if capacityTimes < maxCapacityTimes then
+            if _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.ResProp, _G.ResPropID.Diamond) >=
+                    _G.ConfigManager.storage_cfg[_G.StorageID.Card].extension_consumption then
+                _G.StorageUtils.CardBagAdd(nextPopWindow)
+                return
+            end
+        end
+
+        --弹窗提示: 升星界面
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+                1007,
+                nil,
+                function()
+                    _G.JumpManager:GetInstance():Jump(129002)
+                end,
+                nextPopWindow
+        )
+    end
+    --self:AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.OnePay)
+    _G.PopWindowManager:GetInstance():AddPopWindowQuene(MainOpenViewFunItem, _G.PopViewShowOrder.AutoCardDevelop)
+end
+
+---打开卡牌展示界面
+function MainManager:OpenCardShowView()
+    ---@type MainView
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if not mainView then
+        return
+    end
+
+    if mainView:IsToggled("card") then
+        ---@type MainPanel
+        local panel = mainView:GetToggledWindow("card")
+        if panel then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CardShowView.Name, nil, panel.cardView)
+        end
+    end
+end

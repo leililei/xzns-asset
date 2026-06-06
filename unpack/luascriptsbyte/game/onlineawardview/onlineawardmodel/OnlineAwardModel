@@ -1,0 +1,340 @@
+--------------------------------------------------------------------------
+-- D:.Game.Client.Assets.Resources.LuaScripts.Game.OLineAwardView.OnlineAwardModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/05/26
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local OnLineAwardData = require "OnLineAwardData"
+local OnlineAwardNet = require("OnlineAwardNet")
+---@class OnlineAwardModel : Singleton	在线奖励数据类
+local OnlineAwardModel = _G.BaseClass("OnlineAwardModel", _G.GameDataModelBase)
+
+---@return OnlineAwardModel OnlineAwardModel
+function OnlineAwardModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+local awardstateEnum = {
+    none = 0, -- 正常
+    receive = 1, -- 可以领取
+    already_receive = 2 -- 已领取
+}
+---创建对象时,入口构造函数
+function OnlineAwardModel:__init()
+    self.endCallback = nil
+    self.curFunctionOpenID = 68
+    self:InitModelData()
+end
+
+---销毁对象时,析构函数
+function OnlineAwardModel:Dispose()
+    self.login_time = nil
+    self.award_list = nil
+    self.All_OnLineAward = nil
+    if self.timer ~= nil then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.msg = nil
+end
+
+--region 初始化
+---@field award_list table 领取的奖励id {数组}
+---@field msg table 在线奖励的数据信息
+---@field All_OnLineAward table 整合后的 数据信息
+function OnlineAwardModel:InitModelData()
+    self.time = 0
+    self.login_time = 0
+    self.All_OnLineAward = {}
+    self.msg = {}
+end
+--endregin
+function OnlineAwardModel:GetDataFormServer()
+    OnlineAwardNet:GetInstance():GetOnlineAwardInfos(_G.handler(self, self.ParseData))
+end
+function OnlineAwardModel:ParseData(msg)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.msg = msg
+    self.super.ParseData(self)
+end
+---后台停留 从新刷新数据
+function OnlineAwardModel:UpdateData()
+    if _G.AppSetting.DEBUG then
+        _G.Log("后台停留：", "在线奖励刷新倒计时，刷新数据")
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(68) then
+        return
+    end
+    self:StopClooling()
+    if self.timer ~= nil then
+        if _G.AppSetting.DEBUG then
+            _G.Log("后台 到计时")
+        end
+    end
+    OnlineAwardNet:GetInstance():GetOnlineAwardInfos(
+        function(msg)
+            self.msg = msg
+            self:InitFunction()
+        end
+    )
+end
+function OnlineAwardModel:InitFunction()
+    if _G.table.isEmptyOrNil(self.msg) then
+        _G.FloatTipsModel:GetInstance():Show("获取信息为空")
+        return
+    end
+    self.login_time = self.msg.info.login_time
+    self.current_id = self.msg.info.a_id or 0
+    self:SetAllOLinesAward()
+    self:InitOnlineTime()
+    if (self.current_id + 1) > #self.All_OnLineAward then
+    else
+        local state = self.All_OnLineAward[self.current_id + 1]:GetAwardState()
+        if state == awardstateEnum.none then
+            self:StopClooling()
+            if self.timer ~= nil then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("开始 ，注册倒计时")
+                end
+            end
+            self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.ResClooling, self, false, false, true)
+            self.timer:Start()
+        end
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.OnlineAward.id)
+end
+--region 对外接口 主界面显示时间
+---检测显示是时间 还是 文字
+function OnlineAwardModel:CheckTimeOrText()
+    local flag = true
+    local str = "" --_G.LangUtil.GetLangPackValue(90025600001)
+    --功能开启检测
+    if self.current_id then
+    else
+        return flag, str
+    end
+    if (self.current_id + 1) > #self.All_OnLineAward then
+        --str = _G.LangUtil.GetLangPackValue(90025600001)
+    else
+        local state = self.All_OnLineAward[self.current_id + 1]:GetAwardState()
+        if state == awardstateEnum.none then
+            str = _G.TimeUtil.TimeToString(Mathf.RoundToInt(self.All_OnLineAward[self.current_id + 1].time_online), 2)
+            flag = false
+        end
+    end
+    return flag, str
+end
+--endregin
+---根据配置设置下信息
+function OnlineAwardModel:SetAllOLinesAward()
+    local cfg = _G.ConfigManager.online_cfg
+    for i = 1, #cfg do
+        self.All_OnLineAward[i] = {}
+        local olineItem = OnLineAwardData.New()
+        local msg = {}
+        msg.cfgid = cfg[i].id
+        msg.time_online = cfg[i].time_online
+        msg.rewards = cfg[i].rewards
+        olineItem:Parse(msg)
+        self.All_OnLineAward[i] = olineItem
+    end
+end
+---倒计时
+function OnlineAwardModel:ResClooling(elapsed)
+    local itemdata = self.All_OnLineAward[self.current_id + 1]
+    -- if itemdata:GetAwardState() ~= awardstateEnum.none then
+    --     if self.timer ~= nil then
+    --         self.timer:Stop()
+    --         self.timer = nil
+    --     end
+    --     return
+    -- end
+    if itemdata:GetAwardState() == awardstateEnum.none then
+        itemdata.time_online = itemdata.time_online - elapsed
+        if itemdata.time_online <= 0 then
+            itemdata:SetAwardState(awardstateEnum.receive)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.OnlineAward.id)
+            self:StopClooling()
+        end
+        _G.Events:GetInstance():Broadcast(_G.eOnline.RefreshOnlineTime)
+        _G.Events:GetInstance():Broadcast(_G.eMainOnline.RefreshMainOnlineTime)
+    end
+end
+
+function OnlineAwardModel:StopClooling()
+    if self.timer ~= nil then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+
+--region 网络请求
+---领取奖励信息 (单个奖励领取，一键领取)
+---@param msg online_award.c2s_online_award_get a_id = {} 奖励id
+function OnlineAwardModel:SendAward(msg, callback)
+    local pbData = {
+        a_id = msg[1]
+    }
+    OnlineAwardNet:GetInstance():SendAward(pbData, _G.handlerbind(self, self.ReceiveOnlineAward, msg, callback))
+end
+---接受领取奖励回调
+function OnlineAwardModel:ReceiveOnlineAward(data, msg, callback)
+    if data.ack ~= 1 then
+        _G.Log(
+            "",
+            "<color=red>" ..
+                "领取奖励有延迟，请稍等:" .. "领取奖励时间 login_time ：" .. self.login_time .. "领取奖励时间：" .. self.lingqutime .. "</color>"
+        )
+        return
+    end
+    --放入仓库
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+    local a_id = 0
+    a_id = msg[1]
+    self.All_OnLineAward[a_id]:SetAwardState(awardstateEnum.already_receive)
+    --设置下一个刷新得时间
+    self.current_id = self.current_id + 1
+    self.login_time = _G.TimeUtil.GetServerUnixTime()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.OnlineAward.id)
+    if (a_id + 1) > #self.All_OnLineAward then
+        if callback then
+            callback()
+        end
+        return
+    else
+        self:SetAwardTime(self.All_OnLineAward[a_id + 1])
+        self:StopClooling()
+        if self.timer ~= nil then
+            if _G.AppSetting.DEBUG then
+                _G.Log("领取奖励 ，注册倒计时")
+            end
+        end
+        self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.ResClooling, self, false, false, true)
+        self.timer:Start()
+    end
+    if callback then
+        callback()
+    end
+end
+--endregin
+--region 对外接口
+---暂时打开界面 检测下（奖励有没有时间到了可以领取奖励）
+function OnlineAwardModel:OpenWindowSetTime()
+    --self:InitOnlineTime()
+    if (self.current_id + 1) > #self.All_OnLineAward then
+        return
+    end
+    --self:SetAwardTime(self.All_OnLineAward[self.current_id + 1])
+    --打开界面
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.OnlineAwardView.Name)
+end
+function OnlineAwardModel:GetOneAwardInfo(index)
+    return self.All_OnLineAward[index]
+end
+--endregin
+---设置奖励信息的时间，奖励信息的状态
+function OnlineAwardModel:InitOnlineTime()
+    local cfg = _G.ConfigManager.online_cfg
+    local tatle = #cfg
+    local sid = self.msg.info.a_id and self.msg.info.a_id + 1 or 1
+    if sid > tatle then
+        for i = 1, tatle do
+            local onlineitem = self.All_OnLineAward[i]
+            onlineitem:SetAwardState(awardstateEnum.already_receive)
+        end
+        return
+    end
+    local tag = 0
+    for i = 1, sid do
+        local onlineitem = self.All_OnLineAward[i]
+        if i < sid then
+            tag = awardstateEnum.already_receive
+        else
+            if self:CheckAwardTime(onlineitem.time_online) then
+                tag = awardstateEnum.receive
+            else
+                tag = awardstateEnum.none
+                self:SetAwardTime(onlineitem)
+            end
+        end
+        onlineitem:SetAwardState(tag)
+    end
+end
+
+---设置时间
+function OnlineAwardModel:SetAwardTime(onlineawarddata)
+    local nowtime = _G.TimeUtil.GetServerUnixTime()
+    self.lingqutime = nowtime
+    local time_online = onlineawarddata.old_time
+    time_online = time_online - (nowtime - self.login_time)
+    onlineawarddata:SetTimeOnline(time_online)
+    if time_online <= 0 then
+        onlineawarddata:SetAwardState(awardstateEnum.receive)
+    end
+end
+---检测建立 是否 都已经领取
+function OnlineAwardModel:CheckAwardAlreadyreceive()
+    for i = 1, #self.All_OnLineAward do
+        if self.All_OnLineAward[i]:GetAwardState() ~= awardstateEnum.already_receive then
+            return true
+        end
+    end
+    return false
+end
+---检测是不是 可以领取奖励
+function OnlineAwardModel:CheckAward()
+    for i = 1, #self.All_OnLineAward do
+        if self.All_OnLineAward[i]:GetAwardState() == awardstateEnum.receive then
+            return true
+        end
+    end
+    return false
+end
+--region 对外接口 （main_function,检测函数）
+-----是否显示.false是关闭,true是显示
+function OnlineAwardModel.CheckShowMainFunction()
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(68) then
+    else
+        return false
+    end
+    local flag = require("OnlineAwardModel"):GetInstance():CheckAwardAlreadyreceive()
+    if flag then
+    else
+        local all = require("OnlineAwardModel"):GetInstance().All_OnLineAward
+        if _G.table.isEmptyOrNil(all) then
+            return true
+        end
+    end
+    return flag
+end
+---检测时间 是否到了 可以领取了
+function OnlineAwardModel:CheckAwardTime(awardtime)
+    local nowtime = _G.TimeUtil.GetServerUnixTime()
+    local number = nowtime - self.login_time
+    if number < awardtime then
+        return false
+    end
+    return true
+end
+
+---红点检测
+function OnlineAwardModel:CheckPointRed()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(68) then
+        return false
+    end
+    if self:CheckAward() then
+        return true
+    end
+    return false
+end
+function OnlineAwardModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.super:Dispose()
+end
+return OnlineAwardModel

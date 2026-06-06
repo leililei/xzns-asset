@@ -1,0 +1,263 @@
+local base = require("GameDataModelBase")
+local CardConvertNet = require("CardConvertNet")
+local CardResonanceModel = require("CardResonanceModel")
+
+---可转化卡牌的目标品质
+local ConvertOrder = 6
+
+---@class CardConvertModel : GameDataModelBase 卡牌转化控制类
+---@field GetInstance fun():CardConvertModel
+---@field convertNumber number                          @单次最多转化数量
+---@field convertDict table<number,number>              @不同种族转化获得的道具
+---@field convertInitialOrder table<number,boolean>     @初始可转化卡牌品质
+---@field reserveNumber number                          @转化时相同sid的卡牌保留n张
+local CardConvertModel = _G.BaseClass("CardConvertModel", base)
+
+function CardConvertModel:__init()
+    --self.curFunctionOpenID = _G.FunctionID.CardConvert
+
+    --初始化配置表
+    local cfg1 = _G.ConfigManager.discrete_cfg[129001]
+    local cfg2 = _G.ConfigManager.discrete_cfg[129002]
+    local cfg3 = _G.ConfigManager.discrete_cfg[129003]
+    local cfg4 = _G.ConfigManager.discrete_cfg[129004]
+    self.reserveNumber = cfg3 and cfg3[1][1] or 1
+    self.convertNumber = cfg4 and cfg4[1][1] or 10
+    if cfg1 then
+        self.convertDict = {}
+        for _, v in ipairs(cfg1) do
+            self.convertDict[v[1]] = v[2]
+        end
+    end
+    if cfg2 then
+        self.convertInitialOrder = {}
+        for _, order in ipairs(cfg2[1]) do
+            self.convertInitialOrder[order] = true
+        end
+    end
+end
+
+function CardConvertModel:GetFunctionOpen()
+    if self.curFunctionOpenID and self.curFunctionOpenID > 0 then
+        return base.GetFunctionOpen(self)
+    end
+
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return false
+    end
+
+    --读取离散表条件配置
+    local cfg = _G.ConfigManager.discrete_cfg[129006]
+    if not cfg then
+        return false
+    end
+    for _, condition in ipairs(cfg) do
+        local type, param1 = table.unpack(condition)
+        if _G.GlobalConditionManager.CheckCondition(type, param1) then
+            return true
+        end
+    end
+    return false
+end
+
+function CardConvertModel:Dispose()
+end
+
+-- function CardConvertModel:GetDataFormServer()
+--     base.ParseData(self)
+-- end
+
+---检测卡牌是否可以转化
+---@return boolean
+function CardConvertModel:CheckCardConvert()
+    local list = self:GetConvertCardList(1)
+    return list and #list > 0
+end
+
+---获取可转化卡牌列表
+---@param num? number 转化数量, 默认为discrete_cfg配置
+---@return CardData[]
+function CardConvertModel:GetConvertCardList(num)
+    if not self.convertDict or not self.convertInitialOrder then
+        return nil
+    end
+    ---@type table<number,CardData>
+    local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    if _G.table.isEmptyOrNil(allCards) then
+        return nil
+    end
+
+    --需要转化的数量
+    if not num then
+        num = self.convertNumber
+    end
+
+    local needNum = num
+
+    ---@type table<number,number>
+    local reserveCardSids = {} --保留的卡牌数量
+    ---@type table<number,CardData[]>
+    local cardList = {}        --可转化的卡牌列表
+    for _, cardData in pairs(allCards) do
+        if self.convertInitialOrder[cardData.cfg.Order] and cardData.star == ConvertOrder then --策划说只计算6星的保留数量
+            local reserveSidNum = reserveCardSids[cardData.sid] or 0                           --当前保留的卡牌数量
+            local list = cardList[cardData.sid]                                                --待转化卡牌列表
+            if not list then
+                list = {}
+                cardList[cardData.sid] = list
+            end
+
+            --检测卡牌是否单独强化过(升星丶升级丶穿装备饰品等)
+            if cardData.star > ConvertOrder or
+                cardData.lv > 1 and CardResonanceModel:GetInstance():CheckCardIsInPos(cardData.uid) or
+                cardData.shenshiPosType ~= _G.StonePosType.PosZero or
+                not self:IsEmptyCardData(cardData)
+            then
+                reserveCardSids[cardData.sid] = reserveSidNum + 1
+                if reserveSidNum < self.reserveNumber and reserveSidNum + #list >= self.reserveNumber then
+                    needNum = needNum - 1 --保留卡牌基数增加, 待转化卡牌列表+1
+                end
+            else
+                if #list + reserveSidNum >= self.reserveNumber then
+                    needNum = needNum - 1 --满足保留数量, 待转化卡牌列表+1
+                end
+                table.insert(list, cardData)
+            end
+            if needNum <= 0 then
+                break
+            end
+        end
+    end
+
+    if needNum == num then
+        --未找到任何可用卡牌
+        return nil
+    end
+
+    ---@type CardData[]
+    local results = {}
+    for sid, cards in pairs(cardList) do
+        local needReserveNum = self.reserveNumber - (reserveCardSids[sid] or 0) --需要从转化列表中保留的卡牌数量
+        local index = needReserveNum > 0 and (needReserveNum + 1) or 1
+        for i = index, #cards do
+            table.insert(results, cards[i])
+        end
+    end
+    return results
+end
+
+---获取卡牌列表转化获得的道具
+---@param cardList CardData[] 转化卡牌列表
+---@return number[][]
+function CardConvertModel:GetConvertAwardList(cardList)
+    if _G.table.isEmptyOrNil(cardList) then
+        return nil
+    end
+
+    local itemIds = {}
+    for _, cardData in ipairs(cardList) do
+        local itemId = self.convertDict[cardData.cfg.Elements]
+        if itemId then
+            itemIds[itemId] = (itemIds[itemId] or 0) + 1
+        end
+    end
+
+    local results = {}
+    for itemId, num in pairs(itemIds) do
+        table.insert(results, { itemId, num })
+    end
+    return results
+end
+
+---获取单次转化数量上限
+---@return number
+function CardConvertModel:GetConvertNumber()
+    return self.convertNumber
+end
+
+---获取奖励预览
+---@return number[][]
+function CardConvertModel:GetAwardPreview()
+    if _G.table.isEmptyOrNil(self.convertDict) then
+        return nil
+    end
+
+    local results = {}
+    for _, itemId in pairs(self.convertDict) do
+        table.insert(results, { itemId, 1 })
+    end
+    return results
+end
+
+---请求转化卡牌
+---@param cardList CardData[] 转化卡牌列表
+---@param callback fun(msg:public.s2c_common_ack):void 完成回调
+function CardConvertModel:Convert(cardList, callback)
+    if _G.table.isEmptyOrNil(cardList) then
+        return
+    end
+
+    ---待消耗的卡牌uid列表
+    ---@type number[]
+    local uids = {}
+    for _, cardData in pairs(cardList) do
+        table.insert(uids, cardData.uid)
+    end
+
+    CardConvertNet:GetInstance():Convert({ uid_list = uids }, function(msg)
+        if not msg or msg.ack ~= 1 then
+            if callback then
+                callback(msg)
+            end
+            return
+        end
+        --获取奖励
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        --消耗卡牌
+        local cardManager = require("CardInfoManager"):GetInstance()
+        cardManager:CardNewStartDestroy(uids)
+        for _, uid in ipairs(uids) do
+            _G.StorageManager:GetInstance():DelCard(uid)
+        end
+
+        --广播事件
+        _G.Events:GetInstance():Broadcast(_G.CardUpdateEvent.CardConvert, uids)
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---卡牌未装备任何道具(装备丶饰品丶神器丶饰品, 未强化或觉醒)
+---@private
+---@param cardData CardData
+---@return boolean
+function CardConvertModel:IsEmptyCardData(cardData)
+    if not cardData then
+        return true
+    end
+    if not _G.table.isEmptyOrNil(cardData.SpiritualBar) then
+        return false
+    end
+    if not _G.table.isEmptyOrNil(cardData.ArtifactBar) then
+        return false
+    end
+    if cardData.EquipBar then
+        for _, d in pairs(cardData.EquipBar) do
+            if not _G.table.isEmptyOrNil(d) then
+                return false
+            end
+        end
+    end
+    if cardData.DecorationBar then
+        for _, d in pairs(cardData.DecorationBar) do
+            if not _G.table.isEmptyOrNil(d) and not _G.table.isEmptyOrNil(d.decoration) then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+return CardConvertModel

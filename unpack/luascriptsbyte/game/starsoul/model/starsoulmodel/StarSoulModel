@@ -1,0 +1,334 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.StarSoul.Model.StarSoulModel	(修改路径必须修正此项!)
+-- Created by 刘畅
+-- DateTime: 2022/1/6
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+local StarSoulNet = require "StarSoulNet"
+local base = require("BaseSystemMaterialModel")
+---@class StarSoulModel : BaseSystemMaterialModel    中文描述
+---@field infoData system_prof.i_prof 星魂试炼信息
+---@field rankData system_prof.i_prof_rank[] 排行榜数据
+---@field proId number
+---@field Datas table<number,table<number,SystemMaterialData>>
+---@field floorSid table<number,number[]>
+local StarSoulModel = _G.BaseClass("StarSoulModel", base)
+
+function StarSoulModel:Init()
+    self.systemID = 105
+    local cfg = _G.ConfigManager.system_cfg[self.systemID]
+    self.curTimes = 3
+    self.curInstance = 0
+    self.maxTimes = cfg.count_reset
+    self.curFunctionOpenID = 49
+    self.redID = _G.ConfigManager.redpoint_cfg.SoulTrial.id
+    self.proTb = _G.ConfigManager.discrete_cfg[104101][1]
+    self.addAdNum = 0
+end
+
+function StarSoulModel:InitFloorSid()
+    self.floorSid = {}
+    for key, value in pairs(_G.ConfigManager.system_prof_cfg) do
+        if not self.floorSid[value.professional] then
+            self.floorSid[value.professional] = {}
+        end
+        self.floorSid[value.professional][value.difficulty] = key
+    end
+end
+
+---@return StarSoulModel StarSoulModel
+function StarSoulModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+function StarSoulModel:GetDataFormServer()
+    if self:CheckFunction() == false then
+        self:ParseData()
+        return
+    end
+    self:GetWorldBossData()
+end
+
+function StarSoulModel:UpdateTimesByAd(num)
+    base.UpdateTimesByAd(self, num)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.TimesofStarAdd.id)
+end
+
+--region 检测功能
+function StarSoulModel:CheckFunction()
+    local flag = false
+    flag = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID)
+    return flag
+end
+
+---计算初始BOOS职业
+function StarSoulModel:GetLeftTime()
+    return self.RTS
+end
+
+function StarSoulModel:StartTimer()
+    local TypeDay = (_G.TimeUtil.GetServerUnixTime() - _G.PlayerModel:GetInstance().open_time) %
+        (_G.ConfigManager.system_cfg[self.systemID].time_duration * 5)
+    self.RTS = _G.ConfigManager.system_cfg[self.systemID].time_duration -
+        TypeDay % _G.ConfigManager.system_cfg[self.systemID].time_duration
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTimer, self, false, false, true)
+    self.timer:Start()
+end
+
+---更新倒计时
+function StarSoulModel:UpdateTimer(elapsed)
+    self.RTS = self.RTS - elapsed
+    if self.RTS <= 0 then
+        self:FreshInfo()
+        self.proId = self:GetNextPro()
+        self.index = self.index + 1 > #self.proTb and 1 or self.index + 1
+        self:SetCanNextFight(false)
+    end
+    if self.callback then
+        self.callback(Mathf.RoundToInt(self.RTS))
+    end
+end
+
+---获取星魂试炼信息
+function StarSoulModel:GetWorldBossData(callback)
+    StarSoulNet:GetInstance():GetInfo(_G.handlerbind(self, self.DataFuZhi, callback))
+end
+
+---获取星魂试炼信息回调
+---@param msg system_prof.s2c_system_prof_info
+function StarSoulModel:DataFuZhi(msg, callback)
+    self.proId = msg.info.type
+    self.curInstance = msg.info.sid
+    self.curTimes = msg.info.f_num
+    self.high_section = msg.info.high_section
+    self:UpdateMaxTimes()
+    for i, v in ipairs(self.proTb) do
+        if v == self.proId then
+            self.index = i
+            break
+        end
+    end
+    if not self.sTime then
+        self.sTime = self.maxTimes
+    end
+    require("SystemEntranceModel"):GetInstance():SetTimes(self.systemID, self.curTimes, self.maxTimes)
+    self:InitDatas()
+    self:StartTimer()
+    self:ParseData(msg)
+end
+
+---更新最大次数
+function StarSoulModel:UpdateMaxTimes()
+    local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.System.Count, self.systemID })
+    local cfg = _G.ConfigManager.system_cfg[self.systemID]
+    local adTimes = require("AdvertisementModel"):GetInstance():GetWatchedAdNum(_G.AdvertisementType.StarAdd) or 0
+    if data[1] then
+        self.maxTimes = data[1] + cfg.count_reset + adTimes
+    else
+        self.maxTimes = cfg.count_reset + adTimes
+    end
+end
+
+function StarSoulModel:AddUpdateListener(callback)
+    self.callback = callback
+end
+
+function StarSoulModel:RemoveUpdateListener(callback)
+    self.callback = nil
+end
+
+---获取当前职业
+function StarSoulModel:GetPro()
+    return self.proId
+end
+
+---获取下个职业
+function StarSoulModel:GetNextPro()
+    return self.index + 1 > #self.proTb and self.proTb[1] or self.proTb[self.index + 1]
+end
+
+function StarSoulModel:InitDatas()
+    if not self.Datas then
+        self.Datas = {}
+        for _, v in pairs(_G.ConfigManager.system_prof_cfg) do
+            if not self.Datas[v.professional] then
+                self.Datas[v.professional] = {}
+            end
+            self.Datas[v.professional][v.id] = require "SystemMaterialData".New(_G.ConfigManager.system_prof_cfg)
+            self.Datas[v.professional][v.id]:Init(v.id, self.curInstance)
+        end
+    else
+        for _, v in pairs(self.Datas[self.proId]) do
+            v:UpdateData(self.curInstance, true)
+        end
+    end
+end
+
+---获取数据
+---@param includeAll? boolean 包含全部数据
+---@return table<number,SystemMaterialData>
+function StarSoulModel:GetDatas(includeAll)
+    local proDatas = self.Datas[self.proId]
+    if includeAll or not proDatas then
+        return proDatas
+    end
+    local results = {}
+    for k, v in pairs(proDatas) do
+        if not v.isHide then
+            results[k] = v
+        end
+    end
+    return results
+end
+
+---获取资源找回奖励
+function StarSoulModel:GetResourceRecoveryDatas()
+    local award = {}
+    if self.high_section then
+        for i = 1, #self.high_section do
+            if self.high_section[i].value ~= 0 then
+                local floor = _G.ConfigManager.system_prof_cfg[self.high_section[i].value].difficulty
+                local curData = self.floorSid[self.high_section[i].key] and
+                    self.floorSid[self.high_section[i].key][floor] or 1
+                local list = _G.DeepCopyCfgTable(self.Datas[self.high_section[i].key][curData].cfg.reward)
+                for j = 1, #list do
+                    table.insert(award, list[j])
+                end
+            end
+        end
+    end
+    return award
+end
+
+---检测是否通关过任意职业第一关
+function StarSoulModel:CheckOverAnyFloor()
+    if self.high_section then
+        for i = 1, #self.high_section do
+            if self.high_section[i].value ~= 0 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---获取当前层级
+function StarSoulModel:GetCurChallengeFloor()
+    return self.curInstance == 0 and 0 or _G.ConfigManager.system_prof_cfg[self.curInstance].difficulty
+end
+
+function StarSoulModel:GetMaterailIDBySidAndFloor(floor)
+    return self.floorSid[self.proId] and self.floorSid[self.proId][floor] or 1
+end
+
+function StarSoulModel:GetEBattleType()
+    return _G.EBattleType.StarSoul
+end
+
+---获取布阵数据
+function StarSoulModel:GetEmbattleType()
+    return _G.EmbattleType.StarSoul
+end
+
+---检测关卡是否通关
+function StarSoulModel:CheckIsPass(sid)
+    if not self.curInstance then
+        return false
+    end
+    return self.curInstance >= sid
+end
+
+---获取总层数
+---@param sid number 副本id
+---@return number 总层数
+function StarSoulModel:GetFloorCount()
+    local proIds = self.floorSid[self.proId]
+    local proDatas = self.Datas and self.Datas[self.proId]
+    if not proIds or not proDatas then
+        return proIds and #proIds or 0
+    end
+    local num = 0
+    for _, id in pairs(proIds) do
+        if not proDatas[id].isHide then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+---获取怪物
+function StarSoulModel:GetMonster(id)
+    return _G.ConfigManager.system_prof_cfg[id].monster
+end
+
+---扫荡
+function StarSoulModel:OnSweep(times, callback, notUITip)
+    require "StarSoulNet":GetInstance():Sweep(
+        times,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            if not notUITip then
+                _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                    data,
+                    nil,
+                    true,
+                    nil,
+                    require "DoubleResourcesModel":GetInstance():FanHui(self.systemID)
+                )
+            end
+            self.curTimes = _G.Mathf.Max(self.curTimes - times, 0)
+            require("SystemEntranceModel"):GetInstance():SetTimes(self.systemID, self.curTimes, self.maxTimes)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SoulTrial.id)
+            self:InitData()
+            if callback then
+                callback(data)
+            end
+        end
+    )
+end
+
+--endregion
+
+---检测是否挑战(红点)
+function StarSoulModel:CheckIsChallenge()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return true
+    end
+    if not self.curInstance then
+        return false
+    end
+    return self.curInstance > 0
+end
+
+function StarSoulModel:GetImagePath()
+    return _G.ConfigManager.system_prof_cfg[100000 + self.proId * 1000 + 1].image
+end
+
+---获取通关录像
+---@param call function
+---@param sid number
+function StarSoulModel:GetRecommend(call, sid)
+    require "StarSoulNet":GetInstance():GetRecommend(
+        { sid = sid },
+        function(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---销毁对象时,析构函数
+function StarSoulModel:Dispose()
+end
+
+return StarSoulModel

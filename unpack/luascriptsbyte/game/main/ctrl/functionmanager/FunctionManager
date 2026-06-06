@@ -1,0 +1,1657 @@
+-----------------------------------------------------------------------
+-- Created by szs 2020.3.17
+--
+-- @Description FunctionManager 功能开放管理器
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+require "FunctionData"
+
+---main_function_cfg.function_open大于此值时, 则其对应activity_info_cfg配置表
+---@type number
+local ACTIVITY_INFO_ID = 1000000
+
+local LockPath = "UI/Common/ZHJ/@_aorbtn_Lock"
+local base = require "GameDataModelBase"
+---@class FunctionManager : Singleton
+---@field GetInstance fun():FunctionManager
+---@field mainView MainView 主界面显示对象
+---@field functionQueue table 非主界面新功能开放添加到队列延迟处理
+---@field functionForbidden table<number, boolean> 功能禁用列表
+---@field super GameDataModelBase 功能禁用列表
+local FunctionManager = _G.BaseClass("FunctionManager", base)
+_G.FunctionManager = FunctionManager
+function FunctionManager:__init()
+    --- true 初始化完成
+    self.isInit = false
+    ---所有功能开放表解锁的id {id=true}
+    self.FunctionOpenDic = {}
+    ---@field updataNumFun function 更新当前进度
+    ---@field CheckFun function 解锁判断 true 解锁
+    ---@field lockDic table 待解锁的id {id=num,}
+    ---@field num number 当前值 比大小
+    ---@class FunctionOpenDicTypeFunctionTouchType
+    self.FunctionOpenDicType = {
+        [_G.FunctionTouchType.PlayerLevel] = {
+            --- 当前值 比大小    当前等级
+            num = 0,
+            --- 待解锁的id {id=num,}
+            lockDic = {},
+            --- 解锁判断 true 解锁
+            CheckFun = function(value)
+                return value <= self.FunctionOpenDicType[_G.FunctionTouchType.PlayerLevel].num
+            end,
+            updataNumFun = function()
+                self.FunctionOpenDicType[_G.FunctionTouchType.PlayerLevel].num = _G.PlayerModel:GetInstance():GetLevel()
+            end
+        },
+        [_G.FunctionTouchType.Section] = {
+            ---当前应挑战id
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return value < self.FunctionOpenDicType[_G.FunctionTouchType.Section].num
+            end,
+            updataNumFun = function()
+                self.FunctionOpenDicType[_G.FunctionTouchType.Section].num = require("ChapterModel"):GetInstance():GetCurSectionSID()
+            end
+        },
+        [_G.FunctionTouchType.Afk] = {
+            --- 当前挑战关卡
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return value < self.FunctionOpenDicType[_G.FunctionTouchType.Afk].num
+            end,
+            updataNumFun = function()
+                self.FunctionOpenDicType[_G.FunctionTouchType.Afk].num = require("AfkModel"):GetInstance():GetCurSection()
+            end
+        },
+        [_G.FunctionTouchType.Afk] = {
+            --- 当前挑战关卡
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return value < self.FunctionOpenDicType[_G.FunctionTouchType.Afk].num
+            end,
+            updataNumFun = function()
+                self.FunctionOpenDicType[_G.FunctionTouchType.Afk].num = require("AfkModel"):GetInstance():GetCurSection()
+            end
+        },
+        [_G.FunctionTouchType.ServerTime] = {
+            --- 当前挑战关卡
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return _G.TimeUtil.GetServerUnixTime() - _G.PlayerModel:GetInstance().open_time >= (value - 1) * 86400
+            end,
+            updataNumFun = function()
+            end
+        },
+        [_G.FunctionTouchType.PlayerCreateTime] = {
+            --- 玩家创号天数
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                local day = value or 0
+                local ct = _G.PlayerModel:GetInstance():GetCreateRoleTime()
+                if _G.TimeUtil.GetInterValDayByGame(ct, _G.TimeUtil.GetServerUnixTime()) + 1 < value then
+                    return false
+                end
+                return true
+            end,
+            updataNumFun = function()
+            end
+        },
+        [_G.FunctionTouchType.BattleAreaServerTime] = {
+            --- 当前挑战关卡
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return _G.TimeUtil.GetServerUnixTime() - _G.PlayerModel:GetInstance():GetBattleOpenTime() >=
+                        (value - 1) * 86400
+            end,
+            updataNumFun = function()
+            end
+        },
+        [_G.FunctionTouchType.VipLevel] = {
+            ---VIP等级
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return require("VIPPrivilegeModel"):GetInstance().realVipLevel >= value
+            end,
+            updataNumFun = function()
+                self.FunctionOpenDicType[_G.FunctionTouchType.VipLevel].num = require("VIPPrivilegeModel"):GetInstance().realVipLevel
+            end
+        },
+        [_G.FunctionTouchType.TotalCash] = {
+            ---累计充值
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                local curCashNum = require("MallManager"):GetInstance():GetCashRmb() or 0
+                return curCashNum >= value
+            end,
+            updataNumFun = function()
+                self.FunctionOpenDicType[_G.FunctionTouchType.TotalCash].num = require("MallManager"):GetInstance():GetCashRmb() or 0
+            end
+        },
+        [_G.FunctionTouchType.ArraignedMod] = {
+            ---提审模式
+            num = 0,
+            lockDic = {},
+            CheckFun = function(params)
+                local value = params and params[1] or 0
+                local bool = value ~= 1 or not _G.AppSetting.IsArraigned
+                if not bool and #params > 1 then
+                    for i = 2, #params do
+                        local platform = params[i]
+                        if platform == 0 or platform == _G.GameUtil.GetPlatform() then
+                            return false
+                        end
+                    end
+                    bool = true
+                end
+                return bool
+            end,
+            updataNumFun = function()
+            end
+        },
+        [FunctionTouchType.MaxStar] = {
+            ---历史最高星级
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return _G.GlobalConditionManager.CheckCondition(FunctionTouchType.MaxStar, value)
+            end,
+            updataNumFun = function()
+            end
+        },
+        [_G.FunctionTouchType.DailyActive] = {
+            ---日常活跃度
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return require("ActiveTaskManager"):GetInstance().ActiveValue >= value
+            end,
+            updataNumFun = function()
+                self.FunctionOpenDicType[_G.FunctionTouchType.DailyActive].num = require("ActiveTaskManager"):GetInstance().ActiveValue or 0
+            end
+        },
+        [_G.FunctionTouchType.GuildTrain] = {
+            ---公会试炼
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+                return require("SociatyModel"):GetInstance():GetChallenge_times() >= value
+            end,
+            updataNumFun = function()
+                self.FunctionOpenDicType[_G.FunctionTouchType.VipLevel].num = require("SociatyModel"):GetInstance():GetChallenge_times()
+            end
+        },
+        [_G.FunctionTouchType.Platform] = {
+            ---当前平台
+            num = 0,
+            lockDic = {},
+            CheckFun = function(value)
+            end,
+            updataNumFun = function()
+            end
+        },
+    }
+    ---功能开放id 对应需要解锁的类型映射map {funcId ={type=state}}
+    self.ConditionTypeWithId = {}
+    ---所有主界面待解锁的功能  {解锁类型={cfg,cfg,cfg},}
+    self.FunctionCfgDic = {}
+    ---所有主界面待解锁的功能 会关闭的功能  Fun() false功能关闭
+    self.FunctionIdCloseFunDic = {}
+    ---所有主界面待解锁的功能 会关闭的功能  {id= false功能关闭}
+    self.FunctionIdCloseDic = {}
+
+    for key, value in pairs(_G.ConfigManager.main_function_cfg) do
+        ---@type function_open_cfg
+        local functionOpenCfg
+        if value.function_open >= ACTIVITY_INFO_ID then
+            --配置activity_info_cfg表解锁
+            local activityCfg = _G.ConfigManager.activity_info_cfg[value.function_open]
+            if activityCfg and not _G.table.isEmptyOrNil(activityCfg.condition_display) then
+                if #activityCfg.condition_display == 1 then
+                    functionOpenCfg = _G.ConfigManager.function_open_cfg[activityCfg.condition_display[1]]
+                else
+                    for i = 1, #activityCfg.condition_display, 2 do
+                        if self.FunctionCfgDic[activityCfg.condition_display[i]] == nil then
+                            self.FunctionCfgDic[activityCfg.condition_display[i]] = {}
+                        end
+                        table.insert(self.FunctionCfgDic[activityCfg.condition_display[i]], value)
+                    end
+                end
+            end
+        elseif value.function_open > 0 then
+            --配置function_open_cfg表解锁
+            functionOpenCfg = _G.ConfigManager.function_open_cfg[value.function_open]
+        end
+        if functionOpenCfg and not _G.table.isEmptyOrNil(functionOpenCfg.condition_type) then
+            for i = 1, #functionOpenCfg.condition_type do
+                if self.FunctionCfgDic[functionOpenCfg.condition_type[i][1]] == nil then
+                    self.FunctionCfgDic[functionOpenCfg.condition_type[i][1]] = {}
+                end
+                table.insert(self.FunctionCfgDic[functionOpenCfg.condition_type[i][1]], value)
+            end
+        end
+        if not _G.table.isEmptyOrNil(value.Display_condition) then
+            if self.FunctionCfgDic[value.Display_condition[1]] == nil then
+                self.FunctionCfgDic[value.Display_condition[1]] = {}
+            end
+            _G.table.insert(self.FunctionCfgDic[value.Display_condition[1]], value)
+        end
+        ---功能关闭 相关
+        if string.IsNullOrEmpty(value.function_close[1]) == false then
+            local model = require(value.function_close[1])
+            local tFun = value.function_close[2]
+            if model and model[tFun] then
+                self.FunctionIdCloseDic[key] = true
+                self.FunctionIdCloseFunDic[key] = model[tFun]
+            end
+        end
+    end
+    --- 当前已解锁功能   [funid]=true
+    self.nowOpenFunid = {}
+    --- 显示用的功能id    有些功能  未解锁可显示  或 需要解锁但始终不显示
+    ---[funid]=true
+    self.showFunid = {}
+    --功能开放队列
+    self.functionQueue = {}
+    --- 本次新功能开放显示 (累计  防止打开两次界面)
+    self.ShowNewfunctionData = {}
+    self.tipsId = {
+        [1] = 280101,
+        [2] = 280102,
+        ---填充
+        [3] = 0,
+        [4] = 280103,
+        [9] = 280105,
+        [50] = 110124,
+        [54] = 110124,
+        [55] = 280107
+    }
+    self.languageId = {
+        ---团队等级达到%s级时开启该功能
+        [1] = 90028010101,
+        ---通关主线剧情%s时开启该功能
+        [2] = 90028010102,
+        ---填充
+        [3] = 0,
+        ---通关灵域巡查%s时开启该功能
+        [4] = 90028010103,
+        ---创号%d天开启
+        [9] = 90028300082,
+        ---开服第%s天开放
+        [50] = 90028300082,
+        [54] = 90028300082,
+        [55] = 90028010135
+    }
+    ---需要特殊显示提示处理的function_open_cfg
+    self.specialTip = {
+        [52] = {
+            ---语言包id
+            [1] = 90021000019,
+            ---tips_system_cfg.id
+            [2] = 510102
+        }
+    }
+end
+
+function FunctionManager:Dispose()
+    self:RemoveListener()
+    self.isInit = nil
+    self.ShowNewfunctionData = nil
+    self.functionQueue = nil
+    self.showFunid = nil
+    self.nowOpenFunid = nil
+    self.FunctionCfgDic = nil
+    self.AfkFuncArr = nil
+    if self.WaitGetAwardTimer then
+        self.WaitGetAwardTimer:Stop()
+        self.WaitGetAwardTimer = nil
+    end
+end
+
+---从服务器拉取数据
+function FunctionManager:GetDataFormServer()
+    require("UserNet"):GetInstance():SetFunctionManagerInstance(self)
+    require("UserNet"):GetInstance():GetOpenFunction(_G.handler(self, self.ParseData))
+end
+
+---解析数据
+---@param data role.s2c_function_open_info 服务器返回数据
+function FunctionManager:ParseData(data)
+    self:InitFunctionForbidden(data.close_ids)
+    self:InitServerFunctionOpen(data.ids, data.award or {})
+    self:InitDefaultFunctionOpen()
+    self.isInit = true
+    base.ParseData(self)
+end
+
+---内部方法 设置条件状态
+function FunctionManager:SetConditionTypeState(funcId, conditionType, state)
+    if not _G.table.isEmptyOrNil(self.ConditionTypeWithId[funcId]) then
+        if self.ConditionTypeWithId[funcId] ~= nil then
+            if self.ConditionTypeWithId[funcId][conditionType] then
+                self.ConditionTypeWithId[funcId][conditionType].state = state
+            else
+                self.ConditionTypeWithId[funcId][conditionType] = {
+                    type = conditionType,
+                    state = state
+                }
+            end
+        end
+    else
+        self.ConditionTypeWithId[funcId] = {}
+        self.ConditionTypeWithId[funcId][conditionType] = {
+            type = conditionType,
+            state = state
+        }
+    end
+end
+
+---初始化功能逻辑
+function FunctionManager:InitFunction()
+    for key, value in pairs(_G.ConfigManager.function_open_cfg) do
+        ---将功能开放id和自身所需条件做映射
+        if not self.ConditionTypeWithId[key] then
+            self.ConditionTypeWithId[key] = {}
+        end
+        if not self.FunctionOpenDic[key] then
+            --endregin
+            -- 支付宝测试版本调整赛季相关功能开放条件
+            local condition = value.condition_type
+            if _G.AppSetting.IsAlipay then
+                local cfg = _G.ConfigManager.discrete_cfg[126103]
+                local openIds = cfg[1]
+                if _G.table.ContainsValue(openIds, key) then
+                    local temp = {}
+                    for i = 1, #cfg[2], 2 do
+                        _G.table.insert(temp, { cfg[2][i * 2 - 1], cfg[2][i * 2] })
+                    end
+                    condition = temp
+                end
+            end
+
+            local Open = _G.GlobalConditionManager.CheckConditionByArray(condition)
+            self.FunctionOpenDic[key] = Open
+            ---设置map(功能id和条件检测映射)的状态
+            local _open = false ---每一个条件是否开启
+            if not _G.table.isEmptyOrNil(value.condition_type) then
+                for i = 1, #value.condition_type do
+                    if Open then
+                        self.ConditionTypeWithId[key][value.condition_type[i][1]] = {
+                            type = value.condition_type[i][1],
+                            state = true
+                        }
+                        self.FunctionOpenDicType[value.condition_type[i][1]].lockDic[key] = nil
+                    else
+                        _open = _G.GlobalConditionManager.CheckCondition(
+                                value.condition_type[i][1],
+                                value.condition_type[i][2]
+                        )
+                        if _open then
+                            self.FunctionOpenDicType[value.condition_type[i][1]].lockDic[key] = nil
+                        end
+                        self.ConditionTypeWithId[key][value.condition_type[i][1]] = {
+                            type = value.condition_type[i][1],
+                            state = _open
+                        }
+                    end
+                end
+            end
+            if Open then
+                --领取礼物的回调在MainManager里注册到_G.eFunctionsStatus.OpenCfgFunctionId了
+                --self:GetAward(key)
+                _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.OpenCfgFunctionId, key)
+            end
+            --region 临时填写 VIP 特权 功能解锁
+            ---检测有vip  将神召唤,放置推图功能
+            local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.VIP.unlockFunction })
+            if data and data[1] then
+                local count = 1
+                local check_type = type(data[1])
+                if check_type == "number" then
+                    -- 检测是不是数值类型
+                    count = 1
+                else
+                    count = 2
+                end
+                for i = 1, #data do
+                    local fun_id = 0
+                    if count < 2 then
+                        fun_id = data[i]
+                    else
+                        fun_id = data[i][2]
+                    end
+                    if fun_id == key then
+                        --("降神召唤： init 初始化")
+                        self.FunctionOpenDic[key] = true
+                        for type, param in pairs(value.condition_type) do
+                            self.FunctionOpenDicType[param[1]].lockDic[key] = nil
+                            self:SetConditionTypeState(key, param[1], true)
+                        end
+                        --领取礼物的回调在MainManager里注册到_G.eFunctionsStatus.OpenCfgFunctionId了
+                        --self:GetAward(key)
+                        _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.OpenCfgFunctionId, key)
+                    end
+                end
+            end
+            ---战斗跳过
+            local resoult, value = require "PrivilegeManager":GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.VIP.fightJump)
+            if resoult and key == value[1] then
+                self.FunctionOpenDic[key] = true
+                if not _G.table.isEmptyOrNil(self.ConditionTypeWithId[key]) then
+                    ---将该功能的所有限制条件状态全部设置为true
+                    for k, v in pairs(self.ConditionTypeWithId[key]) do
+                        v.state = true
+                    end
+                end
+                self.FunctionOpenDicType[_G.FunctionTouchType.PlayerLevel].lockDic[key] = nil
+                --领取礼物的回调在MainManager里注册到_G.eFunctionsStatus.OpenCfgFunctionId了
+                --self:GetAward(key)
+                _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.OpenCfgFunctionId, key)
+            end
+        else
+            for type, param in pairs(value.condition_type) do
+                self:SetConditionTypeState(key, param[1], true)
+            end
+        end
+    end
+    self:CacheAfkFuncOpenArr()
+    if self.sixClockInitCall then
+        self.sixClockInitCall()
+        self.sixClockInitCall = nil
+    end
+end
+
+function FunctionManager:CacheAfkFuncOpenArr()
+    self.AfkFuncArr = {}
+    for _, v in pairs(_G.ConfigManager.function_open_cfg) do
+        if not _G.table.isEmptyOrNil(v.condition_type) then
+            for k, type in pairs(v.condition_type) do
+                if type[1] == 4 then
+                    _G.table.insert(self.AfkFuncArr, { type[2], v.function_preview, v.Id })
+                end
+            end
+        end
+    end
+    if not _G.table.isEmptyOrNil(self.AfkFuncArr) then
+        _G.SortList(
+                self.AfkFuncArr,
+                function(a)
+                    return -a[1]
+                end
+        )
+    end
+end
+
+function FunctionManager:GetAfkFuncOpenArr()
+    if _G.table.isEmptyOrNil(self.AfkFuncArr) then
+        return nil
+    else
+        return self.AfkFuncArr
+    end
+end
+
+---初始化默认开启的功能(配置中 type = 1 params = 1 即等级为1)
+function FunctionManager:InitDefaultFunctionOpen()
+    for key, v in pairs(_G.ConfigManager.function_open_cfg) do
+        if not self.FunctionOpenDic[key] then
+            local value = v.condition_type
+            -- 支付宝测试版本调整赛季相关功能开放条件
+            if _G.AppSetting.IsAlipay then
+                local cfg = _G.ConfigManager.discrete_cfg[126103]
+                local openIds = cfg[1]
+                if _G.table.ContainsValue(openIds, key) then
+                    local temp = {}
+                    for i = 1, #cfg[2], 2 do
+                        _G.table.insert(temp, { cfg[2][i * 2 - 1], cfg[2][i * 2] })
+                    end
+                    value = temp
+                end
+            end
+            if not _G.table.isEmptyOrNil(value) then
+                if #value == 1 then
+                    for _, type in pairs(value) do
+                        if type[1] == _G.FunctionTouchType.PlayerLevel then
+                            if type[2] <= 1 then
+                                self.FunctionOpenDic[key] = true
+                            else
+                                self.FunctionOpenDicType[type[1]].lockDic[key] = type[2]
+                            end
+                        elseif type[1] == _G.FunctionTouchType.ServerTime then
+                            if type[2] <= 1 then
+                                self.FunctionOpenDic[key] = true
+                            else
+                                self.FunctionOpenDicType[type[1]].lockDic[key] = type[2]
+                            end
+                        elseif type[1] == _G.FunctionTouchType.BattleAreaServerTime then
+                            if type[2] <= 1 then
+                                self.FunctionOpenDic[key] = true
+                            else
+                                self.FunctionOpenDicType[type[1]].lockDic[key] = type[2]
+                            end
+                        elseif type[1] == _G.FunctionTouchType.VipLevel then
+                            if type[2] <= 1 then
+                                self.FunctionOpenDic[key] = true
+                            else
+                                self.FunctionOpenDicType[type[1]].lockDic[key] = type[2]
+                            end
+                        else
+                            self.FunctionOpenDicType[type[1]].lockDic[key] = type[2]
+                        end
+                    end
+                else
+                    for _, type in pairs(value) do
+                        self.FunctionOpenDicType[type[1]].lockDic[key] = type[2]
+                    end
+                end
+            end
+        end
+    end
+end
+
+---初始化服务器功能开启列表
+---@param ids table 功能开启id组
+function FunctionManager:InitServerFunctionOpen(ids, award)
+    if not ids or #ids == 0 then
+        return
+    end
+    local condition = {}
+    ---服务器标记了但是没有发奖
+    for i = 1, #ids do
+        if ids[i] ~= 299 then
+            -- 299 功能直接关闭 后台不修数据，只能前台改，以后的人不要骂前端
+            self.FunctionOpenDic[ids[i]] = true
+            local is = true
+
+            for _, value in pairs(award) do
+                if value == ids[i] then
+                    is = false
+                    break
+                end
+            end
+            if is and not self:CheckFunctionForbidden(ids[i]) then
+                if #_G.ConfigManager.function_open_cfg[ids[i]].reward > 0 then
+                    _G.table.insert(condition, ids[i])
+                end
+            end
+        end
+    end
+    if #condition > 0 then
+        local msg = {}
+        msg.function_ids = condition
+
+        require "QuestionAnswerNet":GetInstance():OpenAward(
+                msg,
+                function(data)
+                    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                end
+        )
+    end
+
+    local cfgTrueList = {}
+    ---服务器没有标记并且没有发奖
+    for id, info in pairs(_G.ConfigManager.function_open_cfg) do
+        if not self.FunctionOpenDic[id] then
+            local is = true
+            for _, value in pairs(award) do
+                if value == id then
+                    is = false
+                end
+            end
+            local condition = info.condition_type
+            local cfg = _G.ConfigManager.discrete_cfg[126103]
+            local openIds = cfg[1]
+            if _G.table.ContainsValue(openIds, id) then
+                local temp = {}
+                for i = 1, #cfg[2], 2 do
+                    _G.table.insert(temp, { cfg[2][i * 2 - 1], cfg[2][i * 2] })
+                end
+                condition = temp
+            end
+            if is and _G.GlobalConditionManager.CheckConditionByArray(condition) then
+                self.FunctionOpenDic[id] = true
+                if #info.reward > 0 and not self:CheckFunctionForbidden(id) then
+                    _G.table.insert(cfgTrueList, id)
+                end
+            end
+        end
+    end
+
+    if #cfgTrueList > 0 then
+        local msg = {}
+        msg.function_ids = cfgTrueList
+
+        require "QuestionAnswerNet":GetInstance():OpenAward(
+                msg,
+                function(data)
+                    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                end
+        )
+    end
+end
+
+---初始化功能禁用列表
+---@param ids number[]
+function FunctionManager:InitFunctionForbidden(ids)
+    if not ids then
+        return
+    end
+    self.functionForbidden = {}
+    for i = 1, #ids do
+        self.functionForbidden[ids[i]] = true
+    end
+end
+
+---更新功能禁用列表
+---@param ids number[]
+function FunctionManager:UpdateFunctionForbidden(ids)
+    if not self.isInit then
+        return
+    end
+
+    ---@type table<number,boolean>, table<number,boolean>
+    local oldForbidden, newForbidden = self.functionForbidden, {}
+    if ids then
+        for i = 1, #ids do
+            newForbidden[ids[i]] = true
+        end
+    end
+    self.functionForbidden = newForbidden
+
+    local main_function_cfg = _G.ConfigManager.main_function_cfg
+    --功能禁用事件:
+    for functionId, _ in pairs(newForbidden) do
+        if self.FunctionOpenDic[functionId] and (not oldForbidden or not oldForbidden[functionId]) then
+            _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.FunctionForbidden, functionId)
+            --关闭主页面功能
+            for _, cfg in pairs(main_function_cfg) do
+                if cfg.function_open == functionId then
+                    self:CloseFunById(cfg.Id, true)
+                    --break
+                end
+            end
+        end
+    end
+    --功能解除事件:
+    if oldForbidden then
+        for functionId, _ in pairs(oldForbidden) do
+            if self.FunctionOpenDic[functionId] and not newForbidden[functionId] then
+                --_G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.FunctionForbidden, functionId)
+                --_G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.NewFunction, functionId)
+                _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.OpenCfgFunctionId, functionId)
+                --开启主页面功能
+                for _, cfg in pairs(main_function_cfg) do
+                    if cfg.function_open == functionId then
+                        self:OpenFunById(cfg.Id, true)
+                        --break
+                    end
+                end
+            end
+        end
+    end
+end
+
+---检查功能是否禁用
+---@param id number 功能id
+---@return boolean 是否禁用
+function FunctionManager:CheckFunctionForbidden(id)
+    if not self.functionForbidden then
+        return false
+    end
+    return self.functionForbidden[id] or false
+end
+
+function FunctionManager:GetAward(id)
+    if self:CheckFunctionForbidden(id) then
+        return
+    end
+    if not self.waitGetAwardList then
+        self.waitGetAwardList = {}
+    end
+    _G.table.insert(self.waitGetAwardList, id)
+    if self.WaitGetAwardTimer then
+        return
+    end
+    self.WaitGetAwardTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnGetAward, self, true, true, true)
+    self.WaitGetAwardTimer:Start()
+end
+
+function FunctionManager:OnGetAward()
+    self.WaitGetAwardTimer = nil
+    local msg = {}
+    msg.function_ids = self.waitGetAwardList
+    if _G.table.isEmptyOrNil(self.waitGetAwardList) then
+        return
+    end
+    require "QuestionAnswerNet":GetInstance():OpenAward(
+            msg,
+            function(msg2)
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg2)
+                self.waitGetAwardList = {}
+                --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            end
+    )
+end
+
+function FunctionManager:AddListener()
+    _G.Events:GetInstance():AddListener(_G.ePlayerStatus.PlayerUpLevel, self.PlayerUpLevel, self)
+    _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.PlayAaction, self.OnAactionEnent, self)
+    _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.VIP, self.PlayerVIP, self)
+    _G.Events:GetInstance():AddListener(_G.eRechargeEvent.TotalCash, self.OnTotalCash, self)
+    _G.Events:GetInstance():AddListener(_G.FunctionOpenDailyCheckEvent.DailyActive, self.DailyActive, self)
+    _G.Events:GetInstance():AddListener(_G.FunctionOpenDailyCheckEvent.GuildTrain, self.GuildTrain, self)
+end
+
+function FunctionManager:OnTotalCash()
+    self:DoFunctionAction(_G.FunctionTouchType.TotalCash)
+end
+
+---VIP 特权
+---@param VIP number 条件类型 (暂时使用，玩家等级)
+function FunctionManager:PlayerVIP(VIP)
+    --("VIP 解锁")
+    self:DoFunctionAction(_G.FunctionTouchType.VipLevel)
+end
+
+---玩家升级检测功能开放
+function FunctionManager:PlayerUpLevel(level)
+    self:DoFunctionAction(_G.FunctionTouchType.PlayerLevel)
+end
+
+---玩家升级检测功能开放
+function FunctionManager:DailyActive(num)
+    self:DoFunctionAction(_G.FunctionTouchType.DailyActive)
+end
+
+---玩家升级检测功能开放
+function FunctionManager:GuildTrain(times)
+    self:DoFunctionAction(_G.FunctionTouchType.GuildTrain)
+end
+
+---监听玩家操作
+function FunctionManager:OnAactionEnent(id, parmas, isfh)
+    local type = id[1]
+    if type == nil then
+        return
+    end
+    if type == _G.ActiveTaskEnum.ConditionEnum.Section.SectionPass then
+        self:DoFunctionAction(_G.FunctionTouchType.Section)
+    elseif type == _G.ActiveTaskEnum.ConditionEnum.AFK.IsPass then
+        self:DoFunctionAction(_G.FunctionTouchType.Afk)
+    elseif type == _G.ActiveTaskEnum.ConditionEnum.CardLevel.assignCountAssignStar then
+        self:DoFunctionAction(_G.FunctionTouchType.MaxStar)
+    end
+end
+
+function FunctionManager:CheckAfkChapterTitleViewOpen()
+    local MainOpenViewFunItem = {}
+    MainOpenViewFunItem.OpenViewFun = function()
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ChapterTitleView.Name, nil, true)
+    end
+    _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.mainOthen)
+end
+
+function FunctionManager:RemoveListener()
+    _G.Events:GetInstance():RemoveListener(_G.ePlayerStatus.PlayerUpLevel, self.PlayerUpLevel, self)
+    _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.PlayAaction, self.OnAactionEnent, self)
+    _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.VIP, self.PlayerVIP, self)
+    _G.Events:GetInstance():RemoveListener(_G.eRechargeEvent.TotalCash, self.OnTotalCash, self)
+    _G.Events:GetInstance():RemoveListener(_G.FunctionOpenDailyCheckEvent.DailyActive, self.DailyActive, self)
+    _G.Events:GetInstance():RemoveListener(_G.FunctionOpenDailyCheckEvent.GuildTrain, self.GuildTrain, self)
+end
+
+function FunctionManager:GetMainView()
+    local view = self.mainView
+    if _G.IsNil(view) then
+        local MainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+        if not _G.IsNil(MainView) then
+            self.mainView = MainView
+        end
+    end
+    return view
+end
+
+---新功能触发操作
+---@field functionTouchType FunctionTouchType 触发类型,用于判断流程以及回调
+---@field functions number[] 功能id
+---@field callBack function
+function FunctionManager:DoFunctionAction(touchType, functions, callBack)
+    local functionData = _G.FunctionData.New()
+    functionData.touchType = touchType
+    functionData.callBack = callBack
+    local _functions = {}
+    _functions = self:CheckFunctionCfgOpen(touchType)
+    if touchType == _G.FunctionTouchType.Afk then
+        self:CheckAfkIsBack(_functions)
+        self:CheckOpenFunc(#_functions)
+    end
+    if #_functions > 0 then
+        functionData.functions = _functions
+        -- -- --- 新功能开启界面 根据function_open_cfg表显示   ZHJ-7220【客户端】功能开放时机  2021年12月14日 15:14 周二
+        self:CheckInMainView(functionData)
+    end
+
+    local minFunIDArr = self:CheckMainFunctionOpen(touchType)
+    for key, value in pairs(minFunIDArr) do
+        self:AddNewFunId(value)
+    end
+
+    _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.OpenFunctionNewEvent)
+end
+
+function FunctionManager:InitOpenFunid()
+    self.FunctionOpenDicType[_G.FunctionTouchType.PlayerLevel].updataNumFun()
+    self.FunctionOpenDicType[_G.FunctionTouchType.Section].updataNumFun()
+    self.FunctionOpenDicType[_G.FunctionTouchType.Afk].updataNumFun()
+    self.FunctionOpenDicType[_G.FunctionTouchType.VipLevel].updataNumFun()
+    self.FunctionOpenDicType[_G.FunctionTouchType.TotalCash].updataNumFun()
+    self.FunctionOpenDicType[_G.FunctionTouchType.DailyActive].updataNumFun()
+    self.FunctionOpenDicType[_G.FunctionTouchType.GuildTrain].updataNumFun()
+
+    local maincfg = _G.ConfigManager.main_function_cfg
+    self.nowOpenFunid = {}
+    for mainId, _ in pairs(maincfg) do
+        if mainId == 5048 or mainId == "5048" then
+            local isopen = self:CheckLimit(mainId)
+        end
+        local isopen = self:CheckLimit(mainId)
+        if isopen == true then
+            self.nowOpenFunid[mainId] = true
+            self:RemoveWaitFunOpen(mainId)
+        else
+            isopen = self:CheckLimit(mainId, true)
+        end
+        self:CheckCloseMainFun(mainId)
+        ---观影台需要根据渠道id屏蔽
+        if mainId == _G.MainFunctionItems.ViewingAD then
+            if not require("AdvertisementModel"):GetInstance().isADOpen then
+                isopen = false
+            end
+        end
+        --- 解锁  且不是已关闭功能
+        if isopen == true and self.FunctionIdCloseDic[mainId] ~= false then
+            self.showFunid[mainId] = true
+        elseif self:CheckMallCondition(mainId) then
+            self.showFunid[mainId] = true
+        end
+    end
+    ---初始化完成后在监听
+    self:AddListener()
+end
+
+---放置结算是否显示返回按钮
+function FunctionManager:AfkIsBack()
+    return self.afkIsBack
+end
+
+function FunctionManager:CheckAfkIsBack(funcs)
+    local function_open_cfg = _G.ConfigManager.function_open_cfg
+    if #funcs > 0 then
+        for k, v in pairs(funcs) do
+            if function_open_cfg[v].is_return then
+                self.afkIsBack = true
+                return
+            end
+        end
+    end
+    if not require("AfkModel"):GetInstance():CheckNextSectionCondition() then
+        self.afkIsBack = true
+        return
+    end
+    self.afkIsBack = false
+end
+
+function FunctionManager:CheckOpenFunc(num)
+    self.haveOpenFunc = num > 0
+end
+
+function FunctionManager:HaveOpenFunc()
+    return self.haveOpenFunc
+end
+
+function FunctionManager:CheckCloseMainFun(mainFunId, isForce)
+    local state = self.FunctionIdCloseDic[mainFunId]
+    if (state == nil or state == false) and not isForce then
+        return false
+    end
+
+    ---@type main_function_cfg
+    local item = _G.ConfigManager.main_function_cfg[mainFunId]
+    if item and item.function_open > 0 then
+        if item.function_open >= ACTIVITY_INFO_ID then
+            --配置activity_info_cfg表解锁
+            local activityCfg = _G.ConfigManager.activity_info_cfg[item.function_open]
+            if not activityCfg then
+                self.FunctionIdCloseDic[mainFunId] = false
+                return false
+            end
+            if #activityCfg.condition_display == 1 then
+                local functionOpenCfg = _G.ConfigManager.function_open_cfg[activityCfg.condition_display[1]]
+                if not functionOpenCfg or not self:CheckCondition(functionOpenCfg.condition_type, activityCfg.condition_display[1]) then
+                    self.FunctionIdCloseDic[mainFunId] = false
+                    return false
+                end
+            else
+                for i = 1, #activityCfg.condition_display, 2 do
+                    if not _G.GlobalConditionManager.CheckCondition(activityCfg.condition_display[i], activityCfg.condition_display[i + 1]) then
+                        self.FunctionIdCloseDic[mainFunId] = false
+                        return false
+                    end
+                end
+            end
+        else
+            --配置function_open_cfg表解锁
+            if not self:CheckFunctionIsUnlock(item.function_open) then
+                self.FunctionIdCloseDic[mainFunId] = false
+                return false
+            end
+        end
+    end
+    if self.FunctionIdCloseFunDic[mainFunId] then
+        self.FunctionIdCloseDic[mainFunId] = self.FunctionIdCloseFunDic[mainFunId]()
+    end
+    return self.FunctionIdCloseDic[mainFunId]
+end
+
+---关闭 一个主界面功能
+function FunctionManager:CloseFunById(mainFunId, isForce)
+    if self.showFunid[mainFunId] == nil then
+        return
+    end
+    self:CheckCloseMainFun(mainFunId, isForce)
+    if self.FunctionIdCloseDic[mainFunId] == false then
+        self.showFunid[mainFunId] = nil
+        self.FunctionIdCloseFunDic[mainFunId] = nil
+        _G.MainManager:GetInstance():InitFunctions()
+    end
+end
+
+---开启 一个主界面功能
+function FunctionManager:OpenFunById(mainFunId, isForce)
+    local value = _G.ConfigManager.main_function_cfg[mainFunId]
+    if not value then
+        return
+    end
+    if string.IsNullOrEmpty(value.function_close[1]) == false then
+        local model = require(value.function_close[1])
+        local tFun = value.function_close[2]
+        if model and model[tFun] then
+            self.FunctionIdCloseDic[mainFunId] = true
+            self.FunctionIdCloseFunDic[mainFunId] = model[tFun]
+        end
+    elseif isForce then
+        --强制开启功能, 在下一步CheckCloseMainFun中将会更改状态
+        self.FunctionIdCloseDic[mainFunId] = true
+    end
+    self.showFunid[mainFunId] = self:CheckCloseMainFun(mainFunId, isForce)
+    _G.MainManager:GetInstance():InitFunctions()
+end
+
+---是否满足 主界面功能开放
+function FunctionManager:CheckMainFunctionOpen(FunctionTouchType)
+    local functions = {}
+    if self.FunctionCfgDic[FunctionTouchType] ~= nil then
+        ---@param Value function_open_cfg_Item
+        for _, Value in _G.pairs(self.FunctionCfgDic[FunctionTouchType]) do
+            --是否满足条件
+            if self:LimitAndNotIndexOf(Value.Id) then
+                _G.table.insert(functions, Value.Id)
+            end
+        end
+    end
+    if #functions <= 0 then
+        --
+        if _G.AppSetting.DEBUG then
+            _G.Log("没有满足等级的新功能开放，回到游戏", "<color=red>" .. ">>>" .. "</color>")
+        end
+    end
+    return functions
+end
+
+---内部方法 当玩家行为事件抛出 当检测类型通过时 检查其他限制条件是否通过
+---@param funcId number function_id
+---@param passType number FunctionTouchType
+function FunctionManager:CheckOtherCondition(funcId, passType)
+    for k, v in pairs(self.ConditionTypeWithId[funcId]) do
+        if v.type ~= passType then
+            if v.state == false then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+---是否满足 function_open_cfg 功能开放等级
+function FunctionManager:CheckFunctionCfgOpen(FunctionTouchType)
+    local functions = {}
+
+    if self.FunctionOpenDicType[FunctionTouchType] ~= nil then
+        self.FunctionOpenDicType[FunctionTouchType].updataNumFun()
+
+        local dic = self.FunctionOpenDicType[FunctionTouchType].lockDic
+        ---@param Value function_open_cfg_Item
+        for id, Value in _G.pairs(dic) do
+            local islock = self.FunctionOpenDicType[FunctionTouchType].CheckFun(Value)
+            local otherlock = self:CheckOtherCondition(id, FunctionTouchType)
+            if islock == true then
+                self.FunctionOpenDicType[FunctionTouchType].lockDic[id] = nil
+                if otherlock == true then
+                    self.FunctionOpenDic[id] = true
+                    _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.OpenCfgFunctionId, id)
+                    table.insert(functions, id)
+                else
+                    self:SetConditionTypeState(id, FunctionTouchType, true)
+                end
+            end
+        end
+        --return functions
+    end
+    --region 临时 检测vip
+    ---该功能会导致后面的功能无法正常解锁 现注释掉
+    local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.VIP.unlockFunction })
+    if data and data[1] then
+        local count = 1
+        local check_type = type(data[1])
+        if check_type == "number" then
+            -- 检测是不是数值类型
+            count = 1
+        else
+            count = 2
+        end
+        ---vip特权解锁条件特权id和功能id对应配置
+        local extraCondition = _G.ConfigManager.discrete_cfg[104315]
+        ---判断一下main_function_cfg里面是否配置了主界面不显示
+        local bol = _G.ConfigManager.main_function_cfg[extraCondition[1][1]].ShowInMainView
+        extraCondition = bol and extraCondition or {}
+        for i = 1, #data do
+            local fun_id = nil
+            if count < 2 then
+                fun_id = data[1]
+            else
+                fun_id = data[i][2]
+            end
+            if fun_id then
+                if self.FunctionOpenDic[fun_id] then
+                    --已经存在不管
+                    --return functions
+                else
+                    --return functions
+                    self.FunctionOpenDic[fun_id] = true
+                    for _, v in pairs(extraCondition) do
+                        ---vip特权解锁的功能直接开启
+                        if fun_id == v[3] then
+                            self:AddNewFunId(v[1])
+                            break
+                        end
+                    end
+                    _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.OpenCfgFunctionId, fun_id)
+                end
+            end
+        end
+    end
+    local resoult, fun_id1 = require "PrivilegeManager":GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.VIP.fightJump)
+    if resoult then
+        if self.FunctionOpenDic[fun_id1[1]] then
+            --已经存在不管
+            --return functions
+        else
+            --return functions
+            self.FunctionOpenDic[fun_id1[1]] = true
+            _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.OpenCfgFunctionId, fun_id1[1])
+        end
+    end
+    --endregion
+    return functions
+end
+
+---满足条件并且还没有创建
+function FunctionManager:LimitAndNotIndexOf(id)
+    if self:CheckLimit(id) then
+        self:GetMainView()
+
+        --并且没有添加的
+        if self.nowOpenFunid[id] == nil then
+            if _G.AppSetting.DEBUG then
+                _G.Log(id, "<color=red>" .. "这个新功能开放了" .. "</color>")
+            end
+            return true
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log(id, "<color=red>" .. "已存在这个功能" .. "</color>")
+            end
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log(id, "<color=red>" .. "等级/任务/剧情条件不满足" .. "</color>")
+        end
+    end
+    return false
+end
+
+---检查是否在主界面并弹窗或者存档
+function FunctionManager:CheckInMainView(functionData)
+    for i = #functionData.functions, 1, -1 do
+        local cfg = _G.ConfigManager.function_open_cfg[functionData.functions[i]]
+        if not cfg.open_animation then
+            table.remove(functionData.functions, i)
+        end
+    end
+
+    if #functionData.functions == 0 then
+        return
+    end
+    --- 防止添加两次显示
+    if #self.ShowNewfunctionData == 0 then
+        self.ShowNewfunctionData = functionData.functions
+        ---@type MainOpenViewFunItem
+        local MainOpenViewFunItem = {}
+        -- MainOpenViewFunItem.checkFun = function()
+        --     local isSection = false
+        --     local CurrentWorld = _G.WorldManager:GetInstance():GetCurWorld()
+        --     if CurrentWorld.Cfg.Scene_Type == _G.SceneType.Section then
+        --         isSection = true
+        --     end
+        --     return isSection == false and #self.ShowNewfunctionData > 0
+        -- end
+        MainOpenViewFunItem.OpenViewFun = function()
+            functionData.functions = self.ShowNewfunctionData
+            self:OpenFunctionsView(functionData)
+            self.ShowNewfunctionData = {}
+        end
+        _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.FunctionOpen)
+    else
+        table.insertto(self.ShowNewfunctionData, functionData.functions)
+    end
+end
+
+--- 是否有新功能开放界面 要显示
+function FunctionManager:IsHaveFunOpenView()
+    return #self.ShowNewfunctionData > 0
+end
+
+---打开新功能开放窗口
+function FunctionManager:OpenFunctionsView(functionData)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.OpenFunctionsView.Name, functionData)
+end
+
+--添加隐藏一个功能
+function FunctionManager:UpdateFunctions(functionId, show)
+    self:GetMainView()
+    if self.mainView then
+        self.mainView:UpdateFunctions(functionId, show)
+    end
+end
+
+--endregion
+
+--region 初始判断
+--检查条件返回满足条件的功能
+---@param id MainFunctionItems 功能id
+---@param isInitMain boolean 是否仅显示判断
+function FunctionManager:CheckLimit(id, isInitMain)
+    ---@type MainFunction_Item itemData
+    local itemData = _G.ConfigManager.main_function_cfg[id]
+    if itemData == nil then
+        return false
+    end
+    if not itemData.ShowInMainView then
+        return false
+    end
+
+    if isInitMain == true then
+        --功能开启条件未满足时是否可见
+        if itemData.is_display then
+            return true
+        end
+    end
+
+    ---功能开启id（无配置则默认开启）
+    if itemData.function_open == 0 then
+        self:CheckCloseMainFun(id, true)
+        if itemData.function_close[1] and self.FunctionIdCloseDic[id] == false then
+            return false
+        end
+        return true
+    end
+
+    --检查显示条件
+    if not _G.table.isEmptyOrNil(itemData.Display_condition) and
+        not _G.GlobalConditionManager.CheckConditionArrays({itemData.Display_condition}) then
+        return false
+    end
+
+    --检查功能开启条件
+    if itemData.function_open >= ACTIVITY_INFO_ID then
+        --配置activity_info_cfg表解锁
+        local activityCfg = _G.ConfigManager.activity_info_cfg[itemData.function_open]
+        if not activityCfg then
+            return false
+        end
+        if #activityCfg.condition_display == 1 then
+            local functionOpenCfg = _G.ConfigManager.function_open_cfg[activityCfg.condition_display[1]]
+            if not functionOpenCfg or not self:CheckCondition(functionOpenCfg.condition_type, activityCfg.condition_display[1]) then
+                return false
+            end
+        else
+            for i = 1, #activityCfg.condition_display, 2 do
+                if not _G.GlobalConditionManager.CheckCondition(activityCfg.condition_display[i], activityCfg.condition_display[i + 1]) then
+                    return false
+                end
+            end
+        end
+    else
+        --配置function_open_cfg表解锁
+        --开启条件类型（1-等级；2-主线副本；4-主线放置）
+        local functionOpenCfg = _G.ConfigManager.function_open_cfg[itemData.function_open]
+        if not functionOpenCfg or not self:CheckCondition(functionOpenCfg.condition_type, itemData.function_open) then
+            return false
+        end
+    end
+
+    if itemData.Id == _G.MainFunctionItems.MaterialCard then
+        return require "MaterialGiftModel":GetInstance():CheckIsOpen(1)
+    elseif itemData.Id == _G.MainFunctionItems.MaterialLM then
+        return require "MaterialGiftModel":GetInstance():CheckIsOpen(2)
+    end
+    self:CheckCloseMainFun(id, true)
+    if self.FunctionIdCloseDic[id] == false then
+        return false
+    end
+    return true
+end
+
+---检查main_function_cfg是否已解锁
+---@param id number main_function_cfg.id
+---@return boolean
+function FunctionManager:CheckMainFunctionCfgUnlock(id)
+    return self:CheckLimit(id)
+end
+
+--- 检测  内部方法
+function FunctionManager:CheckCondition(type1, id)
+    --开启条件类型（1-等级；2-主线副本；4-主线放置）
+    if self.isInit then
+        if self:CheckFunctionForbidden(id) then
+            return false
+        end
+        if not self.FunctionOpenDic[id] then
+            if id == 96 then
+                local resoult, fun_id = require "PrivilegeManager":GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.VIP.fightJump)
+                return resoult and id == fun_id[1]
+            elseif id == 301 then
+                return _G.GlobalConditionManager.CheckConditionByArray(type1)
+            elseif id == 26 then
+                return _G.GlobalConditionManager.CheckConditionByArray(type1)
+            end
+            return false
+        else
+            return self.FunctionOpenDic[id] == true
+        end
+    else
+        --region 临时填写 VIP 特权 功能解锁
+        ---检测有vip  将神召唤,放置推图功能
+        local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.VIP.unlockFunction })
+        if data and data[1] then
+            local count = 1
+            local check_type = type(data[1])
+            if check_type == "number" then
+                -- 检测是不是数值类型
+                count = 1
+            else
+                count = 2
+            end
+            for i = 1, #data do
+                if count < 2 then
+                    if data[i] == id then
+                        return true
+                    end
+                else
+                    if data[i][2] == id then
+                        return true
+                    end
+                end
+            end
+        end
+        ---战斗跳过
+        local resoult, fun_id = require "PrivilegeManager":GetInstance():GetPrivilegeBoolen(_G.PrivilegeType.VIP.fightJump)
+        if resoult and id == fun_id[1] then
+            return true
+        end
+        --endregin
+        return _G.GlobalConditionManager.CheckConditionByArray(type1)
+    end
+end
+
+--判断可视等级要求
+---@param needLevel number 可视等级
+function FunctionManager:CheckLevel(needLevel)
+    return _G.PlayerModel:GetInstance():GetLevel() >= needLevel
+end
+
+--判断剧情要求
+---@param plotId number 要判断的剧情id
+function FunctionManager:CheckPlot(plotId)
+    if plotId == 0 then
+        return true
+    end
+    local isFinish = true
+    --TODO 这里添加剧情检测
+    --isFinish = Plot.CheckPlot(plotId)
+    return isFinish
+end
+
+--判断任务要求
+---@param taskNeed number[] 要判断的任务id/state
+function FunctionManager:CheckTask(taskNeed)
+    if #taskNeed <= 0 then
+        return true
+    end
+    local isFinish = true
+    --TODO 这里添加任务检测
+    --isFinish = Task.CheckTask(taskNeed[1], taskNeed[2])
+    return isFinish
+end
+
+--endregion
+
+---ios的商城提审模式下特殊处理
+---TODO:http://log.youkia.com:8084/browse/ZHJH-9573 和策划确认，在ios提审模式下商场直接解锁
+function FunctionManager:CheckMallCondition(mainId)
+    if mainId == _G.MainFunctionItems.Mall and _G.AppSetting.IsArraigned and not _G.AppSetting.IsWebGl and _G.AppSetting.IsIos then
+        return true
+    end
+    return false
+end
+
+--判断这个按钮的使用限制
+---@param functionId MainFunctionItem 功能id
+function FunctionManager:CheckCanUse(functionId)
+    if self:CheckMallCondition(functionId) then
+        return true
+    end
+    local canUse = false
+
+    local itemData = _G.ConfigManager.main_function_cfg[functionId]
+    if itemData.function_open == 0 then
+        canUse = true
+    else
+        canUse = self:CheckLimit(functionId)
+    end
+    return canUse
+end
+
+--获取主界面 显示用的功能id
+function FunctionManager:GetNowOpenFunctionID()
+    local tb = {}
+    local insert = _G.table.insert
+    for k, v in pairs(self.showFunid) do
+        if v then
+            insert(tb, k)
+        end
+    end
+    return tb
+end
+
+--新解锁一个功能id
+function FunctionManager:AddNewFunId(Funid)
+    self.showFunid[Funid] = true
+
+    ---已解锁功能忽略
+    if self.nowOpenFunid[Funid] == true then
+        return
+    end
+    self.nowOpenFunid[Funid] = true
+
+    _G.Events:GetInstance():Broadcast(_G.eFunctionsStatus.NewFunction, Funid)
+
+    self:RemoveWaitFunOpen(Funid)
+
+    if Funid == 5036 then
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MacheIcon.id)
+    elseif Funid == 44 then
+        require("CampsiteModel"):GetInstance():RefredPointAllCamp()
+    end
+end
+
+--删除已解锁的功能
+function FunctionManager:RemoveWaitFunOpen(Funid)
+    --- 删除已解锁功能
+    ---@param funlist function_open_cfg_Item[]
+    for opentype, funlist in pairs(self.FunctionCfgDic) do
+        for i, value in pairs(funlist) do
+            if value.Id == Funid then
+                table.remove(self.FunctionCfgDic[opentype], i)
+                return
+            end
+        end
+    end
+end
+
+--移动一个新功能
+---@param item Transform 要移动的显示对象
+---@param id number 功能id
+---@param delayTime number 移动速度
+function FunctionManager:ItemMove(item, id, delayTime)
+    self:GetMainView()
+    if self.mainView then
+        self.mainView:ItemMove(item, id, delayTime)
+    end
+end
+
+---判断功能是否解锁
+---@param sid number function_open_cfg 表Id
+function FunctionManager:CheckFunctionIsUnlock(sid)
+    if sid == 0 then
+        return true
+    end
+    local cfg = _G.ConfigManager.function_open_cfg[sid]
+    if cfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" function_open_cfg 未找到  " .. tostring(sid))
+        end
+        return true
+    end
+    -- --endregin
+    return self:CheckCondition(cfg.condition_type, sid)
+end
+
+---显示功能未开启提示
+---@param sid number function_open_cfg 表Id
+function FunctionManager:ShowFuncitonOpenTips(sid)
+    local str, mTipsid
+    if sid == 156 then
+        --冒险关卡跳过功能显示固定提示语句
+        mTipsid = _G.AppSetting.IsArraigned and 3706 or 3704
+        if mTipsid == 3704 then
+            str = _G.GetLangPackValue(_G.GameUtil.GetVoucherArg(90020800026, 90036300034))
+        end
+    else
+        str, mTipsid = self:GetTipsStr(sid)
+    end
+    _G.PopWindowManager:GetInstance():ShowAllTips(mTipsid, str)
+end
+
+function FunctionManager:GetTipsStr(sid)
+    local funopenCfg = _G.ConfigManager.function_open_cfg[sid]
+    if funopenCfg == nil then
+        return
+    end
+    local _, lockType = _G.GlobalConditionManager.CheckConditionByArray(funopenCfg.condition_type)
+    if lockType then
+        return self:GetStrWithType(lockType[1], lockType[2], nil, sid)
+    else
+        ---按以前的逻辑给默认
+        if not _G.table.isEmptyOrNil(funopenCfg.condition_type) then
+            return self:GetStrWithType(funopenCfg.condition_type[1][1], funopenCfg.condition_type[1][2])
+        end
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("检测条件FunctionManager,无condition_type")
+    end
+    return
+end
+
+---@return table 返回所有未通过condition的提示
+function FunctionManager:GetAllTipsStr(sid)
+    local funopenCfg = _G.ConfigManager.function_open_cfg[sid]
+    if funopenCfg == nil then
+        return
+    end
+    local _, lockType = _G.GlobalConditionManager.CheckConditionByArray(funopenCfg.condition_type, true)
+    local str, mTipsid
+    local strT = {}
+    local mTipsidT = {}
+    if not _G.table.isEmptyOrNil(lockType) then
+        for i = 1, #lockType do
+            str, mTipsid = self:GetStrWithType(lockType[i][1], lockType[i][2], nil, sid)
+            table.insert(strT, str)
+            table.insert(mTipsidT, mTipsid)
+        end
+        return strT, mTipsidT
+    else
+        ---按以前的逻辑给默认
+        if not _G.table.isEmptyOrNil(funopenCfg.condition_type) then
+            str, mTipsid = self:GetStrWithType(funopenCfg.condition_type[1][1], funopenCfg.condition_type[1][2])
+            table.insert(strT, str)
+            table.insert(mTipsidT, mTipsid)
+            return strT, mTipsidT
+        end
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("检测条件FunctionManager,无condition_type")
+    end
+    return strT, mTipsidT
+end
+
+---获取提示
+---@param type number 开启条件类型
+---@param params number 参数
+---@param isDark boolean 是不是暗底文字
+---@param sid number 需要特殊处理的function_open_cfg表id 可不传入
+function FunctionManager:GetStrWithType(type, params, isDark, sid)
+    ---开启条件类型（1-等级；2-主线副本；4-主线放置）
+    local condition_type = type
+
+    local mTipsid = self.tipsId[condition_type]
+    --如果是暗底需要改文本ID(文字颜色由浅色改为深色)
+    local mLanguageId = (isDark and condition_type == 4) and 90020600071 or self.languageId[condition_type]
+
+    local str = ""
+    if condition_type == 1 then
+        if params > 10000 then
+            str = _G.LangUtil.GetLangPackValue(90100000165)
+        else
+            str = _G.LangUtil.GetLangPackValue(mLanguageId, params)
+        end
+    elseif condition_type == 2 then
+        local sectCfg = _G.ConfigManager.main_section_cfg[params]
+        str = _G.LangUtil.GetLangPackValue(mLanguageId, _G.LangUtil.GetLangPackValue(sectCfg.Name))
+    elseif condition_type == 4 then
+        local sectCfg = _G.ConfigManager.afk_cfg[params]
+        if sectCfg then
+            str = _G.LangUtil.GetLangPackValue(mLanguageId, sectCfg.chapter, sectCfg.section)
+        end
+    elseif condition_type == 50 then
+        str = _G.TimeUtil.TranslateDayForStr(
+                (params - 1) * 86400 + _G.PlayerModel:GetInstance():GetServerOpenTime() - _G.TimeUtil.GetServerUnixTime()
+        )
+    elseif condition_type == 54 then
+        str = _G.TimeUtil.TranslateDayForStr(
+                (params - 1) * 86400 + _G.PlayerModel:GetInstance():GetBattleOpenTime() - _G.TimeUtil.GetServerUnixTime()
+        )
+    elseif condition_type == 9 then
+        if sid and self.specialTip[sid] ~= nil then
+            str = _G.LangUtil.GetLangPackValue(self.specialTip[sid][1], params)
+            mTipsid = self.specialTip[sid][2]
+        else
+            str = _G.TimeUtil.TranslateDayForStrSix(
+                    (params - 1) * 86400 + _G.PlayerModel:GetInstance():GetCreateRoleTime() -
+                            _G.TimeUtil.GetServerUnixTime()
+            )
+        end
+    elseif condition_type == 55 then
+        local name = _G.GetLangPackValue(_G.ConfigManager.hell_title_cfg[params].name)
+        str = _G.LangUtil.GetLangPackValue(mLanguageId, name)
+    end
+    return str, mTipsid
+end
+
+---检测功能是否要进行显示 (主要用来给页签功能显示锁)
+---@param sid number function_open sid
+---@param node UnityEngine.Transform| UnityEngine.GameObject
+---@param IsHideBtn boolean true 根据配置is_display 控制按钮显示
+function FunctionManager:CheckIsDisplay(sid, node, IsHideBtn)
+    if not self.ShowLock then
+        self.ShowLock = {}
+    end
+
+    local isUnLock = self:CheckFunctionIsUnlock(sid)
+    if isUnLock then
+        if IsHideBtn then
+            _G.GameUtil.SetActiveByCondition(node, true)
+        end
+        return true
+    else
+        local cfg = _G.ConfigManager.function_open_cfg[sid]
+        if cfg.is_display then
+            if node:GetChildE(node:GetChildCountE() - 1):GetName() ~= "@_aorbtn_Lock" and not self.ShowLock[sid] then
+                self.ShowLock[sid] = true
+                _G.PoolsManager:GetInstance():Spawn(
+                        LockPath,
+                        _G.ePoolType.Temporary,
+                        node,
+                        function(trans)
+                            local grayComp = node:GetComponentsInChildren(_G.typeof(_G.CS.IGrayMember))
+                            if grayComp then
+                                local count = grayComp.Length
+                                for i = 1, count do
+                                    grayComp[i - 1]:SetGray(true)
+                                end
+                            end
+                            local text = node:GetComponentInChildrenE(_G.typeof(_G.CS.AorText))
+                            if text then
+                                text.color = _G.Color.gray
+                            end
+                            trans:SetAnchorPosition(0, 0)
+                            --trans:SetRectOffSetToZero()
+                            trans:GetComponentE(_G.typeof(_G.CS.AorButton)).onClick:AddListener(
+                                    function()
+                                        self:ShowFuncitonOpenTips(sid)
+                                    end
+                            )
+                            self.ShowLock[sid] = nil
+                        end
+                )
+            end
+            if IsHideBtn then
+                _G.GameUtil.SetActiveByCondition(node, true)
+            end
+            return true
+        end
+        if IsHideBtn then
+            _G.GameUtil.SetActiveByCondition(node, false)
+        end
+
+        return false
+    end
+end
+
+function FunctionManager:OnSixClockUpdate(endcall)
+    ---ZHJ-33628会走在InitFunction前面，无法领取奖励
+    self.sixClockInitCall = function()
+        self:DoFunctionAction(_G.FunctionTouchType.ServerTime)
+        self:DoFunctionAction(_G.FunctionTouchType.BattleAreaServerTime)
+        self:DoFunctionAction(_G.FunctionTouchType.PlayerCreateTime)
+    end
+    self.super.OnSixClockUpdate(self, endcall)
+end

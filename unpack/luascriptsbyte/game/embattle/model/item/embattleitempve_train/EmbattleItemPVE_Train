@@ -1,0 +1,651 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Embattle.Model.Item.EmbattleItemPVE_Train	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/01/06
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+--region --------------------------------------匹配战斗临时构建的卡牌数据类--------
+
+---@class EmbattleItemTrainTemporaryCardData
+local EmbattleItemTrainTemporaryCardData = _G.BaseClass("EmbattleItemTrainTemporaryCardData")
+---@param cfg monster_cfg
+function EmbattleItemTrainTemporaryCardData:__init(cfg)
+    self.uid = cfg.id
+    self.sid = cfg.CardID
+    self.cfg = _G.ConfigManager.card_cfg[self.sid]
+    self.level = cfg.Level
+    self.star = cfg.Stars
+    self.power = cfg.Power
+end
+function EmbattleItemTrainTemporaryCardData:Dispose()
+    self.uid = nil
+    self.sid = nil
+    self.cfg = nil
+    self.level = nil
+    self.star = nil
+    self.power = nil
+end
+function EmbattleItemTrainTemporaryCardData:GetLevel()
+    return self.level
+end
+function EmbattleItemTrainTemporaryCardData:GetStar()
+    return self.star
+end
+
+function EmbattleItemTrainTemporaryCardData:GetPower()
+    return self.power
+end
+
+--endregion------------------------------------匹配战斗临时构建的卡牌数据类--------
+
+local EmbattleItemPVE = require "EmbattleItemPVE"
+
+---@class EmbattleItemPVE_Train:EmbattleItemPVE	中文描述
+local EmbattleItemPVE_Train = _G.BaseClass("EmbattleItemPVE_Train", EmbattleItemPVE)
+-- _G.EmbattleItemPVE_Train = EmbattleItemPVE_Train
+
+---@field sectionId number 关卡id
+---@class  Params_EmbattleItemPVE_Train
+
+---类的构造函数
+---@param data Params_EmbattleItemPVE_Train
+---@field tag number 0 = 正常，1 = 固定不可移动 -1 = 固定可以移动
+function EmbattleItemPVE_Train:__init(etype, saveType, notPassServer, monsterGroupID, data)
+    self.Data = data
+    --- 上阵限制  1=1人1灵 共两角色
+    self.Poslimit = 1
+    local train_section_cfgItem = _G.ConfigManager.train_section_cfg[self.Data.sectionId]
+    if train_section_cfgItem ~= nil then
+        if train_section_cfgItem.num_cards > 0 then
+            self.Poslimit = train_section_cfgItem.num_cards
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("  num_cards is nil , train_section_cfg id :" .. self.Data.sectionId)
+        end
+    end
+    self:InitEnemyEmbattleData()
+    self:InitEmbattleData()
+    self:InitSectionId()
+
+    require "EmbattleController":GetInstance():SetHelpInstructionID(23)
+end
+
+---类的析构函数
+function EmbattleItemPVE_Train:Dispose()
+end
+
+--region 重写方法
+function EmbattleItemPVE_Train:InitSectionId()
+    require "TrainingModel":GetInstance():SetTrainScetionID(self.Data.sectionId)
+end
+
+---初始化布阵数据
+function EmbattleItemPVE_Train:InitEmbattleData()
+    self.curEmbattleData = self.curEmbattleData or {false, false, false, false, false}
+    self.curUids = {}
+    self.curSids = {}
+    self:InitSpecialEmbattle()
+    self:InitSpecialEmbattleMove()
+    local data = self:GetServerEmbattleData(self.curEmbattleType)
+    for j = 1, #self.curEmbattleData do
+        if not self.curEmbattleData[j] then --使用布阵数据
+            local ed = {
+                uid = 0,
+                sid = 0,
+                star = 0,
+                level = 1,
+                soulLink_lv = 0,
+                tag = 0
+            }
+            self.curEmbattleData[j] = ed
+            if data[j] > 0 then
+                local card = self:GetCardData(data[j])
+                if not self.curSids[card.sid] then
+                    ed.uid = card.uid
+                    ed.sid = card.sid
+                    ed.star = card:GetStar()
+                    ed.level = card:GetLevel()
+                    ed.soulLink_lv = card.soulLink_lv
+                    ed.tag = 0
+                    self.curUids[card.uid] = true
+                    self.curSids[card.sid] = true
+                end
+            end
+        elseif self.curEmbattleData[j].uid > 0 then --会运行两次初始化
+            self.curUids[self.curEmbattleData[j].uid] = true
+            self.curSids[self.curEmbattleData[j].sid] = true
+        end
+    end
+    self:SetCombSkillData()
+    self:SetPetSkillData()
+end
+
+---检测空位是否还有可上阵的英雄
+---@return boolean 是否有空位并且有可上阵的英雄
+function EmbattleItemPVE_Train:CheckEmptyPos()
+    --- 上阵限制已满
+    if self:GetIntoCount() >= (self.Poslimit) then
+        return 0
+    end
+    return EmbattleItemPVE.CheckEmptyPos(self)
+end
+---@return boolean 是否显示编队按钮
+function EmbattleItemPVE_Train:ShowFormationBtn()
+    return false
+end
+function EmbattleItemPVE_Train:GetEmbattleSaveKey()
+    return self.curEmbattleType .. self.Data.sectionId
+end
+---清空
+---@param index number 编号(针对多布阵数据  挂机副本)
+function EmbattleItemPVE_Train:ClearEmbattle(index)
+    if self.Data == nil then
+        return
+    end
+
+    if self.curEmbattleData == nil then
+        return
+    end
+    local card
+    for i = 1, #self.curEmbattleData do
+        card = self.curEmbattleData[i]
+        if card.tag == 0 then
+            local num = self:CheckIsSpecialEmbattle(card.uid)
+            if card.uid > 0 then
+                if num == 0 then
+                    self:SetCurUids(card.uid, false)
+                    self:SetCurSids(card.sid, false)
+                end
+            end
+            if num == 0 then
+                card.uid = 0
+                card.sid = 0
+                card.level = 0
+                card.star = 0
+                card.soulLink_lv = 0
+            end
+        end
+    end
+    if not self.curCombSkillData then
+        return
+    end
+    local skill
+    for i = 1, #self.curCombSkillData do
+        skill = self.curCombSkillData[i]
+        if skill.tag == 0 then
+            skill.id = 0
+            skill.lv = 0
+            skill.cskillID = 0
+        end
+    end
+
+    require("TrainingModel"):GetInstance():UpdataUpCount()
+end
+
+---获取第一个空的位置
+---@param index number 多布阵序列号
+---@return number 空序列
+function EmbattleItemPVE_Train:GetFirstEmptyIndex(etIndex, index)
+    local count = 0
+    for i = 1, 5 do
+        if self.curEmbattleData[i].uid > 0 then
+            count = count + 1
+        end
+        if count >= (self.Poslimit * 2) then
+            return 0
+        end
+    end
+    return EmbattleItemPVE.GetFirstEmptyIndex(self, index)
+end
+---获取可上阵人数
+function EmbattleItemPVE_Train:GetEmbattleCount()
+    local count = 0
+    for i = 1, 5 do
+        if self.curEmbattleData[i].uid > 0 then
+            count = count + 1
+        end
+        if count >= self.Poslimit then
+            return 0
+        end
+    end
+    return self.Poslimit - count
+end
+---检测卡牌状态 除了状态1 其他状态全部为lock
+---@param uid number 卡牌uid
+---@param index number 当前选择的分组
+---@return EmbattleState  布阵卡牌状态
+function EmbattleItemPVE_Train:CheckCardLock(uid, curIndex)
+    --     local data = self:GetCardData(uid)
+    --     local indexS = data.cfg.UnitType == 1 and {1, 3, 5} or {2, 4, 6}
+
+    local count = 0
+    for i = 1, 5 do
+        if self.curEmbattleData[i].uid > 0 then
+            count = count + 1
+        end
+        if count >= self.Poslimit then
+            return 4
+        end
+    end
+    return 1
+end
+---初始化卡牌列表
+---@return table 卡牌列表
+function EmbattleItemPVE_Train:InitCardList()
+    self.curChooseCardList = {}
+    ---@type train_section_cfg
+    local sectioncfg = _G.ConfigManager.train_section_cfg[self.Data.sectionId]
+    if sectioncfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("train_section_cfg sectionId is nil " .. tostring(self.Data.sectionId))
+        end
+        return
+    end
+
+    local monster_cfg = _G.ConfigManager.monster_cfg
+    local monster_cfgItem
+    local cardlist = {}
+    if not _G.table.isEmptyOrNil(sectioncfg.cards_usable) then
+        for i = 1, #sectioncfg.cards_usable do
+            if sectioncfg.cards_usable[i] > 0 then
+                _G.table.insert(cardlist, sectioncfg.cards_usable[i])
+            end
+        end
+    end
+    if not _G.table.isEmptyOrNil(sectioncfg.fixed_format) then
+        for i = 1, #sectioncfg.fixed_format do
+            if sectioncfg.fixed_format[i] > 0 then
+                _G.table.insert(cardlist, sectioncfg.fixed_format[i])
+            end
+        end
+    end
+    if not _G.table.isEmptyOrNil(sectioncfg.format_swap) then
+        for i = 1, #sectioncfg.format_swap do
+            if sectioncfg.format_swap[i] > 0 then
+                _G.table.insert(cardlist, sectioncfg.format_swap[i])
+            end
+        end
+    end
+    for _, monsterid in pairs(cardlist) do
+        monster_cfgItem = monster_cfg[monsterid]
+        if monster_cfgItem == nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("monster_cfg monsterid No Find " .. tostring(monsterid))
+            end
+        else
+            local carddata = EmbattleItemTrainTemporaryCardData.New(monster_cfgItem)
+            _G.table.insert(self.curChooseCardList, carddata)
+        end
+    end
+    self:SortCardList()
+end
+
+---初始化 固定阵容 不可移动
+function EmbattleItemPVE_Train:InitSpecialEmbattle()
+    if self.Data == nil then
+        return
+    end
+    local sectioncfg = _G.ConfigManager.train_section_cfg[self.Data.sectionId]
+    if sectioncfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("train_section_cfg sectionId is nil " .. tostring(self.Data.sectionId))
+        end
+        return
+    end
+    local data = {}
+    if not _G.table.isEmptyOrNil(sectioncfg.fixed_format) then
+        for i = 1, #sectioncfg.fixed_format do
+            _G.table.insert(data, sectioncfg.fixed_format[i])
+        end
+    else
+        return
+    end
+    for j = 1, #self.curEmbattleData do
+        if self.curEmbattleData[j] then --使用布阵数据
+            if data[j] > 0 then
+                local card = self:GetCardData(data[j])
+                if not self.curSids[card.sid] then
+                    self.curEmbattleData[j].uid = card.uid
+                    self.curEmbattleData[j].sid = card.sid
+                    self.curEmbattleData[j].star = card:GetStar()
+                    self.curEmbattleData[j].level = card:GetLevel()
+                    self.curEmbattleData[j].soulLink_lv = card.soulLink_lv
+                    self.curEmbattleData[j].tag = 0
+                    self.curUids[card.uid] = true
+                    self.curSids[card.sid] = true
+                end
+            end
+        end
+    end
+end
+---初始化 固定阵容 可移动
+function EmbattleItemPVE_Train:InitSpecialEmbattleMove()
+    if self.Data == nil then
+        return
+    end
+    local sectioncfg = _G.ConfigManager.train_section_cfg[self.Data.sectionId]
+    if sectioncfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("train_section_cfg sectionId is nil " .. tostring(self.Data.sectionId))
+        end
+        return
+    end
+    local data = {}
+    if not _G.table.isEmptyOrNil(sectioncfg.format_swap) then
+        for i = 1, #sectioncfg.format_swap do
+            _G.table.insert(data, sectioncfg.format_swap[i])
+        end
+    else
+        return
+    end
+    for j = 1, #self.curEmbattleData do
+        if self.curEmbattleData[j] then --使用布阵数据
+            if data[j] > 0 then
+                local card = self:GetCardData(data[j])
+                if not self.curSids[card.sid] then
+                    self.curEmbattleData[j].uid = card.uid
+                    self.curEmbattleData[j].sid = card.sid
+                    self.curEmbattleData[j].star = card:GetStar()
+                    self.curEmbattleData[j].level = card:GetLevel()
+                    self.curEmbattleData[j].soulLink_lv = card.soulLink_lv
+                    self.curUids[card.uid] = true
+                    self.curSids[card.sid] = true
+                end
+            end
+        end
+    end
+end
+---检测卡牌是否可操作（特殊阵容，固定不可移动，固定可移动）
+function EmbattleItemPVE_Train:CheckCardHandle(uid)
+    local num = self:CheckIsSpecialEmbattle(uid)
+    if num ~= 0 then
+        if num == 1 then
+            _G.FloatTipsModel:GetInstance():Show(_G.LangUtil.GetLangPackValue(90024300055))
+        else
+            _G.FloatTipsModel:GetInstance():Show(_G.LangUtil.GetLangPackValue(90024300054))
+        end
+        return false, num
+    end
+    return self.super.CheckCardHandle(self, uid)
+end
+---特殊阵容 ( 1= 固定不可以移动，0 =  正常，-1 = 固定可以移动)
+---@return 0,1 -1
+function EmbattleItemPVE_Train:CheckIsSpecialEmbattle(uid)
+    if self.Data == nil then
+        return
+    end
+    local sectioncfg = _G.ConfigManager.train_section_cfg[self.Data.sectionId]
+    if sectioncfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("train_section_cfg sectionId is nil " .. tostring(self.Data.sectionId))
+        end
+        return
+    end
+    if not _G.table.isEmptyOrNil(sectioncfg.fixed_format) then
+        for key, value in pairs(sectioncfg.fixed_format) do
+            if value > 0 and uid == value then
+                return 1
+            end
+        end
+    end
+    if not _G.table.isEmptyOrNil(sectioncfg.format_swap) then
+        for key, value in pairs(sectioncfg.format_swap) do
+            if value > 0 and uid == value then
+                return -1
+            end
+        end
+    end
+    return 0
+end
+
+---获取己方战斗力
+---@param index number 布阵序列号
+---@return number 战斗力
+function EmbattleItemPVE_Train:GetMyEmbattlePower(index, isView)
+    return 0
+end
+
+function EmbattleItemPVE_Train:GetEnemyEmbattlePower(index)
+    return 0
+end
+
+---获取卡牌对象
+---@param uid number 卡牌uid
+---@return EmbattleItemTrainTemporaryCardData 卡牌数据对象
+function EmbattleItemPVE_Train:GetCardData(uid)
+    local cfg = _G.ConfigManager.monster_cfg[uid]
+    if cfg == nil then
+        return nil
+    end
+    return EmbattleItemTrainTemporaryCardData.New(cfg)
+end
+
+---是否显示顶部战斗力
+---@return 变量类型 中文描述
+function EmbattleItemPVE_Train:ShowTopPower()
+    return false
+end
+--region --------------------------------------新增 --------
+
+---获取上阵数量
+function EmbattleItemPVE_Train:GetIntoCount()
+    local count = 0
+    for i = 1, 5 do
+        if self.curEmbattleData[i].uid > 0 then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+--设置合击技显示数据
+function EmbattleItemPVE_Train:OtherGroupSkillListNew(index)
+    if self.combineSkillList then
+        return self.combineSkillList
+    end
+    self.combineSkillList = {}
+    for key, value in pairs(_G.ConfigManager.train_section_cfg[self.Data.sectionId].skills) do
+        _G.table.insert(self.combineSkillList, {value[1], value[2]})
+    end
+    for k, v in pairs(_G.ConfigManager.train_section_cfg[self.Data.sectionId].fixed_skills) do
+        _G.table.insert(self.combineSkillList, {v[1], v[2]})
+    end
+    return self.combineSkillList
+end
+
+function EmbattleItemPVE_Train:SetCombSkillData(data, index)
+    if self.Data == nil then
+        return
+    end
+    if data then
+        local cur, last
+        for i = 1, #data do
+            last = self.curCombSkillData[i]
+            if last.tag == 0 then
+                cur = data[i]
+                last.id = cur.id
+                last.lv = cur.lv
+                last.cskillID = cur.cskillID
+            end
+        end
+    else
+        self.curCombSkillData = self:GetSkillIndex(self.curEmbattleType)
+        local CombineModelIns = require("CombineModel"):GetInstance()
+        local cfgs = _G.ConfigManager.combine_cfg
+        local groupCfg = _G.ConfigManager.train_section_cfg[self.Data.sectionId].skill
+        local flag = false
+        if _G.table.isEmptyOrNil(groupCfg) then
+            groupCfg = {}
+            groupCfg = _G.ConfigManager.train_section_cfg[self.Data.sectionId].fixed_skills
+            flag = true
+        end
+        local skill
+        for i = 1, #self.curCombSkillData do
+            skill = {
+                id = 0,
+                lv = 0,
+                cskillID = 0,
+                tag = 0
+            }
+            if groupCfg[i] and groupCfg[i][1] ~= 0 then
+                local id = groupCfg[i][1]
+
+                if flag then
+                    local id2 = self:CheckSameType(id)
+                    if id2 == 0 or id < id2 then
+                        skill.tag = -1
+                        skill.cskillID = cfgs[id].skills[groupCfg[i][2]]
+                        skill.id = groupCfg[i][1]
+                        skill.lv = 0
+                        self.storyBattleTag = true
+                    end
+                else
+                    skill.tag = 1
+                    skill.cskillID = cfgs[id].skills[groupCfg[i][2]]
+                    skill.id = groupCfg[i][1]
+                    skill.lv = 0
+                end
+            else
+                if self.curCombSkillData[i] > 0 then
+                    skill.id = self.curCombSkillData[i]
+                    skill.lv = CombineModelIns:GetCombineLevel(self.curCombSkillData[i])
+                    skill.cskillID = cfgs[skill.id].skills[skill.lv]
+                end
+            end
+            self.curCombSkillData[i] = skill
+        end
+    end
+end
+---检测是否存在相同类型的合击技
+function EmbattleItemPVE_Train:CheckSameType(id)
+    if not id or id <= 0 then
+        return 0
+    end
+    local type = _G.ConfigManager.combine_cfg[id].classify
+    local cfg2
+    for _, v in pairs(self.curCombSkillData) do
+        if _G.type(v) == "table" then
+            if v.id > 0 then
+                cfg2 = _G.ConfigManager.combine_cfg[v.id]
+                if cfg2.classify == type then
+                    return v.id
+                end
+            end
+        elseif v > 0 then
+            if v > 0 then
+                cfg2 = _G.ConfigManager.combine_cfg[v]
+                if cfg2.classify == type then
+                    return v
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---获取合击技能状态
+---@return table 技能位置状态
+function EmbattleItemPVE_Train:GetCombineSkillState()
+    if self.combinePosState then
+        return self.combinePosState
+    end
+    local count = _G.table.count(_G.ConfigManager.train_section_cfg[self.Data.sectionId].skills)
+    count = count > 3 and 3 or count
+    self.combinePosState = {false, false, false}
+    for i = 1, count do
+        self.combinePosState[i] = true
+    end
+    count = _G.table.count(_G.ConfigManager.train_section_cfg[self.Data.sectionId].fixed_skills)
+    count = count > 3 and 3 or count
+    for j = 1, count do
+        self.combinePosState[j] = true
+    end
+    return self.combinePosState
+end
+function EmbattleItemPVE_Train:GetCombineSkillList()
+    if not self.skills then
+        self.skills = {}
+        self.skillsCfg = _G.ConfigManager.train_section_cfg[self.Data.sectionId].skills
+        for k, v in pairs(self.skillsCfg) do
+            self.skills[v[1]] = v[2]
+        end
+        self.skillsCfg = {}
+        self.skillsCfg = _G.ConfigManager.train_section_cfg[self.Data.sectionId].fixed_skills
+        for key, value in pairs(self.skillsCfg) do
+            self.skills[value[1]] = value[2]
+        end
+    end
+    return self.skills
+end
+
+---保存布阵数据
+---@param saveCall function 保存回调
+---@return any 默认没有返回
+function EmbattleItemPVE_Train:SaveEmbattle(saveCall)
+    if self.storyBattleTag then
+        self.onSaveCall = saveCall
+        local sits = {0, 0, 0, 0, 0}
+        for i = 1, #self.curEmbattleData do
+            if self.curEmbattleData[i].tag == 0 then
+                sits[i] = self.curEmbattleData[i].uid
+            end
+        end
+        local skills = {0, 0, 0}
+        for i = 1, #self.curCombSkillData do
+            if self.curCombSkillData[i].tag == 0 then
+                skills[i] = self.curCombSkillData[i].id
+            end
+        end
+        local EmbattleModelIns = require("EmbattleModel"):GetInstance()
+        EmbattleModelIns:SetSkillIndex(self.curEmbattleType, skills)
+        EmbattleModelIns:SaveEmbattleDataNew(
+            self.curEmbattleType,
+            _G.handler(self, self.OnSaveEnd),
+            self.saveType,
+            self.notPassServer,
+            sits
+        )
+        sits = nil
+    else
+        require "EmbattleItemBase".SaveEmbattle(self, saveCall)
+    end
+end
+--endregion------------------------------------新增 --------
+
+---处理下阵
+------@param embattleArray table 布阵数据
+---@param index number 布阵序列
+---@param uid number 卡牌uid
+---@param etIndex number 多布阵序列号
+---@param pos number 位置编号
+---@return 变量类型 中文描述
+function EmbattleItemPVE_Train:SetEmbattleDataSingle(index, uid, etIndex, pos)
+    local uid1 = self.curEmbattleData[index].uid
+    if self:CheckIsSpecialEmbattle(uid1) ~= 0 then
+        return false
+    end
+    return self.super.SetEmbattleDataSingle(self, index, uid, etIndex, pos)
+end
+
+function EmbattleItemPVE_Train:GetCombineSkillUnLockCondition()
+    return nil
+end
+
+function EmbattleItemPVE_Train:ShowClearBtn()
+    return false
+end
+---是否显示皮肤
+function EmbattleItemPVE_Train:EmbattleIs()
+    self.Embattle = false
+    return self.Embattle
+end
+
+--region override pet function
+function EmbattleItemPVE_Train:GetPetSkillState()
+    return {false, false}
+end
+--endregion
+
+return EmbattleItemPVE_Train

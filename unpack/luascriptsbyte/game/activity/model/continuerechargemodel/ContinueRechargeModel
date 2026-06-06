@@ -1,0 +1,247 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DailyDelivery.Model.ContinueRechargeModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/12/17
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ActivitySynNet = require "ActivitySynNet"
+local ActivitySynManager = require "ActivitySynManager"
+local base = require "ActivitySynTypeBase"
+---@class ContinueRechargeModel : Singleton
+local ContinueRechargeModel = _G.BaseClass("ContinueRechargeModel", base)
+function ContinueRechargeModel:__init()
+    _G.Events:GetInstance():AddListener(_G.eRechargeEvent.DayCash, self.OnCash, self)
+    self.curActivityState = false
+    self.curActivityClass:AddStateChanged(self.StateChange, self)
+end
+---当状态改变
+function ContinueRechargeModel:StateChange(state)
+    if state == ActivitySynManager.State.Close then
+        require "FreeGiftManager":GetInstance():Remove(
+            _G.FreeGiftID.ContinueRecharge,
+            self.curActivityClass:GetActivityID()
+        )
+    end
+end
+
+---@param msg s2c_activity_recruiting_info
+function ContinueRechargeModel:OnHandleGMData(info)
+    self:ParseData(info)
+end
+function ContinueRechargeModel:ParseData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+function ContinueRechargeModel:GetInfo(call)
+    self.CallBack = call
+    require("ActivitySynNet"):GetInstance():InitActivity(
+        self.curActivityClass:GetActivityID(),
+        _G.handler(self, self.UpdateInitData)
+    )
+end
+function ContinueRechargeModel:UpdateInitData(msg)
+    if msg.ack == 1 then
+        self:OnHandleGMData(msg.activity[1].self_info)
+    end
+end
+function ContinueRechargeModel:OnCash()
+    self:GetInfo(_G.handler(self, self.RefreshRedPointContinueRecharge))
+end
+---初始化功能逻辑
+function ContinueRechargeModel:InitFunction()
+    if not self.curActivityState then
+        return
+    end
+end
+function ContinueRechargeModel:GetActivityCommonData()
+    return self.curActivityClass
+end
+function ContinueRechargeModel:GetCurActivitySelfData()
+    return self.SelfData
+end
+-- ---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function ContinueRechargeModel:InitRedPointTree()
+    self.checkRedPointFunc = {self.CheckHaveAwardItem}
+    self.redpointTree = {{2}, false}
+end
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function ContinueRechargeModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+---刷新奖励红点
+function ContinueRechargeModel:RefreshRedPointContinueRecharge()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+---是否有可以足够兑换次数可以兑换的item
+function ContinueRechargeModel:CheckHaveAwardItem()
+    ---免费礼包
+    ---ZHJ-22428 移除免费赠礼
+    --if
+    --    require "FreeGiftManager":GetInstance():CheckCanTake(
+    --        _G.FreeGiftID.ContinueRecharge,
+    --        self.curActivityClass:GetActivityID()
+    --    )
+    -- then
+    --    return 1
+    --end
+    if not _G.table.isEmptyOrNil(self.SelfData) then
+        for i = 1, #self.SelfData do
+            if self.SelfData[i].State == 2 then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+function ContinueRechargeModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ContinueRecharge.Name, self:GetActivityCommonData())
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+function ContinueRechargeModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.ContinueRecharge.Name
+end
+---处理活动私有信息
+---@type i_activity_exchange
+function ContinueRechargeModel:SetSelfData(info)
+    self.SelfData = {}
+    local _data
+    local cash = 0
+    ---当前充值挡位
+    self.CurCashSid = info.day_cash.cash_sid
+    self.curActivityState = true
+    for _, v in pairs(info.day_cash.item) do
+        _data = {}
+        _data.Sid = v.day
+        ---@type prop.i_award_item
+        _data.Award = v.award
+        _data.CashNum = v.cash_num
+        _data.State = self.CurCashSid == 0 and 1 or 0
+        _G.table.insert(self.SelfData, _data)
+    end
+    _G.SortList(
+        self.SelfData,
+        function(a)
+            return -a.Sid
+        end
+    )
+    ---@return boolean 是否已领取
+    local checkIsGet = function(sid, _table)
+        if not _G.table.isEmptyOrNil(_table) then
+            for _, v in pairs(_table) do
+                ---解析已完成已领取的档位
+                if v == sid then
+                    return true
+                end
+            end
+            return false
+        else
+            return false
+        end
+    end
+    if self.CurCashSid ~= 0 then
+        for k, v in pairs(self.SelfData) do
+            ---小于当前档位的 又不在已领取档位中的 即可以领取
+            if v.Sid < self.CurCashSid then
+                if checkIsGet(v.Sid, info.day_cash.get_sids) then
+                    v.State = 1
+                else
+                    v.State = 2
+                end
+            elseif v.Sid == self.CurCashSid then
+                if checkIsGet(v.Sid, info.day_cash.get_sids) then
+                    v.State = 1
+                end
+            end
+        end
+        ---根据当前正在进行的档位的对应累计充值金额判断当前档位完成情况
+        local c = true ---停止符
+        for _, data in pairs(self.SelfData) do
+            if c then
+                if not _G.table.isEmptyOrNil(info.day_cash.cash_info) then
+                    for _, cashinfo in pairs(info.day_cash.cash_info) do
+                        if cashinfo.k == self.CurCashSid and cashinfo.k == data.Sid and data.State ~= 1 then
+                            cash = cashinfo.v
+                            if cash >= data.CashNum then
+                                data.State = 2
+                            end
+                            c = false
+                            break
+                        end
+                    end
+                else
+                    break
+                end
+            else
+                break
+            end
+        end
+    end
+    if self:CheckActivityState() and self.curActivityClass:GetHideViewByAward() then
+        self.curActivityClass:ChangeState(ActivitySynManager.State.Close)
+    end
+    self.SelfData.curCashInfo = {self.CurCashSid, cash}
+    if self.curActivityClass:GetCurActivityState() == ActivitySynManager.State.Open then
+        local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ContinueRecharge.Name)
+        if view then
+            view.View:InitView(self:GetActivityCommonData())
+        end
+    end
+    ---ZHJ-22428 移除免费赠礼
+    --require "FreeGiftManager":GetInstance():Add(
+    --    _G.FreeGiftID.ContinueRecharge,
+    --    info.day_cash.day_award,
+    --    function(call)
+    --        require "ActivitySynNet":GetInstance():GetAward(
+    --            self.curActivityClass:GetActivityID(),
+    --            {0},
+    --            function(msg)
+    --                if call then
+    --                    call(msg)
+    --                end
+    --            end
+    --        )
+    --    end,
+    --    self:GetRedpointIDByIndex(1),
+    --    self.curActivityClass:GetActivityID()
+    --)
+    if self.CallBack ~= nil then
+        self.CallBack()
+    end
+    self:RefreshRedPointContinueRecharge()
+end
+function ContinueRechargeModel:CheckActivityState()
+    for i = 1, #self.SelfData do
+        if self.SelfData[i].State ~= 1 then
+            return false
+        end
+    end
+    return true
+end
+function ContinueRechargeModel:GetAward(parms, call)
+    require "ActivitySynNet":GetInstance():GetAward(
+        self.curActivityClass:GetActivityID(),
+        parms,
+        function(msg)
+            if call then
+                call(msg)
+            end
+            self:RefreshRedPointContinueRecharge()
+        end
+    )
+end
+function ContinueRechargeModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eRechargeEvent.DayCash, self.OnCash, self)
+    self.curActivityState = nil
+    self.SelfData = nil
+end
+
+return ContinueRechargeModel

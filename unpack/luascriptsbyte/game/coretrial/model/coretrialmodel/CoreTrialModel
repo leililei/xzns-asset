@@ -1,0 +1,520 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie.alpha_0.0.8_FT.Client.Assets.Resources.LuaScripts.Game.CoreTrial.Model.CoreTrialModel	(修改路径必须修正此项!)
+-- Created by huangbaiying
+-- DateTime: 2023/05/04
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+---@class CoreTrialModel	中文描述
+local ActivitySynManager = require "ActivitySynManager"
+local base = require "ActivitySynTypeBase"
+local CoreTrialModel = _G.BaseClass("CoreTrialModel", base)
+local table = _G.table
+local awardCfg = _G.ConfigManager.system_trial_reward_cfg
+local card_cfg = _G.ConfigManager.card_cfg
+local CardData = _G.CardData
+local groupId = _G.ConfigManager.discrete_cfg[107701][1][1]
+local embattleType = _G.EmbattleType.coreTrial
+local SortList = _G.SortList
+local CoreTrialNet = require "CoreTrialNet":GetInstance()
+
+---类的构造函数
+function CoreTrialModel:__init()
+    _G.Events:GetInstance():AddListener(_G.eAfkEvents.Pass, self.RefreshFinalRedPoint, self)
+end
+
+---类的析构函数
+function CoreTrialModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eAfkEvents.Pass, self.RefreshFinalRedPoint, self)
+end
+
+function CoreTrialModel:InitData()
+    self.isFirst = false
+    self.levelCfg = {}
+    self.levelInfo = {}
+    self.finalAwardCfg = {}
+    self.defenseList = {}
+    self.endTime = self.curActivityClass:GetActivityDeadLineByCondition(ActivitySynManager.State.Close)
+    self.openTime = self.curActivityClass:GetActivityDeadLineByCondition(ActivitySynManager.State.Open)
+end
+
+---@return CoreTrialModel CoreTrialModel
+---获取GM数据
+---@param info activity.i_activity_heart_trial
+function CoreTrialModel:OnHandleGMData(info)
+    self:InitData()
+    self:ParseData(info)
+end
+
+---解析数据
+function CoreTrialModel:ParseData(info)
+    self:InitInfo(info)
+end
+
+---初始化活动数据
+function CoreTrialModel:InitInfo(info)
+    self.curSid = self.curActivityClass:GetActivityID()
+    local data = info.heart_trial
+    ---当前开放层数
+    self.openLevel = data.open_layer
+    ---后续每N天开放层数
+    self.continue = data.continue_layer
+    ---后续开放间隔天数
+    self.intervalDay = data.continue_day
+    ---当前最高层数
+    self.curLevel = data.attack_layer + 1
+    self.curTime = _G.TimeUtil:GetServerUnixTime()
+    self.intervalTimes = self.intervalDay - _G.TimeUtil.GetInterValDayByGame(self.openTime,self.curTime)%self.intervalDay
+    self.haveStar = 0
+    self.levelCfg = {}
+    local newdata
+    self.awradList = {}
+    if data.layer_info then
+        local param = self:GetSoulLinkAndTalent()
+        local soulStar = _G.ConfigManager.discrete_cfg[102401][1][1]
+        local talentStar = _G.ConfigManager.discrete_cfg[107401][1][1]
+        for k,v in pairs(data.layer_info) do
+            newdata = {}
+            newdata.sid = v.sid
+            newdata.star = 0
+            --newdata.condition = {}
+            newdata.conditionList = {}
+            if v.star_con then
+                for k1,con in pairs(v.star_con) do
+                    local condition = con
+                    condition.isFinish = false
+                    table.insert(newdata.conditionList,condition)
+                end
+            end
+            if v.star_award then
+                for k1,index in pairs(v.star_award) do
+                    newdata.conditionList[index].isFinish = true
+                    newdata.star = newdata.star + 1
+                    self.haveStar = self.haveStar + 1
+                end
+            end
+            newdata.enemyList = {}
+            for _,cardData in pairs(v.card_info) do
+                if not cardData.lv then
+                    cardData.lv = -1
+                    cardData.star = -1
+                end
+                local card = CardData.New()
+                local cfg = card_cfg[cardData.sid]
+                card.cfg = cfg
+                card.sid = cardData.sid
+                card.lv = cardData.lv
+                card.star = cardData.star == -1 and card.cfg.Star or cardData.star
+                card.Icon = card.cfg.Icon
+                self:UpdateEnemyCardSoulAndTalent(card, param, soulStar, talentStar)
+                table.insert(newdata.enemyList,card)
+            end
+            newdata.awradList = {}
+            for _,award in pairs(v.reward) do
+                local data = {[1] = award.k,[2] = award.v}
+                table.insert(newdata.awradList,data)
+            end
+            newdata.layer =  v.layer
+            table.insert(self.levelCfg,newdata)
+        end
+    end
+    SortList(
+        self.levelCfg,
+        function(a)
+            return -a.layer
+        end
+    )
+    self.finalAwardCfg ={}
+    for _,v in pairs(awardCfg) do
+        local item ={}
+        item.select = v.item_select
+        item.condition = v.limit_condition
+        item.receive = false
+        item.index = 0
+        item.sid = v.id
+        self.finalAwardCfg[v.id] = item
+    end
+    if data.select_award then
+        for _,v in pairs(data.select_award) do
+            self.finalAwardCfg[v.sid].index = v.index
+            self.finalAwardCfg[v.sid].receive = v.is_receive
+        end
+    end
+    if data.attack_layer == 0 and self.levelCfg[1].enemyList[1].lv < 0 then
+        self.isFirst = true
+    end
+    ---留着6点刷新界面，现在没东西要刷
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name)
+    if window then
+        window.View:RefreshData()
+    end
+end
+
+function CoreTrialModel:ReConnect(endcall)
+    if endcall ~= nil then
+        endcall(self.__cname)
+    end
+end
+
+---初始化功能逻辑
+function CoreTrialModel:InitFunction()
+end
+
+---进入活动主体
+function CoreTrialModel:OnEnterActivity()
+    if self.isFirst then
+        self:CheckLevelDefense(self.levelCfg[1].sid,
+        function(data)
+            self:ChangeLevelInfo(data,1)
+            self.isFirst = false
+            require "RedPointManager":GetInstance():RefreshNode(self:GetRedpointIDByIndex(2))
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name,self.curActivityClass)
+        end)
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name,self.curActivityClass)
+    end
+end
+
+function CoreTrialModel:InitRedPointTree()
+    self.checkRedPointFunc = {self.CheckCanGet,self.CheckIsFirst}
+    self.redpointTree = {{2},false}
+end
+
+---刷新最终奖励红点
+function CoreTrialModel:RefreshFinalRedPoint()
+    require "RedPointManager":GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+function CoreTrialModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---检测第一次进入活动
+function CoreTrialModel:CheckIsFirst()
+    if self.levelCfg[1].enemyList[1].lv < 1 then
+        return 1
+    else
+        return 0
+    end
+end
+
+---检测能否领奖
+function CoreTrialModel:CheckCanGet()
+    local curAfk = require "AfkModel":GetInstance():GetCurSection()
+    if self.curLevel > #self.levelCfg then
+        for _,v in pairs(self.finalAwardCfg) do
+            if not v.receive then
+                if v.index ~= 0 or v.condition[2] < curAfk then
+                    return 1
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---获取排行榜数据
+function CoreTrialModel:GetRankInfo(call)
+    CoreTrialNet:GetRank({page = 1, id = self.curSid}, call)
+end
+
+---获取个人排行榜数据
+function CoreTrialModel:GetSelfRankInfo(call)
+    CoreTrialNet:GetSelfRank({type= self.curSid},call)
+end
+
+---选择奖励
+function CoreTrialModel:ChoiceAward(sid,index,callBack)
+    local pbData = {activity_id = self.curSid, position_sid = sid,index = index}
+    CoreTrialNet:ChoiceAward(pbData,function(data)
+        if data.ack == 1 then
+            self.finalAwardCfg[sid].index = index
+            self:RefreshFinalRedPoint()
+            if callBack then
+                callBack()
+            end
+        end
+    end)
+end
+
+---领取奖励
+function CoreTrialModel:GetFinalAward(call)
+    local params = {}
+    for _,v in pairs(self.finalAwardCfg) do
+        if v.index ~= 0 and not v.receive then
+            table.insert(params,v.sid)
+        end
+    end
+    if #params > 0 then
+        require("ActivitySynNet"):GetInstance():GetAward(self.curSid,params,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+            for _,v in pairs(params) do
+                self.finalAwardCfg[v].receive = true
+            end
+            self:RefreshFinalRedPoint()
+            if call then
+                call()
+            end
+        end)
+    end 
+end
+
+---修改关卡数据
+function CoreTrialModel:ChangeLevelInfo(data,level)
+    for _,v in pairs(data.defense_team) do
+        for _1,v1 in pairs(self.levelCfg[level].enemyList) do
+            if v.sid == v1.sid then
+                v1.lv = v.lv
+                v1.star = v.star
+            end
+        end
+    end
+end
+
+---进入布阵界面
+function CoreTrialModel:EnterEmbattle(level,curbattle)
+    self.fightLevel = level
+    self.curBattleLevel = curbattle
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    if self.defenseList[level] then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.CoreTrialEmbattleView.Name,
+            embattleType,
+            _G.handler(self, self.ExitEmbattle),
+            _G.handler(self, self.EnterFight),
+            groupId,
+            self.defenseList[level],
+            self.curBattleLevel,
+            self.levelCfg[self.curBattleLevel]
+        )
+    else
+        self:CheckLevelDefense(level,function(data)
+            local fighters = {}
+            for j = 1, #data.defense_team do
+                local fi = data.defense_team[j]
+                _G.table.insert(
+                    fighters,
+                    {
+                        uid = fi.uid,
+                        sid = fi.sid,
+                        level = fi.lv,
+                        star = fi.star
+                    }
+                )
+            end
+            fighters.power = data.power
+            self.defenseList[level] = fighters 
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CoreTrialEmbattleView.Name,
+                embattleType,
+                _G.handler(self, self.ExitEmbattle),
+                _G.handler(self, self.EnterFight),
+                groupId,
+                fighters,
+                self.curBattleLevel,
+                self.levelCfg[self.curBattleLevel]
+            )
+        end)
+    end
+end
+
+---挑战关卡
+function CoreTrialModel:ChanllengeLevel(callBack)
+    local array = {layer_sid = self.fightLevel,activity_id = self.curSid}
+    local port = CoreTrialNet:ChanllengeLevel(array,callBack)
+    return port
+end
+
+---获取防守整容
+function CoreTrialModel:CheckLevelDefense(layerId,callBack)
+    local array = {layer_sid = layerId,activity_id = self.curSid}
+    CoreTrialNet:GetLevelInfo(array,callBack)
+end
+
+---布阵界面监听
+function CoreTrialModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.CoreTrialEmbattleView.Name then
+        local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name)
+        if window then
+            window.View:Hide()
+        end
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    end
+end
+
+---退出布阵界面
+function CoreTrialModel:ExitEmbattle()
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name)
+    if window then
+        window.View:Show()
+        --window.View:UpdateFightFloor()
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name,self.curActivityClass)
+    end
+end
+
+---进入战斗
+---@field atkSid number[] 进攻数据
+function CoreTrialModel:EnterFight()
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.coreTrial,self.curActivityClass)
+end
+
+---刷新最终奖励列表
+---@param sid number 槽位
+---@param index number 下标
+function CoreTrialModel:RefreshFinalList(sid,index)
+    self.finalAwardList[sid].index = index
+end
+
+---返回活动界面
+---@param win boolean 是否获胜
+---@param result table 战斗数据
+function CoreTrialModel:ReturnActivityView(win,result)
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name)
+    if window then
+        window.View:Show()
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name,self.curActivityClass)
+    end
+    if win then
+        ---达成条件第一个必定为战斗获胜
+        local isNext = false
+        if not table.isEmptyOrNil(result.condition) then
+            for k,v in pairs(result.condition)do
+                if not self.levelCfg[self.curBattleLevel].conditionList[v].isFinish then
+                    self.levelCfg[self.curBattleLevel].conditionList[v].isFinish = true
+                    self.levelCfg[self.curBattleLevel].star = self.levelCfg[self.curBattleLevel].star + 1
+                    self.haveStar = self.haveStar + 1
+                    if v == 1 then
+                        self.curLevel = self.curLevel + 1
+                        isNext = true
+                    end
+                end
+            end
+        end
+        if result.enemyData and result.enemyData[1] ~= 0 and self.curBattleLevel+1 <= #self.levelCfg then
+            local param = self:GetSoulLinkAndTalent()
+            local soulStar = _G.ConfigManager.discrete_cfg[102401][1][1]
+            local talentStar = _G.ConfigManager.discrete_cfg[107401][1][1]
+            for _,v in pairs(self.levelCfg[self.curBattleLevel+1].enemyList) do
+                v.lv = result.enemyData[1]
+                v.star = result.enemyData[2]
+                self:UpdateEnemyCardSoulAndTalent(v, param, soulStar, talentStar)
+            end
+        end
+        if not table.isEmptyOrNil(result.award) then
+            _G.StorageManager:GetInstance():ReceiveAwardData(result.award)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, result.award,function()
+                if window then
+                    window.View:RefreshData(isNext,self.curLevel)
+                end
+            end)
+        else
+            if window then
+                window.View:RefreshData(isNext,self.curLevel)
+            end
+        end
+    end
+end
+
+---退出活动
+function CoreTrialModel:ExitActivity()
+    local mainview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialView.Name)
+    if mainview then
+        mainview:Close()
+    end
+    local selectview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialSelectView.Name)
+    if selectview then
+        selectview:Close()
+    end
+    local detailview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialDetailView.Name)
+    if detailview then
+        detailview:Close()
+    end
+    local rankview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialRankView.Name)
+    if rankview then
+        rankview:Close()
+    end
+    local embattleview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CoreTrialEmbattleView.Name)
+    if embattleview then
+        embattleview:Close()
+    end
+end
+
+function CoreTrialModel:UpdateEnemyCardSoulAndTalent(card, param, soulStar, talentStar)
+    if card.star >= soulStar then
+        card.soulLink_IsActivate = card.hunlianIsActive
+        card.soulLink_lv = param.maxHunLian
+    else
+        card.soulLink_IsActivate = 0
+        card.soulLink_lv = 0
+    end
+    card.open_inborn = {}
+    card.big_born_num = 0
+    if card.star >= talentStar then
+        if param.maxTF > 0 then
+            local index = 0
+            for i = 1, #card.cfg.talent do
+                for j = 1, #card.cfg.talent[i] do
+                    index = index + 1
+                    card.open_inborn[index] = card.cfg.talent[i][j]
+                    if index >= param.maxTF then
+                        break
+                    end
+                end
+                if index >= param.maxTF then
+                    break
+                end
+            end
+        end
+        card.big_born_num = require("CardInfoManager"):GetInstance():GetTalentsNumByInborn(card.open_inborn)
+    end
+end
+
+---获取卡牌参数
+function CoreTrialModel:GetSoulLinkAndTalent()
+    ---@type CardData[]
+    local datas = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    datas = _G.table.toArray(datas)
+    _G.SortList(
+        datas,
+        function(data)
+            return data.power, data.star, data.Grade, data.uid
+        end
+    )
+    ---@type CardData[]
+    local chooseCards = {}
+    local count = #datas
+    if count > 5 then
+        count = 5
+    end
+    for i = 1, count do
+        chooseCards[i] = datas[i]
+    end
+    local param = {
+        maxTF = 0,
+        maxHunLian = 0,
+        hunlianIsActive = 0
+    }
+    for _, v in pairs(chooseCards) do
+        if v.soulLink_IsActivate == 1 then
+            param.hunlianIsActive = 1
+        end
+        param.maxHunLian = param.maxHunLian + v.soulLink_lv
+        param.maxTF = param.maxTF + #v.open_inborn
+    end
+
+    param.maxHunLian = _G.Mathf.RoundToInt(param.maxHunLian / count)
+    param.maxTF = _G.Mathf.RoundToInt(param.maxTF / count)
+    return param
+end
+
+return CoreTrialModel

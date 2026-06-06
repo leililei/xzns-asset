@@ -1,0 +1,184 @@
+-----------------------------------------------------------------------
+-- G:.zhenhunjie.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Battle.BattleController.BattleControllerDecorationBoss	(修改路径必须修正此项!)
+-- Created by ly
+-- DateTime: 2022/09/14
+-- Description: 终末之焉战斗控制器
+-----------------------------------------------------------------------
+local base = require "BattleControllerBase"
+---@class BattleControllerDecorationBoss	中文描述
+local BattleControllerDecorationBoss = _G.BaseClass("BattleControllerDecorationBoss", base)
+
+---类的构造函数
+function BattleControllerDecorationBoss:__init()
+end
+
+---类的析构函数
+function BattleControllerDecorationBoss:Dispose()
+end
+
+---设置战斗参数
+function BattleControllerDecorationBoss:SetArgs(sid, isTestFight, dps, fightCard)
+    self.sid = sid
+    self.isTestFight = isTestFight
+    self.dps = dps or {}
+    self.fightCard = fightCard
+end
+
+function BattleControllerDecorationBoss:OnHandleParams(sid, isTestFight)
+    self.sid = sid
+    ---是否是测试战斗
+    self.isTestFight = isTestFight
+end
+
+function BattleControllerDecorationBoss:CheckFight(call)
+    self.checkCall = call
+    local port
+    if self.isTestFight then
+        port = require("DecorationBossNet"):GetInstance():StartTestFight(
+            { monster_sid = self.sid },
+            _G.handler(self, self.OnFightMsgCall)
+        )
+    else
+        port = require("DecorationBossNet"):GetInstance():StartFight(
+            { monster_sid = self.sid },
+            _G.handler(self, self.OnFightMsgCall)
+        )
+    end
+    _G.BattleManager:GetInstance():AddLuaNetEvent(port)
+end
+
+function BattleControllerDecorationBoss:OnFightMsgCall(msg)
+    if msg.ack == 1 then
+        if not self.isTestFight then
+            require("DecorationBossModel"):GetInstance():SetMonsterSid(self.sid)
+            require("DecorationBossModel"):GetInstance():SetLastFightTime(_G.TimeUtil.GetServerUnixTime())
+        else
+            require("DecorationBossModel"):GetInstance():SetLastTestTime(_G.TimeUtil.GetServerUnixTime())
+        end
+        self.mgCfg = _G.ConfigManager.monster_group_cfg[msg.data.sid]
+        ---对boss造成的总伤害
+        self.dps = msg.dps or 0
+        self.fightCard = msg.fight_card
+        self.checkCall(true)
+    else
+        self.checkCall(false, msg.ack)
+    end
+    self.checkCall = nil
+end
+
+---加载战斗(协程加载)
+function BattleControllerDecorationBoss:OnLoadFight()
+    local uiManager = _G.UIManager:GetInstance()
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(false)
+    local battleView = uiManager:OpenWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    -- 等待 战斗窗口 加载完成
+    while (_G.IsNil(battleView.View.gameObject)) do
+        _G.coroutine.waitforendofframe()
+    end
+    battleView.View:SetSettingBtnActive(false)
+    uiManager:HideWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+
+    _G.BaseBattleManager:GetInstance():ClearView(false)
+    _G.WorldManager:GetInstance():GetCurWorld():ShowOrHideAllItem(false)
+    local battleManager = _G.BattleManager:GetInstance()
+    local fighterSids = require("EmbattleModel"):GetInstance():GetEmbattleData(_G.EmbattleType.DecorationBoss)
+    battleManager:initAttackSids(fighterSids, _G.EmbattleType.DecorationBoss, true, 0, 0, 0)
+    -- 协程等待
+    while battleManager.Progress < 1 do
+        _G.coroutine.waitforendofframe()
+    end
+    battleView.View:SetCanvasGroupTrue()
+end
+
+---战斗开始
+function BattleControllerDecorationBoss:OnStart()
+    local uiManager = _G.UIManager:GetInstance()
+    uiManager:ShowWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    local view = uiManager:GetWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    if view then
+        view.View:SetAutoBtnActive(false)
+        view.View.AtActive = false
+    end
+    local battleManagerIns = _G.BattleManager:GetInstance()
+    battleManagerIns:SetBattlePause(true)
+    battleManagerIns:SetBattleStart()
+    battleManagerIns:ShowBattleTeam()
+    battleManagerIns:ShowSkipBattleBtn(true)
+end
+
+---战斗结束
+---@param tab table 战斗数据
+function BattleControllerDecorationBoss:OnFightResult(tab, call)
+    self.FightResult = tab
+    call()
+end
+
+---结算
+function BattleControllerDecorationBoss:OnSettlement(call)
+    call(_G.SettlementModel.SettlementType.DecorationBoss, self.FightResult, self.sid, self.dps, self.fightCard)
+end
+
+---战斗退出
+function BattleControllerDecorationBoss:OnSettlementEnd()
+    _G.WorldManager:GetInstance():GetCurWorld():ChangeCameraBattle()
+    _G.WorldManager:GetInstance():DespawnRoleParent()
+    local cfg = _G.ConfigManager.decoration_boss_cfg[self.sid]
+    if self.isTestFight then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecorationBossTrainView.Name, cfg)
+    else
+        require("DecorationBossModel"):GetInstance():GetBossInfo({self.sid})
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecorationBossBattleView.Name, cfg)
+    end
+end
+
+--- 退出关卡
+function BattleControllerDecorationBoss:EndFight()
+    _G.BattleManager:GetInstance():PauseBattle(true)
+    self:OnFightResult(nil, _G.handlerbind(self, self.OnSettlement, _G.handler(self, self.StartSettlement)), true)
+end
+
+---手动停止战斗(跳过)
+function BattleControllerDecorationBoss:OnEndFight()
+    --调用两次的目的是因为正常结算的流程会调用两次
+    self:Settlement()
+    self:Settlement()
+end
+
+function BattleControllerDecorationBoss:QuitToMainWorld(call)
+    _G.BattleControllerBase.FightExit(self)
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+    call()
+end
+
+function BattleControllerDecorationBoss:OnReEmbattle()
+    _G.BattleManager:GetInstance():DestroyBattle()
+    _G.WorldManager:GetInstance():GetCurWorld():ShowOrHideAllItem(true)
+    require "DecorationBossController":GetInstance():ReEnterFight()
+end
+
+---加载战斗(协程加载)
+function BattleControllerDecorationBoss:OnLoadRecordFight()
+    _G.BattleManager:GetInstance():initAttackSids(
+        require("EmbattleModel"):GetInstance():GetEmbattleData(_G.EmbattleType.DecorationBoss),
+        _G.EBattleType.DecorationBoss,
+        true,
+        1
+    )
+end
+
+---获取怪物组ID
+---@return number 怪物组ID
+function BattleControllerDecorationBoss:GetMonsterGroupID()
+    return self.mgCfg.id
+end
+
+---加载战斗(协程加载)
+function BattleControllerDecorationBoss:OnLoadRecordFight()
+    _G.BattleManager:GetInstance():initAttackSids(
+        require("EmbattleModel"):GetInstance():GetEmbattleData(_G.EmbattleType.DecorationBoss),
+        _G.EBattleType.DecorationBoss,
+        true,
+        1
+    )
+end
+return BattleControllerDecorationBoss

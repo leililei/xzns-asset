@@ -1,0 +1,846 @@
+-----------------------------------------------------------------------
+-- C:.workspace.alpha_FT.Client.Assets.Resources.LuaScripts.Game.ArenaPeak.View.GMArenaPeakView	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/08/01
+-- Description: 巅峰演武主页面
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local GMArenaPeakModel = require("GMArenaPeakModel")
+local GMArenaPeakNet = require("GMArenaPeakNet"):GetInstance()
+local RankUtils = require("RankUtils")
+local ActivitySynManager = require "ActivitySynManager"
+
+---@class GMArenaPeakView : UIBaseView    中文描述
+---@field public go_table ArenaPeakView_GoTable GoTable
+---@field curModel number 当前模式(1排位赛2友谊赛)
+local GMArenaPeakView = _G.BaseClass("GMArenaPeakView", _G.UIBaseView)
+
+local GetLangPackValue = _G.GetLangPackValue
+local ConfigManager = _G.ConfigManager
+local UIManager = _G.UIManager
+local GetAutoGoTable = _G.GetAutoGoTable
+local TimeUtil = _G.TimeUtil
+local UIUtils = _G.UIUtils
+local Events = _G.Events
+local net_map = _G.ConfigManager.net_map
+
+local unLight = "ui_dfyw_xingxing_weidianliang"
+local HostingKey = "GMArenaPeakHosting"
+local HostingLimit = _G.ConfigManager.discrete_cfg[108130][1][1]
+
+local viewName = {
+    [2] = _G.ConfigManager.ui_cfg.GMArenaPeakReportView.Name,
+    [4] = _G.ConfigManager.ui_cfg.ArchaeologyRankView.Name,
+    [3] = _G.ConfigManager.ui_cfg.RewardPreviewFullView.Name,
+    [5] = _G.ConfigManager.ui_cfg.ExchangeShopView.Name,
+}
+
+
+function GMArenaPeakView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self:AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnUIOpen, self)
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    self.playerHead = self:AddComponent(self.go_table.obj_playerInfo,
+            require("PlayerComponent").New(self.go_table.obj_playerInfo))
+end
+
+function GMArenaPeakView:ResUpdata(data)
+    for _, value in pairs(data) do
+        local sid = value.type[1]
+        local num = value.type[2]
+        if sid == _G.ConfigManager.discrete_cfg[108137][1][1] and num > 0 then
+            self:UpdateView(true)
+        end
+    end
+end
+
+---界面的入口函数
+function GMArenaPeakView:OnCreate()
+    self.winLog = { {}, {}, {} }
+    self.costID = _G.ConfigManager.discrete_cfg[108137][1][1]
+    self.costNum = _G.ConfigManager.discrete_cfg[108137][1][2]
+    self.itemList = {}
+    self.activity = GMArenaPeakModel:GetInstance():GetActivity()
+    
+    self.toggles = {}
+    self.toggleCom = {}
+    self.views = { [1] = { gameObject = self.go_table.obj_mainView } }
+    for i = 1, 6 do
+        self.toggles[i] = _G.GetAutoGoTable(self.go_table["toggle_tag" .. i], _G.handlerbind(self, self.OnClickToggle, i))
+        self.toggleCom[i] = self.toggles[i].gameObject:GetComponentE(_G.typeof(
+            _G.CS.UnityEngine.UI.Toggle))
+    end
+
+    local precast = _G.string.split(self.activity.cfg.info.front.precast, "#")
+    self.cardid = tonumber(precast[1])
+    self.skinid = tonumber(precast[2])
+    self.jumpcardimage = precast[3]
+
+    local sid = tonumber(self.jumpcardimage)
+    if sid and _G.ConfigManager.player_title_effect_cfg[sid] then
+        _G.UIUtils.LoadEffectTitleOrFrame(
+                _G.ConfigManager.player_title_effect_cfg[sid].title,
+                self.go_table.aorrawimage_skin,
+                function(trans)
+                    if not self.go_table then
+                        _G.DestroyImmediate(trans)
+                        return
+                    end
+                    self.go_table.aorrawimage_skin.Alpha = 0
+                    local parClip = trans:AddComponentE(_G.typeof(_G.CS.ParticleClipRect))
+                    parClip.NeedCheck = true
+                    parClip.CheckCount = 10
+                    parClip.CheckOne = 3
+                end
+        )
+    else
+        self.go_table.aorrawimage_skin:LoadImage(self.jumpcardimage)
+    end
+
+    --兑换
+    self.activityExchange = ActivitySynManager:GetInstance():GetChildAcitivity(10005, self.activity:GetJumpType(self.activityID))
+    self.toggles[5].gameObject:SetActiveE(self.activityExchange and 1 or 0)
+    if self.activityExchange then
+        self.toggles[5].obj_redpoint:UpdateRedPointItemIDAndParam(self.activityExchange:GetActivityTypeCls():GetRedpointIDByIndex(1))
+    end
+    --礼包
+    self.giftActivity = ActivitySynManager:GetInstance():GetChildAcitivity(10014, self.activity:GetJumpType(self.activityID))
+    if self.giftActivity then
+        self.go_table.obj_redpointGift:UpdateRedPointItemIDAndParam(self.giftActivity:GetActivityTypeCls():GetRedpointIDByIndex(1))
+    end
+    self.go_table.aorbtn_gift:SetActiveE(self.giftActivity and 1 or 0)
+    self:OnClickToggle(nil, true, 1)
+    self.go_table.scrollloophorizontal_curAward:InitItemData(0, _G.handler(self, self.RefreshCurList))
+    self:InitView()
+    Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.UpdateView, self)
+    Events:GetInstance():AddListener(_G.eArenaPeak.AutoNext, self.AutoNext, self)
+    self:AddListener(_G.ConfigManager.net_map.p2c_ban_pick_log_notice.Cmd, self.OnNewLog)
+    self:AddListener(_G.AnimationEvents.ActivityDispatchBroadcast1, self.PlayWinBroadcast1, self)
+    self:AddListener(_G.AnimationEvents.ActivityDispatchBroadcast2, self.PlayWinBroadcast2, self)
+    self:AddListener(_G.AnimationEvents.ActivityDispatchBroadcast3, self.PlayWinBroadcast3, self)
+    GMArenaPeakModel:GetInstance():RefreshRedPoint()
+    self.embattle = require("EmbattleItemGMArenaPeak").New(_G.EmbattleType.ArenaPeak, _G.EmbattleSaveType.temporary, true)
+    self.go_table.aorrawimage_Prop1:LoadImage(
+        _G.StorageManager:GetInstance():GetItemIcon(self.costID),
+        function(image)
+            if image then
+                image:SetActiveE(1)
+            end
+        end
+    )
+    
+    local res = _G.ConfigManager.ui_cfg.GMArenaPeakView.resources
+    res = {19, self.costID}
+    self:AddComponent(self.go_table.obj_goldInfo, require("ResourceCompont").New(self.go_table.obj_goldInfo, res))
+    self:InitActivityTime()
+end
+
+function GMArenaPeakView:OnEnable()
+    self:UpdateView()
+end
+
+---跑马灯
+---@param msg arena_global.p2c_log_notice
+function GMArenaPeakView:OnNewLog(msg)
+    for _, v in pairs(msg.log) do
+        if v.type == 1 then --连胜
+            -- _G.PopWindowManager:GetInstance():ShowAllTips(1080201, nil, nil, nil, nil, nil, v.args[1], v.args[3])
+            v.content = _G.GetLangPackValue(90033404041, v.args[1], v.args[3])
+            if _G.tonumber(v.args[3]) >= 20 then
+                _G.table.insert(self.winLog[1], v)
+            else
+                _G.table.insert(self.winLog[3], v)
+            end
+        elseif v.type == 2 then --终结
+            v.content = _G.GetLangPackValue(90033404042, v.args[1], v.args[2])
+            _G.table.insert(self.winLog[2], v)
+            -- _G.PopWindowManager:GetInstance():ShowAllTips(1080202, nil, nil, nil, nil, nil, v.args[1], v.args[2])
+        end
+    end
+    for i = 1, 3 do
+        if self.go_table["obj_itemLog" .. i] and self.go_table["obj_itemLog" .. i]:GetActiveSelf() ~= 1 then
+            self:SetWinBroadcastView(i)
+        end
+    end
+end
+
+function GMArenaPeakView:PlayWinBroadcast1()
+    self:SetWinBroadcastView(1)
+end
+
+function GMArenaPeakView:PlayWinBroadcast2()
+    self:SetWinBroadcastView(2)
+end
+
+function GMArenaPeakView:PlayWinBroadcast3()
+    self:SetWinBroadcastView(3)
+end
+
+function GMArenaPeakView:SetWinBroadcastView(type)
+    self.go_table["obj_itemLog" .. type]:SetActiveE(0)
+    local data = _G.table.remove(self.winLog[type], 1)
+    if not data then
+        return
+    end
+    self.go_table["obj_itemLog" .. type]:SetActiveE(1)
+    if not self.WinBroadcastItem then
+        self.WinBroadcastItem = {}
+    end
+    if self.WinBroadcastItem[type] == nil then
+        self.WinBroadcastItem[type] = _G.GetAutoGoTable(self.go_table["obj_itemLog" .. type])
+    end
+    local goTable = self.WinBroadcastItem[type]
+    goTable.aortext_des.text = data.content
+    if data.role_info then
+        _G.UIUtils.SetPlayerHeadItemNew(goTable.obj_HeadItemBase, data.role_info, 0.7, true, true, false)
+    end
+end
+
+---累充任务大奖显示
+function GMArenaPeakView:SetTaskAward()
+    local itemData, act = GMArenaPeakModel:GetInstance():GetNextAward()
+    if itemData then
+        if act then
+            self.go_table.obj_redpointTaskAward:UpdateRedPointItemIDAndParam(
+                act:GetActivityTypeCls():GetRedpointIDByIndex(1)
+            )
+        end
+        self.go_table.obj_taskAward:SetActiveE(1)
+        local target = GMArenaPeakModel:GetInstance():GetHisFightNum()
+        if target > itemData.Cfg.count then
+            target = itemData.Cfg.count
+        end
+        self.go_table.obj_taskAwardRoot:RemoveAllChildren()
+        _G.StorageManager:GetInstance():GetItemBaseViewNew(
+            itemData.Cfg.reward[1].type,
+            self.go_table.obj_taskAwardRoot,
+            function(tran)
+                tran.gameObject:SetLocalScaleXYZ(0.7)
+                if itemData.Cfg.reward[1].type[2] > 1 then
+                    tran:ShowNumText(true, require "ItemViewBase".NumTextAnchor.RightDown)
+                else
+                    tran:ShowNumText(false)
+                end
+                if tran.ShowEffectOrder and tran.cfg then
+                    tran:ShowEffectOrder(tran.cfg.ef_item == 1 and true or false)
+                end
+            end
+        )
+        local w = target / itemData.Cfg.count
+        if w > 1 then
+            w = 1
+        end
+        self.go_table.aorimage_awardBar:SetRectTransformSize(target > 0 and w * (87) or 0, 20)
+        self.go_table.aortext_taskAward.text = target .. "/" .. itemData.Cfg.count
+    else 
+        self.go_table.obj_taskAward:SetActiveE(0)
+    end
+end
+
+---开始时间~结束时间  (日月)
+function GMArenaPeakView:InitActivityTime()
+    local starTime = self.activity.cfg.time.start_time
+    local start = _G.TimeUtil.GetDateTime(starTime)
+    local endt = _G.TimeUtil.GetDateTime(starTime + self.activity.cfg.time.run_time - 1)
+    local color = "<color=#96ce51>"
+    if _G.AppSetting.IsXzns then
+        color = "<color=#1ACC55>"
+    end
+    self.go_table.aortext_qualifyingTimeSlot.text = _G.GetLangPackValue(
+        90025800003, color .. string.format("%s</color>", _G.GetLangPackValue(90032100011, start.month, start.day) .. " " .. string.format("%02d:%02d", start.hour, start.minute) .. "~" .. _G.GetLangPackValue(90032100011, endt.month, endt.day) .. " " .. string.format("%02d:%02d", endt.hour, endt.minute)))
+end
+
+---监听Toggle点击事件
+---@param key string
+---@param callback function
+function GMArenaPeakView:OnClickToggle(_, isOn, key)
+    local tb = self.toggles[key]
+    local view = self.views[key]
+    tb.aorimage_isOff:SetActiveE(isOn and 0 or 1)
+    tb.aorimage_isOn:SetActiveE(isOn and 1 or 0)
+    local lastToggle = self.curToggle
+    self.curToggle = key
+
+    --节点显隐
+    if view then
+        if self.curToggle == 4 and isOn then
+            RankUtils.ClearAllRankData()
+            if view.RefreshData then
+                view:RefreshData()
+            end
+        elseif self.curToggle == 5 and isOn then
+            view:RefreshUI()
+        elseif self.curToggle == 3 and isOn then
+            view:RefreshUI()
+        elseif self.curToggle == 1 and isOn and lastToggle then
+        end
+        self.playerHead.gameObject:SetActiveE((self.curToggle == 1 and isOn) and 0 or 1)
+        view.gameObject:SetActiveE(isOn and 1 or 0)
+    end
+
+    if isOn then
+        self:OpenView()
+    end
+end
+
+function GMArenaPeakView:OpenView()
+    local view = self.views[self.curToggle]
+    self.openView = viewName[self.curToggle]
+    if not view then
+        if self.curToggle == 2 then
+            _G.UIManager:GetInstance():OpenWindow(self.openView, self.peakReportBol)
+            self.peakReportBol = nil
+        elseif self.curToggle == 3 then
+            --奖励
+            local cfg = GMArenaPeakModel:GetInstance():GetRankAwardCfgList()
+            ---@type RewardPreviewView.OpenData[]
+            local OpenData = {
+                --TODO 排行榜 常量
+                RankUtils.GetData(18, 0, 0, nil, nil, _G.ConfigManager.arena_rank_cfg, cfg[1][1], cfg[1][#cfg[1]], 1),
+                RankUtils.GetData(19, 0, 0, nil, nil, nil, nil, nil, 1, nil)
+            }
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RewardPreviewFullView.Name, OpenData, 1)
+        elseif self.curToggle == 4 then
+            --排行
+            RankUtils.ClearAllRankData()
+            ---@type RecordRankModel
+            local model = require("RecordRankModel"):GetInstance()
+            local RankDatas = {
+                model:GetRankData(RankUtils.RankType.GMArenaPeak)
+            }
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArchaeologyRankView.Name,RankDatas,RankUtils.RankType.GMArenaPeak,nil,true)
+        elseif self.curToggle == 5 then
+            --兑换
+            self.openView = self.activityExchange:GetActivityTypeCls():OnGetMainViewName()
+            self.activityExchange:GetActivityTypeCls():OnEnterActivity()
+        end
+    else
+        if self.curToggle == 2 then
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(self.openView)
+            if view then
+            end
+        end
+    end
+end
+
+function GMArenaPeakView:OnUIOpen(name)
+    if name ~= self.openView then
+        return
+    end
+
+    _G.UIManager:GetInstance():ChangeCanvasOrder(
+        self.openView,
+        self.gameObject:RequireComponentE(_G.typeof(_G.CS.UnityEngine.Canvas)).sortingOrder - 10
+    )
+    self.views[self.curToggle] = _G.UIManager:GetInstance():GetWindowCtrl(name)
+    self.views[self.curToggle].transform:SetParentE(self.go_table.obj_windows)
+    self.views[self.curToggle].transform:SetAsLastSiblingE()
+end
+
+---@private
+function GMArenaPeakView:InitView()
+    self:UpdateView()
+    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false, true)
+    self.timer:Start()
+    self.init = true
+    self.init = false
+end
+
+---刷新显示
+function GMArenaPeakView:UpdateView(ignorMatch)
+    self.init = true
+    self.status, self.countDown, self.des = GMArenaPeakModel:GetInstance():GetStatusAndNextStatusTimeLine()
+    if not self.countDown then
+        self:Close()
+        return
+    end
+    self.countDown = self.countDown - _G.TimeUtil.GetServerUnixTime()
+    local _time = TimeUtil.TranslateSecond(self.countDown)
+    local str = ""
+    if _time.day > 0 then
+        str = _G.GetLangPackValue(90028010120, _time.day, _time.hour, _time.min)
+    elseif _time.hour > 0 then
+        str = _G.GetLangPackValue(90028010121, _time.hour, _time.min)
+    else
+        str = _G.GetLangPackValue(90028010122, _time.min, _time.sec)
+    end
+    self.go_table.aortext_countDown.text = _G.GetLangPackValue(self.des, _G.string.AddColor(str, "96ce51"))
+    if self.isMatching and not ignorMatch then
+        self:QuitMatch()
+    end
+    local GMArenaPeakModelIns = GMArenaPeakModel:GetInstance()
+    local nowState, nextTime = GMArenaPeakModelIns:GetStatusAndNextTimeLine()
+    local totalTimes = ConfigManager.discrete_cfg[108138][1][1]
+    self.go_table.aorbtn_fight:SetGray(nowState ~= GMArenaPeakModelIns.ArenaStatus.fight)
+    self.go_table.aortext_Prop1Num.text = "X " .. self.costNum
+    if nowState == GMArenaPeakModelIns.ArenaStatus.idle then 
+        self.go_table.obj_cost:SetActiveE(0) 
+        if nextTime ~= GMArenaPeakModelIns.end_time then
+            self.go_table.aortext_qualifyingTimes:SetActiveE(1)
+            local serverTime = _G.TimeUtil.GetServerUnixTime()
+            local time = TimeUtil.TranslateSecond(Mathf.RoundToInt(nextTime - serverTime))
+            if time.hour > 0 then
+                str = _G.GetLangPackValue(90028010121, time.hour, time.min)
+            else
+                str = _G.GetLangPackValue(90028010122, time.min, time.sec)
+            end
+            self.go_table.aortext_qualifyingTimes.text = _G.GetLangPackValue(90049800026,
+                    _G.string.AddColor(str, "96ce51")
+            )
+        else 
+            self.go_table.aortext_qualifyingTimes:SetActiveE(0) 
+        end
+    elseif nowState == GMArenaPeakModelIns.ArenaStatus.fight then 
+        self.go_table.aortext_qualifyingTimes:SetActiveE(GMArenaPeakModelIns.fightTimes > 0 and 1 or 0) 
+        self.go_table.obj_cost:SetActiveE(GMArenaPeakModelIns.fightTimes > 0 and 0 or 1) 
+        self.go_table.aortext_qualifyingTimes.text = _G.GetLangPackValue(90049800010, GMArenaPeakModelIns.fightTimes .. "/" .. totalTimes) 
+        local color = _G.StorageManager:GetInstance():GetItemCountBySid(GMArenaPeakModelIns.fightItem) >= self.costNum and "FFFFFF" or "DE3316"
+        self.go_table.aortext_Prop1Num.text = _G.string.AddColor("X " .. self.costNum, color)
+    else 
+        self.go_table.aortext_qualifyingTimes.text = _G.GetLangPackValue(90049800032)
+        --self.go_table.aortext_qualifyingTimes:SetActiveE(0)
+        self.go_table.obj_cost:SetActiveE(0)
+    end
+    self.go_table.aortext_peakScore.text = GMArenaPeakModelIns:GetScore()
+    -- local rankNum = GMArenaPeakModelIns:GetRankNum()
+    -- self.go_table.aortext_rank.text = rankNum > 0 and rankNum or GetLangPackValue(90022900040)
+    local winNum = GMArenaPeakModelIns:GetWinNum()
+    local totalNum = GMArenaPeakModelIns:GetTotalNum()
+    if totalNum > 0 then
+        self.go_table.aorbtn_presets:SetActiveE(1)
+        self.go_table.aortext_winRate.text = _G.string.format("%.1f", 100 * winNum / totalNum) .. "%"
+    else
+        self.go_table.aorbtn_presets:SetActiveE(0)
+        self.go_table.aortext_winRate.text = _G.string.format("%.1f", 0) .. "%"
+    end
+    self.go_table.aortext_total.text = totalNum
+    self.go_table.aortext_win.text = winNum
+    self.go_table.aortext_fail.text = totalNum - winNum
+    
+    self.curCfg = GMArenaPeakModelIns:GetCurDanCfg()
+    self.curAward, self.nextAward = GMArenaPeakModelIns:GetCurAndNextDanAward()
+    for i = 1, 3 do
+        if i <= self.curCfg.quantity then
+            self.go_table["aorimage_midStar" .. i].SpriteName = self.curCfg.art
+        else
+            self.go_table["aorimage_midStar" .. i].SpriteName = unLight
+        end
+    end
+    self.go_table.aorrawimage_king:LoadImage(
+        self.curCfg.icon,
+        function(trans)
+            trans:SetActiveE(1)
+        end
+    )
+    self.go_table.aortext_nowDan.text = _G.GetLangPackValue(90049800077) .. _G.GetLangPackValue(self.curCfg.name)
+    if self.curCfg.quantity == 0 and self.curCfg.id ~= 1 then
+        self.go_table.obj_midStar:SetActiveE(0)
+        -- self.go_table.aorrawimage_king:LoadImage(
+        --     self.curCfg.icon,
+        --     function(trans)
+        --         trans:SetActiveE(1)
+        --     end
+        -- )
+    else
+        --self.go_table.obj_midStar:SetActiveE(1)
+        --self.go_table.aorrawimage_king:SetActiveE(0)
+    end
+    self.go_table.scrollloophorizontal_curAward:UpdateCount(#self.curAward)
+
+    --self.go_table.aortext_qualifyingTimeSlot.text = GMArenaPeakModel:GetInstance():GetOpenTimeStr()
+    self:SetTaskAward()
+    self:UpdateHostingShow()
+    self.init = false
+end
+
+function GMArenaPeakView:UpdateHostingShow()
+    local num = HostingLimit - GMArenaPeakModel:GetInstance():GetTotalNum()
+    local canHosting = num <= 0
+    self.go_table.aortext_hosting.text = _G.GetLangPackValue(90029400193, num)
+    self.go_table.aortext_hosting:SetActiveE(canHosting and 0 or 1)
+    self.go_table.toggle_hosting:SetActiveE(canHosting and 1 or 0)
+    --self.go_table.aorbtn_presets:SetGray(not canHosting)
+    if canHosting then 
+        if _G.PlayerPrefsManager.GetInt(HostingKey) ~= 1 or GMArenaPeakModel:GetInstance():IsCoinLimit() then
+            self.go_table.toggle_hosting.isOn = false
+            _G.PlayerPrefsManager.SetInt(HostingKey, 0)
+            --_G.PopWindowManager:GetInstance():ShowAllTips(1080502)
+        else 
+            self.go_table.toggle_hosting.isOn = true
+        end
+    end
+    if self.isMatching then
+        self.go_table.aortext_hosting:SetActiveE(0)
+        self.go_table.toggle_hosting:SetActiveE(0)
+    end
+end
+
+---@private
+function GMArenaPeakView:RefreshTimeShow(elapsed)
+    self.countDown = self.countDown - elapsed
+    local _time = TimeUtil.TranslateSecond(Mathf.RoundToInt(self.countDown))
+    local str = ""
+    if _time.day > 0 then
+        str = _G.GetLangPackValue(90028010120, _time.day, _time.hour, _time.min)
+    elseif _time.hour > 0 then
+        str = _G.GetLangPackValue(90028010121, _time.hour, _time.min)
+    else
+        str = _G.GetLangPackValue(90028010122, _time.min, _time.sec)
+    end
+    self.go_table.aortext_countDown.text = _G.GetLangPackValue(self.des, _G.string.AddColor(str, "96ce51"))
+end
+
+function GMArenaPeakView:RefreshTime()
+    local str
+    local GMArenaPeakModelIns = GMArenaPeakModel:GetInstance()
+    local nowState, nextTime = GMArenaPeakModelIns:GetStatusAndNextTimeLine()
+    if nowState == GMArenaPeakModelIns.ArenaStatus.idle then
+        self.go_table.obj_cost:SetActiveE(0)
+        if nextTime ~= GMArenaPeakModelIns.end_time then
+            self.go_table.aortext_qualifyingTimes:SetActiveE(1)
+            local serverTime = _G.TimeUtil.GetServerUnixTime()
+            local time = TimeUtil.TranslateSecond(Mathf.RoundToInt(nextTime - serverTime))
+            if time.hour > 0 then
+                str = _G.GetLangPackValue(90028010121, time.hour, time.min)
+            else
+                str = _G.GetLangPackValue(90028010122, time.min, time.sec)
+            end
+            self.go_table.aortext_qualifyingTimes.text = _G.GetLangPackValue(90049800026,
+                    _G.string.AddColor(str, "96ce51")
+            )
+        else
+            self.go_table.aortext_qualifyingTimes:SetActiveE(0)
+        end
+    end
+end
+
+---更新时间
+function GMArenaPeakView:UpdateTime(elapsed)
+    if self:IsNil() then
+        return
+    end
+    if self.countDown <= 0 and self.status == GMArenaPeakModel:GetInstance().ArenaStatus.settle then
+        self:Close()
+        return
+    end
+    self:RefreshTimeShow(elapsed)
+    self:RefreshTime()
+end
+
+---更新匹配时间
+function GMArenaPeakView:UpdateMatchTime(elapsed)
+    self.matchTime = Mathf.RoundToInt(self.matchTime + elapsed)
+    local overIdx = GMArenaPeakModel:GetInstance().isKing and 3 or 1
+    if self.matchTime > ConfigManager.discrete_cfg[108105][1][overIdx] + 10 then --延长十秒
+        _G.PopWindowManager:GetInstance():ShowAllTips(880107)
+        self:QuitMatch()
+        if self.timerMatch then
+            self.timerMatch:Stop()
+            self.timerMatch = nil
+        end
+        if GMArenaPeakModel:GetInstance():GetHosting() then
+            _G.DelayDo(
+                1,
+                function()
+                    if self:IsNil() then
+                        return
+                    end
+                    if self.isMatching and not self.isCanceling then
+                        return
+                    end
+                    if self.matchOk then
+                        return
+                    end
+                    if GMArenaPeakModel:GetInstance():GetHosting() and self.go_table.toggle_hosting.isOn == true then
+                        self:AutoNext()
+                    end
+                end
+            )
+        end
+    end
+    self.go_table.aortext_matchTime.text =
+        GetLangPackValue(90029400019, _G.string.AddColor(TimeUtil.TimeToString(self.matchTime, 2), "96ce51"))
+end
+
+---@private
+function GMArenaPeakView:RefreshCurList(index, obj)
+    index = index + 1
+    local instanceID = obj:GetInstanceIDE()
+    local item = self.itemList[instanceID]
+    if not item then
+        item = require "BaseAwardNewItem".New(obj, nil, 88, obj)
+        self.itemList[instanceID] = item
+    end
+    item:Show(_G.StorageManager:GetInstance():GetItemDataClassByCfg(self.curAward[index]))
+end
+
+---@private
+function GMArenaPeakView:QuitMatch()
+    self:CancelMatch()
+    self.isCanceling = false
+end
+
+---取消匹配/匹配失败/匹配成功后处理
+function GMArenaPeakView:CancelMatch()
+    self.isMatching = false
+    if not self:IsNil() then
+        self:UpdateHostingShow()
+    end
+end
+
+function GMArenaPeakView:AutoNext()
+    if not GMArenaPeakModel:GetInstance():IsCoinLimit() then
+        self:OnClickBtn(self.go_table.aorbtn_fight)
+    end
+end
+
+function GMArenaPeakView:CheckPresetPosEmpty()
+    local cards = self.embattle:GetCardList()
+    local preChoose = require("GMArenaPeakModel"):GetInstance():GetPrePick() 
+    if preChoose then
+        for _, v in pairs(preChoose) do
+            if v == 0 then
+                return true
+            end
+            if not self:CheckCardCanUse(cards, v) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function GMArenaPeakView:CheckCardCanUse(cards, uid)
+    for _, v in pairs(cards) do
+        if v.uid == uid then
+            return true
+        end
+    end
+    return false
+end
+
+function GMArenaPeakView:StartMatch()
+    local hosting =
+        _G.PlayerPrefsManager.GetInt(HostingKey) == 1 and
+        GMArenaPeakModel:GetInstance():GetTotalNum() >= _G.ConfigManager.discrete_cfg[108130][1][1] and
+        (not GMArenaPeakModel:GetInstance():IsCoinLimit())
+    GMArenaPeakModel:GetInstance():SetHosting(hosting)
+    GMArenaPeakNet:Match(
+        function(msg)
+            if msg.ack == 1 then
+                self.isMatching = true
+                if GMArenaPeakModel:GetInstance().fightTimes > 0 then 
+                    GMArenaPeakModel:GetInstance().fightTimes = GMArenaPeakModel:GetInstance().fightTimes - 1
+                else 
+                    _G.StorageManager:GetInstance():Consume({self.costID, self.costNum})
+                end
+                if GMArenaPeakModel:GetInstance():GetBackIng() then 
+                    require("GMArenaPeakNet"):GetInstance():GetRoomInfo({room_uid = msg.room_uid}, function(info)
+                        if info.ack == 1 then 
+                            require("GMArenaPeakModel"):GetInstance():OnChallenge(info.room_info)
+                        end
+                    end)
+                else 
+                    UIManager:GetInstance():OpenWindow(ConfigManager.ui_cfg.GMArenaPeakMateView.Name, msg)
+                    self:CloseOtherView()
+                    self:CancelMatch()
+                end
+            end
+        end
+    )
+end
+
+---关闭其它页面
+function GMArenaPeakView:CloseOtherView()
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.ArenaPeakRankView.Name)
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.CommonRankTopView.Name)
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.ArenaPeakReportView.Name)
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.GMArenPeakGroupStatisticsView.Name)
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.GetItemWayView.Name)
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.GamePlayDescribeView.Name)
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.GMArenaPeakPresetsView.Name)
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.GMArenaPeakPromotionView.Name)
+    UIManager:GetInstance():CloseWindow(ConfigManager.ui_cfg.BattleStatisticsPVEView.Name)
+end
+
+---@private
+function GMArenaPeakView:OnDisable()
+    if self.isMatching and not self.isCanceling then
+        self.isCanceling = true
+        self:QuitMatch()
+    end
+end
+
+---界面的销毁函数
+function GMArenaPeakView:OnDestroy()
+    if self.isMatching and not self.isCanceling then
+        self.isCanceling = true
+        self:QuitMatch()
+    end
+    self:CloseOtherView()
+    self:RemoveAllListener()
+    Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.UpdateView, self)
+    Events:GetInstance():RemoveListener(_G.eArenaPeak.AutoNext, self.AutoNext, self)
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.timerMatch then
+        self.timerMatch:Stop()
+        self.timerMatch = nil
+    end
+    --关闭内嵌页面
+    if self.views then
+        for k, view in pairs(self.views) do
+            if k ~= 1 then
+                view:Close()
+            end
+        end
+        self.views = nil
+    end
+    require "GMArenaPeakNet":GetInstance():EnterOrQuit({type = 2})
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+end
+
+---按钮点击事件在这里派发
+function GMArenaPeakView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_fight then
+        if _G.MainManager:GetInstance():IsFighting(true) then
+            return
+        end
+        if GMArenaPeakModel:GetInstance():IsCoinLimit() then
+            if _G.StorageManager:GetInstance():GetItemCountBySid(self.costID) < _G.ConfigManager.discrete_cfg[108137][1][2] then
+                self.go_table.toggle_hosting.isOn = false
+                _G.PopWindowManager:GetInstance():ShowAllTips(880129)
+                self:OpenGiftView()
+                return
+            end
+            _G.PopWindowManager:GetInstance():ShowAllTips(880105)
+            return
+        end
+        local state, tipsID = GMArenaPeakModel:GetInstance():CheckInOpenTime()
+        if state ~= 0 then
+            if tipsID then
+                _G.PopWindowManager:GetInstance():ShowAllTips(tipsID)
+            end
+            return
+            
+        end
+        if not self.isMatching then
+            if self.go_table.toggle_hosting.isOn == true and self:CheckPresetPosEmpty() then
+                _G.PopWindowManager:GetInstance():ShowBtnWindowByToggle(
+                    880128,
+                    function()
+                        UIManager:GetInstance():OpenWindow(ConfigManager.ui_cfg.GMArenaPeakPresetsView.Name)
+                    end,
+                    _G.handler(self, self.StartMatch),
+                    _G.handler(self, self.StartMatch)
+                )
+            else
+                self:StartMatch()
+            end
+        else
+            self:QuitMatch()
+        end
+    elseif go == self.go_table.aorbtn_close then
+        if self.curToggle ~= 1 then 
+            self.toggleCom[1].isOn = true
+        else 
+            self:Close()
+        end
+    elseif go == self.go_table.aorbtn_skin then
+        if not _G.AppSetting.IsXzns then
+            --- 获取卡牌数据 查找此皮肤是否已经挂载在卡牌上了
+            local skinData = {cardID = self.cardid, skinID = self.skinid}--GMArenaPeakModel:GetInstance():GetSkinData()
+
+            local cardData = require("CardData").GetPreviewData(skinData.cardID)
+            local skinList = cardData.cfg.skin
+            local show = #skinList > 0 and cardData.type ~= _G.CardType.Timer
+            local haveSkin = false
+            if show then
+                for i = 1, #skinList do
+                    if skinList[i] == skinData.skinID then
+                        haveSkin = true
+                    end
+                end
+            end
+
+            if haveSkin then
+                cardData:SetSkin(0)
+                _G.UIManager:GetInstance():OpenWindow(
+                        _G.ConfigManager.ui_cfg.CardShowView.Name,
+                        { CardData = cardData },
+                        nil,
+                        true,
+                        nil,
+                        skinData.skinID)
+            end
+        end
+    elseif go == self.go_table.aorbtn_rank then
+        self.toggleCom[4].isOn = true
+    elseif go == self.go_table.aorbtn_help then
+        UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 214)
+    elseif go == self.go_table.aorbtn_group then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GMArenPeakGroupStatisticsView.Name)
+    elseif go == self.go_table.aorbtn_presets then
+        -- if HostingLimit > GMArenaPeakModel:GetInstance():GetTotalNum() then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(880123)
+        --     return
+        -- end
+        UIManager:GetInstance():OpenWindow(ConfigManager.ui_cfg.GMArenaPeakPresetsView.Name)
+    elseif go == self.go_table.toggle_hosting then
+        local noArray = true
+        local preChoose = require("GMArenaPeakModel"):GetInstance():GetPrePick() 
+        if preChoose then
+            for _, v in pairs(preChoose) do
+                if v > 0 then
+                    noArray = false
+                    break
+                end
+            end
+        end
+        if noArray then
+            self.go_table.toggle_hosting.isOn = false
+            _G.PopWindowManager:GetInstance():ShowAllTips(880125)
+            return
+        end
+        -- 获取 代币的获得信息，判断是否达到上限
+        if not self.init and GMArenaPeakModel:GetInstance():IsCoinLimit() then
+            self.go_table.toggle_hosting.isOn = false
+            _G.PopWindowManager:GetInstance():ShowAllTips(880129)
+            self:OpenGiftView()
+            return
+        end
+        _G.PlayerPrefsManager.SetInt(HostingKey, isOn and 1 or 0)
+    elseif go == self.go_table.aorbtn_serverList then
+        GMArenaPeakNet:GetServerList(
+            function(data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RelicTeamServerListView.Name, data)
+            end
+        )
+    elseif go == self.go_table.aorbtn_gift then
+        --打开礼包界面
+        local activity = ActivitySynManager:GetInstance():GetChildAcitivity(10014,
+            self.activity:GetJumpType(self.activityID))
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GiftPackGMCommonView.Name, activity, 2)
+    elseif go == self.go_table.aorbtn_taskAward then
+        --打开限时任务界面
+        _G.GlobalInterface.JumpActivityByGM(10007, self.activity:GetJumpType(self.activity.activityID))
+    elseif go == self.go_table.aorbtn_peakReport then 
+        self.peakReportBol = true
+        for i = 1, 6 do 
+            self.go_table["toggle_tag" .. i].isOn = (i == 2)
+        end
+    end
+end
+
+function GMArenaPeakView:OpenGiftView()
+    --打开礼包界面
+    local activity = ActivitySynManager:GetInstance():GetChildAcitivity(10014,
+    self.activity:GetJumpType(self.activityID))
+    if activity then 
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GiftPackGMCommonView.Name, activity, 2)
+    end
+end
+
+return GMArenaPeakView

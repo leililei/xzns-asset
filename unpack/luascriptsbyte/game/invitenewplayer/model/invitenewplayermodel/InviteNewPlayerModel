@@ -1,0 +1,247 @@
+local InviteNewPlayerNet = require "InviteNewPlayerNet"
+local InviteNewPlayerModel = _G.BaseClass("InviteNewPlayerModel", _G.GameDataModelBase)
+---@return InviteNewPlayerModel InviteNewPlayerModel
+function InviteNewPlayerModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function InviteNewPlayerModel:__init()
+    --已领取的目标奖励
+    self.award_lists = {}
+    self.login_count = 0
+    self.curFunctionOpenID = _G.FunctionID.HeroesGathering
+    self.redPointId = _G.ConfigManager.redpoint_cfg.FirstGather.id
+end
+
+---销毁对象时,析构函数
+function InviteNewPlayerModel:Dispose()
+end
+
+--region 子类重写
+---从服务器拉取数据
+function InviteNewPlayerModel:GetDataFormServer()
+    --self:GetDataToInf()
+
+    self:ParseData()
+end
+
+---获取绑定的邀请码
+function InviteNewPlayerModel:GetBindCode()
+    return self.targetCode
+end
+
+---获取已邀请人数
+function InviteNewPlayerModel:GetInviteMemberNum()
+    return #self.bindRoles
+end
+
+---获取任务
+function InviteNewPlayerModel:GetTaskList()
+    local cfg = _G.ConfigManager.recruit_new_cfg
+    local topTask = {}
+    local task = {}
+    for k, v in ipairs(self.taskLists) do
+        if cfg[v.sid].condition[1][1] == 1 then
+            _G.table.insert(topTask, v)
+        else
+            _G.table.insert(task, v)
+        end
+    end
+    _G.table.sort(task, function(a, b)
+        if a.is_award ~= b.is_award then
+            return a.is_award == 1
+        end
+        if (cfg[a.sid].number > a.award_times) ~= (cfg[b.sid].number > b.award_times) then
+            return cfg[a.sid].number > a.award_times
+        end
+        return a.sid < b.sid
+    end)
+    _G.table.insert(task,1,topTask[1])
+    return topTask, task
+end
+
+---获取邀请人列表
+function InviteNewPlayerModel:GetBindRoles()
+    return self.bindRoles
+end
+
+---获取自己的邀请码
+function InviteNewPlayerModel:GetSelfCode()
+    return self.selfCode
+end
+
+---初始化功能逻辑
+function InviteNewPlayerModel:InitFunction()
+end
+
+---获取信息
+function InviteNewPlayerModel:GetDataToInf(Call)
+    InviteNewPlayerNet:GetInstance():GetInfo(
+        function(data)
+            if data.code ~= nil then
+                self.selfCode = data.code
+            else
+                self.selfCode = ""
+            end
+            if data.target_code ~= nil then
+                self.targetCode = data.target_code
+            else
+                self.targetCode = ""
+            end
+            if data.band_roles ~= nil then
+                self.bindRoles = data.band_roles
+            else
+                self.bindRoles = {}
+            end
+            if data.tasks ~= nil then
+                self.taskLists = data.tasks
+            else
+                self.taskLists = {}
+            end
+            if Call ~= nil then
+                Call(data)
+            end
+            self:ParseData()
+        end
+    )
+end
+
+---绑定
+function InviteNewPlayerModel:Bind(code, Call)
+    InviteNewPlayerNet:GetInstance():Bind(code,
+        function(data)
+            if data.ack == 1 then
+                self.targetCode = code
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data, nil, true)
+                if Call ~= nil then
+                    Call()
+                end
+            end
+        end
+    )
+end
+
+---解绑
+function InviteNewPlayerModel:BindCancel(uid, Call)
+    local function confirmFunc()
+        InviteNewPlayerNet:GetInstance():BindCancel(uid,
+        function(data)
+            if data.ack == 1 then
+                for k, v in ipairs(self.bindRoles) do
+                    if v.role.uid == uid then
+                        _G.table.remove(self.bindRoles, k)
+                        break
+                    end
+                end
+                _G.Events:GetInstance():Broadcast(_G.eInviteNewPlayer.RelieveBind)
+                if Call ~= nil then
+                    Call()
+                end
+            end
+        end
+    )
+    end
+    _G.PopWindowManager:GetInstance():ShowAllTips(6005, nil, confirmFunc)
+end
+
+---领奖
+function InviteNewPlayerModel:GetAwards(sid, num, Call)
+    InviteNewPlayerNet:GetInstance():GetAwards(sid, num,
+        function(data)
+            if data.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data, nil, true)
+                for i = 1, #self.taskLists do
+                    if self.taskLists[i].sid == sid then
+                        self.taskLists[i] = data.task
+                        break
+                    end
+                end
+                self:RefreshTaskRedPoint()
+                _G.Events:GetInstance():Broadcast(_G.eInviteNewPlayer.TaskGetAwards)
+                if Call ~= nil then
+                    Call(data)
+                end
+            end
+        end
+    )
+end
+
+---任务状态变更推送
+function InviteNewPlayerModel:OnTaskChange(msg)
+    local newTask = {}
+    for k, v in ipairs(msg.tasks) do
+        newTask[v.sid] = v
+    end
+    for i = 1, #self.taskLists do
+        local sid = self.taskLists[i].sid
+        if newTask[sid] then
+            self.taskLists[i] = newTask[sid]
+        end
+    end
+    if #msg.tasks > 0 then
+        self:RefreshTaskRedPoint()
+        _G.Events:GetInstance():Broadcast(_G.eInviteNewPlayer.TaskGetAwards)
+    end
+end
+
+---设置任务红点刷新
+function InviteNewPlayerModel:SetTaskRedPoint(RefreshRedPointCall)
+    self.RefreshTaskRedPointCall = RefreshRedPointCall
+end
+
+---设置绑定红点刷新
+function InviteNewPlayerModel:SetBindRedPoint(RefreshRedPointCall)
+    self.RefreshBindRedPointCall = RefreshRedPointCall
+end
+
+---设置任务红点本地化刷新
+function InviteNewPlayerModel:SetRefreshTaskRedPoint(RefreshRedPointCall)
+    self.SetRefreshTaskRedPointCall = RefreshRedPointCall
+end
+
+---设置绑定红点本地化刷新
+function InviteNewPlayerModel:SetRefreshBindRedPoint(RefreshRedPointCall)
+    self.SetRefreshBindRedPointCall = RefreshRedPointCall
+end
+
+---刷新任务红点
+function InviteNewPlayerModel:RefreshTaskRedPoint()
+    if self.RefreshTaskRedPointCall ~= nil then
+        self.RefreshTaskRedPointCall()
+    end
+end
+---刷新绑定红点
+function InviteNewPlayerModel:RefreshBindRedPoint()
+    if self.RefreshBindRedPointCall ~= nil then
+        self.RefreshBindRedPointCall()
+    end
+end
+---刷新任务红点本地化
+function InviteNewPlayerModel:RefreshTaskRedPointValua()
+    if self.SetRefreshTaskRedPointCall ~= nil then
+        self.SetRefreshTaskRedPointCall()
+    end
+end
+---刷新绑定红点本地化
+function InviteNewPlayerModel:RefreshBindRedPointValua()
+    if self.SetRefreshBindRedPointCall ~= nil then
+        self.SetRefreshBindRedPointCall()
+    end
+end
+
+---是否显示任务红点
+function InviteNewPlayerModel:CheckTaskRed()
+    local value = 0
+    for i = 1, #self.taskLists do
+        if self.taskLists[i].is_award == 1 then
+            value = 1
+            break
+        end
+    end
+    return value
+end
+
+return InviteNewPlayerModel

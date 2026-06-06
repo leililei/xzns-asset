@@ -1,0 +1,392 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.HellGuardView.Model.HellGuardModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/08/01
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+---@class HellGuardModel:GameDataModelBase	中文描述
+---@field infoData HellGuardInfoData 信息数据
+---@field TaskDatas HellRoadTaskData[] 任务数据
+local HellGuardModel = _G.BaseClass("HellGuardModel", _G.GameDataModelBase)
+
+local Key = "HellGuardModelFirst"
+---@return HellGuardModel HellGuardModel
+function HellGuardModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function HellGuardModel:__init()
+    self.TaskDatas = {}
+    self.curFunctionOpenID = _G.FunctionID.HellGuard
+    self.realData = true
+    self.infoData = require "HellGuardInfoData".New()
+    self.redPointId = _G.ConfigManager.redpoint_cfg.HellGuard.id
+end
+
+---销毁对象时,析构函数
+function HellGuardModel:Dispose()
+    self.TaskDatas = nil
+    self.infoData = nil
+    self.curFunctionOpenID = nil
+    if self.sixTimer then
+        self.sixTimer:Stop()
+        self.sixTimer = nil
+    end
+end
+
+--region 子类重写
+---从服务器拉取数据
+function HellGuardModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---初始化功能逻辑
+function HellGuardModel:InitFunction()
+    local time = _G.TimeUtil.GetSecondsOfDayOf6Hour()
+    if time > 0 and time < 60 and not self.sixTimer then
+        self.sixTimer =
+            _G.TimerManager:GetInstance():GetTimer(60 - time, self.OnSixClockUpdate, self, true, false, true)
+        self.sixTimer:Start()
+    end
+
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.HellGuard.PassFloors
+        },
+        self.infoData.sid
+    )
+end
+
+---重连成功调用
+---@param endcall function 完成回调
+function HellGuardModel:ReConnect(endcall)
+    self:InitData(endcall)
+end
+
+--region 获取Info
+function HellGuardModel:GetInfo()
+    require "HellGuardNet":GetInstance():GetInfo(_G.handler(self, self.GetInfoCall))
+end
+
+---获取成功回调
+---@param msg guard.proto.s2c_guard_info
+function HellGuardModel:GetInfoCall(msg)
+    self.infoData:Parse(msg)
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.HellGuard.PassFloors
+        },
+        msg.info.sid
+    )
+
+    self:CheckIsFirst()
+    self:ParseData()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(self.redPointId)
+    self.realData = false
+end
+
+function HellGuardModel:GetKillNumInfo(call)
+    ---@param msg guard.s2c_guard_info
+    require "HellGuardNet":GetInstance():GetInfo(
+        function(msg)
+            self.infoData.killNum=msg.info.kill_num
+            self.infoData.role_kill_num = msg.info.role_kill_num
+            self.infoData.role_fight_sid = msg.info.role_fight_sid
+            if call then
+                call(self.infoData.role_kill_num)
+            end
+        end
+    )
+end
+
+---检测是否为当天首次打开
+function HellGuardModel:CheckIsFirst()
+    if _G.PlayerPrefsManager.HasKey(Key) then
+        local time = _G.PlayerPrefsManager.GetInt(Key, 0)
+        local time2 = self:GetTime()
+        self.isFirst = time < time2
+    else
+        self.isFirst = true
+    end
+end
+
+---完成任务
+---@param data HellGuardTaskData
+function HellGuardModel:FinishTask(sids, call)
+    require "HellGuardNet":GetInstance():FinishTask(
+        {tid = sids},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            for _, v in pairs(sids) do
+                self.infoData:FinishTask(v)
+            end
+
+            if call then
+                call(msg)
+            end
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.HellGuard.id, 1)
+        end
+    )
+end
+
+--region 获取Info
+---获取当前挑战的难度
+function HellGuardModel:GetCuDifficulty()
+    return self.infoData.curSid
+end
+
+---获取难度
+function HellGuardModel:GetDifficulty(index)
+    return self.infoData.start + index - 1
+end
+
+---获取血量加成
+function HellGuardModel:GetHpAdd()
+    return self.infoData.cfg.hp_bonus
+end
+
+---获取进入下一关条件
+function HellGuardModel:GetNextLevelCondition()
+    return self.infoData.cfg.level_conditions
+end
+
+---获取击杀数
+function HellGuardModel:GetKillNum()
+    if (self.infoData.maxKillNum ~= nil) then
+        return self.infoData.maxKillNum
+    else
+        return 0
+    end
+    --return self.infoData.killNum
+end
+
+---检测关卡是否通关
+function HellGuardModel:CheckIsPass(id)
+    local last = _G.ConfigManager.hell_guard_diff_cfg[#_G.ConfigManager.hell_guard_diff_cfg].id
+    if (id == last and self.infoData.curSid == last) then
+        if (_G.PlayerPrefsManager.GetInt("HellGuardLastPass") == 2) then
+            return true
+        end
+        if (self:GetKillNum() >= _G.ConfigManager.discrete_cfg[107703][1][1]) then
+            _G.PlayerPrefsManager.SetInt("HellGuardLastPass", 2)
+            return true
+        end
+    end
+    return self.infoData.sid >= id
+end
+
+---是否为当前是否为最后一关(sid从0开始，info从1开始，最大难度是50)
+function HellGuardModel:CheckIsMax()
+    return self.infoData.sid + 1 >= self.infoData.maxDifficulty
+end
+
+--endregion
+
+--region 任务
+
+---获取任务数据
+function HellGuardModel:GetTaskDatas()
+    return self.infoData:GetTaskDatas()
+end
+
+---检测任务是否完成
+function HellGuardModel:CheckTaskIsFinish(sid)
+    return self.infoData:CheckTaskIsFinish(sid)
+end
+
+---
+function HellGuardModel:SortTask()
+    return self.infoData:SortTask()
+end
+
+--endregion
+
+--region 战斗
+
+---挑战
+---@class battleView:HellGuardEmbattleView
+function HellGuardModel:OnChallenge()
+    self.isChallenge = true
+    self.battleView = _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.HellGuardEmbattleView.Name).View
+    ---_G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.HellGuardView.Name)
+    ---_G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+end
+
+---获取结算期时长
+---@return number
+function HellGuardModel:GetSettlementDuration()
+    local cfg = _G.ConfigManager.discrete_cfg[105803]
+    return cfg and cfg[1][1] or 0
+end
+
+---是否在结算期中
+---@return boolean
+function HellGuardModel:IsSettlementTime()
+    local sd = self:GetSettlementDuration()
+    if sd <= 0 or sd >= 86400 then
+        return false
+    end
+    local nowTime = _G.TimeUtil.GetServerUnixTime()
+    local endTime = _G.TimeUtil.GetDayBegin(nowTime) + 86400 - sd --战斗其结束时间
+    return nowTime >= endTime
+end
+
+---进入战斗
+function HellGuardModel:Fight()
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.HellGuard, self.infoData.sid)
+end
+
+---自动进入下一关战斗
+---@class battleView:HellGuardEmbattleView
+function HellGuardModel:AutoNextFight()
+    self.battleView:ClickStartBattleBtn()
+end
+
+---退出战斗
+function HellGuardModel:ExitFitght()
+    self.isChallenge = false
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.HellGuardView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ChangllengeView.Name)
+end
+
+--重新开始战斗
+function HellGuardModel:ReEnterFight()
+    self:OnChallenge()
+end
+
+--endregion
+
+--region 排行
+function HellGuardModel:GetPlayerRank(call)
+    require "HellGuardNet":GetInstance():GetPlayerRank(
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.playerRank = msg
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+function HellGuardModel:GetRank(call)
+    require "HellGuardNet":GetInstance():GetRank(
+        function(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---@param data fight.c2s_fight_result
+function HellGuardModel:FightWin(data)
+    self.killNum = data
+    self:InitData()
+end
+
+---领取排行奖励
+function HellGuardModel:GetLastRankAwarwd(call)
+    if self:CheckCanTakeRankAward() then
+        require "HellGuardNet":GetInstance():GetLastRankAwarwd(
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                self.infoData:ClearLast()
+                if call then
+                    call(msg)
+                end
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.HellGuard.id, 2)
+            end
+        )
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(650101)
+    end
+end
+
+---检测是否可以领取排行榜奖励
+function HellGuardModel:CheckCanTakeRankAward()
+    local time = _G.TimeUtil.GetSecondsOfDayOf6Hour()
+    if self.infoData.last_rank and (not self.infoData.is_get_award or self.infoData.is_get_award == 0) then 
+        return (time < 0 or time > 60) 
+    end
+    return false
+end
+
+---检测红点
+function HellGuardModel:CheckRedPoint(id)
+    if id == 0 then
+        return self.isFirst
+    elseif id == 1 then
+        if self:CheckHaveGetTask() then
+            return true
+        -- elseif self.infoData.is_get_award == 0 and self:CheckCanTakeRankAward() then
+        --     return true
+        end
+        return false
+    elseif id == 2 then 
+        return self:CheckCanTakeRankAward()
+    end
+end
+
+---检测是否又可以领取的任务
+function HellGuardModel:CheckHaveGetTask(type)
+    return self.infoData.taskModel:CheckHaveGetTask(type)
+end
+
+function HellGuardModel:GetTime()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local data = _G.TimeUtil.GetDateTime(time)
+    if data.hour < _G.TimeUtil.GAME_DAY_HOUR then
+        return _G.TimeUtil.GetDayBegin(time - _G.TimeUtil.GAME_DAY_TIME) + _G.TimeUtil.GAME_DAY_TIME
+    else
+        return _G.TimeUtil.GetDayBegin(time) + _G.TimeUtil.GAME_DAY_TIME
+    end
+end
+
+---检测是否为首次登录
+function HellGuardModel:ChangeIsFirst()
+    self.isFirst = false
+    _G.PlayerPrefsManager.SetInt(Key, self:GetTime())
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.HellGuard.id, 0)
+end
+
+function HellGuardModel:OnSixClockUpdate(endCall)
+    if not self.sixTimer then
+        self.sixTimer = _G.TimerManager:GetInstance():GetTimer(60, self.OnSixClockUpdate, self, true, false, true)
+        self.sixTimer:Start()
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(self.redPointId)
+        _G.GameDataModelBase.OnSixClockUpdate(self, endCall)
+    else
+        self.realData = true
+        self.sixTimer:Stop()
+        self.sixTimer = nil
+        _G.GameDataModelBase.OnSixClockUpdate(self)
+    end
+end
+
+function HellGuardModel:OnSettlement()
+    if not self.isChallenge then
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.HellGuardView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.CommonRankView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.HellGuardTaskView.Name)
+    end
+end
+
+function HellGuardModel:OpenView()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.HellGuardView.Name)
+end
+
+--endregion
+
+return HellGuardModel

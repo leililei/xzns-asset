@@ -1,0 +1,346 @@
+-----------------------------------------------------------------------
+-- File Name:       ExchangeShopView.lua
+-- Description:     兑换商店 （战歌争锋）
+-- Author:          admin
+-- Create Date:     2025/07/23
+-------------------------------------------------------------------------region require赋值区
+
+--endregion
+
+local LimitTimeDropShopView = require("LimitTimeDropShopView")
+local ActivitySynManager = require("ActivitySynManager")
+
+---@class ExchangeShopView : LimitTimeDropShopView 窗口
+---@field private go_table ExchangeShopView_GoTable GoTable
+local ExchangeShopView = _G.BaseClass("ExchangeShopView", LimitTimeDropShopView)
+local tipId = {
+    noItem = 650103,
+    limitCount = 650102
+}
+
+---@param data ActivitySynBase
+function ExchangeShopView:OnCreate(activity)
+    self:InitData(activity)
+    self:InitUI()
+    self:RefreshUI()
+end
+
+---@param activity ActivitySynTypeBase
+function ExchangeShopView:InitData(activity)
+    self.Activity = activity
+    self.TypeCls = activity:GetActivityTypeCls()
+    self.ItemList = {}
+
+    ---@type currency_type_cfg
+    local coinID = self.TypeCls:GetCoinSid() or 74
+    self.Coin = _G.ConfigManager.currency_type_cfg[coinID] or _G.ConfigManager.currency_type_client_cfg[coinID]
+
+    self.rewardList = self.TypeCls:GetCurActivitySelfData()
+    --self:RefreshData()
+    --self:Sortfunc(self.rewardList)
+
+    _G.PlayerPrefsManager.SetInt(
+        "LimitTimeExchangeModelDaily" .. activity:GetActivityID(),
+        _G.TimeUtil.GetServerUnixTime()
+    )
+    if coinID == 19 then
+        self.go_table.aortext_bubble.text = _G.GetLangPackValue(90049800019)
+    elseif coinID == 191 then
+        self.go_table.aortext_bubble.text = _G.GetLangPackValue(90049900101)
+    end
+    activity:GetActivityTypeCls():RefreshRedPointExchange()
+end
+
+function ExchangeShopView:RefreshData()
+    --按 解锁需要数量>商品品质>商品价格 的优先级升序排序
+    _G.table.sort(self.rewardList, function(a, b)
+        if a.State == b.State then
+            if a.Conditions[1] == nil or a.Conditions[1].v == b.Conditions[1].v then
+                local aSid = a.GetItem[1].sid
+                local bSid = b.GetItem[1].sid
+                local aQuality = _G.ConfigManager.item_cfg[aSid].Quality
+                local bQuality = _G.ConfigManager.item_cfg[bSid].Quality
+                if aQuality == bQuality then
+                    return a.NeedItem[1].num < b.NeedItem[1].num
+                end
+                return aQuality < bQuality
+            end
+            return a.Conditions[1].v < b.Conditions[1].v
+        end
+        return a.State > b.State
+    end)
+    for _, data in pairs(self.rewardList) do
+        if data.Conditions[1] then
+            if data.Conditions[1].k == 105 then
+                data.unlockNeedNum = data.Conditions[1].v - require("ActivityDispatchModel"):GetInstance():GetHisCoinNum()
+                if data.unlockNeedNum > 0 then
+                    data.isLock = _G.GetLangPackValue(90033401032, data.unlockNeedNum)
+                else
+                    data.isLock = nil
+                end
+            elseif data.Conditions[1].k == 107 then
+                data.unlockNeedNum = data.Conditions[1].v - require("GMArenaPeakModel"):GetInstance():GetHisCoinNum()
+                if data.unlockNeedNum > 0 then
+                    data.isLock = _G.GetLangPackValue(90049800027, data.unlockNeedNum)
+                else
+                    data.isLock = nil
+                end
+            end
+        end
+    end
+end
+
+function ExchangeShopView:OnDestroy()
+    self.timer:Stop()
+    self.timer = nil
+end
+
+function ExchangeShopView:InitUI()
+    self.go_table = _G.GetAutoGoTable(self.transform, _G.handler(self, self.OnClickBtn))
+
+    self:SetView()
+
+    ---@type activity.i_activity_time
+    local tiemdata = self.Activity.cfg.time
+
+    local endTime = tiemdata.start_time + tiemdata.run_time
+    local time = _G.TimeUtil.GetServerUnixTime()
+    self.RTS = endTime - time
+    self:UpdateTimeShow(true)
+    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTimeShow, self, false, false, true, false)
+    self.timer:Start()
+
+    local resources = _G.ConfigManager.ui_cfg.ExchangeShopView.resources
+    resources = { 12, self.Coin.id }
+    if #resources > 0 then
+        self:AddComponent(
+            self.go_table.obj_GoldInfo,
+            require("ResourceCompont").New(self.go_table.obj_GoldInfo, resources)
+        )
+    end
+    self:AddComponent(self.go_table.obj_playerInfo, require("PlayerComponent").New(self.go_table.obj_playerInfo))
+
+end
+
+function ExchangeShopView:SetView()
+    --self.go_table.aortext_num.text = require "LimitTimeDropCoinModel":GetInstance():GetCoin()
+    --self.coinCfg = _G.ConfigManager.currency_type_client_cfg[self.TypeCls:GetCoinSid()]
+    --self.go_table.aorrawimage_icon:LoadImage(self.coinCfg.icon)
+    self.go_table.scrollloopvectical_ItemList:InitItemData(0, _G.handler(self, self.RefreshItem))
+end
+
+function ExchangeShopView:RefreshItem(index, obj)
+    local ide = obj:GetInstanceIDE()
+    local x = index + 1
+    obj:SetName(x)
+    local data = self.rewardList[x]
+    local tb = _G.GetAutoGoTable(obj)
+    if data then
+        tb.data = data
+        tb["_onclick"] = _G.handlerbind(self, self.ClickItemBtn, tb, ide)
+        self:CreateItem(tb, ide)
+    end
+end
+
+---@param tb ExchangeShopView._obj_ListItem_GoTable
+function ExchangeShopView:CreateItem(tb, ide)
+    local data = tb.data
+    local item = self.ItemList[ide]
+
+    local isUnlock = true
+    if data.Conditions and #data.Conditions > 0 then
+        isUnlock = _G.GlobalConditionManager.CheckCondition(data.Conditions[1].k, data.Conditions[1].v)
+        if data.Conditions[1].k == 105 then
+            tb.aortext_name.text = _G.GetLangPackValue(90033400073, data.unlockNeedNum)
+        elseif data.Conditions[1].k == 107 then
+            tb.aortext_name.text = _G.GetLangPackValue(90049800027, data.unlockNeedNum)
+        end
+    end
+
+    --生成商品item方法
+    ---@param p UnityEngine.Transform
+    local getItem = function(_data, p, type, eff)
+        p:RemoveAllChildren()
+        _G.StorageManager:GetInstance():GetItemBaseView(
+            _data.sid,
+            _data.num,
+            p,
+            function(tran)
+                tran.gameObject:SetName(_data.sid)
+                tran.sid = _data.sid
+                tran.gameObject:SetLocalPosition(0, 0, 0)
+                if type then
+                    tran:ShowNumText(true, require "ItemViewBase".NumTextAnchor.RightDown)
+                end
+                if tran.SetGradeNew then
+                    tran:SetGradeNew(false)
+                end
+                self.ItemList[ide] = tran
+            end,
+            function(go)
+                require "CommonTipManager":GetInstance():OpenTip(p, go.sid or go[1].sid)
+            end
+        )
+    end
+    local NeedItem = data.NeedItem[1]
+    local GetItem = data.GetItem[1]
+    tb.obj_Lock:SetActiveE(isUnlock and 0 or 1)
+    tb.obj_Limit:SetActiveE(isUnlock and 1 or 0)
+    tb.aortext_MaterialNum.text = data.NeedItem[1].num
+    --设置商品消耗的货币图标
+    if self.Coin then
+        tb.aorrawimage_Material:LoadImage(self.Coin.icon)
+    end
+    local myCount = 0
+    if NeedItem.sid == 101 then
+        --活动代币（恶灵入侵）
+        myCount = require "MonsterSiegeManager":GetInstance():GetCoinActivity()
+    elseif NeedItem.sid == 103 then
+        myCount = require "ArenaFairManager":GetInstance():GetCoin()
+    elseif NeedItem.sid == 104 then
+        myCount = require "GuessGameModel":GetInstance():GetCoin()
+    elseif NeedItem.sid == 109 then
+        myCount = require "SixVsSixCoinModel":GetInstance():GetCoin()
+    elseif NeedItem.sid == 125 then
+        myCount = require "LimitTimeDropCoinModel":GetInstance():GetCoin()
+    elseif NeedItem.sid == 74 then
+        myCount = _G.StorageManager:GetInstance():GetOtherItemCountBySid(NeedItem.sid) or 0
+    elseif NeedItem.sid == 19 then
+        myCount = _G.StorageManager:GetInstance():GetOtherItemCountBySid(NeedItem.sid) or 0
+    else
+        local _, storageId = _G.StorageManager:GetInstance():CheckSidType(NeedItem.sid)
+        myCount = _G.StorageManager:GetInstance():GetItemCountByID(storageId, NeedItem.sid)
+    end
+    local IsCanTake = myCount >= NeedItem.num and data.State == 1
+    --_G.GameUtil.SetActiveByCondition(tb.aorimage_gou, data.isGou > 0)
+    tb.aorbtn_Btn:SetActiveE(data.State == 1 and 1 or 0)
+    --tb.aorbtn_gray:SetGray(data.State == 0)
+    tb.obj_SellOut:SetActiveE(data.State == 0 and 1 or 0)
+    tb.exchange = nil
+    tb.aorimage_recommend:SetActiveE(data.recommend == 1 and 1 or 0)
+    tb.aortext_itemname.text = _G.StorageManager:GetInstance():GetItemName(GetItem.sid)
+    -- tb.obj_isTips:SetActiveE(data.ShowGou and 1 or 0)
+    -- tb.aorbtn_gou:SetActiveE(data.ShowGou and 1 or 0)
+    -- _G.GameUtil.SetActiveByCondition(tb.obj_getEff, data.ShowGou and IsCanTake and data.isGou > 0)
+    if myCount >= NeedItem.num then
+        -- tb.aortext_rootPercent.text = _G.GameUtil.NumberToUnitStrFight(myCount) .. "/" .. NeedItem.num
+        tb.aortext_num.text = NeedItem.num
+    else
+        --tb.exchange = tipId.noItem
+        tb.aortext_num.text = --"<color=red>" .. _G.GameUtil.NumberToUnitStrFight(myCount) .. "</color>" .. "/" .. NeedItem.num
+        NeedItem.num
+    end
+    local remainCount = data.LimitTime - data.ExchangeTime --剩余可兑换次数
+    local color = "<color=red>"
+    if _G.AppSetting.IsXzns then
+        color = "<color=#818389>"
+    end
+    if data.State == 1 then
+        if remainCount <= 0 then
+            tb.aortext_num.text = _G.GetLangPackValue(90000011045, color .. remainCount .. "</color>", data.LimitTime)
+        else
+            tb.aortext_num.text = _G.GetLangPackValue(90000011045, remainCount, data.LimitTime)
+        end
+    else
+        tb.exchange = tipId.limitCount
+        --tb.aortext_percent.text = remainCount .. "/" .. data.LimitTime
+        if remainCount <= 0 then
+            tb.aortext_num.text = _G.GetLangPackValue(90000011045, color .. remainCount .. "</color>", data.LimitTime)
+        else
+            tb.aortext_num.text = _G.GetLangPackValue(90000011045, remainCount, data.LimitTime)
+        end
+    end
+    --getItem(NeedItem, tb.obj_itemfrom, false)
+    getItem(GetItem, tb.obj_itemRoot, true, IsCanTake)
+end
+
+function ExchangeShopView:ClickItemBtn(go, isOn, tb, ide)
+    if not self.Activity:CheckActivityInteractable() then
+        return
+    end
+    local name = go:GetName()
+    if name == "@_aorbtn_Btn" then
+        if tb.exchange then
+            _G.PopWindowManager:GetInstance():ShowAllTips(tb.exchange)
+            return
+        end
+        if not self.clickbtn then
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.LimitBuyView.Name,
+                tb.data,
+                function(_data)
+                    self:RefreshUI()
+                    require "CommonTipManager".OpenCommonAwardView(
+                        _data,
+                        function()
+                            self.clickbtn = false
+                        end
+                    )
+                end,
+                self.TypeCls
+            )
+        end
+        -- elseif name == "@_aorbtn_gou" then
+        --     if tb.data then
+        --         local data = tb.data
+        --         local myCount = 0
+        --         data.isGou = data.isGou > 0 and 0 or 1
+        --         _G.PlayerPrefsManager.SetInt(
+        --             "LimitTimeExchangeModelGou" .. self.Activity:GetActivityID() .. tb.data.Sid,
+        --             tb.data.isGou
+        --         )
+        --         _G.GameUtil.SetActiveByCondition(tb.aorimage_gou, tb.data.isGou > 0)
+        --         if data.NeedItem[1].sid == 101 then --活动代币（恶灵入侵）
+        --             myCount = require "MonsterSiegeManager":GetInstance():GetCoinActivity()
+        --         elseif data.NeedItem[1].sid == 103 then
+        --             myCount = require "ArenaFairManager":GetInstance():GetCoin()
+        --         elseif data.NeedItem[1].sid == 109 then
+        --             myCount = require "SixVsSixCoinModel":GetInstance():GetCoin()
+        --         elseif data.NeedItem[1].sid == 104 then
+        --             myCount = require "GuessGameModel":GetInstance():GetCoin()
+        --         else
+        --             local _, storageId = _G.StorageManager:GetInstance():CheckSidType(data.NeedItem[1].sid)
+        --             myCount = _G.StorageManager:GetInstance():GetItemCountByID(storageId, data.NeedItem[1].sid)
+        --         end
+        --         local IsCanTake = myCount >= data.NeedItem[1].num and data.State == 1
+        --         _G.GameUtil.SetActiveByCondition(tb.obj_getEff, IsCanTake and data.isGou > 0)
+        --    end
+        self.TypeCls:RefreshRedPointExchange()
+    end
+end
+
+function ExchangeShopView:RefreshUI()
+    --self.aortext_Timer.text = TimeUtil.TimeToString(self.TypeCls.changeStateTime,1)
+    if self.rewardList == nil then
+        return
+    end
+    self:RefreshData()
+    self.go_table.scrollloopvectical_ItemList:UpdateCount(#self.rewardList)
+end
+
+function ExchangeShopView:UpdateTimeShow(show, elapsed)
+    if not show then
+        self.RTS = self.RTS - elapsed
+    end
+    self.go_table.aortext_Timer.text = _G.TimeUtil.TimeToString(_G.Mathf.RoundToInt(self.RTS), 1)
+    if self.RTS <= 0 then
+        if self.timer then
+            self.timer:Stop()
+            self.timer = nil
+        end
+        --self:Close()
+    end
+end
+
+---OnClickBtn按钮点击事件
+---@protected
+---@param go UnityEngine.GameObject 按钮对象
+---@param isOn boolean 状态（toggle使用）
+function ExchangeShopView:OnClickBtn(go, isOn)
+    if self.go_table.aorbtn_closeBtn == go then
+
+    end
+end
+
+---@return ExchangeShopView
+return ExchangeShopView

@@ -1,0 +1,282 @@
+local base = _G.GameDataModelBase
+
+---@class ArraignedMallModel : GameDataModelBase    审核模式_充值商店
+---@field GetInstance fun():ArraignedMallModel
+---@field pointSid number                           @点数sid
+---@field pointNum number                           @点数数量
+---@field cfgs table<number,store_audit_cfg>        @商品数据列表
+---@field buyList table<number,boolean>             @已购买商品列表
+local ArraignedMallModel = _G.BaseClass("ArraignedMallModel", base)
+
+function ArraignedMallModel:__init()
+    self.pointNum = 0
+    self.pointSid = 0
+    --初始化商品列表
+    self.cfgs = {}
+    for _, cfg in pairs(_G.ConfigManager.store_audit_cfg) do
+        table.insert(self.cfgs, cfg)
+        --点数sid
+        if self.pointSid <= 0 and cfg.voucher and #cfg.voucher > 0 then
+            self.pointSid = cfg.voucher[1][1]
+        end
+    end
+    table.sort(self.cfgs, function(a, b)
+        return a.id < b.id
+    end)
+
+    self:ReadPointToDisk()
+    self:ReadBuyListToDisk()
+
+    --注册事件接口
+end
+
+function ArraignedMallModel:Dispose()
+    --移除事件接口
+end
+
+---从服务器拉取数据
+function ArraignedMallModel:GetDataFormServer()
+    self:ParseData()
+end
+
+--region =========================数据接口=========================
+
+---获取商品配置
+---@return store_audit_cfg[]
+function ArraignedMallModel:GetCfgs()
+    return self.cfgs or {}
+end
+
+---是否已购买商品
+---@param id number @商品id
+---@return boolean
+function ArraignedMallModel:IsBuy(id)
+    -- if not self.buyList then
+    --     return false
+    -- end
+    -- return self.buyList[id] or false
+    return true --没有首充
+end
+
+---获取点数sid
+---@return sid
+function ArraignedMallModel:GetPointSid()
+    return self.pointSid or 0
+end
+
+---获取点数余额
+---@return number
+function ArraignedMallModel:GetPointNum()
+    return self.pointNum or 0
+end
+
+---使用点数
+---@param num number @使用点数
+---@return boolean @是否成功使用点数
+function ArraignedMallModel:UsePointNum(num)
+    if num <= 0 or self.pointNum < num then
+        return false
+    end
+    self.pointNum = self.pointNum - num
+    self:SavePointToDisk()
+    _G.Events:GetInstance():Broadcast(_G.ArraignedMall.PointUpdate)
+    return true
+end
+
+---增加点数
+---@param num number @增加点数
+function ArraignedMallModel:AddPointNum(num)
+    self.pointNum = self.pointNum + num
+    self:SavePointToDisk()
+    _G.Events:GetInstance():Broadcast(_G.ArraignedMall.PointUpdate)
+end
+
+--endregion
+
+--region =========================IO操作=========================
+
+---保存点数到磁盘
+---@private
+function ArraignedMallModel:SavePointToDisk()
+    _G.PlayerPrefsManager.SetInt(" ArraignedMall_Point", self.pointNum or 0, true)
+end
+
+---从磁盘获取点数
+---@private
+function ArraignedMallModel:ReadPointToDisk()
+    local v = _G.PlayerPrefsManager.GetInt(" ArraignedMall_Point", 0, true)
+    self.pointNum = math.max(0, v or 0)
+end
+
+---保存已购买商品列表到磁盘
+---@private
+function ArraignedMallModel:SaveBuyListToDisk()
+    local ids = {}
+    if self.buyList then
+        for id, _ in pairs(self.buyList) do
+            table.insert(ids, id)
+        end
+    end
+    local str = table.concat(ids, ",")
+    _G.PlayerPrefsManager.SetString(" ArraignedMall_BuyList", str, true)
+end
+
+---从磁盘获取已购买商品列表
+---@private
+function ArraignedMallModel:ReadBuyListToDisk()
+    self.buyList = {}
+
+    local str = _G.PlayerPrefsManager.GetString(" ArraignedMall_BuyList", nil, true)
+    if not str or #str <= 0 then
+        return
+    end
+    for _, id in ipairs(string.split(str, ",")) do
+        local _id = tonumber(id)
+        if _id then
+            self.buyList[_id] = true
+        end
+    end
+end
+
+--endregion
+
+--region =========================UI逻辑=========================
+
+---更新点数余额显示
+---@param item CommonRsItem_GoTable
+function ArraignedMallModel:UpdatePointItem(item)
+    if not item or _G.IsNil(item.gameObject) then
+        return false
+    end
+    local pointSid = self:GetPointSid()
+    item.gameObject:SetActiveE(pointSid > 0 and 1 or 0)
+    if pointSid <= 0 then
+        return true
+    end
+
+    local iconPath = _G.StorageManager:GetInstance():GetItemIcon(pointSid) --即使不登录, 此接口也可正常使用
+    item.aorrawimage_icon:LoadImage(iconPath)
+    item.aortext_num.text = tonumber(self:GetPointNum())
+    item.obj_redpoint:SetActiveE(0)
+
+    return true
+end
+
+---加载资源余额显示Item
+---@param parent UnityEngine.Transform @父节点
+---@param callback fun(item:CommonRsItem_GoTable):void @加载完成回调
+---@param onAddCallback fun():void @点击添加按钮回调, 不传则隐藏按钮
+function ArraignedMallModel:LoadPointItem(parent, callback, onAddCallback)
+    if self:GetPointSid() <= 0 then
+        return
+    end
+    _G.PoolsManager:GetInstance():Spawn(
+        "UIH5/Common/CommonRsItem",
+        _G.ePoolType.Temporary,
+        parent,
+        function(trans)
+            if not trans then
+                return
+            end
+            if _G.IsNil(parent) then
+                _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.Temporary)
+                return
+            end
+            ---@type CommonRsItem_GoTable
+            local item = _G.GetAutoGoTable(trans, onAddCallback)
+            item.aorbtn_add:SetActiveE(onAddCallback and 1 or 0)
+            item.aorimage_add:SetActiveE(onAddCallback and 1 or 0)
+
+            self:UpdatePointItem(item)
+
+            if callback then
+                callback(item)
+            end
+        end
+    )
+end
+
+--endregion
+
+---发起购买操作
+---@param id number @商品id
+---@param callback fun(msg:public.s2c_common_ack) @回调函数
+function ArraignedMallModel:Buy(id, callback)
+    local cfg = _G.ConfigManager.store_audit_cfg[id]
+    if not cfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("找不到商品id: " .. tostring(id))
+        end
+        return
+    end
+
+    local gear = cfg.gear and #cfg.gear > 0 and cfg.gear[1]
+    if not gear then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("找不到商品gear: " .. tostring(id))
+        end
+        return
+    end
+    --支付成功处理
+    local function successed()
+        self:OnMallCashListener(cfg)
+        if callback then
+            --模拟public.s2c_common_ack结构
+            ---@type public.s2c_common_ack
+            local msg = { ack = 1 }
+            if cfg.voucher and #cfg.voucher > 0 then
+                msg.award = {
+                    item = {
+                        {
+                            type = cfg.voucher[1]
+                        }
+                    },
+                }
+            end
+            callback(msg)
+        end
+    end
+    if _G.AppSetting.IsEditor then
+        successed()
+        return
+    end
+    _G.SDKManager:GetInstance():ArraignedPay(gear, function(ok, msg)
+        --121支付成功、122支付失败
+        if not ok or type(msg) ~= "table" or msg.code ~= 121 then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(msg, "ArraignedMallModel:Buy请求失败: ")
+            end
+            if callback then
+                callback({ ack = 470103 }) --充值失败
+            end
+            return
+        end
+
+        successed()
+    end)
+end
+
+---监听商品充值
+---@private
+---@param cfg store_audit_cfg
+function ArraignedMallModel:OnMallCashListener(cfg)
+    local isBuy = self:IsBuy(cfg.id)
+
+    --保存购买状态
+    if not self.buyList then
+        self.buyList = {}
+    end
+    self.buyList[cfg.id] = true
+    self:SaveBuyListToDisk()
+
+    --点数状态
+    local num = cfg.voucher and #cfg.voucher > 0 and cfg.voucher[1][2] or 0
+    self.pointNum = self.pointNum + num
+    if not isBuy then
+        self.pointNum = self.pointNum + 0
+    end
+    self:SavePointToDisk()
+    _G.Events:GetInstance():Broadcast(_G.ArraignedMall.PointUpdate)
+end
+
+return ArraignedMallModel

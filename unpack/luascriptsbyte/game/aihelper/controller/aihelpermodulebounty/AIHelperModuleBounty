@@ -1,0 +1,416 @@
+local BountyEnum = require("BountyEnum")
+
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleBounty : AIHelperModuleBaseNumberMock	    @AI助手-派遣贪字营
+---@field count number              @有几个待派遣任务
+---@field hasAward boolean          @是否有可领奖的任务
+---@field failure number            @不满足条件的派遣任务数量, 依次执行时跳过n个节点
+local AIHelperModuleBounty = _G.BaseClass("AIHelperModuleBounty", base)
+
+---是否满足模块使用条件
+function AIHelperModuleBounty:IsActive()
+    return self.index <= self.number and (self.count > 0 or self.hasAward)
+end
+
+---获取Number范围
+function AIHelperModuleBounty:GetCountRange()
+    return 0, 10
+end
+
+---重置状态
+function AIHelperModuleBounty:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.count = 1
+    self.failure = 0
+    self.hasAward = false
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleBounty:Check(callback)
+    ---获取可交互的任务数量
+    self.count = self:GetBountyQuestDataCount(BountyEnum.BountyQuestStateEnum.DNS)
+    self.hasAward = self:GetBountyQuestDataCount(BountyEnum.BountyQuestStateEnum.Award) > 0
+    self.index = 1
+    self.failure = 0
+
+    if callback then
+        callback(true)
+    end
+end
+
+---获取当前执行状态
+function AIHelperModuleBounty:GetExecuteState()
+    if self.hasAward then
+        return nil
+    end
+    local data = self:GetFirstBountyQuestData(BountyEnum.BountyQuestStateEnum.DNS, self.failure)
+    return {
+        id = data and data.cfg.id or nil
+    }
+end
+
+---获取当前执行标题
+function AIHelperModuleBounty:GetExecuteTitle(state)
+    if not state or not state.id then
+        return base.GetExecuteTitle(self, state)
+    end
+    local cfg = _G.ConfigManager.bounty_quest_cfg[state.id]
+    if not cfg then
+        return base.GetExecuteTitle(self, state)
+    end
+    return _G.GetLangPackValue(self.cfg.title) .. "-" .. _G.GetLangPackValue(cfg.name)
+end
+
+---执行逻辑
+function AIHelperModuleBounty:Execute(callback)
+    local function response(success, results, isSkip)
+        if isSkip then
+            self.failure = self.failure + 1
+        end
+        if not callback then
+            return
+        end
+        callback(success, results)
+    end
+
+    if self.hasAward then
+        self.hasAward = false
+        ---领取派遣奖励
+        local tasks = self:GetBountyQuestDatas(BountyEnum.BountyQuestStateEnum.Award)
+        if not tasks or #tasks == 0 then
+            response(true, nil)
+            return
+        end
+        ---@type BountySystemManager
+        local manager = require("BountySystemManager"):GetInstance()
+
+        --发起请求
+        ---@type number[]
+        local sids = {}
+        for _, v in pairs(tasks) do
+            table.insert(sids, v.mission.sid)
+        end
+        manager:FinshEvilTask(sids, function(msg)
+            if msg and msg.ack == 1 then
+                --获取奖励
+                if msg.award then
+                    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                end
+                --更新任务状态
+                for _, v in pairs(tasks) do
+                    v.taskState = BountyEnum.BountyQuestStateEnum.Awarding
+                    manager:RemoveQuest(v.mission.sid, manager:ChangeCards())
+                end
+                --新增任务
+                if msg.missions and manager.BountyData then
+                    _G.table.insertto(manager.BountyData.missions, msg.missions)
+                    manager:AddQuest(msg.missions)
+                    --更新可派遣任务数量
+                    self.count = self:GetBountyQuestDataCount(BountyEnum.BountyQuestStateEnum.DNS)
+                end
+
+                response(true, msg, false)
+            else
+                response(false, nil, false)
+            end
+        end)
+    else
+        ---开始派遣
+        self.index = self.index + 1
+        self.count = self.count - 1
+
+        ---@type  BountyQuestData
+        local task = self:GetFirstBountyQuestData(BountyEnum.BountyQuestStateEnum.DNS, self.failure)
+        if not task then
+            response(false, nil)
+            return
+        end
+
+        ---@type BountySystemManager
+        local manager = require("BountySystemManager"):GetInstance()
+
+        --获取可以使用的卡牌
+        ---@type CardData[]
+        local allCards = manager.Cards[0]
+        ---@type table<number,table<number,CardData>>
+        local cards = {}
+        for _, v in pairs(allCards) do
+            if not manager:ChekcIsDispath(v.uid) then
+                if not cards[v.star] then
+                    cards[v.star] = {}
+                end
+                cards[v.star][v.uid] = v
+            end
+        end
+
+        local needStarNum, needStar = task.cfg.condition_attribute[1], task.cfg.condition_attribute[2]
+        local needProps = _G.DeepCopy(task.mission.five_elements)
+        local needNum = task.cfg.condition_num
+        ---@type CardData[]
+        local useCards = {}
+
+        --计算需要的卡牌(同时满足星级和五行)
+        for star, lstCards in pairs(cards) do
+            if star >= needStar then
+                for _, cardData in pairs(lstCards) do
+                    local index = false
+                    for i = 1, #cardData.cfg.Elements_new do
+                        local itemp = _G.table.indexof(needProps, cardData.cfg.Elements_new[i])
+                        if itemp ~= false then
+                            index = itemp
+                            break
+                        end
+                    end
+                    if index and index >= 1 then
+                        table.remove(needProps, index)
+                        table.insert(useCards, cardData)
+                        lstCards[cardData.uid] = nil
+
+                        if #useCards >= needStarNum or #needProps <= 0 then
+                            break
+                        end
+                    end
+                end
+                if #useCards >= needStarNum or #needProps <= 0 then
+                    break
+                end
+            end
+        end
+        if needStarNum + #task.mission.five_elements - needNum > #useCards then
+            response(true, self:CreateFailureResults(self.cfg.fail_tip), true)
+            return
+        end
+
+        --计算需要的卡牌(满足星级要求)
+        if #useCards < needStarNum then
+            for star, lstCards in pairs(cards) do
+                if star >= needStar then
+                    for _, cardData in pairs(lstCards) do
+                        table.insert(useCards, cardData)
+                        lstCards[cardData.uid] = nil
+                        if #useCards >= needStarNum then
+                            break
+                        end
+                    end
+                    if #useCards >= needStarNum then
+                        break
+                    end
+                end
+            end
+        end
+        if #useCards < needStarNum then
+            response(true, self:CreateFailureResults(self.cfg.fail_tip), true)
+            return
+        end
+
+        --计算需要的卡牌(满足五行要求)
+        if #needProps > 0 then
+            for _, lstCards in pairs(cards) do
+                for _, cardData in pairs(lstCards) do
+                    local index = false
+                    for i = 1, #cardData.cfg.Elements_new do
+                        local itemp = _G.table.indexof(needProps, cardData.cfg.Elements_new[i])
+                        if itemp ~= false then
+                            index = itemp
+                            break
+                        end
+                    end
+
+                    if index and index >= 1 then
+                        table.remove(needProps, index)
+                        table.insert(useCards, cardData)
+                        lstCards[cardData.uid] = nil
+
+                        if #needProps <= 0 then
+                            break
+                        end
+                    end
+                end
+                if #needProps <= 0 then
+                    break
+                end
+            end
+        end
+        if #needProps > 0 then
+            response(true, self:CreateFailureResults(self.cfg.fail_tip), true)
+            return
+        end
+
+        --计算需要的卡牌(任意填充)
+        if #useCards < needNum then
+            for _, lstCards in pairs(cards) do
+                for _, cardData in pairs(lstCards) do
+                    table.insert(useCards, cardData)
+                    lstCards[cardData.uid] = nil
+                    if #useCards >= needNum then
+                        break
+                    end
+                end
+                if #useCards >= needNum then
+                    break
+                end
+            end
+        end
+        if #useCards < needNum then
+            response(true, self:CreateFailureResults(self.cfg.fail_tip), true)
+            return
+        end
+
+        --检查卡牌组合是否满足条件需求
+        local limitStarNum = 0
+        local limitNeedProps = _G.DeepCopy(task.mission.five_elements)
+        for _, cardData in pairs(useCards) do
+            if cardData.star >= needStar then
+                limitStarNum = limitStarNum + 1
+            end
+            if #limitNeedProps > 0 then
+                local index = false
+                    for i = 1, #cardData.cfg.Elements_new do
+                        local itemp = _G.table.indexof(limitNeedProps, cardData.cfg.Elements_new[i])
+                        if itemp ~= false then
+                            index = itemp
+                            break
+                        end
+                    end
+                if index and index >= 1 then
+                    table.remove(limitNeedProps, index)
+                end
+            end
+        end
+        if limitStarNum < needStarNum or #limitNeedProps > 0 then
+            response(true, self:CreateFailureResults(self.cfg.fail_tip), true)
+            return
+        end
+
+        --发起请求
+        local pbData = { sid = task.mission.sid, card_uid = {} }
+        local cardInfos = {}
+        for _, cardData in pairs(useCards) do
+            table.insert(pbData.card_uid, cardData.uid)
+            table.insert(
+                cardInfos,
+                {
+                    sid = cardData.sid,
+                    uid = cardData.uid,
+                    star = cardData.star
+                }
+            )
+        end
+        manager:AcceptEvilTask({ pbData }, function(msg)
+            if not msg or msg.ack ~= 1 then
+                response(false, nil, false)
+                return
+            end
+            --更新任务状态
+            task:StartTask(msg.start_time, cardInfos, true)
+            task:Dispose()
+            manager:RespawnQuestData(task)
+
+            ---@type number[][]
+            local colne = {}
+            for i = 1, #cardInfos do
+                local sid, uid, star = cardInfos[i].sid, cardInfos[i].uid, cardInfos[i].star
+                colne[i] = { sid, uid, star, star }
+            end
+            response(true, { cards = colne }, false)
+        end)
+    end
+end
+
+---显示执行状态
+function AIHelperModuleBounty:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    item.aortext_tip.text = ""
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleBounty:ShowExecuteResult(item, success, results)
+    if success and results.cards then
+        base.ShowExecuteResult(self, item, true, results)
+
+        self.Util.ShowAwardList(item, results.cards)
+        item.aortext_tip.text = _G.GetLangPackValue(90022500615)
+    elseif success and results.award then
+        base.ShowExecuteResult(self, item, true, results)
+
+        self.Util.ShowAwardListOfMsg(item, results)
+        item.aortext_tip.text = _G.GetLangPackValue(90021700013)
+    else
+        base.ShowExecuteResult(self, item, false, results)
+    end
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleBounty:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardList(item, results and results.cards or nil)
+end
+
+---获取所有可交互的贪字营任务(可开始丶可领奖)
+---@param state BountyEnum.BountyQuestStateEnum?      @目标任务状态, 默认:BountyEnum.BountyQuestStateEnum.DNS|BountyEnum.BountyQuestStateEnum.Award
+---@return BountyQuestData[]
+function AIHelperModuleBounty:GetBountyQuestDatas(state)
+    ---@type BountySystemManager
+    local manager = require("BountySystemManager"):GetInstance()
+    manager:InitAllQuset()
+    if not manager.AllQuest then
+        return nil
+    end
+
+    ---@type BountyQuestData[]
+    local results = {}
+    for _, task in pairs(manager.AllQuest) do
+        --BountyEnum.BountyQuestStateEnum.DNS: 待派遣
+        --BountyEnum.BountyQuestStateEnum.Award: 待领奖
+        if state and task.taskState == state or
+            not state and (task.taskState == BountyEnum.BountyQuestStateEnum.DNS or task.taskState == BountyEnum.BountyQuestStateEnum.Award) then
+            if task.timer then
+                task.timer:Stop()
+            end
+            table.insert(results, task)
+        else
+            manager:RespawnQuestData(task)
+        end
+    end
+    return results
+end
+
+---获取可交互的贪字营任务数量
+---@param state BountyEnum.BountyQuestStateEnum 目标任务状态
+---@return number
+function AIHelperModuleBounty:GetBountyQuestDataCount(state)
+    local datas = self:GetBountyQuestDatas(state)
+    return datas and #datas or 0
+end
+
+---获取第一个可交互的贪字营任务
+---@param state BountyEnum.BountyQuestStateEnum 目标任务状态
+---@param skipCount number 跳过n个数据
+---@return BountyQuestData
+function AIHelperModuleBounty:GetFirstBountyQuestData(state, skipCount)
+    local datas = self:GetBountyQuestDatas(state)
+    if not datas or #datas <= 0 then
+        return nil
+    end
+
+    _G.table.sort(
+        datas,
+        function(a, b)
+            return a.cfg.id > b.cfg.id
+        end
+    )
+
+    for i = 1, #datas do
+        if not skipCount or skipCount <= 0 then
+            return datas[i]
+        end
+        skipCount = (skipCount or 0) - 1
+    end
+
+    return nil
+end
+
+return AIHelperModuleBounty

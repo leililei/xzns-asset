@@ -1,0 +1,436 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.World.Object.WorldBasePlayer	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/01/05
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+local base = require "BaseItem"
+
+---@class WorldBasePlayer:BaseItem
+local WorldBasePlayer = _G.BaseClass("WorldBasePlayer", base)
+
+---@param info BaseItemParam 类型
+---@param data WorldItemData 数据
+---@param world BaseWorld 所属世界
+function WorldBasePlayer:__init(info, data, world)
+    self.ItemData = data
+    self.OriginalShowState = not (self.ItemData and self.ItemData.IsHidden)
+end
+function WorldBasePlayer:Dispose()
+    self:RemoveAllListeners()
+    self.ItemData = nil
+    self.OriginalShowState = nil
+    self.TitleTextName = nil
+    self.RolePoint = nil
+    -- if self.setTitlePosTimer then
+    --     self.setTitlePosTimer:Stop()
+    -- end
+    -- self.setTitlePosTimer = nil
+    self.TitleScaleRoot = nil
+end
+--region 创建
+---世界物件模型创建延迟到进入世界时，因为切换场景做了资源缓存
+function WorldBasePlayer:LoadResObj()
+    self:OnLoadResObjComplete()
+end
+---初始化头顶标题
+---@param nameStr string 名字
+function WorldBasePlayer:InitTitle(nameStr, resPath, callback)
+    if true then
+        if callback then
+            callback()
+        end
+        return
+    end
+    local path = "CommonPrefab/World/Common_TitleWithDesignation"
+    if resPath then
+        path = resPath
+    end
+    self.TitleLoading = true
+    _G.PoolsManager:GetInstance():Spawn(
+        path,
+        _G.ePoolType.Default,
+        self.World:GetTitleRoot(),
+        function(title)
+            local go_table = _G.GetAutoGoTable(title)
+            self.TitleTransform = title
+            self.TitleTransform:SetName(self.Uid)
+            self.TitleTextName = go_table.aortext_TextName
+            self.TitleScaleRoot = go_table.trans_root
+            self.TitleTextName.text = nameStr
+            if self.ItemData and self.ItemData.hell_id then
+                self:UpdateHell(self.ItemData.hell_id)
+            end
+            if self.Uid == _G.PlayerModel:GetInstance().role_uid then
+                self.TitleTransform:SetPosition(0, 100, 0)
+                self.TitleTransform:SetActiveE(1)
+            else
+                self.TitleTransform:SetActiveE(0)
+            end
+            self:SetTitlePos()
+            _G.GameUtil.ReBuildRTF(self.TitleTransform:FindE("@_trans_root/title"))
+            self.TitleLoading = false
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+function WorldBasePlayer:InitObjectModel(model)
+    self.ObjectMod = model
+    if self.ItemData and self.ItemData.IsInShadow then
+        _G.GraphicsManager.Instance:SetTargetDarken(self.ObjectMod, 1)
+    end
+    self.IdleEffetTrans = model:FindE("Bone077")
+    self.ObjectMod:SetParentE(self.Transform)
+    self.ObjectMod:SetLocalPosition(0, 0, 0)
+    self.ObjectMod:SetLocalEulerAngles(0, 0, 0)
+    self.AnimComponent = _G.RoleAnimatorController.GetOrCreateAnimatorController(self.Transform, true)
+    self.AnimComponent:HandInit()
+    self.RolePoint = self.ObjectMod:GetComponentE(_G.typeof(_G.CS.RolePoint))
+    self:ShowOrHide(not (self.ItemData and self.ItemData.IsHidden) or self.ItemShowState)
+
+    if not self.TitleLoading then
+        if _G.IsNil(self.TitleTransform) then
+            self:CreateCurPlayerTitle()
+        else
+            _G.DelayFrameDo(_G.handler(self, self.SetTitlePos))
+            self:AddCommonEffect()
+        end
+    end
+    self:CheckPlayerChangeModelCall()
+    self:InitSkinnedMeshRenderer()
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        if self.Uid == _G.PlayerModel:GetInstance().role_uid then
+            self.ObjectMod:SetActiveE(1)
+        else
+            self.ObjectMod:SetActiveE(0)
+        end
+    else
+        self.ObjectMod:SetActiveE(0)
+    end
+end
+
+function WorldBasePlayer:CreateCurPlayerTitle()
+    if self.World.Cfg.IsDisplay then
+        local name
+        if self.ItemData.role_name then
+            name = "<color=#ffee9c>" .. self.ItemData.role_name .. "</color>"
+            self:InitTitle(
+                name,
+                nil,
+                function()
+                    _G.DelayFrameDo(_G.handler(self, self.SetTitlePos))
+                    self:AddCommonEffect()
+                end
+            )
+        end
+    end
+end
+
+---当前切换角色模型 是否有剧情行为 等待加载完成回调
+function WorldBasePlayer:CheckPlayerChangeModelCall()
+end
+---隐藏绑定特效
+function WorldBasePlayer:HideEffect(hide)
+    if self.IdleEffetTrans then
+        _G.GameUtil.SetActiveByCondition(self.IdleEffetTrans, not hide)
+    end
+end
+
+---清理模型
+function WorldBasePlayer:ClearObjectModel()
+    if _G.IsNil(self.ObjectMod) then
+        return
+    end
+    self:ShowShadow()
+    if self.ItemData and self.ItemData.IsInShadow then
+        _G.GraphicsManager.Instance:SetTargetDarken(self.ObjectMod, 0)
+    end
+    self:RemoveCommonEffect()
+
+    if not _G.IsNil(self.ObjectMod) then
+        _G.DestroyImmediate(self.ObjectMod)
+        self.ObjectMod = nil
+    end
+
+    if not _G.IsNil(self.TitleTransform) then
+        _G.DestroyImmediate(self.TitleTransform)
+        self.TitleTransform = nil
+    end
+
+    self.ObjectModActive = false
+    self.TitleTransformActive = false
+    self.FootEffectActive = false
+end
+---创建模型
+function WorldBasePlayer:CreateObjectModel()
+    if self.loadModelObj or not _G.IsNil(self.ObjectMod) then
+        return
+    end
+    if self.Cfg and not _G.string.IsNullOrEmpty(self.Cfg.Res) then
+        self.loadModelObj = true
+        local loadfunc = function(tran)
+            self.loadModelObj = nil
+            if _G.IsNil(self.Transform) then
+                tran:DestroyObject()
+                return
+            end
+            self:InitObjectModel(tran)
+        end
+        local model_Path = self.Cfg.Res
+        if _G.string.contains(model_Path, "/") then
+            -- if _G.DownloadPlayManager:GetInstance():IsInRemotePackage(model_Path) then
+            --     if not _G.DownloadPlayManager:GetInstance():IsABDownloaed(model_Path) then
+            --         --策划给的id,默认模型显示
+            --         model_Path = _G.ConfigManager.object_world_cfg[707010168].Res
+            --     end
+            -- end
+            model_Path = _G.ConfigManager.object_world_cfg[707010168].Res
+            require("CardInfoManager").GetRole(
+                model_Path,
+                _G.ePoolType.World,
+                self.Transform,
+                _G.RoleEffTypeEnum.Main,
+                loadfunc
+            )
+            
+        else
+            local trans = _G.WorldManager:GetInstance():GetItemGameObj(model_Path)
+            loadfunc(trans)
+        end
+    end
+end
+--endregion
+
+---初始化位置
+function WorldBasePlayer:InitPosition()
+end
+---获取名称Y轴偏移值
+---@return number Y轴偏移值
+function WorldBasePlayer:GetTitleDeltaY()
+    return _G.ConfigManager.discrete_cfg[103503][1][1]
+end
+---初始化头顶名称位置
+---@param deltaY number Y轴便宜值
+function WorldBasePlayer:SetTitlePos()
+    if not _G.IsNil(self.TitleTransform) then
+        local x, y, z = self:GetHeadPoint()
+        if x then
+            self.titleDeltaY = self:GetTitleDeltaY()
+            -- local deltaY = self:GetTitleDeltaY()
+            local x1, y1, z1 = self.Transform:GetPosition()
+            local s = self.TitleTransform:GetLocalScale()
+            -- local pos = {}
+            -- pos.x = 0
+            -- pos.z = 0
+            self.titleDeltaY = (y - y1 + self.titleDeltaY) * s
+            self.titlePosX = 0
+            self.titlePosY = 0
+            self.titlePosZ = 0
+            -- self.TitleTransform:SetLocalPosition(pos.x, pos.y, pos.z)
+            self.World.WorldSetting:TranLookAtCamera(self.TitleTransform, self.Transform)
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("未找到名字挂载点 Point_Hp.请检测模型 " .. self.Uid)
+            end
+            self.TitleTransform:SetActiveE(0)
+        end
+    end
+end
+
+function WorldBasePlayer:SetTitleScale(scale)
+    if self.TitleScaleRoot then
+        self.TitleScaleRoot:SetworldScaleXYZ(scale)
+    end
+end
+function WorldBasePlayer:UpdateTitlePos()
+    if not self.titleDeltaY then
+        return
+    end
+    if _G.IsNil(self.TitleTransform) then
+        return
+    end
+    self.titlePosX, self.titlePosY, self.titlePosZ = self.Transform:GetPosition()
+    self.titlePosY = self.titlePosY + self.titleDeltaY
+    if self.titlePosY > 1000 then
+        local _, y = self.TitleTransform:GetPosition()
+        self.titlePosY = y
+    end
+    self.TitleTransform:SetPosition(self.titlePosX, self.titlePosY, self.titlePosZ)
+end
+--region 对触发器响应
+-----当物件被点击时的处理函数
+---由子类重写具体的逻辑
+function WorldBasePlayer:OnClick()
+end
+--endregion
+
+--region 子类重写
+---添加效果
+function WorldBasePlayer:AddCommonEffect()
+end
+---移除效果
+function WorldBasePlayer:RemoveCommonEffect()
+    if not _G.IsNil(self.ObjectMod) then
+        self.World.CommonEff:SetSelectState(self.ObjectMod, false)
+        --还原渲染状态
+        local renders = self.ObjectMod:GetComponentsInChildren(_G.typeof(_G.Renderer))
+        if not _G.IsNil(renders) then
+            local len = renders.Length - 1
+            for i = 0, len do
+                local render = renders[i]
+                if not _G.IsNil(render) and not _G.IsNil(render.sharedMaterial) then
+                    render.sharedMaterial:SetFloat("_ShadowArea", 0)
+                    render.shadowCastingMode = _G.CS.UnityEngine.Rendering.ShadowCastingMode.On
+                end
+            end
+        end
+    end
+end
+function WorldBasePlayer:ShowOrHide(show, force)
+    if force then
+        self.OriginalShowState = show
+    end
+    -- if show == self.curSetEnable then
+    --     return
+    -- end
+    base.ShowOrHide(self, show and self.OriginalShowState)
+    if not _G.WorldManager:GetInstance():CheckCurSceneType(_G.SceneType.MainWorld) then
+        if not _G.IsNil(self.TitleTransform) then
+            _G.GameUtil.SetActiveByCondition(self.TitleTransform, show and self.OriginalShowState)
+        --self.curSetEnable)
+        end
+    end
+    if show and self.OriginalShowState then --self.curSetEnable then
+        if self.ObjShowTimer then
+            self.ObjShowTimer:Stop()
+            self.ObjShowTimer = nil
+        end
+        self.ObjShowTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnGameObjShow, self, true, true):Start()
+    else
+        if self.ObjShowTimer then
+            self.ObjShowTimer:Stop()
+            self.ObjShowTimer = nil
+        end
+        self:OnGameObjHide()
+    end
+end
+function WorldBasePlayer:OnGameObjShow()
+end
+function WorldBasePlayer:OnGameObjHide()
+end
+function WorldBasePlayer:Reset()
+    if _G.IsNil(self.ObjectMod) then
+        if not self.ItemData.IsHidden then
+            self:OnEnterWorld()
+        else
+            self:OnExitWorld()
+        end
+    else
+        self:ShowOrHide(not self.ItemData.IsHidden)
+    end
+end
+function WorldBasePlayer:OnEnterWorld()
+    self:InitPosition()
+    self:CreateObjectModel()
+end
+-----退出世界时调用，由子类重写
+function WorldBasePlayer:OnExitWorld()
+    self:ClearObjectModel()
+    base.OnExitWorld(self)
+end
+---清理item节点下的对象
+function WorldBasePlayer:DisWorldItem()
+    _G.NavManager:GetInstance():DeleteNavItemByUid(self.Uid, true)
+    self:RemoveNavUpdateMove()
+    self:RemoveUpdateMoveFunction()
+    if self.Transform then
+        _G.DestroyObject(self.Transform)
+    end
+    self:Dispose()
+end
+--endregion
+
+--region获取节点和坐标
+---获取子节点,以物体根节点为父级往下找，找不到就返回根节点
+---@param path string 路径
+function WorldBasePlayer:GetChildNode(path)
+    if _G.IsNil(self.ObjectMod) then
+        return self.Transform
+    end
+    if _G.string.IsNullOrEmpty(path) then
+        return self.ObjectMod
+    end
+    local node = self.ObjectMod:FindE(path)
+    if _G.IsNil(node) then
+        node = self.ObjectMod
+    end
+    return node
+end
+
+---获取头顶点坐标
+---@return number|number|number x,y,z
+function WorldBasePlayer:GetHeadPoint()
+    if _G.IsNil(self.RolePoint) then
+        return nil
+    end
+    if _G.IsNil(self.RolePoint.Point_Hp) then
+        if _G.IsNil(self.RolePoint.Point_Head) then
+            return nil
+        else
+            return self.RolePoint.Point_Head:GetPosition()
+        end
+    end
+    return self.RolePoint.Point_Hp:GetPosition()
+end
+--endregion
+
+--region新增点击目标
+---检测物体是否为点击的目标物体
+---@param uid number 物件uid
+---@return boolean 是否为目标物体
+function WorldBasePlayer:CheckPlayerClickTarget()
+    return self.World.WorldPlayer:CheckClickTarget(self.Uid)
+end
+---设置玩家目标为nil
+function WorldBasePlayer:SetPlayerClickTargetNil()
+    self.World.WorldPlayer:SetClickTarget(nil)
+end
+--endregion
+function WorldBasePlayer:SetRandomPos()
+    local posCfg = _G.ConfigManager.discrete_cfg[103506]
+    local random = _G.Mathf.Random(1, #posCfg)
+    local x, y, z =
+        _G.CS.UnityObjectExtends.GetRandomPointByR(
+        posCfg[random][1],
+        posCfg[random][2],
+        posCfg[random][3],
+        posCfg[random][4]
+    )
+    self.Transform:SetLocalPosition(x, y, z)
+end
+---更新地狱道头衔
+function WorldBasePlayer:UpdateHell(id)
+    if _G.IsNil(self.TitleTransform) then
+        return
+    end
+    local path = require "HellRoadManager":GetInstance():GetHellImage(id)
+    local go_table = _G.GetAutoGoTable(self.TitleTransform)
+    if _G.string.IsNullOrEmpty(path) then
+        _G.GameUtil.SetActiveByCondition(go_table.aorrawimage_hell, false)
+    else
+        go_table.aorrawimage_hell:LoadImage(
+            path,
+            function(obj)
+                obj:SetNativeSize()
+                local x, y = obj:GetRectTransformSizeDelta()
+                obj:SetRectTransformSize(x * 1.5, y * 1.5)
+            end
+        )
+        _G.GameUtil.SetActiveByCondition(go_table.aorrawimage_hell, true)
+    end
+end
+
+return WorldBasePlayer

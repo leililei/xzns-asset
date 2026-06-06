@@ -1,0 +1,632 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DailyDelivery.Model.LimitTimeSynModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/12/17
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ActivitySynManager = require "ActivitySynManager"
+local base = require "ActivitySynTypeBase"
+local isEmptyOrNil = _G.table.isEmptyOrNil
+---@class LimitTimeSynModel : Singleton
+local LimitTimeSynModel = _G.BaseClass("LimitTimeSynModel", base)
+local LimitTimeEnum = {"exchange", "task", "cash_gift"}
+-------------------兑换相关-------------------
+local ExchangeModel = _G.BaseClass("ExchangeModel")
+---@param data i_activity_exchange
+function ExchangeModel:__init(obj, data, TypeCls)
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    ---策划要求 仅第一登录有红点判断
+    self:Init(data, TypeCls)
+end
+function ExchangeModel:Init(data, TypeCls)
+    self.TypeCls = TypeCls
+    self.Data = {}
+    self:InitData(data, TypeCls)
+end
+function ExchangeModel:OnInitFunction()
+end
+function ExchangeModel:UpdateView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.LimitTimeETG.Name)
+    if view and view.gameObject:GetActiveSelf() == 1 then
+        view:SetView()
+    end
+end
+function ExchangeModel:InitData(data)
+    local _data
+    self.NeedMoneyType = {}
+    self.ExchangeType = data.type
+    for _, v in pairs(data.item) do
+        _data = {}
+        _data.Sid = v.sid
+        ---@type prop.i_item
+        _data.NeedItem = v.need_item
+        if not self.CoinSid then
+            self.CoinSid = v.need_item[1].sid
+        end
+        if not self.NeedMoneyType[v.need_item[1].sid] then
+            self.NeedMoneyType[v.need_item[1].sid] = v.need_item[1].sid
+        end
+        ---@type prop.i_item
+        _data.GetItem = v.get_item
+        _data.LimitTime = v.count_limit
+        _data.ExchangeTime = 0
+        _data.State = 1
+        _data.isGou = _G.PlayerPrefsManager.GetInt("LimitTimeSynModelExchange" .. self.TypeCls.ActivityID .. v.sid)
+        if not isEmptyOrNil(data.bought_times) then
+            for _, a in pairs(data.bought_times) do
+                if a.sid == v.sid then
+                    _data.ExchangeTime = a.times
+                    _data.State = a.times < v.count_limit and 1 or 0
+                end
+            end
+        end
+        _G.table.insert(self.Data, _data)
+    end
+end
+function ExchangeModel:ResUpdata(data)
+    for _, value in pairs(data) do
+        local sid = value.type[1]
+        if self.NeedMoneyType[sid] then
+            self.TypeCls:RefreshRedPointLimit(1)
+        end
+    end
+end
+function ExchangeModel:GetCoinSid()
+    return self.CoinSid
+end
+function ExchangeModel:CheckRedPoint()
+    if self.TypeCls:GetActivityState() ~= ActivitySynManager.State.Open then
+        return 0
+    else
+        local curDate = _G.TimeUtil.GetServerUnixTime()
+        local locationTime = _G.PlayerPrefsManager.GetInt("LimitTimeSynModelDaily" .. self.TypeCls.ActivityID)
+        if locationTime == 0 then
+            return 1
+        else
+            if _G.TimeUtil.GetInterValDayByGame(curDate, locationTime) >= 1 then
+                return 1
+            end
+        end
+        local myCount
+        if not isEmptyOrNil(self.Data) then
+            for k, v in pairs(self.Data) do
+                for i = 1, #v.NeedItem do
+                    if v.NeedItem[i].sid == 101 then --活动代币（恶灵入侵）
+                        myCount = require "MonsterSiegeManager":GetInstance():GetCoinActivity()
+                    else
+                        local _, storageId = _G.StorageManager:GetInstance():CheckSidType(v.NeedItem[i].sid)
+                        myCount = _G.StorageManager:GetInstance():GetItemCountByID(storageId, v.NeedItem[i].sid)
+                    end
+                    if myCount >= v.NeedItem[i].num and v.ExchangeTime < v.LimitTime and v.isGou > 0 then
+                        return 1
+                    end
+                end
+            end
+        end
+        return 0
+    end
+end
+function ExchangeModel:OnEnterLimitView()
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.LimitTimeETG.Name,
+        self.TypeCls:GetActivityCommonData()
+    )
+    self.TypeCls:RefreshRedPointLimit(1)
+end
+function ExchangeModel:OnActivityStateChanged(state)
+    self.TypeCls:RefreshRedPointLimit(1)
+end
+function ExchangeModel:Exchange(data, award, call)
+    local sid = data.Sid
+    require "ExchangeNet":GetInstance():Exchange(
+        sid,
+        1,
+        self.TypeCls.ActivityID,
+        function(_data)
+            if _data.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(_data)
+                _G.StorageManager:GetInstance():ConsumeItem(award.sid, 0, award.num)
+                data.ExchangeTime = data.ExchangeTime + 1
+                if data.ExchangeTime >= data.LimitTime then
+                    data.ExchangeTime = data.LimitTime
+                    data.State = 0
+                end
+                if call then
+                    call(_data)
+                end
+            else
+                if call then
+                    call()
+                end
+            end
+        end
+    )
+    self.TypeCls:RefreshRedPointLimit(1)
+end
+
+-------------------任务-------------------
+local LimitTimeTaskData = require "LimitTimeTaskData"
+local LimitTimeTaskNet = require "LimitTimeTaskNet"
+local TaskModel = _G.BaseClass("TaskModel")
+---@param data i_activity_exchange
+function TaskModel:__init(obj, data, TypeCls)
+    self:Init(data, TypeCls)
+end
+function TaskModel:Init(data, TypeCls)
+    if not _G.table.isEmptyOrNil(self.taskList) then
+        for k, v in pairs(self.taskList) do
+            v:Dispose()
+        end
+    end
+    self.TypeCls = TypeCls
+    self.finishTaskList = {}
+    self.taskList = {}
+    self.TaskCfg = {}
+    self:InitTaskCfg(data)
+    self:InitFinishTask(data.finish_task)
+    self:InitCurTask(data.task_curr)
+    self:UpdateView()
+    self.TypeCls:RefreshRedPointLimit(2)
+end
+function TaskModel:CheckRedPoint()
+    if self.TypeCls:GetActivityState() ~= ActivitySynManager.State.Open then
+        return 0
+    end
+    if not isEmptyOrNil(self.taskList) then
+        for k, v in pairs(self.taskList) do
+            if v:CheckIsCanTake() then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+function TaskModel:OnInitFunction()
+end
+function TaskModel:UpdateView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.LimitTimeMission.Name)
+    if view and view.gameObject:GetActiveSelf() == 1 then
+        view:UpdateView(self)
+    end
+end
+function TaskModel:OnEnterLimitView()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LimitTimeMission.Name, self)
+end
+function TaskModel:InitTaskCfg(data)
+    local initCfgFunc = function(task, type)
+        local _task
+        for k, v in pairs(task) do
+            _task = {}
+            _task.id = v.sid
+            _task.name = v.name
+            _task.desc = v.desc
+            _task.type_calculate = v.type_calculate
+            _task.condition = v.complete
+            _task.count = v.count
+            _task.reward = v.award
+            _task.link = v.link
+            _task.function_open = 0
+            _task.taskType = type
+            self.TaskCfg[v.sid] = _task
+        end
+    end
+    initCfgFunc(data.task, 2)
+    initCfgFunc(data.task_daily, 1)
+end
+function TaskModel:InitCurTask(task)
+    if task then
+        for _, v in pairs(task) do
+            if self.TaskCfg[v.sid] then
+                self.taskList[v.sid] =
+                    LimitTimeTaskData.New(
+                    {sid = v.sid, target = v.target, state = v.state, cfg = self.TaskCfg[v.sid], taskModel = self}
+                )
+            end
+        end
+    end
+end
+function TaskModel:InitFinishTask(finish)
+    if finish then
+        for _, v in pairs(finish) do
+            if not self.finishTaskList[v] then
+                self.finishTaskList[v] = true
+                if self.TaskCfg[v] then
+                    self.taskList[v] =
+                        LimitTimeTaskData.New(
+                        {
+                            sid = v,
+                            target = {999},
+                            state = _G.TaskEnum.ETaskState.Completed,
+                            cfg = self.TaskCfg[v],
+                            taskModel = self
+                        }
+                    )
+                end
+            end
+        end
+    end
+end
+---检测任务是否完成
+function TaskModel:CheckIsFinish(id)
+    return self.finishTaskList[id]
+end
+
+---完成任务
+---@param data HellRoadTaskData
+function TaskModel:FinishTask(sid, callback)
+    LimitTimeTaskNet:GetInstance():FinishTask(
+        {activity_id = self.TypeCls.ActivityID, task_sid = sid, finish_type = 2},
+        function(msg)
+            if msg.ack ~= 1 then
+                if callback then
+                    callback()
+                end
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self.finishTaskList[sid] = true
+            self:ChangeSingleTaskState(sid, _G.TaskEnum.ETaskState.Submited)
+            if callback then
+                callback(msg)
+            end
+            self.TypeCls:RefreshRedPointLimit(2)
+        end
+    )
+end
+---更新任务状态
+function TaskModel:ChangeSingleTaskState(sid, state)
+    self.taskList[sid].state = state
+    self.taskList[sid]:CheckTaskState()
+end
+---获取任务信息
+function TaskModel:GetTaskInfo(sid)
+    if not self.taskList then
+        return nil
+    end
+    return self.taskList[sid]
+end
+function TaskModel:UpdateTask(taskinfo)
+    if self.taskList[taskinfo.sid] then
+        self.taskList[taskinfo.sid]:UpdataData(taskinfo)
+    end
+    self.TypeCls:RefreshRedPointLimit(2)
+end
+function TaskModel:OnActivityStateChanged(state)
+    self.TypeCls:RefreshRedPointLimit(2)
+end
+function TaskModel:Dispose()
+    self.taskList = nil
+    self.TaskCfg = nil
+    self.finishTaskList = nil
+end
+
+-------------------礼包-------------------
+---1-每日礼包；2-每周礼包；3-每月礼包；4-皮肤礼包
+local XianGouText = {
+    [1] = "90021600007",
+    [2] = "90021600008",
+    [3] = "90021600009",
+    [4] = "90021600010"
+}
+local GiftModel = require "GiftModel"
+local CashGiftModel = _G.BaseClass("CashGiftModel")
+---@param data i_activity_exchange
+function CashGiftModel:__init(obj, data, TypeCls)
+    self:Init(data, TypeCls)
+    self.redpoint = false
+end
+function CashGiftModel:Init(data, TypeCls)
+    self.Data = {}
+    self.BuyTimeList = {}
+    self.TypeCls = TypeCls
+    self:InitData(data)
+end
+function CashGiftModel:OnInitFunction()
+end
+function CashGiftModel:InitData(data)
+    local _data
+    self:SetGiftBuyTime(data.times)
+    if data.gifts then
+        for k, v in pairs(data.gifts) do
+            _data = {}
+            _data.sid = v.sid
+            _data.icon = v.icon
+            _data.award = self:GetAward(v.award)
+            _data.conditons = v.condition
+            _data.name = v.name
+            _data.count = v.count
+            _data.price = v.price
+            _data.type_reset = v.type_reset
+            _data.discount = v.discount
+            _data.sellout = self:CheckGiftSellOut(v.sid, v.count)
+            _data.limit = self:GetLimit(v.sid, v.type_reset, v.count)
+            _G.table.insert(self.Data, _data)
+        end
+    end
+    self:SortGoods()
+    if self.TypeCls:GetActivityState() == ActivitySynManager.State.Open then
+        GiftModel:GetInstance():AddLimitGift(self.Data, self.TypeCls.ActivityID, 90010050031)
+        require("MallManager"):GetInstance():UpdataView(_G.MallViewPage.gift)
+    end
+    self.TypeCls:RefreshRedPointLimit(3)
+end
+function CashGiftModel:GetAward(award)
+    local _award = {}
+    for i = 1, #award do
+        _award[i] = {}
+        for _, v in pairs(award[i].type) do
+            _G.table.insert(_award[i], v)
+        end
+    end
+    return _award
+end
+function CashGiftModel:GetLimit(sid, type_reset, count)
+    if type_reset then
+        local buytime = self:GetGiftBuyTime(sid)
+        return _G.LangUtil.GetLangPackValue(XianGouText[type_reset], buytime, count)
+    else
+        return nil
+    end
+end
+function CashGiftModel:SetBuyTime(sid, time)
+    if not self.BuyTimeList[sid] then
+        self.BuyTimeList[sid] = {sid = sid, times = time}
+    else
+        self.BuyTimeList[sid].times = time
+    end
+end
+function CashGiftModel:BuyGift(good, index)
+    good.sellout = self:CheckGiftSellOut(good.id, good.count)
+    good.limit = self:GetLimit(good.id, good.type_reset, good.count)
+    require "GiftModel":GetInstance():Sortfunc(index)
+    self:SortGoods()
+end
+function CashGiftModel:SortGoods()
+    _G.SortList(
+        self.Data,
+        function(a)
+            local res = a.sellout == true and 0 or 1
+            return res, -a.price
+        end
+    )
+end
+function CashGiftModel:SetGiftBuyTime(times)
+    if not times then
+        self.BuyTimeList = {}
+        return
+    end
+    for k, v in pairs(times) do
+        if not self.BuyTimeList[v.k] then
+            self.BuyTimeList[v.k] = {}
+        end
+        self.BuyTimeList[v.k] = {sid = v.k, times = v.v}
+    end
+end
+function CashGiftModel:CheckGiftSellOut(sid, count)
+    local good = self.BuyTimeList[sid]
+    if good then
+        return not (good.times < count)
+    else
+        return false
+    end
+end
+function CashGiftModel:GetGiftBuyTime(sid)
+    local good = self.BuyTimeList[sid]
+    if good then
+        return good.times
+    else
+        return 0
+    end
+end
+function CashGiftModel:SetItemBuyTimes(sid)
+    local time = self:GetGiftBuyTime(sid)
+    self:SetBuyTime(sid, time + 1)
+end
+function CashGiftModel:CheckRedPoint()
+    if self.TypeCls:GetActivityState() ~= ActivitySynManager.State.Open then
+        return 0
+    else
+        if not self.redpoint then
+            if not isEmptyOrNil(self.Data) then
+                for k, v in pairs(self.Data) do
+                    if not v.sellout then
+                        return 1
+                    end
+                end
+                return 0
+            else
+                return 0
+            end
+        else
+            return 0
+        end
+    end
+end
+function CashGiftModel:OnEnterLimitView()
+    self.redpoint = true
+    GiftModel:GetInstance():JumpToActivityPage(self.TypeCls.ActivityID)
+    self.TypeCls:RefreshRedPointLimit(3)
+    --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MallView.Name, _G.MallViewPage.gift)
+end
+function CashGiftModel:OnActivityStateChanged(state)
+    self.TypeCls:RefreshRedPointLimit(3)
+    if state ~= ActivitySynManager.State.Open then
+        GiftModel:GetInstance():RemoveLimitGift(self.TypeCls.ActivityID)
+        require("MallManager"):GetInstance():UpdataView(_G.MallViewPage.gift)
+    end
+end
+function CashGiftModel:BuyActivityGiftFree(sid, call)
+    require "ActivitySynNet":GetInstance():GetAward(
+        self.TypeCls.ActivityID,
+        {sid},
+        function(data)
+            if data.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                require "CommonTipManager".OpenCommonAwardView(data)
+                self:SetItemBuyTimes(sid)
+                if call then
+                    call()
+                end
+            end
+        end
+    )
+end
+
+function CashGiftModel:Dispose()
+end
+local LimitTimeModels = {
+    exchange = ExchangeModel,
+    task = TaskModel,
+    cash_gift = CashGiftModel
+}
+function LimitTimeSynModel:__init()
+    self.curActivityClass:AddStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+    self.ActivityID = self.curActivityClass:GetActivityID()
+    self.Data = {}
+    self.SelfData = {}
+    self.curActivityState = false
+end
+---@param msg s2c_activity_recruiting_info
+function LimitTimeSynModel:OnHandleGMData(info)
+    self:ParseData(info)
+    base.ParseData(self)
+end
+---初始化功能逻辑
+function LimitTimeSynModel:InitFunction()
+    if not self.curActivityState then
+        return
+    end
+    for k, v in pairs(self.SelfData) do
+        v:OnInitFunction()
+    end
+end
+function LimitTimeSynModel:GetActivityCommonData()
+    return self.curActivityClass
+end
+function LimitTimeSynModel:GetModel(Name)
+    return self.SelfData[Name]
+end
+function LimitTimeSynModel:GetCurActivitySelfData()
+    return self.SelfData
+end
+-- ---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function LimitTimeSynModel:InitRedPointTree()
+    self.redpointTree = {{2, 3}, false, false}
+end
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function LimitTimeSynModel:CheckRedPointNumChild(index, param)
+    if self.SelfData[LimitTimeEnum[index]] then
+        return self.SelfData[LimitTimeEnum[index]]:CheckRedPoint()
+    end
+    return 0
+end
+---刷新奖励红点
+function LimitTimeSynModel:RefreshRedPointLimit(index)
+    if index == 1 then
+        require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(index))
+        return
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(index))
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+---刷新任务数据
+function LimitTimeSynModel:UpdateTask(taskinfo)
+    if self.SelfData["task"] then
+        self.SelfData["task"]:UpdateTask(taskinfo)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log("活动里没有对应任务模块或数据", taskinfo.sid)
+        end
+    end
+end
+---刷新礼包数据
+function LimitTimeSynModel:SetItemBuyTimes(sid)
+    if self.SelfData["cash_gift"] then
+        self.SelfData["cash_gift"]:SetItemBuyTimes(sid)
+    end
+end
+---购买免费礼包
+function LimitTimeSynModel:GetCoinSid()
+    if self.SelfData["exchange"] then
+        return self.SelfData["exchange"]:GetCoinSid()
+    end
+end
+---购买免费礼包
+function LimitTimeSynModel:BuyActivityGiftFree(sid, call)
+    if self.SelfData["cash_gift"] then
+        self.SelfData["cash_gift"]:BuyActivityGiftFree(sid, call)
+    end
+end
+function LimitTimeSynModel:BuyGift(good, index)
+    if self.SelfData["cash_gift"] then
+        self.SelfData["cash_gift"]:BuyGift(good, index)
+    end
+    if self.SelfData["exchange"] then
+        self.SelfData["exchange"]:UpdateView()
+    end
+end
+
+function LimitTimeSynModel:OnEnterActivity()
+    self:EnterLimitView(1)
+    self:RefreshRedPointLimit(1)
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+function LimitTimeSynModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.LimitTimeETG.Name
+end
+function LimitTimeSynModel:GetActivityState()
+    return self.curActivityClass:GetCurActivityState()
+end
+---处理活动私有信息
+---@type i_activity_exchange
+function LimitTimeSynModel:SetSelfData(info)
+    for k, v in pairs(info.cash_task_exchange) do
+        if not self.SelfData[k] then
+            self.SelfData[k] = LimitTimeModels[k]:New(v, self)
+        else
+            self.SelfData[k]:Init(v, self)
+        end
+    end
+    self.curActivityState = true
+end
+function LimitTimeSynModel:ParseData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+function LimitTimeSynModel:CheckActivityEnabled()
+    return self.curActivityClass:CheckActivityInteractable()
+end
+---进入兑换子功能
+function LimitTimeSynModel:EnterLimitView(index)
+    if self.SelfData[LimitTimeEnum[index]] then
+        self.SelfData[LimitTimeEnum[index]]:OnEnterLimitView()
+    end
+end
+function LimitTimeSynModel:GetActivityTime(state)
+    return self.curActivityClass:GetActivityDeadLineByCondition(state)
+end
+function LimitTimeSynModel:GetActivityDescription()
+    return self.curActivityClass.cfg.info.description
+end
+function LimitTimeSynModel:OnActivityStateChanged(state)
+    self:RefreshRedPointLimit(1)
+
+    for k, v in pairs(self.SelfData) do
+        v:OnActivityStateChanged(state)
+    end
+end
+function LimitTimeSynModel:Dispose()
+    -- for k, v in pairs(self.SelfData) do
+    --     v:Dispose()
+    -- end
+    -- self.Data = {}
+    -- self.curActivityState = nil
+    -- self.SelfData = nil
+end
+return LimitTimeSynModel

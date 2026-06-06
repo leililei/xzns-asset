@@ -1,0 +1,394 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Advertisement.Model.AdvertisementModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/07/03
+-- Description: 灵兽抽卡数据类
+-----------------------------------------------------------------------
+
+local base = _G.GameDataModelBase
+---@class AdvertisementModel : GameDataModelBase
+---@field GetInstance fun():AdvertisementModel
+local AdvertisementModel = _G.BaseClass("AdvertisementModel", base)
+
+---@return AdvertisementModel AdvertisementModel
+local AdvertisementNet = require "AdvertisementNet"
+local MonthlyModel = require("MonthlyModel"):GetInstance()
+local adCfg = _G.ConfigManager.advertisement_cfg
+local VideoName = {
+    [_G.AdvertisementType.PlaneAD] = "PlaneAD",
+    [_G.AdvertisementType.Draw] = "Draw",
+    [_G.AdvertisementType.SpiritualDraw] = "SpiritualDraw",
+    [_G.AdvertisementType.ArtifactDraw] = "ArtifactDraw",
+    [_G.AdvertisementType.PetDraw] = "PetDraw",
+    [_G.AdvertisementType.ExpAdd] = "ExpAddTimes",
+    [_G.AdvertisementType.CoinAdd] = "CoinAddTimes",
+    [_G.AdvertisementType.StarAdd] = "StarAddTimes",
+    [_G.AdvertisementType.Equipment] = "EquipmentTimes",
+    [_G.AdvertisementType.SecretRealm] = "SecretRealmTimes"
+}
+
+---TODO: 只是用来上报传给大数据的，除此之外其余功能如果要用通过语言表配置
+local AdFuncName = {
+    [_G.AdvertisementType.PlaneAD] = "漂浮广告观看奖励",
+    [_G.AdvertisementType.Draw] = "角色抽取次数增加",
+    [_G.AdvertisementType.SpiritualDraw] = "饰品抽取次数增加",
+    [_G.AdvertisementType.ArtifactDraw] = "神兵抽取次数增加",
+    [_G.AdvertisementType.PetDraw] = "宠物抽取次数增加",
+    [_G.AdvertisementType.ExpAdd] = "经验秘境次数增加",
+    [_G.AdvertisementType.CoinAdd] = "金币秘境次数增加",
+    [_G.AdvertisementType.StarAdd] = "晶尘秘境次数增加",
+    [_G.AdvertisementType.Equipment] = "原石秘境次数增加",
+    [_G.AdvertisementType.SecretRealm] = "大秘境次数增加",
+    [_G.AdvertisementType.ViewingADTurntable] = "观影礼遇次数增加",
+}
+
+---#re 本地测试广告红点
+local localtestad = false
+local adtimestest = {
+    [_G.AdvertisementType.PlaneAD] = 2,
+    [_G.AdvertisementType.Draw] = 2,
+    [_G.AdvertisementType.SpiritualDraw] = 2,
+    [_G.AdvertisementType.ArtifactDraw] = 2,
+    [_G.AdvertisementType.PetDraw] = 2,
+    [_G.AdvertisementType.ExpAdd] = 2,
+    [_G.AdvertisementType.CoinAdd] = 2,
+    [_G.AdvertisementType.StarAdd] = 2,
+    [_G.AdvertisementType.Equipment] = 2,
+    [_G.AdvertisementType.SecretRealm] = 2
+}
+---#endre
+
+function AdvertisementModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function AdvertisementModel:__init()
+    --广告缓存
+    self.adCallBackCache = {}
+
+    _G.Events:GetInstance():AddListener(_G.eYKNetEvent.ReconnectSuccess, self.OnReconnectSuccess, self)
+end
+
+function AdvertisementModel:OnReconnectSuccess()
+    if not self.info then
+        return
+    end
+    if _G.AppSetting.DEBUG then
+        _G.LogError("断线重连成功，开始处理广告奖励！")
+    end
+    for _, info in pairs(self.adCallBackCache) do
+        if _G.AppSetting.DEBUG then
+            _G.LogError(info.sid, "发送广告奖励, sid =")
+        end
+        self:GetAward(info.sid, info.callBack)
+    end
+    self.adCallBackCache = {}
+end
+
+function AdvertisementModel:ReConnect(endcall)
+    self:InitData(endcall)
+end
+
+---从服务器拉取数据
+function AdvertisementModel:GetDataFormServer()
+    AdvertisementNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg
+function AdvertisementModel:ParseData(msg)
+    self.info = {}
+    if msg.info then
+        for k, v in pairs(msg.info) do
+            self.info[v.sid] = v
+        end
+        _G.Events:GetInstance():Broadcast(_G.eAdvertisement.Refresh)
+    end
+    --ZHJH-9295 改为根据当前渠道id判断是否开启广告
+    self.isADOpen = _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.Advertisement)
+    self.super.ParseData(self)
+end
+
+--看广告
+function AdvertisementModel:VideoAD(sid, callBack, notShowAward)
+    if _G.AppSetting.IsEditor and _G.AppSetting.DEBUG and localtestad then
+        adtimestest[sid] = adtimestest[sid] - 1
+        _G.Log("<color=red><size=20>" .. "广告红点本地测试打开了，直接算做一次播放" .. "</size></color>")
+        if callBack then
+            callBack()
+        end
+        return
+    end
+    if self:CheckFreeAD() then
+        self:GetAward(sid, callBack, notShowAward)
+    else
+        self.sid = sid
+        self.callBack = callBack
+        self:SetAdStartTime()
+        require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_ClickAd)
+        _G.SDKManager:GetInstance():VideoAD(_G.handler(self, self.VideoADCallBack), VideoName[sid], sid)
+    end
+end
+
+--看广告回调
+function AdvertisementModel:VideoADCallBack(bol, data)
+    if _G.AppSetting.DEBUG then
+        _G.LogError(data, "AdvertisementModel:VideoADCallBack,收到SDK的广告回调")
+    end
+    if not bol then
+        return
+    end
+    if data.state == "close" then
+        self:ReportAD(require("SDKDef").AdStep.CloseAd, self.sid, true)
+    end
+    if data.state == "reward" then
+        if self.sid then
+            _G.table.insert(self.adCallBackCache, { sid = self.sid, callBack = self.callBack })
+        end
+        self:ReportAD(require("SDKDef").AdStep.AdAward, self.sid, true)
+        self:GetAward(self.sid, self.callBack)
+    end
+end
+
+--广告看完请求服务器奖励
+function AdvertisementModel:GetAward(sid, callBack, notShowAward)
+    local T = { sid = sid }
+    AdvertisementNet:GetInstance():GetAward(T, _G.handlerbind(self, self.GetAwardCallBack, sid, callBack, notShowAward))
+end
+
+--奖励回调
+function AdvertisementModel:GetAwardCallBack(msg, sid, callBack, notShowAward)
+    if msg.ack == 1 then
+        if not notShowAward then
+            _G.PopWindowManager:GetInstance():ShowAllTips(1030001)
+        end
+        self.info[sid] = msg.n_count or self.info[sid]
+        if msg.award then
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            if not notShowAward then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            end
+        end
+        if callBack then
+            callBack(msg)
+        end
+    end
+
+    for i, v in ipairs(self.adCallBackCache) do
+        if sid == v.sid then
+            _G.table.remove(self.adCallBackCache, i)
+            break
+        end
+    end
+end
+
+---获取观看次数
+function AdvertisementModel:GetAdMax(sid)
+    local cfg = _G.ConfigManager.advertisement_cfg[sid]
+    return cfg.watch or 0
+end
+
+function AdvertisementModel:GetWatchedAdNum(sid)
+    if not self.info or not self.info[sid] then
+        return 0
+    end
+    return self.info[sid].num or 0
+end
+
+---是否还有广告次数
+function AdvertisementModel:HaveAdNum(sid)
+    return self:GetWatchedAdNum(sid) < self:GetAdMax(sid)
+end
+
+---获取广告奖励
+function AdvertisementModel:GetAdAward(sid)
+    local cfg = _G.ConfigManager.advertisement_cfg[sid]
+    return cfg.reward or {}
+end
+
+---大秘境广告
+function AdvertisementModel:PlaySecretRealmAd(callBack, notShowAward)
+    if _G.AppSetting.IsEditor and _G.AppSetting.DEBUG and localtestad then
+        adtimestest[_G.AdvertisementType.SecretRealm] = adtimestest[_G.AdvertisementType.SecretRealm] - 1
+        _G.Log("<color=red><size=20>" .. "广告红点本地测试打开了，直接算做一次播放" .. "</size></color>")
+        if callBack then
+            callBack()
+        end
+        return
+    end
+    if not self:HaveAdNum(_G.AdvertisementType.SecretRealm) then
+        ---没有广告次数
+        return
+    end
+    self:VideoAD(
+        _G.AdvertisementType.SecretRealm,
+        function(msg)
+            ---增加次数
+            local award = self:GetAdAward(_G.AdvertisementType.SecretRealm)
+            local addNum = award[1] and award[1][1] or 1
+            require("SecretRealmModel"):GetInstance():AddTicket(addNum)
+
+            if callBack then
+                callBack(msg)
+            end
+        end,
+        notShowAward
+    )
+end
+
+---材料副本广告
+function AdvertisementModel:PlaySystemMaterialAd(sid, systemID, callBack)
+    if _G.AppSetting.IsEditor and _G.AppSetting.DEBUG and localtestad then
+        adtimestest[sid] = adtimestest[sid] - 1
+        _G.Log("<color=red><size=20>" .. "广告红点本地测试打开了，直接算做一次播放" .. "</size></color>")
+        if callBack then
+            callBack()
+        end
+        return
+    end
+    if not sid or not self:HaveAdNum(sid) then
+        ---没有广告次数
+        return
+    end
+    self:VideoAD(
+        sid,
+        function(msg)
+            ---增加次数
+            local award = self:GetAdAward(_G.AdvertisementType.SecretRealm)
+            local addNum = award[1] and award[1][1] or 1
+            require("SystemMaterialController"):GetInstance():AddTimesAndCount(systemID, addNum)
+            if callBack then
+                callBack(msg)
+            end
+        end
+    )
+end
+
+--获取某id广告总收益
+function AdvertisementModel:GetNowTotalReward(sid)
+    if adCfg[sid] then
+        local times = self.info[sid] and self.info[sid].num or 0
+        return times * adCfg[sid].reward[1][1]
+    end
+    return 0
+end
+
+--是否有月卡免广告
+function AdvertisementModel:CheckFreeAD()
+    return MonthlyModel:GetMonthlyCard(401003) ~= nil or MonthlyModel:GetMonthlyCard(401001) ~= nil
+end
+
+--获取野外飞艇的广告奖励预览列表
+function AdvertisementModel:GetWildRewardList()
+    local T = adCfg[_G.AdvertisementType.PlaneAD].reward[self.info[_G.AdvertisementType.PlaneAD].args[1]]
+    local list = {}
+    for i = 1, #T, 2 do
+        table.insert(list, { T[i], T[i + 1] })
+    end
+    return list
+end
+
+--剩余广告次数
+function AdvertisementModel:GetADTimes(sid)
+    if _G.AppSetting.IsEditor and _G.AppSetting.DEBUG and localtestad then
+        return adtimestest[sid]
+    end
+    if adCfg[sid] and self.info then
+        return adCfg[sid].watch - (self.info[sid] and self.info[sid].num or 0)
+    end
+    return 0
+end
+
+--当前渠道是否开启广告
+function AdvertisementModel:CheckADOPen()
+    return self.isADOpen
+end
+
+--是否显示广告入口
+function AdvertisementModel:CheckADShow(sid)
+    if _G.AppSetting.IsEditor and _G.AppSetting.DEBUG and localtestad then
+        return true
+    end
+    if _G.AppSetting.IsAlipayPC then
+       return false 
+    end
+    ---星座女神把广告统一整理到新功能内，原入口屏蔽（野外界面飞艇保留）
+    if _G.AppSetting.IsXzns and sid ~= _G.AdvertisementType.PlaneAD then
+        return false
+    end
+    if sid and self:CheckADOPen() then
+        return self:GetADTimes(sid) > 0
+    end
+    return false
+end
+
+--是否显示野外广告飞机入口
+function AdvertisementModel:CheckWildPlaneShow()
+    if not self.planeTime or self.planeTime <= 0 then
+        return self:CheckADShow(_G.AdvertisementType.PlaneAD)
+    end
+    return false
+end
+
+--开始野外广告飞机入口倒计时
+function AdvertisementModel:StartPlaneTimer()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.planeTime = _G.ConfigManager.discrete_cfg[122007][1][1]
+    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false, true)
+    self.timer:Start()
+end
+
+function AdvertisementModel:UpdateTime(elapsed)
+    self.planeTime = self.planeTime - elapsed
+    if self:CheckWildPlaneShow() then
+        if self.timer then
+            self.timer:Stop()
+            self.timer = nil
+        end
+        _G.MainManager:GetInstance():RefreshWildPlane()
+    end
+end
+
+---广告上报
+function AdvertisementModel:ReportAD(step, funcId, needAdTime)
+    local duration = 0
+    if needAdTime and self.adStrartTime then
+        duration = _G.TimeUtil.GetServerUnixTime() - self.adStrartTime
+    end
+
+    local json = _G.Table2Json({
+        platform_user_id = _G.tostring(_G.CS.FastSpace.FastSDKCache.fast_uid),
+        phone_name = _G.tostring(_G.CS.UnityEngine.SystemInfo.deviceModel),
+        role_uid = _G.tostring(_G.PlayerModel:GetInstance().role_uid),
+        server_id = _G.tostring(_G.ServerManager:GetInstance().CurServer.ServerID),
+        record_time = _G.TimeUtil.GetServerUnixTime(),
+        ad_uid = 1,
+        ad_step = step,
+        ad_placement_id = _G.tostring(funcId),
+        ad_placement_name = AdFuncName[funcId] or "",
+        view_ad_duration = duration,
+    })
+    if _G.AppSetting.DEBUG then
+        _G.Log(json, "广告数据上报:")
+    end
+    _G.SDKManager:GetInstance():DoShushuData_track("client_ad_view", json)
+end
+
+---记录广告开始时间
+function AdvertisementModel:SetAdStartTime()
+    self.adStrartTime = _G.TimeUtil.GetServerUnixTime()
+end
+
+---销毁对象时,析构函数
+function AdvertisementModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eYKNetEvent.ReconnectSuccess, self.OnReconnectSuccess, self)
+end
+
+return AdvertisementModel

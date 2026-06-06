@@ -1,0 +1,1008 @@
+-------------------------------------------------------------------------
+-- C:.ClientTrunk.Assets.Resources.LuaScripts.Game.Spiritual.Model.SpiritualModel	(修改路径必须修正此项!)
+-- Created by liyi
+-- DateTime: 2024/04/11
+-- Description 灵契管理类
+-----------------------------------------------------------------------
+local SpiritualNet = require("SpiritualNet")
+local SpiritualIllustrationModel = require("SpiritualIllustrationModel")
+local RedPointManager = require("RedPointManager"):GetInstance()
+local table = _G.table
+---@class SpiritualModel : Singleton
+local SpiritualModel = _G.BaseClass("SpiritualModel", _G.Singleton)
+
+---@return SpiritualModel SpiritualModel
+function SpiritualModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SpiritualModel:__init()
+end
+
+---灵契升级
+---@param spiritualData SpiritualData 灵契
+---@param cardUid number 穿戴的卡牌uid,没有穿戴发灵契sid
+---@param level number 提升等级
+---@param isUnstack boolean 是否独立（不堆叠）
+function SpiritualModel:LevelUp(spiritualData, cardUid, level, isUnstack, callback)
+    if not isUnstack and not _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Spiritual, 1) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130303)
+        return
+    end
+    local pbData = { equip = { c_uid = cardUid, s_uid = spiritualData.uid }, up_lv = level }
+    SpiritualNet:GetInstance():LevelUp(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        if isUnstack then
+            spiritualData:UpLevel(spiritualData:GetLevel() + level)
+            if spiritualData.cardUid ~= 0 then
+                ---@type CardData
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, spiritualData.cardUid)
+                if not table.isEmptyOrNil(cardData) then
+                    cardData:CalcNowSumProp()
+                end
+            end
+        else
+            local newMsg = spiritualData.GetMsg(spiritualData)
+            newMsg.uid = msg.uid
+            newMsg.cardUid = spiritualData.cardUid
+            local newData = _G.SpiritualData.New()
+            newData:Parse(newMsg)
+            newData:UpLevel(newData:GetLevel() + level)
+            _G.StorageManager:GetInstance():AddItemBySpiritualData(newData)
+            _G.StorageManager:GetInstance():ConsumeSpiritual(spiritualData.uid, 1, spiritualData)
+            -- if spiritualData.cardUid > 0 then
+            --     _G.StorageManager:GetInstance():TakeOffSpiritual(spiritualData)
+            -- end
+            if newMsg.cardUid ~= 0 then
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, newMsg.cardUid)
+                cardData:PutOnSpiritual(newData)
+            end
+        end
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+function SpiritualModel:GetSameSid(data)
+    local num = 0
+    local SpiritualDic = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual)
+    for _, v in pairs(SpiritualDic) do
+        if v.cfg.id == data.cfg.id then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+---获取可用于升星的材料
+---@param data SpiritualData 升星饰品data
+---@param list table[] 已选择饰品
+---@param needCount number 需要的材料数量
+function SpiritualModel:GetStarUpMaterial(data, list, needCount)
+    local SpiritualDic = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual)
+    local SpiritualList = {}
+    local SelectList = {}
+    local selectedList = {}
+    local stackList = {}
+    for _, v in pairs(list) do
+        --检测堆叠的饰品
+        local select = v[3]
+        if select and select.sid == select.uid then
+            if not stackList[select.uid] then
+                stackList[select.uid] = true --记录已经计算的堆叠饰品
+                selectedList[v[2]] = true
+                for _ = 1, select.count do
+                    _G.table.insert(SelectList, v)
+                    if #SelectList >= needCount then
+                        break
+                    end
+                end
+            end
+        else
+            _G.table.insert(SelectList, v)
+            selectedList[v[2]] = true
+        end
+    end
+    local isNotWear = data.cardUid == 0
+    local isUnstack = data.uid ~= data.sid
+    local excludeSelf = false
+    for _, v in pairs(SpiritualDic) do
+        if v.cfg.id == data.cfg.id and not selectedList[v.uid] then
+            if v.star == 0 then
+                if (v.cardUid ~= 0 and v.cardUid == data.cardUid) or
+                        (isNotWear and not excludeSelf and isUnstack and data.uid == v.uid) or
+                        (isNotWear and not excludeSelf and not isUnstack and v.uid == v.sid)
+                then
+                    if isNotWear then
+                        excludeSelf = true
+                        if not isUnstack then
+                            for i = 1, v.count - 1 do
+                                _G.table.insert(SpiritualList, v)
+                            end
+                        end
+                    end
+                else
+                    for i = 1, v.count do
+                        _G.table.insert(SpiritualList, v)
+                    end
+                end
+            end
+        end
+    end
+    _G.SortList(
+            SpiritualList,
+            function(a)
+                return -a.cardUid, a.star, a.lv
+            end
+    )
+    for k, v in pairs(SpiritualList) do
+        if v.cardUid == 0 then
+            if #SelectList < needCount then
+                _G.table.insert(SelectList, { k, SpiritualList[k].uid, SpiritualList[k] })
+            end
+        end
+    end
+    return {
+        material = SpiritualList,
+        select = SelectList
+    }
+end
+
+---灵契升星
+---@param spiritualData SpiritualData 灵契
+---@param cardUid number 穿戴的卡牌uid
+---@param items spiritual.i_cs_spiritual 消耗的本体材料
+---@param isUnstack boolean 是否独立（不堆叠）
+function SpiritualModel:StarUp(spiritualData, cardUid, items, isUnstack, callback)
+    if not isUnstack and not _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Spiritual, 1) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130303)
+        return
+    end
+
+    local pbData = { equip = { c_uid = cardUid, s_uid = spiritualData.uid }, cs_sp = items }
+    SpiritualNet:GetInstance():StarUp(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        local order, star
+        if isUnstack then
+            spiritualData:UpStar()
+            if spiritualData.cardUid ~= 0 then
+                ---@type CardData
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, spiritualData.cardUid)
+                if not table.isEmptyOrNil(cardData) then
+                    cardData:CalcNowSumProp()
+                end
+            end
+            SpiritualIllustrationModel:GetInstance():ChangeMaxStar(spiritualData.sid, spiritualData:GetStar())
+            order = spiritualData.cfg.Order
+            star = spiritualData:GetStar()
+        else
+            local newMsg = spiritualData.GetMsg(spiritualData)
+            newMsg.uid = msg.uid
+            newMsg.cardUid = spiritualData.cardUid
+            local newData = _G.SpiritualData.New()
+            newData:Parse(newMsg)
+            newData:UpStar()
+            _G.StorageManager:GetInstance():AddItemBySpiritualData(newData)
+            _G.StorageManager:GetInstance():ConsumeSpiritual(spiritualData.uid, 1, spiritualData)
+            if spiritualData.cardUid > 0 then
+                _G.StorageManager:GetInstance():TakeOffSpiritual(spiritualData)
+            end
+            if newMsg.cardUid ~= 0 then
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, newMsg.cardUid)
+                cardData:PutOnSpiritual(newData)
+            end
+            SpiritualIllustrationModel:GetInstance():ChangeMaxStar(newData.sid, newData:GetStar())
+            order = newData.cfg.Order
+            star = newData:GetStar()
+        end
+
+        ---同时拥有x个y星的彩色品质的饰品
+        if order == 4 then
+            _G.Events:GetInstance():Broadcast(
+                    _G.ePlayAactionEvent.PlayAaction,
+                    {
+                        _G.ActiveTaskEnum.ConditionEnum.Spiritual.LevelNum,
+                        order,
+                        star
+                    },
+                    1
+            )
+        end
+
+        if msg.award then
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        end
+        if callback then
+            callback(msg)
+        end
+        RedPointManager:RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.SpiritualPage.id
+        )
+    end)
+end
+
+---灵契分解
+---@param uids siritual.i_cs_siritual[] 要分解的灵契列表
+function SpiritualModel:Decompose(uids, callback)
+    local pbData = { uids = uids }
+    SpiritualNet:GetInstance():Decompose(
+            pbData,
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                local StorageManager = _G.StorageManager:GetInstance()
+                for _, v in pairs(uids) do
+                    StorageManager:ConsumeSpiritual(v.uid, v.num)
+                end
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                RedPointManager:RefreshNodeByAllParams(
+                        _G.ConfigManager.redpoint_cfg.SpiritualPage.id
+                )
+                if callback then
+                    callback(msg)
+                end
+            end
+    )
+end
+
+---穿戴灵契(穿戴 卸下 替换都是通过该协议交互)
+function SpiritualModel:PutOn(pbData, callback)
+    SpiritualNet:GetInstance():PutOn(
+            pbData,
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+
+                if callback then
+                    callback(msg)
+                end
+            end
+    )
+end
+
+---一键卸下
+function SpiritualModel:OneKeyTakeOff(pbData, callback)
+    SpiritualNet:GetInstance():OneKeyTakeOff(
+            pbData,
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+
+                if callback then
+                    callback(msg)
+                end
+            end
+    )
+end
+
+---获取前几个战力最强的可穿戴灵契
+---@param cardData CardData
+function SpiritualModel:GetWearableSpiritual(cardData, infos)
+    local spiritualList = {}
+    local spiritualSidList = {}
+    local spiritualData = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual, _G.ArtifactType.NoWear)
+    if not table.isEmptyOrNil(spiritualData) then
+        spiritualData = _G.table.values(spiritualData)
+        if infos then
+            --如果要穿戴推荐列表里的推荐装备
+            table.sort(spiritualData, function(a, b)
+                local aInInfos = _G.table.ContainsKey(infos, a.sid) and 1 or 0
+                local bInInfos = _G.table.ContainsKey(infos, b.sid) and 1 or 0
+
+                if aInInfos ~= bInInfos then
+                    return aInInfos > bInInfos -- infos 中的排前面
+                else
+                    return a:GetPower() > b:GetPower() -- 否则按战力排
+                end
+            end)
+        else
+            --如果要穿戴一键装备（只按战斗力排序）
+            table.sort(spiritualData, function(a, b)
+                return a:GetPower() > b:GetPower()
+            end)
+        end
+
+        for _, v in pairs(spiritualData) do
+            if (not v.cardUid or v.cardUid == 0) and not spiritualSidList[v.sid] then
+                table.insert(spiritualList, v)
+                spiritualSidList[v.sid] = true
+            end
+        end
+    end
+
+    local unlockData = _G.ConfigManager.discrete_cfg[114001] or {}
+    local wearSpiritualIndex = {}
+    local wearSpiritualData = {}
+    if unlockData[1] then
+        for index, star in pairs(unlockData[1]) do
+            if cardData.star < star then
+                break
+            end
+
+            if spiritualList[index] then
+                table.insert(wearSpiritualIndex, { index = index, uid = spiritualList[index].uid })
+                wearSpiritualData[index] = spiritualList[index]
+            end
+        end
+    end
+    return wearSpiritualIndex, wearSpiritualData
+end
+
+---一键穿戴（角色界面一键穿戴按钮，优化了新的需求ZHJH-7394）
+---@param cardData CardData
+---@param callback function
+---@param wearSpiritual table 结构为 { [index] = uid, usedSpiritualUidMap }
+function SpiritualModel:OneKeyPutOnSpiritual2(cardData, callback, wearSpiritual)
+    local wearMsg = {}              -- 最终协议数据
+    local wearSpiritualData = {}    -- 用于后续穿戴和保存
+
+    local existIndexUidMap = wearSpiritual and wearSpiritual[1] or {}
+    local usedSpiritualUidMap = wearSpiritual and wearSpiritual[2] or {}
+    local usedSpiritualSidMap = wearSpiritual and wearSpiritual[3] or {}
+    local StorageManager = _G.StorageManager:GetInstance()
+
+    -- 获取推荐灵契数组（排除已穿戴）
+    local candidateList = self:GetWearableSpiritual2(usedSpiritualUidMap, usedSpiritualSidMap)
+
+    local unlockData = _G.ConfigManager.discrete_cfg[114001] or {}
+    local indexList = unlockData[1] or {}
+    local cardStar = cardData.star
+    local candidateIndex = 1
+
+    for index, star in pairs(indexList) do
+        if cardStar < star then
+            break
+        end
+
+        local existUid = existIndexUidMap[index]
+        local existData = existUid and StorageManager:GetItemDataByID(_G.StorageID.Spiritual, existUid)
+
+        if existData and existData.uid then
+            table.insert(wearMsg, { index = index, uid = existData.uid, sid = existData.sid })
+            wearSpiritualData[index] = existData
+        else
+            local candidateData = candidateList and candidateList[candidateIndex]
+            if candidateData and candidateData.uid then
+                table.insert(wearMsg, { index = index, uid = candidateData.uid, sid = candidateData.sid })
+                wearSpiritualData[index] = candidateData
+                candidateIndex = candidateIndex + 1
+            end
+        end
+    end
+
+    if not table.isEmptyOrNil(wearMsg) then
+        local pbData = { uid = cardData.uid, msg = wearMsg }
+        self:PutOn(pbData, function()
+            -- 卸下旧装备
+            if not table.isEmptyOrNil(cardData.SpiritualBar) then
+                StorageManager:TakeOffMultiSpiritual(cardData.SpiritualBar)
+            end
+
+            -- 绑定新装备
+            for index, data in pairs(wearSpiritualData) do
+                if data.uid == data.sid then
+                    local newMsg = data.GetMsg(data)
+                    newMsg.cardUid = cardData.uid
+                    newMsg.index = index
+                    cardData:SaveSpiritualData({ spiritual = { newMsg } })
+                    StorageManager:PutOnSpiritual(newMsg)
+                    StorageManager:ConsumeSpiritual(data.uid, 1)
+                else
+                    data:BindCard(cardData.uid, index)
+                    cardData:PutOnSpiritual(data)
+                    StorageManager:PutOnSpiritual(data)
+                end
+            end
+
+            cardData:CalcNowSumProp()
+            RedPointManager:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SpiritualPage.id)
+
+            if callback then
+                callback()
+            end
+        end)
+    end
+end
+
+---获取前几个战力最强的可穿戴灵契（返回有序候选数组）
+---@param excludeUidMap table 要排除的灵契uid集合（如已穿戴的）
+---@param excludeSidMap table 已穿戴好的sid集合
+---@return nil, SpiritualData[] 候选灵契数组（按优先级排好序）
+function SpiritualModel:GetWearableSpiritual2(excludeUidMap, excludeSidMap)
+    local spiritualList = {}
+    local spiritualSidList = {}
+    local allSpiritualData = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual, _G.ArtifactType.NoWear)
+    for k, _ in pairs(excludeSidMap) do
+        spiritualSidList[k] = true
+    end
+    if not table.isEmptyOrNil(allSpiritualData) then
+        allSpiritualData = _G.table.values(allSpiritualData)
+
+        table.sort(allSpiritualData, function(a, b)
+            return a:GetPower() > b:GetPower()
+        end)
+
+        for _, v in ipairs(allSpiritualData) do
+            -- 排除已穿戴的、sid重复的、手动排除的
+            if (not v.cardUid or v.cardUid == 0)
+                and not spiritualSidList[v.sid] then
+                if not (excludeUidMap and excludeUidMap[v.uid]) then
+                    table.insert(spiritualList, v)
+                end
+                spiritualSidList[v.sid] = true
+            end
+        end
+    end
+
+    return spiritualList
+end
+
+---一键穿戴
+---@param cardData CardData
+---@param infos table 推荐装备
+function SpiritualModel:OneKeyPutOnSpiritual(cardData, callback, infos)
+    local wearSpiritualIndex, wearSpiritualData
+    wearSpiritualIndex, wearSpiritualData = self:GetWearableSpiritual(cardData, infos)
+    if not table.isEmptyOrNil(wearSpiritualIndex) then
+        local pbData = { uid = cardData.uid, msg = wearSpiritualIndex }
+        self:PutOn(pbData, function()
+            local StorageManager = _G.StorageManager:GetInstance()
+            if not table.isEmptyOrNil(cardData.SpiritualBar) then
+                StorageManager:TakeOffMultiSpiritual(cardData.SpiritualBar)
+            end
+
+            for index, data in pairs(wearSpiritualData) do
+                if data.uid == data.sid then
+                    local newMsg = data.GetMsg(data)
+                    newMsg.cardUid = cardData.uid
+                    newMsg.index = index
+                    cardData:SaveSpiritualData({ spiritual = { newMsg } })
+                    StorageManager:PutOnSpiritual(newMsg)
+                    StorageManager:ConsumeSpiritual(data.uid, 1)
+                else
+                    data:BindCard(cardData.uid, index)
+                    cardData:PutOnSpiritual(data)
+                    StorageManager:PutOnSpiritual(data)
+                end
+            end
+            cardData:CalcNowSumProp()
+            RedPointManager:RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.SpiritualPage.id
+            )
+            if callback then
+                callback()
+            end
+        end)
+    end
+end
+
+---穿戴单个灵契(穿戴 替换)
+---@param cardData CardData
+---@param msg table 该位置已有装备传0表示脱下,传其他Uid表示替换
+---@param spiritualData SpiritualData 穿戴的灵契数据
+---@param index number 装备位索引
+function SpiritualModel:PutOnSpiritual(cardData, msg, index, spiritualData, callback)
+    local pbData = { uid = cardData.uid, msg = msg }
+    self:PutOn(pbData, function()
+        local SpiritualBar = cardData.SpiritualBar
+        if not table.isEmptyOrNil(SpiritualBar) and SpiritualBar[index] then
+            _G.StorageManager:GetInstance():TakeOffSpiritual(SpiritualBar[index])
+        end
+
+        local StorageManager = _G.StorageManager:GetInstance()
+        if spiritualData.uid == spiritualData.sid then
+            local newMsg = spiritualData.GetMsg(spiritualData)
+            newMsg.cardUid = cardData.uid
+            newMsg.index = index
+            cardData:SaveSpiritualData({ spiritual = { newMsg } })
+            StorageManager:PutOnSpiritual(newMsg)
+            StorageManager:ConsumeSpiritual(spiritualData.uid, 1)
+        else
+            spiritualData:BindCard(cardData.uid, index)
+            cardData:PutOnSpiritual(spiritualData)
+            StorageManager:PutOnSpiritual(spiritualData)
+        end
+        cardData:CalcNowSumProp()
+        RedPointManager:RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.SpiritualPage.id
+        )
+        if callback then
+            callback()
+        end
+    end)
+end
+
+---卸下单个灵契
+---@param cardData CardData
+---@param spiritualData SpiritualData
+function SpiritualModel:TakeOffSpiritual(cardData, spiritualData, index, callback)
+    if not _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Spiritual, 1) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130303)
+        return
+    end
+
+    local pbData = { uid = cardData.uid, msg = { { index = index, uid = 0 } } }
+    self:PutOn(pbData, function()
+        _G.StorageManager:GetInstance():TakeOffSpiritual(spiritualData)
+        cardData:TakeOffSpiritual(index)
+        cardData:CalcNowSumProp()
+        RedPointManager:RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.SpiritualPage.id
+        )
+        if callback then
+            callback()
+        end
+    end)
+end
+
+---一键拆卸(用于角色界面拆卸灵契)
+---@param cardData CardData
+---@param canRedPoint boolean 是否刷新红点
+function SpiritualModel:OneKeyDetachSpiritual(cardData, canRedPoint, callBack)
+    if table.isEmptyOrNil(cardData.SpiritualBar) then
+        return
+    end
+
+    local StorageManager = _G.StorageManager:GetInstance()
+    local count = table.count(cardData.SpiritualBar)
+    if not StorageManager:CheckSize(_G.StorageID.Spiritual, count) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130303)
+        return
+    end
+
+    local detachData = {}
+    ---@field data SpiritualData
+    for _, data in pairs(cardData.SpiritualBar) do
+        table.insert(detachData, { index = data.index, uid = 0 })
+    end
+    local pbData = { uid = cardData.uid, msg = detachData }
+    self:PutOn(pbData, function()
+        StorageManager:TakeOffMultiSpiritual(cardData.SpiritualBar)
+        cardData.SpiritualBar = {}
+        cardData:CalcNowSumProp()
+        if canRedPoint then
+            RedPointManager:RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.SpiritualPage.id
+            )
+        end
+        if callBack then
+            callBack()
+        end
+    end)
+end
+
+---一键卸下灵契(主要用于卡牌被当材料卡时需要先卸下灵契)
+---@param cardUids number[] uid列表
+function SpiritualModel:OneKeyOffSpiritual(cardUids, callBack)
+    if table.isEmptyOrNil(cardUids) then
+        if callBack then
+            callBack()
+        end
+        return
+    end
+
+    local StorageManager = _G.StorageManager:GetInstance()
+    cardUids = table.chooseToArray(
+            cardUids,
+            function(_, v)
+                ---@field cardData CardData
+                local cardData = StorageManager:GetItemDataByID(_G.StorageID.Card, v)
+                return not table.isEmptyOrNil(cardData.SpiritualBar)
+            end
+    )
+    if table.isEmptyOrNil(cardUids) then
+        if callBack then
+            callBack()
+        end
+        return
+    end
+
+    SpiritualNet:GetInstance():OneKeyOffAccess(
+            { uids = cardUids },
+            function(msg)
+                if msg.ack == 1 then
+                    for _, v in pairs(cardUids) do
+                        local cData = StorageManager:GetItemDataByID(_G.StorageID.Card, v)
+                        StorageManager:TakeOffMultiSpiritual(cData.SpiritualBar)
+                        cData.SpiritualBar = {}
+                        cData:CalcNowSumProp()
+                    end
+                    RedPointManager:RefreshNodeByAllParams(
+                            _G.ConfigManager.redpoint_cfg.SpiritualPage.id
+                    )
+                    if callBack then
+                        callBack(true)
+                    end
+                end
+            end
+    )
+end
+
+---一键卸下指定饰品（主要用于升星时需要消耗多个已被穿戴的饰品时需要一键卸下）
+function SpiritualModel:OneKeyTakeOffSpiritual(dataList, callback)
+    if not _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Spiritual, #dataList) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130303)
+        return
+    end
+    local msgList = {}
+    for _, v in pairs(dataList) do
+        _G.table.insert(msgList, {
+            uid = v.cardData.uid,
+            index_list = { v.spiritualData.index }
+        })
+    end
+    local pbData = { list = msgList }
+    self:OneKeyTakeOff(pbData, function()
+        for i = 1, #dataList do
+            local data = dataList[i]
+            local index = data.spiritualData.index
+            _G.StorageManager:GetInstance():TakeOffSpiritual(data.spiritualData)
+            if data.cardData.SpiritualBar[index] then
+                data.cardData:TakeOffSpiritual(index)
+            end
+            data.cardData:CalcNowSumProp()
+        end
+        RedPointManager:RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.SpiritualPage.id
+        )
+        if callback then
+            callback()
+        end
+    end)
+end
+
+---锁定
+---@param type number 锁定-1,解除锁定-2
+---@param uid number 卡牌uid
+---@param spiritualData SpiritualData 灵契数据
+function SpiritualModel:Unlock(type, uid, spiritualData, callBack)
+    if uid == nil then
+        _G.LogError("【容错】饰品锁定卡牌uid为空！")
+        return
+    end
+    if spiritualData == nil or spiritualData.uid == nil then
+        _G.LogError("【容错】饰品锁定饰品uid为空！")
+        return
+    end
+    SpiritualNet:GetInstance():Unlock(
+            { type = type, c_uid = uid, s_uid = spiritualData.uid },
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                spiritualData.unlock = type
+                if callBack then
+                    callBack()
+                end
+            end
+    )
+end
+
+---重置灵契
+---@param spiritualData SpiritualData 灵契数据
+function SpiritualModel:ResetSpiritual(spiritualData, callBack)
+    local resetStar = _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.SpiritualResetStar, 0)
+    SpiritualNet:GetInstance():ResetSpiritual(
+            { s_uid = spiritualData.uid, type = (resetStar == 0 or spiritualData.lv <= 1) and 1 or 2 },
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+
+                local StorageManager = _G.StorageManager:GetInstance()
+                local costNum = _G.ConfigManager.discrete_cfg[114005][1][1]
+                StorageManager:ConsumeItem(_G.ResPropID.Diamond, 0, costNum)
+                spiritualData:Reset(resetStar == 0)
+                StorageManager:ReceiveAwardData(msg)
+
+                ---神器>道具>货币 品质>ID
+                if msg.award.item then
+                    _G.SortList(
+                            msg.award.item,
+                            function(a)
+                                local sid = a.type[1]
+                                local aStorageType = StorageManager:CheckSidType(sid)
+                                local type = 0
+                                if aStorageType == _G.StorageType.Spiritual then
+                                    type = 2
+                                elseif aStorageType == _G.StorageType.Prop then
+                                    type = 1
+                                end
+
+                                return type, StorageManager:GetItemQuality(sid), sid
+                            end
+                    )
+                end
+                _G.UIManager:GetInstance():OpenWindow(
+                        _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                        { award = msg.award },
+                        nil,
+                        true,
+                        nil,
+                        nil,
+                        nil,
+                        nil,
+                        true
+                )
+                if callBack then
+                    callBack()
+                end
+            end
+    )
+end
+
+---检查仓库容器是否足够
+---@param CardDataList CardData[]
+function SpiritualModel:CheckIsEnoughStorageSize(CardDataList, showTip)
+    local num = 0
+    for _, v in pairs(CardDataList) do
+        if not table.isEmptyOrNil(v.SpiritualBar) then
+            num = num + table.count(v.SpiritualBar)
+        end
+    end
+
+    if num == 0 then
+        return true
+    elseif num > 0 and _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Spiritual, num) then
+        return true
+    else
+        if showTip then
+            _G.PopWindowManager:GetInstance():ShowAllTips(130303)
+        end
+        return false
+    end
+end
+
+---是否有可穿戴灵契
+---@param cardData CardData
+function SpiritualModel:CheckCheckCardCanPutOnSpiritual(cardData)
+    if table.isEmptyOrNil(cardData) then
+        return false
+    end
+
+    local StorageManager = _G.StorageManager:GetInstance()
+    ---@type SpiritualData[]
+    local Spirituals = StorageManager:GetDataByID(_G.StorageID.Spiritual, _G.ArtifactType.NoWear)
+    if table.isEmptyOrNil(Spirituals) then
+        return false
+    end
+
+    local unlockStar = _G.ConfigManager.discrete_cfg[114001][1]
+    local haveUnlock = false
+    for _, star in pairs(unlockStar) do
+        if cardData.star >= star then
+            haveUnlock = true
+            break
+        end
+    end
+    if not haveUnlock then
+        return false
+    end
+
+    for _, v in ipairs(Spirituals) do
+        if v:GetOrder() > cardData.SpiritualBar:GetOrder() then
+            return true
+        end
+    end
+    return false
+end
+
+---是否有更好的可穿戴灵契
+---@param spiritualData SpiritualData
+function SpiritualModel:CheckHaveBetterSpiritual(spiritualData)
+    if table.isEmptyOrNil(spiritualData) then
+        return 0
+    end
+
+    if self:CanLevelUp(spiritualData) then
+        return 1
+    end
+
+    local StorageManager = _G.StorageManager:GetInstance()
+    ---@type SpiritualData[]
+    local Spirituals = StorageManager:GetDataByID(_G.StorageID.Spiritual, _G.ArtifactType.NoWear)
+    if table.isEmptyOrNil(Spirituals) then
+        return 0
+    end
+
+    local ret, needCount = self:CanStarUp(spiritualData)
+    local count = 0
+
+    for _, v in pairs(Spirituals) do
+        if (not v.cardUid or v.cardUid <= 0)
+                and v:GetPower() > spiritualData:GetPower()
+        then
+            return 1
+        end
+
+        if ret and v.cardUid == 0 and v.sid == spiritualData.sid and v.star == 0 then
+            count = count + 1
+            if count >= needCount then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---是否可升级
+---@param spiritualData SpiritualData
+function SpiritualModel:CanLevelUp(spiritualData)
+    local curLevel = spiritualData:GetLevel()
+    if curLevel >= spiritualData:GetMaxLevel() then
+        return false
+    end
+
+    local levelCfgs = _G.ConfigManager.spiritual_level_cfg
+    local cfg = levelCfgs[curLevel + 1]
+    local curCfg = levelCfgs[curLevel]
+    local order = spiritualData:GetOrder()
+    local consumeResList = _G.DeepCopyCfgTable(cfg["material_" .. order])
+    for _, v in pairs(consumeResList) do
+        for _, v2 in pairs(curCfg["material_" .. order]) do
+            if v2[1] == v[1] then
+                v[2] = v[2] - v2[2]
+                break
+            end
+        end
+    end
+
+    local StorageManager = _G.StorageManager:GetInstance()
+    for _, v in pairs(consumeResList) do
+        if v[2] > 0 and not StorageManager:CheckItem(v[1], v[2]) then
+            return false
+        end
+    end
+
+    return true
+end
+
+---是否可以升星
+---@param spiritualData SpiritualData
+function SpiritualModel:CanStarUp(spiritualData)
+    if spiritualData.cfg.Star == spiritualData.star then
+        return false, 0
+    end
+
+    local starCfgs = _G.ConfigManager.spiritual_star_cfg
+    local starCfg = starCfgs[100 + spiritualData.star + 1]
+    local lastStarCfg = starCfgs[100 + spiritualData.star]
+    local needCount = starCfg.materials_oneself - lastStarCfg.materials_oneself
+    return true, needCount
+end
+
+--- 判断"升星"材料是否足够
+---@param spiritualData SpiritualData
+---@return boolean, number, number    -- 是否足够，当前数量，需要数量
+function SpiritualModel:IsEnoughStarUpMaterial(spiritualData)
+    if not spiritualData then
+        return false, 0, 0
+    end
+
+    local starCfg = _G.ConfigManager.spiritual_star_cfg[100 + spiritualData.star + 1]
+    local lastStarCfg = _G.ConfigManager.spiritual_star_cfg[100 + spiritualData.star]
+    if not starCfg or not lastStarCfg then
+        return false, 0, 0
+    end
+
+    local needCount = starCfg.materials_oneself - lastStarCfg.materials_oneself
+    local datas = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual, _G.ArtifactType.NoWear)
+
+    datas = _G.table.chooseToArray(datas, function(_, v)
+        return v.star == 0 and v.sid == spiritualData.sid
+    end)
+
+    local allCount = #datas
+    for _, v in ipairs(datas) do
+        if v == spiritualData then
+            allCount = allCount - 1
+            break
+        end
+    end
+
+    return allCount >= needCount
+end
+
+---是否已穿戴灵契
+function SpiritualModel:HadWearSpiritual(spiritualBar, spiritualData)
+    if spiritualBar then
+        for _, v in pairs(spiritualBar) do
+            if v.sid == spiritualData.sid then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--- 为灵契红点提供判断灵契能否替换的方法
+function SpiritualModel:RedPointCheckCanReplace(uid, index)
+    local carddata = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, uid)
+    local spiritualBar = carddata.SpiritualBar or {}
+    local wearSids = {}
+    local spiritualData
+    for index = 1, 5 do
+        spiritualData = spiritualBar[index]
+        if spiritualData then
+            wearSids[spiritualData.sid] = true
+        end
+    end
+    return self:CheckSpiritualCanLvUpOrReplace(carddata.SpiritualBar[index], wearSids, uid, index)
+end
+
+function SpiritualModel:CheckSpiritualCanLvUpOrReplace(spiritualData, wearSids, uid, index)
+    -- local red1 = require("RedPointManager"):GetInstance():GetNodeNum(_G.ConfigManager.redpoint_cfg.SpiritualLevelUp.id, uid * 10 + index)
+    local red2 = require("RedPointManager"):GetInstance():GetNodeNum(_G.ConfigManager.redpoint_cfg.Spiritual.id, index)
+    if red2 > 0 then
+        return false
+    end
+    if self:IsEnoughStarUpMaterial(spiritualData) then
+        return false
+    end
+    if self:CanLevelUp(spiritualData) then
+        return true
+    end
+    local order = spiritualData:GetOrder()
+    if order == 4 then
+        return false
+    end
+    local spirituals = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual, _G.ArtifactType.NoWear)
+    if table.isEmptyOrNil(spirituals) then
+        return false
+    end
+    for _, v in pairs(spirituals) do
+        if v:GetOrder() > order and not wearSids[v.sid] then
+            return true
+        end
+    end
+    return false
+end
+
+function SpiritualModel.GetStarSkillDes(sid, star)
+    ---@type spiritual_cfg
+    local cfg = _G.ConfigManager.spiritual_cfg[sid]
+    return _G.GetLangPackValue(_G.ConfigManager.card_skills_cfg[cfg.skill_id[star + 1]].describe1)
+end
+
+---获取穿戴指定sid饰品的角色中星级最高的饰品
+---@param spSid number 神器sid
+---@return SpiritualData 返回穿戴的最高星级的饰品数据没有就为nil
+function SpiritualModel:GetMaxStarSpiritualBySid(spSid)
+    local list = _G.StorageManager:GetInstance():GetDatasBySid(_G.StorageID.Spiritual, spSid)
+    if _G.TableIsEmpty(list) then
+        return nil
+    end
+    local outSp = nil
+
+    -- local GetCardSidByUid = function(cardUid)
+    --     if not cardUid  or cardUid == 0 then
+    --         return 0
+    --     end
+    --     local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, cardUid)
+    --     if cardData and cardData.sid then
+    --         return cardData.sid
+    --     end
+    --     return 0
+    -- end
+
+    for k, v in pairs(list) do
+        --if v.cfg.card_id ~= 0 and v.cfg.card_id == GetCardSidByUid(v.cardUid) then
+            if not outSp or outSp.star < v.star then
+                outSp = v
+            end
+        --end
+    end
+    return outSp
+end
+
+return SpiritualModel

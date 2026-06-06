@@ -1,0 +1,856 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.StrategyGoddess.Model.StrategyGoddessModel	(修改路径必须修正此项!)
+-- Created by zhaoshubo
+-- DateTime: 2026/04/01
+-- Description: 攻略女神
+-----------------------------------------------------------------------
+local StrategyGoddessNet = require("StrategyGoddessNet")
+
+local base = _G.GameDataModelBase
+---@class StrategyGoddessModel : GameDataModelBase
+local StrategyGoddessModel = _G.BaseClass("StrategyGoddessModel", base)
+
+local GuideSteps = 5
+local gameType = 2
+
+---@return StrategyGoddessModel StrategyGoddessModel
+function StrategyGoddessModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function StrategyGoddessModel:__init()
+    self.redpointId = _G.ConfigManager.redpoint_cfg.StrategyGoddess and _G.ConfigManager.redpoint_cfg.StrategyGoddess.id or 0
+    self.confessRedpointId = _G.ConfigManager.redpoint_cfg.StrategyGoddessConfess and _G.ConfigManager.redpoint_cfg.StrategyGoddessConfess.id or 0
+    self.taskRedpointId = _G.ConfigManager.redpoint_cfg.StrategyGoddessTask and _G.ConfigManager.redpoint_cfg.StrategyGoddessTask.id or 0
+    self.coin = _G.ConfigManager.discrete_cfg[201905] or {{95, 50}, {96,5}}
+    self:InitCfg()
+    _G.Events:GetInstance():AddListener(_G.eAFKAactionEnum.AfkSectionPass, self.UpdateAfkTask, self)
+    _G.Events:GetInstance():AddListener(_G.eRechargeEvent.TotalCash, self.UpdateRechargeTask, self)
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.UpdateLoginTask, self)
+end
+
+---从服务器拉取数据
+function StrategyGoddessModel:GetDataFormServer()
+    if self:CheckIsGuide() or self:CheckIsOpen() then
+        StrategyGoddessNet:GetInstance():GetInfo(
+            function (msg)
+                if msg then
+                    self:ParseData(msg)
+                end
+            end
+        )
+    else
+        base.ParseData(self)
+    end
+end
+
+---解析数据
+function StrategyGoddessModel:ParseData(msg)
+    self.goddessList = {}
+    self.taskList = {}
+    self.tasks = {}
+    self.taskDic = {}
+    self.giftPoint = _G.StorageManager:GetInstance():GetItemCountBySid(self:GetCoin()[1][1]) or 0
+    self.interactPoint = _G.StorageManager:GetInstance():GetItemCountBySid(self:GetCoin()[2][1]) or 0
+    if msg.ack == 1 then
+        if msg.goddess_list then
+            for _, v in pairs(msg.goddess_list) do
+                self:InitSingleGoddess(v.sid, v)
+            end
+        end
+        if msg.task_info then
+            for k, v in pairs(msg.task_info) do
+                self:InitSingleTask(k, v)
+            end
+        end
+        if msg.award then--第一次拉数据的时候会有初始奖励数值，单独解析一次
+            self:ParsePoint(msg.award[1])
+        end
+        self.onlineTime = msg.exp or 0
+        self.loginDay = msg.day or 0
+        self.loginTime = _G.TimeUtil.GetServerUnixTime()
+        self.onlineTimer = _G.TimerManager:GetInstance():GetTimer(
+                1,
+                self.UpdateOnlineTask,
+                self,
+                false,
+                false,
+                true
+        )
+        self.onlineTimer:Start()
+        self:RefreshTaskNode()
+        self:RefreshNode()
+    end
+    self.super.ParseData(self)
+end
+
+function StrategyGoddessModel:ParsePoint(msg)
+    if msg.item then
+        for _, v in pairs(msg.item) do
+            local value = v.type
+            if value[1] == self:GetCoin()[1][1] then--代币单独解析
+                self:AddPoint(1, value[2])
+            elseif value[1] == self:GetCoin()[2][1] then
+                self:AddPoint(2, value[2])
+            end
+        end
+    end
+end
+
+---初始化配置
+function StrategyGoddessModel:InitCfg()
+    self.cfg = _G.ConfigManager.goddess_cfg
+    self.missionCfg = _G.ConfigManager.mission_cfg
+    self.progressCfg = _G.ConfigManager.goddess_progress_cfg
+    self.interactCfg = _G.ConfigManager.goddess_strategy_cfg
+    self.maxFavorLv = 0
+    self.maxIntimacyLv = 0
+    self.favorabilityDic = {}
+    self.intimacyDic = {}
+    self.interactTypeCfg = { }
+    self.missionTypeCfg = {}
+    for _, v in pairs(self.progressCfg) do
+        if v.type == 1 then
+            self.maxFavorLv = _G.math.max(self.maxFavorLv, v.level)
+            self.favorabilityDic[v.level] = v.id
+        else
+            self.maxIntimacyLv = _G.math.max(self.maxIntimacyLv, v.level)
+            self.intimacyDic[v.level] = v.id
+        end
+    end
+    for _, v in pairs(self.interactCfg) do
+        if not self.interactTypeCfg[v.type_section] then
+            self.interactTypeCfg[v.type_section] = {}
+        end
+        _G.table.insert(self.interactTypeCfg[v.type_section], v.id)
+    end
+    for i = 1, #self.interactTypeCfg do
+        _G.table.sort(
+            self.interactTypeCfg[i],
+            function(a, b)
+                return a < b
+            end
+        )
+    end
+    for _, v in pairs(self.missionTypeCfg) do
+        if not self.missionTypeCfg[v.type_section] then
+            self.missionTypeCfg[v.type_section] = {}
+        end
+        _G.table.insert(self.missionTypeCfg[v.type_section], v)
+    end
+    self.cfgDic = {}
+    self.idDic = {}
+    self.nextDic = {}
+    self.preDic = {}
+    self.cfgCount = 0
+    for _, v in pairs(self.cfg) do
+        self.cfgCount = self.cfgCount + 1
+        self.cfgDic[self.cfgCount] = v.id
+        self.idDic[v.id] = self.cfgCount
+    end
+    for i = 1, #self.cfgDic do
+        if i ~= 1 then
+            self.preDic[self.cfgDic[i]] = self.cfgDic[i - 1]
+        end
+        if i ~= #self.cfgDic then
+            self.nextDic[self.cfgDic[i]] = self.cfgDic[i + 1]
+        end
+    end
+end
+
+function StrategyGoddessModel:InitSingleGoddess(sid, msg)
+    self.goddessList[sid] = {
+        sid = sid,
+        favorLevel = msg and msg.favor_level or 1,
+        favorExp = msg and msg.favor_exp or 0,
+        intimacyLevel = msg and msg.intimacy_level or 1,
+        intimacyExp = msg and msg.intimacy_exp or 0,
+        confess = msg and msg.confess or 0
+    }
+end
+
+function StrategyGoddessModel:InitSingleTask(type, msg)
+    self.taskList[type] = {
+        type = msg and msg.type[1] or 1,
+        taskList = msg and msg.task or {},
+        finishList = msg and msg.finish_task or {},
+        taskDic = {}
+    }
+    if not _G.table.isEmptyOrNil(self.taskList[type].taskList) then
+        for k, v in pairs(self.taskList[type].taskList) do
+            self.taskList[type].taskDic[v.sid] = k
+        end
+    end
+end
+
+---前端增/减礼物、交互点
+function StrategyGoddessModel:AddPoint(type, num)
+    if type == 1 then
+        self.giftPoint = self.giftPoint + num
+    else
+        self.interactPoint = self.interactPoint + num
+    end
+    _G.Events:GetInstance():Broadcast(_G.eStrategyGoddessEvent.PointChange, type, num)
+end
+
+---前端增/减好感、亲密度
+function StrategyGoddessModel:AddScore(type, sid, num, times)
+    if type == 1 then
+        self.goddessList[sid].favorExp = self.goddessList[sid].favorExp + (num * times)
+        self:CheckFavorability(sid)
+    else
+        self.goddessList[sid].intimacyExp = self.goddessList[sid].intimacyExp + (num * times)
+        self:CheckIntimacy(sid)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eStrategyGoddessEvent.ScoreChange, type, sid, num)
+end
+
+function StrategyGoddessModel:GetCoin()
+    return self.coin
+end
+
+---获取礼物、交互点数据
+function StrategyGoddessModel:GetPoint(type)
+    if type == 1 then
+        return self.giftPoint
+    else
+        return self.interactPoint
+    end
+end
+
+---获取好感、亲密度数据
+function StrategyGoddessModel:GetScore(type, sid)
+    if type == 1 then
+        return self.goddessList[sid] and self.goddessList[sid].favorLevel or 0, self.goddessList[sid] and self.goddessList[sid].favorExp or 0
+    else
+        return self.goddessList[sid] and self.goddessList[sid].intimacyLevel or 0, self.goddessList[sid] and self.goddessList[sid].intimacyExp or 0
+    end
+end
+
+---获取任务列表
+function StrategyGoddessModel:GetTaskList(type)
+    return self.taskList[type]
+end
+
+---获取任务信息
+function StrategyGoddessModel:GetTaskInfo(sid, type)
+    if type then
+        return self.taskList[type].taskList[self.taskList[type].taskDic[sid]]
+    else
+        for _, v in pairs(self.taskList) do
+            local index = v.taskDic[sid]
+            if index and v.taskList[index].sid == sid then
+                return v.taskList[index]
+            end
+        end
+    end
+    return self.taskList[type]
+end
+
+---获取当日累计登录时间(s)
+function StrategyGoddessModel:GetOnlineTime()
+    return self.onlineTime + _G.TimeUtil.GetServerUnixTime() - self.loginTime
+end
+
+---获取女神配置
+function StrategyGoddessModel:GetGoddessCfg(sid)
+    if not sid then
+        return self.cfg or {}
+    end
+    return self.cfg[sid] or {}
+end
+
+function StrategyGoddessModel:GetNextSid(sid)
+    local next = self.nextDic[sid] or 0
+    while next ~= 0 and not self:CheckGoddessIsOpen(next) do
+        next = self:GetNextSid(next)
+    end
+    return next
+end
+
+function StrategyGoddessModel:GetPreSid(sid)
+    local pre = self.preDic[sid] or 0
+    while pre ~= 0 and not self:CheckGoddessIsOpen(pre) do
+        pre = self:GetPreSid(pre)
+    end
+    return pre
+end
+
+---根据任务类型获取任务配置
+function StrategyGoddessModel:GetMissionCfgByType(type)
+    return self.missionTypeCfg[type] or {}
+end
+
+---根据任务sid获取任务配置
+function StrategyGoddessModel:GetMissionCfgBySid(sid)
+    return self.missionCfg[sid] or {}
+end
+
+---获取等级配置
+function StrategyGoddessModel:GetProgressCfg(type, level, isNext)
+    local sid = 0
+    if isNext then
+        level = level + 1
+    end
+    if type == 1 then
+        sid = self.favorabilityDic[level]
+    else
+        sid = self.intimacyDic[level]
+    end
+    return sid ~= 0 and self.progressCfg[sid] or {}
+end
+
+---获取交互配置
+function StrategyGoddessModel:GetInteractCfg(type)
+    return self.interactTypeCfg[type] or {}
+end
+
+function StrategyGoddessModel:GetGuideStep()
+    self.guideStep = _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.StrategyGoddess .. "Guide", 1)
+    return self.guideStep
+end
+
+function StrategyGoddessModel:GetPhotoList(sid)
+    return self.cfg[sid].photo_unlock or {}
+end
+
+function StrategyGoddessModel:GetBgIndex(sid)
+    return _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.StrategyGoddess .. "Bg_" .. sid, 0)
+end
+
+function StrategyGoddessModel:SetBgIndex(sid, index)
+    _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.StrategyGoddess .. "Bg_" .. sid, index or 0)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.StrategyGoddessView.Name)
+    if view then
+        view:UpdateGoddess()
+    end
+end
+
+function StrategyGoddessModel:CheckTaskProgress(cfg, type)
+    if not type then
+        type = 1
+    end
+    local curProgress, target, text
+    if type == 1 then--通关放置关卡
+        local condition = {}
+        for k, v in pairs(cfg.condition) do
+            condition[k] = {
+                [1] = v[1] == 53 and 4 or v[1],--放置通关用类型4做检测
+                [2] = v[2]
+            }
+        end
+        local isFinish = _G.GlobalConditionManager.CheckConditionByArray(condition)
+        curProgress = isFinish and 1 or 0
+        target = 1
+        text = _G.GetLangPackValue(90020400086)
+    elseif type == 2 then--在线时间
+        curProgress = _G.math.min(self:GetOnlineTime(), cfg.condition[1][2])
+        target = cfg.condition[1][2]
+        text = _G.GetLangPackValue(90020400086)
+        return curProgress >= target, string.format("(%s/%s)", curProgress // 60, target // 60), text
+    elseif type == 3 then--登录天数
+        curProgress = self.loginDay
+        target = cfg.condition[1][2]
+        if curProgress > target then
+            curProgress = target
+        end
+        text = _G.GetLangPackValue(90020400086)
+    elseif type == 4 then--累计充值
+        curProgress = _G.math.min(require("MallManager"):GetInstance():GetCashRmb() or 0, cfg.condition[1][2])
+        target = cfg.condition[1][2]
+        text = _G.GetLangPackValue(90022200010)
+        return curProgress >= target, string.format("(%s/%s)", curProgress // 100, target // 100), text
+    end
+    return curProgress >= target, string.format("(%s/%s)", curProgress, target), text
+end
+
+---检测是否可以提升好感度等级
+function StrategyGoddessModel:CheckFavorability(sid)
+    if self.goddessList[sid].favorLevel >= self.maxFavorLv then
+        return
+    end
+    local isUp = false
+    local curLevel = self.goddessList[sid].favorLevel
+    local cfg = self:GetProgressCfg(1, self.goddessList[sid].favorLevel, true)
+    while self.goddessList[sid].favorLevel < self.maxFavorLv and self.goddessList[sid].favorExp >= cfg.exp do
+        self.goddessList[sid].favorLevel = self.goddessList[sid].favorLevel + 1
+        cfg = self:GetProgressCfg(1, self.goddessList[sid].favorLevel, true)
+        isUp = true
+    end
+    if isUp then
+        _G.Events:GetInstance():Broadcast(_G.eStrategyGoddessEvent.LvUp, 1, sid, self.goddessList[sid].favorLevel - curLevel)
+        self:RefreshConfessNode(sid)
+    end
+end
+
+---检测是否可以提升亲密度等级
+function StrategyGoddessModel:CheckIntimacy(sid)
+    if self.goddessList[sid].intimacyLevel >= self.maxIntimacyLv then
+        return
+    end
+    local isUp = false
+    local curLevel = self.goddessList[sid].intimacyLevel
+    local cfg = self:GetProgressCfg(2, self.goddessList[sid].intimacyLevel, true)
+    while  self.goddessList[sid].intimacyLevel < self.maxIntimacyLv and self.goddessList[sid].intimacyExp >= cfg.exp do
+        self.goddessList[sid].intimacyLevel = self.goddessList[sid].intimacyLevel + 1
+        cfg = self:GetProgressCfg(2, self.goddessList[sid].intimacyLevel, true)
+        isUp = true
+    end
+    if isUp then
+        _G.Events:GetInstance():Broadcast(_G.eStrategyGoddessEvent.LvUp, 2, sid, self.goddessList[sid].intimacyLevel - curLevel)
+        self:RefreshConfessNode(sid)
+    end
+end
+
+---检测女神是否有交互后的随机事件立绘
+function StrategyGoddessModel:CheckRandom(sid)
+    local cfg = self.cfg[sid].random_photos
+    if cfg and #self.cfg[sid].random_photos > 0 then
+        return true
+    end
+    return false
+end
+
+---检测对应写真是否达到解锁条件
+function StrategyGoddessModel:CheckPhotoUnlock(sid, index)
+    local cfg = self:GetPhotoList(sid)
+    if index > #cfg then--最后一张是告白写真，特殊处理
+        return self:CheckGoddessIsConfess(sid)
+    end
+    return self.goddessList[sid].favorExp >= tonumber(cfg[index][1])
+end
+
+---检测女神是否有新解锁写真
+function StrategyGoddessModel:CheckNewUnlockPhoto(sid)
+    local cfg = self:GetPhotoList(sid)
+    for i = 1, #cfg + 1 do
+        if self:CheckPhotoUnlock(sid, i) then
+            local key = _G.PlayerPrefsKey.StrategyGoddess .. "PhotoUnlock" .. sid .. "_" .. i
+            if _G.PlayerPrefsManager.GetInt(key, 0) == 0 then
+                _G.PlayerPrefsManager.SetInt(key, 1)
+                return i
+            end
+        end
+    end
+    return nil
+end
+
+---检测女神是否解锁
+function StrategyGoddessModel:CheckGoddessUnlock(sid, showTips)
+    local condition = self:GetGoddessCfg(sid).condition_type
+    local isUnlock, lockType = _G.GlobalConditionManager.CheckConditionByArray(condition, true)
+    local tipSid, str
+    if not isUnlock then
+        for k, v in ipairs(lockType) do
+            local temp
+            if v then
+                temp, tipSid = _G.FunctionManager:GetInstance():GetStrWithType(v[1], v[2], nil, sid)
+            else
+                if not _G.table.isEmptyOrNil(condition) then
+                    temp, tipSid = _G.FunctionManager:GetInstance():GetStrWithType(condition[k][1], condition[k][2])
+                end
+            end
+            if k == 1 then
+                str = temp
+            else
+                str = str .. _G.GetLangPackValue(9002010024) .. temp
+            end
+        end
+        if showTips then
+            _G.PopWindowManager:GetInstance():ShowAllTips(tipSid, str)
+        end
+        return false, str
+    end
+    return self:CheckGoddessIsOpen(sid), nil
+end
+
+---检测女神是否已解锁
+function StrategyGoddessModel:CheckGoddessIsOpen(sid)
+    return not _G.table.isEmptyOrNil(self.goddessList[sid])--有后台数据就已解锁
+end
+
+---检测是否开启引导
+function StrategyGoddessModel:CheckIsGuide()
+    return _G.GameUtil.GetFunctionData(_G.FunctionBlock.game_type) == gameType
+end
+
+---检测是否在对应渠道开启
+function StrategyGoddessModel:CheckIsOpen()
+    local list = _G.GameUtil.GetFunctionData(_G.FunctionBlock.GameStatus)
+    if not _G.table.isEmptyOrNil(list) and _G.table.ContainsValue(list, gameType) then
+        return _G.FunctionManager:CheckFunctionIsUnlock(1012)
+    end
+    return false
+end
+
+---检测是否完成对应引导步骤
+function StrategyGoddessModel:CheckGuideStep(step)
+    if not self:CheckIsGuide() or self:CheckIsFinishGuide() or self:CheckGuideIsBlock() then
+        return true
+    end
+    if not self.guideStep then
+        self:GetGuideStep()
+    end
+    return self.guideStep > step
+end
+
+function StrategyGoddessModel:CheckIsFinishGuide()
+    if not self:CheckIsGuide() then
+        return true
+    end
+    local notNewPlayer = _G.GlobalConditionManager.CheckConditionByArray(_G.ConfigManager.discrete_cfg[201906])
+    if notNewPlayer then
+        return true
+    end
+    if not self.guideStep then
+        self:GetGuideStep()
+    end
+    return self.guideStep > GuideSteps
+end
+
+---检测女神是否已告白
+function StrategyGoddessModel:CheckGoddessIsConfess(sid)
+    return self.goddessList[sid] and self.goddessList[sid].confess == 1 or false
+end
+
+function StrategyGoddessModel:CheckGoddessCanConfess(sid)
+    local cfg = self.cfg[sid]
+    local unlock = self:GetScore(1, sid) >= cfg.favorability and
+            self:GetScore(2, sid) >= cfg.intimacy
+    return unlock and not self:CheckGoddessIsConfess(sid)
+end
+
+function StrategyGoddessModel:CheckHasConfessItem(sid)
+    local cfg = self.cfg[sid]
+    local count = _G.StorageManager:GetInstance():GetItemCountBySid(cfg.confession_id[1][1])
+    return count >= cfg.confession_id[1][2]
+end
+
+function StrategyGoddessModel:CheckCanInteract(id, times, isShow)
+    local cfg = self.interactCfg[id].consume
+    for _, v in pairs(cfg) do
+        local itemType
+        if v[1] == self:GetCoin()[1][1] then
+            itemType = 1
+        elseif v[1] == self:GetCoin()[2][1] then
+            itemType = 2
+        end
+        if self:GetPoint(itemType) < v[2] * times then
+            if isShow then
+                _G.PopWindowManager:GetInstance():ShowAllTips(95)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, v[1])
+            end
+            return false
+        end
+    end
+    return true
+end
+
+---检测是否屏蔽弱引导
+function StrategyGoddessModel:CheckGuideIsBlock()
+    return true--临时屏蔽
+end
+
+function StrategyGoddessModel:ShowNextGuide()
+    if not self.guideStep then
+        self:GetGuideStep()
+    end
+    if self.guideStep > GuideSteps or self:CheckGuideIsBlock() then
+        return
+    end
+    if _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.StrategyGoddess .. "GuideOperation" .. self.guideStep, 0) == 0 then
+        return
+    end
+    self.guideStep = self.guideStep + 1
+    _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.StrategyGoddess .. "Guide", self.guideStep)
+    _G.Events:GetInstance():Broadcast(_G.eStrategyGoddessEvent.NextGuide, self.guideStep)
+end
+
+function StrategyGoddessModel:EnterMainView(isGuide, callback)
+    if isGuide then
+        if not self:CheckIsGuide() or self:CheckIsFinishGuide() then
+            if callback then
+                callback()
+            end
+            return
+        end
+        if not self.guideStep then
+            self:GetGuideStep()
+        end
+        if self.guideStep == 3 or self.guideStep == 4 then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.StrategyGoddessMainView.Name, false, callback)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.StrategyGoddessView.Name, 1)
+            return
+        end
+    end
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.StrategyGoddessMainView.Name, isGuide, callback)
+end
+
+---交互
+function StrategyGoddessModel:Interact(sid, type, id, times, callback)
+    if not self:CheckCanInteract(id, times, true) then
+        return
+    end
+    local cfg = self.interactCfg[id].consume
+    local pbData = {
+        goddess_sid = sid,
+        type = type,
+        consume = {
+            [1] = {
+                key = id,
+                value = times
+            }
+        }
+    }
+    StrategyGoddessNet:GetInstance():Interact(
+            pbData,
+            function(msg)
+                if msg.ack == 1 then
+                    for _, v in pairs(cfg) do
+                        local itemType
+                        if v[1] == self:GetCoin()[1][1] then
+                            itemType = 1
+                        elseif v[1] == self:GetCoin()[2][1] then
+                            itemType = 2
+                        end
+                        if itemType then
+                            self:AddPoint(itemType, -v[2] * times)
+                        else
+                            _G.StorageManager:GetInstance():ConsumeItem(v[1], nil, v[2] * times)
+                        end
+                    end
+                    self.interactCall = function()
+                        if callback then
+                            callback()
+                        end
+                        local favor = self.interactCfg[id].award_favorability
+                        local intimacy = self.interactCfg[id].award_intimacy
+                        if favor and favor > 0 and self.goddessList[sid].favorLevel < self.maxFavorLv then
+                            self:AddScore(1, sid, favor, times)
+                        end
+                        if intimacy and intimacy > 0 and self.goddessList[sid].intimacyLevel < self.maxIntimacyLv then
+                            self:AddScore(2, sid, intimacy, times)
+                        end
+                    end
+
+                    if type == 2 and self:CheckRandom(sid) then
+                        local interactCfg = self:GetInteractCfg(type)
+                        local index
+                        for k, v in ipairs(interactCfg) do
+                            if v == id then
+                                index = k
+                                break
+                            end
+                        end
+                        _G.UIManager:GetInstance():OpenWindow(
+                                _G.ConfigManager.ui_cfg.StrategyGoddessEventView.Name,
+                                self.cfg[sid],
+                                index,
+                                id
+                        )
+                    end
+                    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnCloseInteractAwardView, self)
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                end
+            end
+    )
+end
+
+---告白
+function StrategyGoddessModel:Confess(sid, consume, callback)
+    local pbData = {
+        goddess_sid = sid
+    }
+    local cfg = self.cfg[sid].confession_id
+    for _, v in pairs(cfg) do
+        if _G.StorageManager:GetInstance():GetItemCountBySid(v[1]) < v[2] then
+            _G.PopWindowManager:GetInstance():ShowAllTips(95)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, v[1])
+            return
+        end
+    end
+    StrategyGoddessNet:GetInstance():Confess(
+            pbData,
+            function(msg)
+                if msg.ack == 1 then
+                    _G.StorageManager:GetInstance():ConsumeItem(consume[1], nil, consume[2])
+                    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                    self.goddessList[sid].confess = 1
+                    self:RefreshConfessNode(sid)
+                    if callback then
+                        callback()
+                    end
+                end
+            end
+    )
+end
+
+---完成任务(type=1预完成不领奖，type=2完成并领奖)
+function StrategyGoddessModel:FinishTask(taskList, type, callback)
+    local pbData = {
+        task = taskList,
+        finish_type = 2
+    }
+    StrategyGoddessNet:GetInstance():FinishTask(
+            pbData,
+            function(msg)
+                if msg.ack == 1 then
+                    if msg.new_task then
+                        local dic = {}
+                        for k, v in pairs(self.taskList[type].taskList) do
+                            dic[v.sid] = k
+                        end
+                        for _, v in pairs(msg.new_task) do
+                            self.taskList[type].taskList[dic[v.sid]] = v--刷新任务信息
+                            _G.table.insert(self.taskList[type].finishList, v.sid)
+                        end
+                    end
+                    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                    self:ParsePoint(msg.award)
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                    self:RefreshTaskNode(type)
+                    self:RefreshConfessNode()
+                end
+                if callback then
+                    callback()
+                end
+            end
+    )
+end
+
+function StrategyGoddessModel:Unlock(sid, callback)
+    local pbData = {
+        goddess_sid = sid
+    }
+    StrategyGoddessNet:GetInstance():Unlock(
+            pbData,
+            function(msg)
+                if msg.ack == 1 then
+                    self:InitSingleGoddess(sid)
+                end
+                if callback then
+                    callback(msg)
+                end
+            end
+    )
+end
+
+function StrategyGoddessModel:CheckRedpoint(param, isGoddess)
+    if not param then
+        for i = 1, 4 do
+            if self:CheckRedpoint(i, false) == 1 then
+                return 1
+            end
+        end
+        if isGoddess then
+            if not _G.table.isEmptyOrNil(self.goddessList) then
+                for _, v in pairs(self.goddessList) do
+                    if self:CheckRedpoint(v.sid, true) == 1 then
+                        return 1
+                    end
+                end
+            end
+        end
+        return 0
+    else
+        if isGoddess then
+            if self:CheckGoddessIsOpen(param) and self:CheckGoddessCanConfess(param) and self:CheckHasConfessItem(param) then
+                return 1
+            end
+        else
+            if self.taskList and self.taskList[param] and self.taskList[param].taskList then
+                for _, v in pairs(self.taskList[param].taskList) do
+                    if v.state ~= _G.TaskEnum.ETaskState.Completed then
+                        local isFinish = self:CheckTaskProgress(self.missionCfg[v.sid], param)
+                        if isFinish then
+                            return 1
+                        end
+                    end
+                end
+            end
+        end
+        return 0
+    end
+end
+
+function StrategyGoddessModel:RefreshNode(param)
+    if self.redpointId ~= 0 then
+        require("RedPointManager"):GetInstance():RefreshNode(self.redpointId, param)
+    end
+end
+
+function StrategyGoddessModel:RefreshTaskNode(param)
+    if self.taskRedpointId ~= 0 then
+        require("RedPointManager"):GetInstance():RefreshNode(self.taskRedpointId, param)
+    end
+end
+
+function StrategyGoddessModel:RefreshConfessNode(param)
+    if self.confessRedpointId ~= 0 then
+        require("RedPointManager"):GetInstance():RefreshNode(self.confessRedpointId, param)
+    end
+end
+
+function StrategyGoddessModel:OnCloseInteractAwardView(name)
+    if name == _G.ConfigManager.ui_cfg.CommonAwardView.Name and self.interactCall then
+        self.interactCall()
+        self.interactCall = nil
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnCloseInteractAwardView, self)
+    end
+end
+
+---刷新放置通关任务状态
+function StrategyGoddessModel:UpdateAfkTask()
+    self:RefreshTaskNode(1)
+end
+
+---刷新在线任务状态
+function StrategyGoddessModel:UpdateOnlineTask()
+    local timeIncrease = false
+    if not self.lastOnlineTime then
+        timeIncrease = true
+    elseif self:GetOnlineTime() // 60 > self.lastOnlineTime then
+        timeIncrease = true        
+    end
+    self.lastOnlineTime = self:GetOnlineTime() // 60
+    if timeIncrease then
+        self:RefreshTaskNode(2)
+        _G.Events:GetInstance():Broadcast(_G.eStrategyGoddessEvent.OnlineTimeIncrease, self:GetOnlineTime())
+    end
+end
+
+---刷新登录任务状态
+function StrategyGoddessModel:UpdateLoginTask()
+    self:RefreshTaskNode(3)
+end
+
+---刷新累充任务状态
+function StrategyGoddessModel:UpdateRechargeTask()
+    self:RefreshTaskNode(4)
+end
+
+function StrategyGoddessModel.CheckOpen()
+    return require("StrategyGoddessModel"):GetInstance():CheckIsGuide() or
+        require("StrategyGoddessModel"):GetInstance():CheckIsOpen()
+end
+
+---销毁对象时,析构函数
+function StrategyGoddessModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eAFKAactionEnum.AfkSectionPass, self.UpdateAfkTask, self)
+    _G.Events:GetInstance():RemoveListener(_G.eRechargeEvent.TotalCash, self.UpdateRechargeTask, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.UpdateLoginTask, self)
+    if self.onlineTimer then
+        self.onlineTimer:Stop()
+        self.onlineTimer = nil
+    end
+    if self.interactCall then
+        self.interactCall = nil
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnCloseInteractAwardView, self)
+    end
+end
+
+
+return StrategyGoddessModel

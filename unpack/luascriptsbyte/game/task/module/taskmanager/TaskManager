@@ -1,0 +1,939 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Task.Module.TaskManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/05/28
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+---@class TaskManager : GameDataModelBase    中文描述
+local TaskManager = _G.BaseClass("TaskManager", _G.GameDataModelBase)
+
+---创建对象时,入口构造函数
+function TaskManager:__init()
+    self.finish_task = nil
+    self.MainTaskdata = nil
+end
+
+function TaskManager:GetDataFormServer()
+    self:GetTaskMains()
+end
+
+function TaskManager:ParseData(SidesTaskdata, MainTaskdata)
+    --- 所有已完成的任务
+    local finish_task = {}
+    if SidesTaskdata.finish_task ~= nil then
+        for _, taskid in pairs(SidesTaskdata.finish_task) do
+            if _G.TaskModule:GetInstance():CheckIsRoomTask(taskid) then
+                _G.TaskModule:GetInstance():SetCompletedRoomTask(taskid)
+                _G.TaskModule:GetInstance():SetCompletedTask(taskid)
+            else
+                local task = {}
+                task.sid = taskid
+                task.state = _G.TaskEnum.ETaskState.Completed
+                table.insert(finish_task, task)
+
+                _G.TaskModule:GetInstance():SetCompletedTask(taskid)
+            end
+        end
+    end
+    if MainTaskdata.finish_task ~= nil then
+        for _, taskid in pairs(MainTaskdata.finish_task) do
+            local task = {}
+            task.sid = taskid
+            task.state = _G.TaskEnum.ETaskState.Completed
+            _G.TaskModule:GetInstance():SetCompletedTask(taskid)
+            table.insert(finish_task, task)
+        end
+    end
+
+    --- 当前正在进行的任务
+    local current_task = {}
+    if SidesTaskdata.task ~= nil then
+        table.insertto(current_task, SidesTaskdata.task)
+    end
+    if MainTaskdata.task ~= nil then
+        table.insertto(current_task, MainTaskdata.task)
+    end
+
+    --- 所有已知任务 入库
+    -- local allhavetask = {}
+    -- table.insertto(allhavetask, finish_task)
+
+    _G.TaskModule:GetInstance():AddTaskInfos(finish_task)
+
+    self.finish_task = finish_task
+    self.MainTaskdata = MainTaskdata
+    self.current_task = current_task
+    self.super.ParseData(self)
+end
+
+---初始化功能逻辑
+function TaskManager:InitFunction()
+    _G.SortList(
+        self.current_task,
+        function(a)
+            return a.sid
+        end
+    )
+    _G.TaskModule:GetInstance():AddTaskInfos(self.current_task)
+
+    --- 所有当前任务不算当前完成   副本任务1 完成过 关卡重置 再次领取副本任务1 不完成 是当前任务
+    for _, task in pairs(self.current_task) do
+        _G.TaskModule:GetInstance():DelCompletedTask(task.sid)
+    end
+
+    --- 所有已完成的任务检测 是否有可领取的后续任务
+    for key, taskinfo in pairs(self.finish_task) do
+        _G.TaskModule:GetInstance():ClaimAllTask_byPer(taskinfo.sid)
+    end
+
+    local maintask = _G.TaskModule:GetInstance().CurrentMainTask
+    if table.isEmptyOrNil(maintask) then
+        local NoviceTasks = _G.ConfigManager.discrete_cfg[103601]
+        if NoviceTasks ~= nil then
+            NoviceTasks = NoviceTasks[1]
+        end
+        -- 103401
+        local oneTaskid
+        if self.MainTaskdata.finish_task ~= nil then
+            _G.SortList(
+                self.MainTaskdata.finish_task,
+                function(v)
+                    return v
+                end
+            )
+            oneTaskid = self.MainTaskdata.finish_task[1]
+            _G.TaskModule:GetInstance():ClaimAllTask_byPer(oneTaskid)
+        else
+            --- 如果 有新手任务
+            if NoviceTasks ~= nil then
+                for i = 1, #NoviceTasks do
+                    oneTaskid = NoviceTasks[i]
+                    local i_task = {}
+                    i_task.sid = oneTaskid
+                    i_task.state = _G.TaskEnum.ETaskState.WaitClaim
+                    _G.TaskModule:GetInstance():AddTaskInfo(i_task)
+                    local task = _G.TaskModule:GetInstance():GetTaskWithID(oneTaskid)
+                    _G.TaskModule:GetInstance():AcceptTask(oneTaskid, _G.handler(task, task.OnReplyClaimTask))
+                end
+            end
+            ---查找第一个主线任务
+            local onetaskcfg = table.find(
+                _G.ConfigManager.task_cfg,
+                function(v)
+                    --- 主线 无前置任务
+                    return v.Type1 == _G.TaskEnum.ETaskType.MainTask and table.isEmptyOrNil(v.per_sid)
+                end
+            )
+            if onetaskcfg ~= nil then
+                oneTaskid = onetaskcfg.ID
+                ---@type task.i_task
+                local i_task = {}
+                i_task.sid = oneTaskid
+                i_task.state = _G.TaskEnum.ETaskState.WaitClaim
+                _G.TaskModule:GetInstance():AddTaskInfo(i_task)
+                local task = _G.TaskModule:GetInstance():GetTaskWithID(oneTaskid)
+                if task.TaskCfg.is_auto_receive then
+                    _G.TaskModule:GetInstance():AcceptTask(oneTaskid, _G.handler(task, task.OnReplyClaimTask))
+                end
+            else
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("未找到启始主线任务")
+                end
+            end
+        end
+    elseif maintask:IsDone() then
+        --- 如果当前主线任务已完成 就领取后续任务
+        -- _G.TaskModule:GetInstance():ClaimAllTask_byPer(maintask.TaskID)
+    end
+
+    --通知任务模块任务数量变化
+    _G.TaskModule:GetInstance():DispatchEvent(_G.TaskModuleEvent, _G.TaskModuleEvent.EnumValueTable.TaskNumberUpdate)
+
+    --177任务类型: 同时拥有x个y星的彩色品质的饰品
+    --任务进度从SpiritualStorage中获取饰品列表, 但英雄穿戴的饰品在StorageManager:InitFunction()中才会加入SpiritualStorage中, 因此在其之后手动触发一次任务
+    local order = 4
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.Spiritual.LevelNum,
+            order,
+            0
+        },
+        1
+    )
+end
+
+---主任务
+function TaskManager:GetTaskMains()
+    require("TaskNet"):GetInstance():GetTaskMains(_G.handler(self, self.GetTaskMainsCallBack))
+end
+
+---@param data task.ReplyGetTaskMains
+function TaskManager:GetTaskMainsCallBack(data)
+    self:GetTaskSides(data)
+end
+
+---获取支线任务
+function TaskManager:GetTaskSides(data)
+    require("TaskNet"):GetInstance():GetTaskSides(_G.handlerbind(self, self.ParseData, data))
+end
+
+local taskEnumTypeFunDic = nil
+-----前端检测任务
+---@param task ActiveTaskBase
+---@param okfun fun(id:number[] ,params:number[],isSet:boolean)
+function TaskManager.CheckTaskTarget(task, okfun)
+    if taskEnumTypeFunDic == nil then
+        taskEnumTypeFunDic = {
+            [_G.ActiveTaskEnum.ConditionEnum.CumulativeLogin.specifiedTime] = function(task, okfun)
+                --指定时间段登录
+                local starSecond = task.taskcontentparams[2]
+                local endSecond = task.taskcontentparams[3]
+                local notSecond = _G.TimeUtil.GetSecondsOfDayOf6Hour()
+                if notSecond < 0 then
+                    notSecond = (24 - _G.TimeUtil.GAME_DAY_HOUR) * 3600 - notSecond
+                end
+                if notSecond >= starSecond and notSecond <= endSecond then
+                    okfun({ task.taskEnumType }, 1, true)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CumulativeLogin.dayAfter] = function(task, okfun)
+                --指定接取任务后几天登录
+                local nowSecond = _G.TimeUtil.GetServerUnixTime()
+                local starSecond = (task.taskcontentparams[2] - 1) * 86400 + _G.TimeUtil.GetDayBySix(task.getTime)
+                if nowSecond >= starSecond then
+                    okfun({ task.taskEnumType }, 1, true)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Section.SectionPass] = function(task, okfun)
+                --副本是否通关
+                local id = task.taskcontentparams[2]
+                if _G.GlobalConditionManager.CheckCondition(2, id) then
+                    okfun({ task.taskEnumType, id }, 1)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Section.CompleteTargetEvent] = function(task, okfun)
+                -- 完成目标事件
+                local id = task.taskcontentparams[2]
+                if _G.GlobalConditionManager.CheckCondition(10, id) then
+                    okfun({ task.taskEnumType, id }, 1)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.AFK.IsPass] = function(task, okfun)
+                ---该放置关卡是否过关
+                local id = task.taskcontentparams[2]
+
+                if _G.GlobalConditionManager.CheckCondition(4, id) then
+                    okfun({ task.taskEnumType, id }, 1)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Section.DeadsoulFoor] = function(task, okfun)
+                ---死魂塔通关达到X层新增byszs
+                local type = task.taskcontentparams[2]
+                local num = task.taskcontentparams[3]
+                local layer = require("DeadsoulTowerModel"):GetInstance():CheckDeadsoulTask(type, num)
+                okfun({ task.taskEnumType, type, num }, layer, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CardLevel.assignCountAssignLevel] = function(task, okfun)
+                --- 指定N张卡 升到指定X级
+                --- 检测并直接设置进度  (初始化)
+                local lv = task.taskcontentparams[2]
+                local num = 0
+                if lv <= 1 then
+                    ---新共鸣系统后端卡牌没有等级概念（此id的配置应换为147）
+                    num = _G.StorageManager:GetInstance():CheckCardLvCount({ lv = lv })
+                end
+                okfun({ task.taskEnumType, lv }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CardLevel.assignSidAssignLevel] = function(task, okfun)
+                --- 指定SID卡牌升到N级（检测当前背包）
+                --- 检测并直接设置进度  (初始化)
+                local sid = task.taskcontentparams[2]
+                local lv = task.taskcontentparams[3]
+                okfun(
+                    { task.taskEnumType, sid, lv },
+                    _G.StorageManager:GetInstance():CheckCardLvCount({ lv = lv, sid = sid }),
+                    true
+                )
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CardUpStar.assignSidAssignStar] = function(task, okfun)
+                --- 指定SID卡牌升到N星（检测当前背包）
+                --- 检测并直接设置进度  (初始化)
+                local sid = task.taskcontentparams[2]
+                local star = task.taskcontentparams[3]
+                okfun(
+                    { task.taskEnumType, sid, star},
+                    require "IllustrationModel":GetInstance():GetCardMaxStar(sid),
+                    true
+                )
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Section.TzyLevel] = function(task, okfun)
+                ---贪字营等级达到X级
+                local lv = task.taskcontentparams[2]
+                local BountySystemManager = require("BountySystemManager"):GetInstance()
+                if BountySystemManager.BountyData and BountySystemManager.BountyData.level > 0 then
+                    okfun({ task.taskEnumType }, BountySystemManager.BountyData.level, true)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CharacterLevel.Level] = function(task, okfun)
+                -- 人物当前等级
+                local Maxlv = task.taskcontentparams[2]
+                local DQlv = _G.PlayerModel:GetInstance():GetLevel()
+                okfun({ task.taskEnumType }, DQlv, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CardLevel.assignCountAssignStar] = function(task, okfun)
+                local star = task.taskcontentparams[2]
+                local num = task.taskcontentparams[3]
+                okfun({ task.taskEnumType, star }, _G.StorageManager:GetInstance():CheckCardStarCount(star, num), true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CumulativeLogin.day] = function(task, okfun)
+                _G.PlayerModel:GetInstance():CumulativeLogin()
+
+                local star = task.taskcontentparams[2]
+                local num = _G.PlayerModel:GetInstance():DayCount()
+                okfun({ task.taskEnumType }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Equipment.assignGradeCount] = function(task, okfun)
+                local grade = task.taskcontentparams[2]
+                local num = require("EquipmentModel"):GetInstance():GetGradeTopCount(grade)
+                okfun({ task.taskEnumType, grade }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.ResonanceCrystal.upCardCount] = function(task, okfun)
+                -- local num = require("StoneModel"):GetInstance():GetAllGridCardNumber()
+                local num = 0
+                okfun({ task.taskEnumType }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.HellRoad.FinishTask] = function(task, okfun)
+                local num = require("HellRoadModel"):GetInstance():GetFinishCount()
+                okfun({ task.taskEnumType }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Guild.joinOrCreate] = function(task, okfun)
+                local num = require("SociatyManager"):GetInstance():HasSociaty() == true and 1 or 0
+                okfun({ task.taskEnumType }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Section.materialAssignLayer] = function(task, okfun)
+                local systemid = task.taskcontentparams[2]
+                local Index = task.taskcontentparams[3]
+                local curIndex = require("SystemMaterialController"):GetInstance():GetCurChallengeFloor(systemid)
+                if not require("SystemMaterialController"):GetInstance():CheckIsPass(systemid, curIndex) then
+                    curIndex = curIndex - 1
+                end
+                if curIndex >= Index then
+                    okfun({ task.taskEnumType, systemid, Index }, 1, true)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.ResonanceCrystal.UnlockGridsuccessful] = function(task, okfun)
+                -- local num = require("StoneModel"):GetInstance():GetJiesuoNumber()
+                local num = 0
+                local count = task.taskcontentparams[2]
+                okfun({ task.taskEnumType, count }, num, true)
+
+                if num >= count then
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Combine.count] = function(task, okfun)
+                local num = require("CombineModel"):GetInstance():GetActiveSkillCount()
+                okfun({ task.taskEnumType }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Combine.levelNum] = function(task, okfun)
+                local level = task.taskcontentparams[2]
+                local num = require("CombineModel"):GetInstance():GetNumByLevel(level)
+                okfun({ task.taskEnumType }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Embattle.EmbattleidSkillCount3] = function(task, okfun)
+                local EmbattleId = task.taskcontentparams[2]
+                local arr = require("EmbattleModel"):GetInstance():GetSkillIndex(EmbattleId)
+                if arr == nil then
+                    return
+                else
+                    local count = 0
+                    for i = 1, #arr do
+                        if arr[i] ~= 0 then
+                            count = count + 1
+                        end
+                    end
+                    okfun({ task.taskEnumType, EmbattleId, count }, 1, true)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.HellRoad.id] = function(task, okfun)
+                local id = require("HellRoadModel"):GetInstance():GetNowHellId()
+                local id2 = task.taskcontentparams[2]
+                if id >= id2 then
+                    okfun({ task.taskEnumType, id2 }, 1, true)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Section.SectionExplore100] = function(task, okfun)
+                local id = task.taskcontentparams[2]
+                local is100 = require("ChapterModel"):GetInstance():IsSectionExplore100(id)
+                if is100 then
+                    okfun({ task.taskEnumType, id }, 1, true)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Section.materialDifficulty] = function(task, okfun)
+                local id = task.taskcontentparams[2]
+                local difficulty = task.taskcontentparams[3]
+                local model = require("SystemMaterialController"):GetInstance():GetModel(id)
+                if model then
+                    local nowDifficulty = model:GetCurChallengeFloor()
+                    if nowDifficulty >= difficulty then
+                        okfun({ task.taskEnumType, id, nowDifficulty }, 1, true)
+                    end
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Train.chpaterSection] = function(task, okfun)
+                local chapter = task.taskcontentparams[2]
+                local section = task.taskcontentparams[3]
+                if section == 0 then
+                    ---检测是否章节通关
+                    local isPass = require("TrainingModel"):GetInstance():IsPass(chapter) == false
+                    if isPass then
+                        okfun({ task.taskEnumType, chapter, 0 }, 1, true)
+                    end
+                else
+                    ---检测是否关卡通关
+                    local isPass = require("TrainingModel"):GetInstance():IsPassChpter(section) == false
+                    if isPass then
+                        okfun({ task.taskEnumType, chapter, section }, 1, true)
+                    end
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.PlayerTree.BranchLv] = function(task, okfun)
+                local branch = task.taskcontentparams[2]
+                local lv = task.taskcontentparams[3]
+                local nowLv = 0
+                if branch == _G.PlayerTreeID.none then
+                    ---如果是任意池
+                    nowLv = require("PlayerTreeModel"):GetInstance():GetMaxLv(branch)
+                else
+                    nowLv = require("PlayerTreeModel"):GetInstance():GetLv(branch)
+                end
+                if nowLv and nowLv >= lv then
+                    nowLv = lv
+                end
+                okfun({ task.taskEnumType, branch, nowLv }, 1, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Equipment.DecorationSuit4Count] = function(task, okfun)
+                local storage = _G.StorageManager:GetInstance():GetDataStorageByID(_G.StorageID.Card)
+                local num = storage:GetSuit_count_noSame()
+                okfun({ task.taskEnumType }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Equipment.DecorationAllWearCount] = function(task, okfun)
+                local storage = _G.StorageManager:GetInstance():GetDataStorageByID(_G.StorageID.Card)
+                local num = storage:GetDecorationUseCount()
+                okfun({ task.taskEnumType }, num, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Campsite.upCardCount] = function(task, okfun)
+                local count = 0
+                local cid = tonumber(task.taskcontentparams[2])
+                local num = tonumber(task.taskcontentparams[3])
+
+                if cid == 0 then
+                    count = require("CampsiteModel"):GetInstance():GetSumCount()
+                    if count >= num then
+                        count = num
+                    end
+                    okfun({ task.taskEnumType, 0 }, count, true)
+                else
+                    count = require("CampsiteModel"):GetInstance():GetCount(cid)
+                    if count >= num then
+                        count = num
+                    end
+                    okfun({ task.taskEnumType, cid }, count, true)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Collection.UnlockNum] = function(task, okfun)
+                local count = require("CollectionModel"):GetInstance():GetActiveCount()
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CardResonance.FivePosLevel] = function(task, okfun)
+                local minLv = require("CardResonanceModel"):GetInstance():GetMinLevel()
+                local count = minLv >= task.taskcontentparams[2] and task.Cfg.count or minLv
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CardResonance.PosLevelNum] = function(task, okfun)
+                local num = require("CardResonanceModel"):GetInstance():CheckTargetLevelNum(task.taskcontentparams[3])
+                local count = num >= task.taskcontentparams[2] and task.Cfg.count or num
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            ---界限突破相关
+            [_G.ActiveTaskEnum.ConditionEnum.Artifact.LevelNum] = function(task, okfun)
+                ---X个神器达到Y级
+                local num = require("LimitBrokenModel"):GetInstance():GetArtifactLevelCount(task.taskcontentparams[3])
+                local count = num >= task.taskcontentparams[2] and task.Cfg.count or num
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Artifact.StarNum] = function(task, okfun)
+                ---X个神器达到Y星
+                local num = require("LimitBrokenModel"):GetInstance():GetArtifactStarCount(task.taskcontentparams[3])
+                local count = num >= task.taskcontentparams[2] and task.Cfg.count or num
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Artifact.AwakenNum] = function(task, okfun)
+                ---X个神器觉醒
+                local num = require("LimitBrokenModel"):GetInstance():GetArtifactAwakenCount()
+                local count = num >= task.taskcontentparams[2] and task.Cfg.count or num
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Artifact.SidLevel] = function(task, okfun)
+                ---指定神器达到x级
+                local sid = task.taskcontentparams[2]
+                local bol = require("LimitBrokenModel"):GetInstance():CheckAppointArtifactLevel(sid,
+                    task.taskcontentparams[3])
+                local count = bol and task.Cfg.count or 0
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Artifact.SidStar] = function(task, okfun)
+                ---指定神器达到x星
+                local sid = task.taskcontentparams[2]
+                local bol = require("LimitBrokenModel"):GetInstance():CheckAppointArtifactStar(sid,
+                    task.taskcontentparams[3])
+                local count = bol and task.Cfg.count or 0
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Artifact.SidAwaken] = function(task, okfun)
+                ---指定神器觉醒
+                local bol = require("LimitBrokenModel"):GetInstance():CheckAppointArtifactAwaken()
+                local count = bol and task.Cfg.count or 0
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CardTalent.LevelNum] = function(task, okfun)
+                ---X个英雄天赋达到Y级
+                local num = require("LimitBrokenModel"):GetInstance():GetCardTalentCount(task.taskcontentparams[3])
+                local count = num >= task.taskcontentparams[2] and task.Cfg.count or num
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.CardSoulLink.LevelNum] = function(task, okfun)
+                ---X个英雄魂链达到Y级
+                local num = require("LimitBrokenModel"):GetInstance():GetCardSoulLinkCount(task.taskcontentparams[3])
+                local count = num >= task.taskcontentparams[2] and task.Cfg.count or num
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Pet.PetStarNum] = function(task, okfun)
+                ---x品阶Y星灵兽达到z个
+                local order = task.taskcontentparams[2]
+                local star = task.taskcontentparams[3]
+                local num = task.taskcontentparams[4]
+
+                local allPetData = require("PetModel"):GetInstance():GetAllActivePets()
+                local totalNum = 0
+                for _, v in pairs(allPetData) do
+                    if v:GetOrder() == order and v:GetStar() >= star then
+                        totalNum = totalNum + 1
+
+                        if totalNum >= num then
+                            break
+                        end
+                    end
+                end
+
+                local count = totalNum >= num and task.Cfg.count or totalNum
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.SecretRealm.SecretRealmLayer] = function(task, okfun)
+                ---通过X层秘境
+                local sid = require("SecretRealmModel"):GetInstance():GetMaxSid()
+                local count = sid == 0 and 0 or _G.ConfigManager.secret_realm_cfg[sid].numb
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.SecretRealm.SecretRealmLayerType] = function(task, okfun)
+                ---通过指定类型X层秘境
+                local sid = require("SecretRealmModel"):GetInstance():GetMaxSid(task.taskcontentparams[2])
+                local count = sid == 0 and 0 or _G.ConfigManager.secret_realm_cfg[sid].numb
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Spiritual.LevelNum] = function(task, okfun)
+                ---同时拥有x个y星的彩色品质的饰品
+                local star = task.taskcontentparams[2]
+                local num = task.taskcontentparams[3]
+                local totalNum = 0
+
+                ---@type table<number, SpiritualData>
+                local allSpiritual = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual)
+                if allSpiritual then
+                    for _, v in pairs(allSpiritual) do
+                        if v:GetStar() >= star and v.cfg.Order == 4 then
+                            totalNum = totalNum + 1
+                            if totalNum >= num then
+                                break
+                            end
+                        end
+                    end
+                end
+
+                local count = totalNum >= num and task.Cfg.count or totalNum
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceStarNum] = function(task, okfun)
+                ---拥有X个达到Z种族#品质Y星的角色
+                local race = task.taskcontentparams[2]
+                local order = task.taskcontentparams[3]
+                local star = task.taskcontentparams[4]
+                local num = task.taskcontentparams[5]
+                local totalNum = 0
+
+                ---@type table<number, CardData>
+                local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+                if allCards then
+                    for _, v in pairs(allCards) do
+                        if require "CardInfoManager":GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, race) and v.cfg.Order >= order and v:GetStar() >= star then
+                            totalNum = totalNum + 1
+                            if totalNum >= num then
+                                break
+                            end
+                        end
+                    end
+                end
+
+                local count = totalNum >= num and task.Cfg.count or totalNum
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceAwakeNum] = function(task, okfun)
+                ---拥有X个Z种族#品质觉醒等级达到Y的角色
+                local race = task.taskcontentparams[2]
+                local order = task.taskcontentparams[3]
+                local awake = task.taskcontentparams[4]
+                local num = task.taskcontentparams[5]
+                local totalNum = 0
+
+                ---@type table<number, CardData>
+                local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+                if allCards then
+                    for _, v in pairs(allCards) do
+                        local count = require("CardPotentialModel"):GetInstance():GetIndexBySid(v:GetPotential())
+                        if require "CardInfoManager":GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, race) and v.cfg.Order >= order and count >= awake then
+                            totalNum = totalNum + 1
+                            if totalNum >= num then
+                                break
+                            end
+                        end
+                    end
+                end
+
+                local count = totalNum >= num and task.Cfg.count or totalNum
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceCurMaxStar] = function(task, okfun)
+                ---X种族#品质角色总星级达到Y
+                local race = task.taskcontentparams[2]
+                local order = task.taskcontentparams[3]
+                local star = task.taskcontentparams[4]
+
+                local allstar = {}
+
+                ---@type table<number, CardData>
+                local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+                if allCards then
+                    for _, v in pairs(allCards) do
+                        local sid = v.sid
+                        if require "CardInfoManager":GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, race) and v.cfg.Order >= order then
+                            if nil == allstar[sid] then
+                                allstar[sid] = v:GetStar()
+                            elseif allstar[sid] < v:GetStar() then
+                                allstar[sid] = v:GetStar()
+                            end
+                        end
+                    end
+                end
+
+                local totalNum = 0
+                for k, v in pairs(allstar) do
+                    totalNum = totalNum + v
+                end
+                local count = totalNum >= star and task.Cfg.count or totalNum
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceAwakeMaxLevel] = function(task, okfun)
+                ---X种族#品质角色总觉醒等级达到Y
+                local race = task.taskcontentparams[2]
+                local order = task.taskcontentparams[3]
+                local awake = task.taskcontentparams[4]
+                local allpotential = {}
+
+                ---@type table<number, CardData>
+                local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+                if allCards then
+                    for _, v in pairs(allCards) do
+                        if require "CardInfoManager":GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, race) and v.cfg.Order >= order then
+                            local count = require("CardPotentialModel"):GetInstance():GetIndexBySid(v:GetPotential())
+                            if nil == allpotential[v.cfg.id] then
+                                allpotential[v.cfg.id] = count
+                            elseif allpotential[v.cfg.id] < count then
+                                allpotential[v.cfg.id] = count
+                            end
+                        end
+                    end
+                end
+                local totalNum = 0
+                for k, v in pairs(allpotential) do
+                    totalNum = totalNum + v
+                end
+
+                local count = totalNum >= awake and task.Cfg.count or totalNum
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.DungeonChallenge.PassChapterNum] = function(task, okfun)
+                local chapter = task.taskcontentparams[2]
+                --LogError(require "DungeonChallengeModel":GetInstance().max_chapter)
+                local count = require "DungeonChallengeBattleModel":GetInstance():GetLevelID()
+                -- LogError(count)
+                okfun({ task.taskEnumType }, chapter <= count and 1 or 0, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.DungeonChallenge.LightSomeEquip] = function(task, okfun)
+                local type = task.taskcontentparams[2]
+                local num = task.taskcontentparams[3]
+                local list = require "DungeonChallengeIllustrationModel":GetInstance():CheckNumByType(type)
+
+                local count = (list and #list > num) and task.Cfg.count or #list
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.ActivityTour.CorrectGuessWinCount] = function(task, okfun)
+                local type = task.taskcontentparams[1]
+                local num = task.taskcontentparams[2]
+                local model = require("ActivityTournamentModel"):GetInstance()
+                if model.GuessData and model.GuessData.guess_role then
+                   model:GetGuessWinCount(function(winCount)
+                       local count = (winCount > num) and task.Cfg.count or winCount
+                       okfun({ task.taskEnumType }, count, true)
+                   end)
+                end
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.ActivityTour.CumulativeSpeechDay] = function(task, okfun)
+                local type = task.taskcontentparams[1]
+                local num = task.taskcontentparams[2]
+                local model = require("ActivityTournamentModel"):GetInstance()
+                local dayCount = 0
+                if model.StageData and model.StageData.eliminate_info and model.StageData.eliminate_info.chat_day then
+                    dayCount = model.StageData.eliminate_info.chat_day
+                elseif model.StageData and model.StageData.champion_info and model.StageData.champion_info.chat_day then
+                    dayCount = model.StageData.champion_info.chat_day
+                end
+                local count = (dayCount > num) and task.Cfg.count or dayCount
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Beast.BeastStar] = function(task, okfun)
+                local sid = task.taskcontentparams[2]
+                local star = task.taskcontentparams[3]
+                local model = require("BeastModel"):GetInstance()
+                local beastStar = model:GetBeast(sid).star
+                local count = (beastStar > star) and star or beastStar
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Beast.BeastQualityStarNum] = function(task, okfun)
+                local order = task.taskcontentparams[2]
+                local star = task.taskcontentparams[3]
+                local num = task.taskcontentparams[4]
+                local model = require("BeastModel"):GetInstance()
+                local beastCount = 0
+                for _, v in pairs(model:GetAllActiveBeasts()) do
+                    if v:GetOrder() == order then
+                        if v:GetStar() >= star then 
+                            beastCount = beastCount + 1
+                        end
+                    end
+                end
+                local count = (beastCount > num) and num or beastCount
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Gemstone.HasGemWithGradeHistory] = function(task, okfun)
+                --- 同时拥有x个y品质或以上的宝石
+                local star = task.taskcontentparams[2]
+                local num = task.taskcontentparams[3]
+                local totalNum = 0
+                local gemList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Gemstone)
+                if gemList then
+                    for _, gem in pairs(gemList) do
+                        if gem:GetStar() >= star then
+                            totalNum = totalNum + 1
+                        end
+                    end
+                end
+                local count = (totalNum > num) and task.Cfg.count or totalNum
+                okfun({ task.taskEnumType }, count, true)
+            end,
+            [_G.ActiveTaskEnum.ConditionEnum.Gemstone.HasGemWithLevelHistory] = function(task, okfun)
+                --- 同时拥有x个y等级或以上的宝石
+                local level = task.taskcontentparams[2]
+                local num = task.taskcontentparams[3]
+                local totalNum = 0
+                local gemList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Gemstone)
+                if gemList then
+                    for _, gem in pairs(gemList) do
+                        if gem:GetLevel() >= level then
+                            totalNum = totalNum + 1
+                        end
+                    end
+                end
+                local count = (totalNum > num) and task.Cfg.count or totalNum
+                okfun({ task.taskEnumType }, count, true)
+            end,
+        }
+    end
+
+    ---任务枚举 ID
+    -- task.taskEnumType
+    ---任务参数
+    -- task.taskcontentparams
+    local fun = taskEnumTypeFunDic[task.taskEnumType]
+    if fun ~= nil then
+        fun(task, okfun)
+    end
+end
+
+---标记任务完成
+---@param Data table 七日目标天Data.dayid   手册idData.manualId
+function TaskManager.MarkTask(eMarkTaskType, taskid, Data, task)
+    local pbData = TaskManager.MarkTaskGetpPbData(eMarkTaskType, taskid, Data)
+    if pbData == nil then
+        return
+    end
+    require("AchieveTipManager"):GetInstance():Show(taskid)
+    if eMarkTaskType == _G.MarkTaskType.Achieve then
+        ----@type achieve.c2s_achieve_finish
+        require("TaskNet"):GetInstance():MarkFinishAchieve(pbData)
+    elseif eMarkTaskType == _G.MarkTaskType.WarTechnology then
+        if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.WarTechnology) then
+            require("WarTechnologyNet"):GetInstance():FinishTask(pbData)
+        end
+    else
+        pbData.finish_type = 1
+
+        if eMarkTaskType == _G.MarkTaskType.Daily then
+            -- -@type task.c2s_task_batch_finish
+            require("TaskNet"):GetInstance():DailyTask_Finish(pbData)
+        elseif eMarkTaskType == _G.MarkTaskType.Goals then
+            -- -@type task_goals.c2s_task_goals_finish
+            --require("ActionGoalsNet"):GetInstance():SendTaskOneFinish(pbData)
+            require "ActionGoalsModel":GetInstance():SendTaskFinshSign(pbData, task)
+        elseif eMarkTaskType == _G.MarkTaskType.Keynote then
+            -- -@type task_goals.c2s_task_goals_finish
+            --require("ActionGoalsNet"):GetInstance():SendTaskOneFinish(pbData)
+            require "ActionKeynoteModel":GetInstance():SendTaskFinshSign(pbData, task)
+        elseif eMarkTaskType == _G.MarkTaskType.Hell then
+            -- -@type task.c2s_task_finish
+            require("HellRoadNet"):GetInstance():FinishTask(pbData)
+        elseif eMarkTaskType == _G.MarkTaskType.Manual then
+            -- -@type handbook.c2s_handbook_finish
+            require("ManualNet"):GetInstance():Finish(pbData)
+        elseif eMarkTaskType == _G.MarkTaskType.TaskMain then
+            require("TaskNet"):GetInstance():Finish(pbData)
+        elseif eMarkTaskType == _G.MarkTaskType.TaskSection then
+            require("TaskNet"):GetInstance():FinishSectionTaskSides(pbData)
+        elseif eMarkTaskType == _G.MarkTaskType.TaskSides then
+            require("TaskNet"):GetInstance():FinishTaskSides(pbData)
+        elseif eMarkTaskType == _G.MarkTaskType.SeasonBoss then
+            require("SeasonNet"):GetInstance():FinishBossTask(pbData)
+        elseif eMarkTaskType == _G.MarkTaskType.ActiveSeverMerge then
+            require("ActiveSeverMergeModel"):GetInstance():SendTaskFinshSign(pbData)
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log("", "<color=red>" .. "类型无效" .. "</color>")
+            end
+            return
+        end
+    end
+end
+
+---标记任务完成 获取pbData
+---@param Data table 七日目标天Data.dayid   手册idData.manualId
+function TaskManager.MarkTaskGetpPbData(eMarkTaskType, taskid, Data)
+    if Data == nil then
+        if _G.AppSetting.DEBUG then
+            _G.Log("", "<color=red>" .. "参数错误" .. "</color>")
+        end
+        return
+    end
+
+    if eMarkTaskType == _G.MarkTaskType.Achieve then
+        ---@type achieve.c2s_achieve_finish
+        local pbdata = {}
+        pbdata.sids = { taskid }
+        return pbdata
+    else
+        if eMarkTaskType == _G.MarkTaskType.Daily then
+            ---@type task.c2s_task_batch_finish
+            local pbdata = {}
+            pbdata.sid = { taskid }
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.Goals then
+            if Data == nil or Data.dayid == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("", "<color=red>" .. "参数无效" .. "</color>")
+                end
+                return
+            end
+            ---@type task_goals.c2s_task_goals_finish
+            local pbdata = {}
+            local T = { day = Data.dayid, sid = { taskid } }
+            pbdata.task = { T }
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.Keynote then
+            if Data == nil or Data.dayid == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("", "<color=red>" .. "参数无效" .. "</color>")
+                end
+                return
+            end
+            ---@type task_keynote.c2s_task_keynote_finish
+            local pbdata = {}
+            pbdata.day = Data.dayid
+            pbdata.sid = taskid
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.Hell then
+            ---@type task.c2s_task_finish
+            local pbdata = {}
+            pbdata.sid = taskid
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.Manual then
+            if Data == nil or Data.manualId == nil then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("", "<color=red>" .. "参数无效" .. "</color>")
+                end
+                return
+            end
+            ---@type handbook.c2s_handbook_finish
+            local pbdata = {}
+            pbdata.t_sid = { taskid }
+            pbdata.sid = Data.manualId
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.TaskMain then
+            ---@type task.c2s_task_finish
+            local pbdata = {}
+            pbdata.sid = taskid
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.TaskSection then
+            ---@type task.c2s_task_finish
+            local pbdata = {}
+            pbdata.sid = taskid
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.TaskSides then
+            ---@type task.c2s_task_finish
+            local pbdata = {}
+            pbdata.sid = taskid
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.ActiveSeverMerge then
+            local pbdata = {}
+            local T = { day = Data.dayid, sid = { taskid } }
+            pbdata.task = { T }
+            return pbdata
+        elseif eMarkTaskType == _G.MarkTaskType.WarTechnology then
+            ---@type task.c2s_task_finish
+            local pbdata = {}
+            pbdata.sids = { taskid }
+            return pbdata
+        else
+            if _G.AppSetting.DEBUG then
+                _G.Log("", "<color=red>" .. "类型无效" .. "</color>")
+            end
+            return
+        end
+    end
+end
+
+---销毁对象时,析构函数
+function TaskManager:Dispose()
+    self.finish_task = nil
+    self.MainTaskdata = nil
+end
+
+return TaskManager

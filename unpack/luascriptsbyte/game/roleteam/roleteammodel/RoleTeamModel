@@ -1,0 +1,336 @@
+-------------------------------------------------------------------------
+-- D:.Game.Client.Assets.Resources.LuaScripts.Game.RoleTeam.RoleTeamModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/07/16
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local RoleTeamNet = require "RoleTeamNet"
+local RoleTeamItemData = require "RoleTeamItemData"
+---@class RoleTeamModel : Singleton	中文描述
+local RoleTeamModel = _G.BaseClass("RoleTeamModel", _G.GameDataModelBase)
+_G.RoleTeamModel = RoleTeamModel
+
+local CS = _G.CS
+local typeof = _G.typeof
+
+---@return RoleTeamModel RoleTeamModel
+function RoleTeamModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+local awardstateEnum = {
+    none = 0, -- 正常
+    receive = 1, -- 可以领取
+    already_receive = 2 -- 已领取
+}
+---创建对象时,入口构造函数
+---@param roleteamAll table 全部队伍
+---@param roleteamAwardSids table 获取的奖励信息
+function RoleTeamModel:__init()
+    self.endCallback = nil
+    self.curFunctionOpenID = 0
+    self.roleteamAll = {}
+    self.roleteamAwardSids = {}
+    self:InitTeamAllInfo()
+end
+
+---销毁对象时,析构函数
+function RoleTeamModel:Dispose()
+    self.roleteamAll = nil
+    self.roleteamAwardSids = nil
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eTeam.TeamYulan, self.SetShenshiHexinHeadUI, self)
+end
+
+function RoleTeamModel:GetDataFormServer()
+    RoleTeamNet:GetInstance():GetAllRoleTeamRewardInfos(_G.handler(self, self.ParseData))
+end
+function RoleTeamModel:ParseData(msg)
+    self.msg = msg
+    self.super.ParseData(self)
+end
+function RoleTeamModel:InitFunction()
+    self:InitTeamAllInfo()
+    if _G.table.isEmptyOrNil(self.msg) then
+        _G.FloatTipsModel:GetInstance():Show("获取信息为空")
+    else
+        self.roleteamAwardSids = self.msg.sid or {}
+    end
+    for i = 1, #self.roleteamAll do
+        local team = self.roleteamAll[i]
+        self:IniteTeamInfo(team)
+    end
+    _G.Events:GetInstance():AddListener(_G.eTeam.TeamYulan, self.SetShenshiHexinHeadUI, self)
+end
+
+--region 对外接口
+--增加，删除卡牌  增加或删除的uid 数组 key ->uid ,value -> sid
+function RoleTeamModel:AddOrRemove(add, remove)
+    if self.timer then
+        return
+    end
+    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateAllTeamInfo, self, true, true, true)
+    self.timer:Start()
+end
+---更新所有阵容推荐
+function RoleTeamModel:UpdateAllTeamInfo()
+    for i = 1, #self.roleteamAll do
+        local team = self.roleteamAll[i]
+        self:IniteTeamInfo(team)
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.TeamShowreward.id)
+    self.timer = nil
+end
+---解锁合击技
+function RoleTeamModel:UnlockCombine(combid)
+    local flag = false
+    for i = 1, #self.roleteamAll do
+        flag = false
+        local team = {}
+        local combo = self.roleteamAll[i].combo
+        for j = 1, #combo do
+            if combo[j].combosid == combid then
+                flag = true
+                break
+            end
+        end
+        if flag then
+            team = self.roleteamAll[i]
+            self:IniteTeamInfo(team)
+        end
+    end
+end
+--endregin
+
+--region 初始化队伍信息
+function RoleTeamModel:InitTeamAllInfo()
+    local cfg = _G.ConfigManager.team_show_cfg
+    for i = 1, #cfg do
+        local teamdata = RoleTeamItemData.New()
+        local msg = {}
+        msg.sid = cfg[i].id
+        teamdata:ParseInitMsg(msg)
+        if self.roleteamAll[i] == nil then
+            self.roleteamAll[i] = {}
+        end
+        self.roleteamAll[i] = teamdata
+    end
+end
+---初始化队伍信息(是否存在卡牌)
+function RoleTeamModel:IniteTeamInfo(team)
+    local count = 0
+    local team_cards_infos = team.teamAllCardsinfos
+    for i = 1, #team_cards_infos do
+        local flag, card = self:CheckCardStorae(team_cards_infos[i].sid)
+        team_cards_infos[i].card = card
+        team_cards_infos[i].flag = flag
+        if flag then
+            --team_cards_infos[i].flag = true
+            count = count + 1
+            if count >= #team_cards_infos then
+                team:SetTeamRewardState(1)
+                team:SetTeamAllCardsState(0)
+            else
+                team:SetTeamRewardState(0)
+                team:SetTeamAllCardsState(1)
+            end
+        else
+            team:SetTeamRewardState(0)
+            team:SetTeamAllCardsState(1)
+        end
+    end
+    --设置奖励状态
+    if _G.table.isEmptyOrNil(self.roleteamAwardSids) then
+    else
+        for i = 1, #self.roleteamAwardSids do
+            if self.roleteamAwardSids[i] == team.sid then
+                team:SetTeamRewardState(2)
+            end
+        end
+    end
+    --设置合击技
+    local comboAll = team.combo
+    count = 0
+    for i = 1, #comboAll do
+        local flag1 = self:CheckCombosid(comboAll[i].combosid)
+        if flag1 then
+            comboAll[i].flag = true
+            count = count + 1
+            if count >= 3 then
+                team:SetTeamAllCombos(0)
+            else
+                team:SetTeamAllCombos(1)
+            end
+        end
+    end
+end
+--endregin
+
+--region 检测方法
+---检测卡牌仓库是否已经存在卡牌
+---@param uid number 卡牌sid
+function RoleTeamModel:CheckCardStorae(sid)
+    local cards = _G.StorageManager:GetInstance():GetDatasBySid(_G.StorageID.Card, sid)
+    if cards then
+        cards = _G.table.toArray(cards)
+        --移除临时助战卡
+        for i = #cards, 1, -1 do
+            if cards[i].type ~= _G.CardType.Normal then
+                table.remove(cards, i)
+            end
+        end
+    end
+
+    local EmbattleModel = require "EmbattleModel":GetInstance()
+    if not _G.table.isEmptyOrNil(cards) then
+        ---@param data CardData
+        _G.SortList(
+            cards,
+            function(data)
+                local index = 1
+                if EmbattleModel:CheckHeroEmbattle(data.uid) then
+                    index = 2
+                end
+                return index, data.power, data.Grade, data.star, data:GetLevel(), data.uid
+            end
+        )
+        return true, cards[1]
+    end
+
+    if not _G.ConfigManager.card_cfg[sid] then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("card_cfg表中没有找到配置，sid: " .. sid)
+        end
+        return false, nil
+    end
+
+    local card = _G.CardData.New()
+    local msg = {}
+    msg.sid = sid
+    card:ParseInitMsg(msg)
+    return false, card
+end
+function RoleTeamModel:CheckCombosid(combosid)
+    local falg = false
+    falg = require "CombineModel":GetInstance():GetIsActive(combosid)
+    return falg
+end
+--endregin
+
+--region 服务交换信息
+--获取角色队伍奖励
+function RoleTeamModel:GetTeamAwards(sid, call)
+    local msg = {}
+    msg.sid = sid
+    RoleTeamNet:GetInstance():GetTeamAwardInfo(msg, _G.handlerbind(self, self.GetTeamAwardsSuc, sid, call))
+end
+---处理，获取角色推荐奖励信息
+function RoleTeamModel:GetTeamAwardsSuc(data, sid, call)
+    if data.ack ~= 1 then
+        return
+    end
+    local index = #self.roleteamAwardSids + 1
+    self.roleteamAwardSids[index] = sid
+    self.roleteamAll[sid]:SetTeamRewardState(2)
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.TeamShowreward.id)
+    if call then
+        call(sid)
+    end
+end
+--复制阵容操作
+---@param type number 0 = 没有 ，1= 有  合击技
+function RoleTeamModel:CopyTeam(teamid)
+    local embattleSkillData = require "EmbattleModel":GetInstance():GetSkillIndex(_G.EmbattleType.AFKOnly)
+    local skills = {
+        [1] = 0,
+        [2] = 0,
+        [3] = 0
+    }
+    local combo = self.roleteamAll[teamid].combo
+    local count = 0
+    for i = 1, #combo do
+        if combo[i].flag then
+            count = count + 1
+            skills[i] = combo[i].combosid
+        end
+    end
+    if count > 0 then
+        require "EmbattleModel":GetInstance():SetSkillIndex(_G.EmbattleType.AFKOnly, skills)
+    end
+    --复制卡牌数据
+    local afkembattleData = require "EmbattleModel":GetInstance():GetEmbattleData(_G.EmbattleType.AFKOnly)
+    local data = self:CopyCheckStorage(self.roleteamAll[teamid], afkembattleData)
+    require "EmbattleModel":GetInstance():SaveEmbattleDataNew(
+        _G.EmbattleType.AFKOnly,
+        function(msg)
+            if msg == 0 then
+                _G.PopWindowManager:GetInstance():ShowAllTips(320117)
+            --_G.FloatTipsModel:GetInstance():Show("复制阵容成功")
+            end
+        end,
+        0,
+        true,
+        data
+    )
+end
+function RoleTeamModel:CopyCheckStorage(team, afkembattleData)
+    local storage = _G.StorageManager:GetInstance():GetCardDataSortList()
+    local sids = team.cfg[team.sid].team_role
+    local sid_cards = {}
+    for i = 1, 5 do
+        local sid = sids[i]
+        if sid_cards[i] == nil then
+            sid_cards[i] = {}
+        end
+        for j = 1, #storage do
+            if storage[j].sid == sid then
+                _G.table.insert(sid_cards[i], storage[j])
+            end
+        end
+    end
+    local uids = {0, 0, 0, 0, 0}
+    for i = 1, #sid_cards do
+        SortList(
+            sid_cards[i],
+            function(car)
+                local num = 9
+                for i = 1, #afkembattleData do
+                    if car.uid == afkembattleData[i] then
+                        num = 10
+                        break
+                    end
+                end
+                --是否在 布阵中
+                --排列规则：按照已上阵>角色当前战力（降序）>角色当前品质（降序）>角色当前星级（降序）>角色当前等级（降序）>角色Uid（升序）；
+                return num, car:GetPower(), car.Grade, car.star, car:GetLevel(), car.uid
+            end
+        )
+        uids[i] = sid_cards[i][1].uid
+    end
+    return uids
+end
+function RoleTeamModel:SetShenshiHexinHeadUI()
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.RoleTeamView.Name)
+    if window then
+        _G.MainManager:GetInstance():OpenMainViewToggle("card")
+        window.View:Show()
+    end
+end
+
+function RoleTeamModel:CheckRedpoint(param)
+    local teamsid = param
+    if self.roleteamAll[teamsid] == nil then
+        return false
+    end
+    local team = self.roleteamAll[teamsid]
+    if team.teamRewardState == 1 then
+        return true
+    end
+    return false
+end
+--endregin
+return RoleTeamModel

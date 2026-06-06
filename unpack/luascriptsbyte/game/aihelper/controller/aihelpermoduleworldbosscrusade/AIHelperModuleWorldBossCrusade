@@ -1,0 +1,190 @@
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleWorldBossCrusade : AIHelperModuleBaseNumberMock	    @AI助手-雪王来袭
+---@field index number                  @已执行次数
+---@field count number                  @剩余挑战次数
+local AIHelperModuleWorldBossCrusade = _G.BaseClass("AIHelperModuleWorldBossCrusade", base)
+
+---是否显示此模块(功能是否开启)
+function AIHelperModuleWorldBossCrusade:IsEnabled()
+    if not base.IsEnabled(self) then
+        return false
+    end
+    return true
+end
+
+---是否满足模块使用条件
+function AIHelperModuleWorldBossCrusade:IsActive()
+    return self.index <= self.number and self.count > 0
+end
+
+---重置状态
+function AIHelperModuleWorldBossCrusade:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.count = 1
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleWorldBossCrusade:Check(callback)
+    self.index = 1
+    self.count = 0
+
+    --检查boss是否已锁定或是否为休战期
+    local model = require("WorldBossModel"):GetInstance()
+    local manager = require("WorldBossManager"):GetInstance()
+    if model:GetBossData(1) and not model:GetBossData(1).isLock and not manager:CheckIsStop() then
+        self.count = model:GetCrusadeNum()
+    end
+
+    if callback then
+        callback(true)
+    end
+end
+
+---获取当前执行状态
+function AIHelperModuleWorldBossCrusade:GetExecuteState()
+    return {
+        total = self.number,
+        index = self.index
+    }
+end
+
+---执行逻辑
+function AIHelperModuleWorldBossCrusade:Execute(callback)
+    self.index = self.index + 1
+    self.count = self.count - 1
+
+    ---检测是否正在战斗中
+    if _G.MainManager:GetInstance():IsFighting(false) then
+        if callback then
+            callback(false, self:CreateFailureResults(90028010143, _G.GetLangPackValue(self.cfg.name)))
+        end
+        return
+    end
+    
+    ---@type WorldBossModel
+    local model = require("WorldBossModel"):GetInstance()
+    ---@type WorldBossManager
+    local manager = require("WorldBossManager"):GetInstance()
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+
+    local function response(success, results)
+        if not callback then
+            return
+        end
+        callback(success, results)
+    end
+
+    --检测布阵是否为空
+    local embattleIds = model:GetEmbattleSid()
+    if not embattleIds or #embattleIds == 0 then
+        response(false, self:CreateFailureResults(self.cfg.fail_tip))
+        return
+    end
+    for _, embattleId in pairs(embattleIds) do
+        if not embattleModel:CheckBattle(embattleId) then
+            response(false, self:CreateFailureResults(self.cfg.fail_tip))
+            return
+        end
+    end
+
+    --发起战斗结算
+    ---@param data any 结算数据
+    local function fightResult(data)
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            data,
+            function(msg)
+                if msg.md5_error == "1" then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                elseif msg.md5_error == "2" then
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                end
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+                --获取奖励
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+                --缓存数据
+                msg.lastMaxDps = model.wordData and model.wordData.score or 0
+                manager:FightWin(msg.atk_dps)
+
+                response(true, msg)
+            end
+        )
+    end
+    --发起战斗请求
+    local function fightBegine()
+        local tb = model:GetEmbattleSid()
+        require("WorldBossNet"):GetInstance():FightCrusadeFight(
+            { gids = tb },
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+
+                --计算战斗结果
+                -- _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+                -- local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+                -- if not record or not record.result then
+                --     response(false, nil)
+                --     return
+                -- end
+                local tab = nil
+                --发起战斗结算
+                fightResult(tab)
+            end
+        )
+    end
+
+    --更新布阵阵容
+    embattleModel:SaveEmbattleDataTable(
+        embattleIds,
+        function(respCode)
+            if respCode ~= 0 then
+                response(false, nil)
+                return
+            end
+            fightBegine()
+        end,
+        nil,
+        _G.EmbattleSaveType.server
+    )
+end
+
+---显示执行状态
+function AIHelperModuleWorldBossCrusade:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    if results and results.atk_dps then
+        item.aortext_tip.text = _G.GetLangPackValue(90029400153) .. _G.UIUtils.NumberToUnitStr(results.atk_dps)
+        if results.lastMaxDps and results.atk_dps > results.lastMaxDps then
+            item.obj_tipNew:SetActiveE(1)
+        end
+    else
+        item.aortext_tip.text = ""
+    end
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleWorldBossCrusade:ShowExecuteResult(item, success, results)
+    if results and (results.award or results.tip) then
+        base.ShowExecuteResult(self, item, success, results)
+    else
+        base.ShowExecuteResult(self, item, success, nil)
+    end
+    self.Util.ShowAwardListOfMsg(item, results)
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleWorldBossCrusade:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+return AIHelperModuleWorldBossCrusade

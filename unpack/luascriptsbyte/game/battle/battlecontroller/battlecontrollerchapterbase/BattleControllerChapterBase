@@ -1,0 +1,359 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Battle.BattleController.BattleControllerChapterBase(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/08/06
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local BattleControllerBase = require "BattleControllerBase"
+---@class BattleControllerChapterBase	中文描述
+local BattleControllerChapterBase = _G.BaseClass("BattleControllerChapterBase", BattleControllerBase)
+
+local replayFightCallback = nil
+
+---类的构造函数
+function BattleControllerChapterBase:__init()
+    self.fightCallback = nil
+    self.monsterGroupID = 0
+    self.objectWorldSid = 0
+    self.storyCardList = nil
+end
+
+---类的析构函数
+function BattleControllerChapterBase:Dispose()
+    self.fightCallback = nil
+    self.monsterGroupID = nil
+    self.mgCfg = nil
+    self.storyCardList = nil
+    self.objectWorldSid = 0
+end
+
+---处理传参
+---@param ... table 动态参数
+function BattleControllerChapterBase:HandleParams(...)
+    replayFightCallback = nil
+    self:OnHandleParams(...)
+end
+
+---处理参数
+---@param callback function 战斗返回
+function BattleControllerChapterBase:OnHandleParams(callback)
+    self.fightCallback = callback
+    self:OpenEmbattle()
+end
+-----检测是否可以进入战斗
+---@param callback function 检测后的回调(参数bool)
+function BattleControllerChapterBase:CheckFight(callback)
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        self.onCheckCall = callback
+        local port =
+            require("BattleNet"):GetInstance():NpcPVEFight(self:GetMsgData(), _G.handler(self, self.OnNpcPVEFightCall))
+        _G.BattleManager:GetInstance():AddLuaNetEvent(port)
+    else
+        self.mgCfg = _G.ConfigManager.monster_group_cfg[self.monsterGroupID]
+        _G.BattleManager:GetInstance():AddLuaNetMsg(self.monsterGroupID)
+        callback(true)
+    end
+end
+function BattleControllerChapterBase:OnNpcPVEFightCall(msg, error)
+    if not _G.string.IsNullOrEmpty(error) or msg.ack ~= 1 then
+        self.onCheckCall(false, msg.ack)
+    else
+        self.mgCfg = _G.ConfigManager.monster_group_cfg[msg.fight_arg.sid]
+        self.onCheckCall(true)
+    end
+end
+---战斗验证不通过
+---@param msg string 错误信息
+function BattleControllerChapterBase:OnCheckFail(msg)
+    BattleControllerBase.OnCheckFail(self)
+
+    if _G.AppSetting.DEBUG then
+        _G.LogError("无法进入战斗 error=", "BattleControllerChapterBase:OnCheckFail")
+    end
+end
+local SpeedFunctionOpenID = 30
+local AutoFightFunctionOpenID = 31
+---加载战斗(协程加载)
+function BattleControllerChapterBase:OnLoadFight()
+    local uiManager = _G.UIManager:GetInstance()
+    --调整相机参数
+    local visualCam =
+        _G.WorldManager:GetInstance():GetCurWorld().WorldSetting.SceneCamera:GetComponentE(
+        _G.typeof(_G.CS.FrameWork.Graphic.VisualCamera)
+    )
+    self.curLerpTime = visualCam.Interpolation
+    visualCam.Interpolation = 0
+    --处理其他界面
+    uiManager:CloseWindowsByLayer(_G.UILayers.NormalLayer, _G.UILayers.InfoLayer)
+    local view = uiManager:OpenWindow(_G.ConfigManager.ui_cfg.BattleView.Name).View
+    while (_G.IsNil(view.gameObject)) do
+        _G.coroutine.waitforendofframe()
+    end
+    uiManager:HideWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    self:LoadOther()
+    _G.WorldManager:GetInstance():GetCurWorld():ShowOrHideAllItem(false)
+    local battleManager = _G.BattleManager:GetInstance()
+    battleManager:initAttackSids(self:GetEmbattleSids(), _G.EBattleType.NormalBattle, self:CheckSceneLoad())
+    -- 协程等待
+    while battleManager.Progress < 1 do
+        _G.coroutine.waitforendofframe()
+    end
+    local FunctionManagerIns = _G.FunctionManager:GetInstance()
+    if _G.AppSetting.IsAlipay then
+        local conditions = _G.ConfigManager.discrete_cfg[126101]
+        view:SetSpeedBtnActive(_G.GlobalConditionManager.CheckCondition(conditions[1][2],conditions[1][3]))
+    else
+        view:SetSpeedBtnActive(FunctionManagerIns:CheckFunctionIsUnlock(SpeedFunctionOpenID))
+    end
+    view:SetAutoBtnActive(FunctionManagerIns:CheckFunctionIsUnlock(AutoFightFunctionOpenID))
+    local createPlayer = _G.PlayerModel:GetInstance():CheckCreateRole()
+    view:SetSettingBtnActive(createPlayer)
+    view:SetSpeedBtnShow(createPlayer)
+    _G.coroutine.waitforendofframe()
+    view:SetCanvasGroupTrue()
+end
+---战斗开始
+function BattleControllerChapterBase:OnStart()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    _G.BattleManager:GetInstance():SetBattleStart()
+    _G.BattleManager:GetInstance():ShowBattleTeam()
+    if self:CheckSceneLoad() then
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(false)
+    end
+end
+
+---战斗结束，死亡动画播放之前
+function BattleControllerChapterBase:OnFightOverBeforePlayDeathAni(tab, call)
+    self.resultData = nil
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            tab,
+            function(_data, error)
+                if _G.string.IsNullOrEmpty(error) and _data.ack == 1 then
+                    if _data.md5_error == "1" then
+                        _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                        _G.BattleManager:GetInstance():SaveLogNew()
+                    elseif _data.md5_error == "2" then
+                        _G.BattleManager:GetInstance():SaveLogNew()
+                    end
+                    self.resultData = _data
+                    self.resultData.winner = self.resultData.winner[1]
+                    local ChapterRoomManagerIns = _G.ChapterRoomManager:GetInstance()
+                    local StorageManagerIns = _G.StorageManager:GetInstance()
+                    StorageManagerIns:ReceiveAwardData(self.resultData)
+                    if self.resultData.award and (self.resultData.award.item or self.resultData.award.overflow) then
+                        ChapterRoomManagerIns:SaveSettlementAward(StorageManagerIns:MergeAward(self.resultData))
+                    end
+                    if self.resultData.other_award then
+                        ChapterRoomManagerIns:SetCurEnemyBoxAward(self.resultData.other_award)
+                    end
+                    ChapterRoomManagerIns:SetCardBaseData(self.resultData.cards, true)
+                    call()
+                end
+            end
+        )
+    else
+        self.resultData = {
+            winner = tab.winner[1],
+            star = {1, 1, 1},
+            award = nil
+        }
+        call()
+    end
+end
+
+---战斗退出
+function BattleControllerChapterBase:OnSettlementEnd(win)
+    _G.WorldManager:GetInstance():GetCurWorld():OpenShadowPlane(true)
+    _G.WorldManager:GetInstance():GetCurWorld():ChangeCameraBattle()
+    if not _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.EmbattleView.Name) then
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        _G.WorldManager:GetInstance():GetCurWorld():ShowOrHideAllItem(true)
+        if self:CheckSceneLoad() then
+            _G.WorldManager:GetInstance():SetCurrentWorldVisible(true)
+        end
+    end
+    if self.fightCallback and not replayFightCallback then
+        self.fightCallback(win)
+    end
+    self.fightCallback = nil
+    local visualCam =
+        _G.WorldManager:GetInstance():GetCurWorld().WorldSetting.SceneCamera:GetComponentE(
+        _G.typeof(_G.CS.FrameWork.Graphic.VisualCamera)
+    )
+    visualCam.Interpolation = self.curLerpTime or 0
+end
+---结算界面关闭回调
+---@param result boolean 是否胜利
+---@param id SettlementModel.FunctionEnum 关闭回调参数
+function BattleControllerChapterBase:OnSettlementEndCall(result, id)
+    self:FightExit()
+    local funid = require("SettlementModel").FunctionEnum
+    id = id or funid.None
+    if id == funid.None then
+        self:OnSettlementEnd(result)
+    elseif id == funid.Continue then
+        self:OnChallengeContinue()
+    elseif id == funid.Next then
+        self:OnChallengeNext()
+    elseif id == funid.DevelopRole or id == funid.DevelopEquip then
+        ---ZHJ-16091【主线副本】剧本中战败后，结算界面战力提升会跳转到主城的养成界面
+        self:OpenCardBagView(
+            function()
+                self:OnSettlementEnd(result)
+            end
+        )
+    elseif id == funid.ReEmbattle then
+        self:OnReEmbattle()
+    end
+end
+---打开卡牌背包功能界面
+function BattleControllerChapterBase:OpenCardBagView(call)
+    local function OnSelectSectionViewClosed(_, name)
+        if name == _G.ConfigManager.ui_cfg.CardShowView.Name then
+            call()
+            _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, OnSelectSectionViewClosed, self)
+        end
+    end
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, OnSelectSectionViewClosed, self)
+    _G.MainManager:GetInstance():OpenMainViewToggle("card")
+end
+---重新布阵
+function BattleControllerChapterBase:OnReEmbattle()
+    self:ReFight()
+end
+
+function BattleControllerChapterBase:OnSettlement(call)
+    local lua = nil
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    --_G.WorldManager:GetInstance():GetCurWorld():ChangeCameraBattle()
+    if self.resultData.winner then
+        lua = _G.SettlementModel.SettlementType.chapterRoomBoss
+    else
+        lua = _G.SettlementModel.SettlementType.chapterRoomFail
+    end
+    call(lua, {result = self.resultData})
+end
+
+---战斗结束播放特效
+function BattleControllerChapterBase:CreateResultEff(call)
+    if self.resultData.winner then
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.BattleVictory,
+            _G.UIManager:GetInstance():GetUILayerTrans("TopLayer"),
+            nil,
+            call
+        )
+    else
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.BattleFail,
+            _G.UIManager:GetInstance():GetUILayerTrans("TopLayer"),
+            nil,
+            call
+        )
+    end
+end
+function BattleControllerChapterBase:GetEmbattleSids()
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return {0, 0, 0, 0, 0}
+    end
+    return _G.DeepCopyCfgTable(_G.ConfigManager.monster_group_cfg[self.monsterGroupID].DefaultAttackerSids)
+end
+function BattleControllerChapterBase:GetMsgData()
+    return {sid = 0, type = 1}
+end
+---手动停止战斗
+function BattleControllerChapterBase:EndFight()
+    _G.WorldManager:GetInstance():GetCurWorld():ChangeCameraBattle()
+    _G.TimerManager:GetInstance():GetTimer(
+        1,
+        self.TimerFunc,
+        self,
+        true,
+        true,
+        false,
+        replayFightCallback
+    ):Start()
+end
+function BattleControllerChapterBase:TimerFunc(replayFightCallback)
+    self:FightExit()
+    self:OnSettlementEnd(false)
+    self.fightCallback = replayFightCallback
+    replayFightCallback = nil
+end
+
+---重新开始战斗
+function BattleControllerChapterBase:OnReFight()
+    replayFightCallback = self.fightCallback
+    _G.WorldManager:GetInstance():GetCurWorld():ShowOrHideAllItem(true)
+    self:OpenEmbattle()
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+end
+function BattleControllerChapterBase:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        self:EndFight()
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    end
+end
+---获取怪物组ID
+---@return number 怪物组ID
+function BattleControllerChapterBase:GetMonsterGroupID()
+    return self.monsterGroupID
+end
+
+function BattleControllerChapterBase:LoadOther()
+end
+---打开布阵
+function BattleControllerChapterBase:OpenEmbattle()
+    _G.WorldManager:GetInstance():GetCurWorld():OpenShadowPlane(false)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ChapterEmbattleView.Name,
+        _G.handler(self, self.OnEmbattleExit),
+        _G.handler(self, self.OnBattleCall),
+        self.monsterGroupID,
+        self.objectWorldSid
+    )
+end
+---布阵退出
+function BattleControllerChapterBase:OnEmbattleExit()
+    _G.WorldManager:GetInstance():GetCurWorld():OpenShadowPlane(true)
+    BattleControllerBase.FightExit(self, true)
+    if self.fightCallback then
+        self.fightCallback(false)
+    end
+end
+---战斗
+---@param storyCardList table self.storyCardList}
+function BattleControllerChapterBase:OnBattleCall(storyCardList)
+    --重玩之后，战斗管理类中的战斗对象置空了，但是战斗并没有退出，未避免重复创建因此直接赋值
+    _G.BattleManager:GetInstance():SetBattleController(self)
+    if storyCardList ~= nil and #storyCardList > 0 then
+        self.storyCardList = storyCardList
+    end
+    self:CheckFight(_G.handler(self, self.CheckEndCall))
+end
+---战斗控制器存当前战斗助战角色信息
+function BattleControllerChapterBase:GetAssistList()
+    if self.storyCardList ~= nil and #self.storyCardList > 0 then
+        return self.storyCardList
+    end
+end
+---检测是否需要加载场景
+---@return boolean 是否需要加载场景
+function BattleControllerChapterBase:CheckSceneLoad()
+    return not _G.string.IsNullOrEmpty(_G.ConfigManager.monster_group_cfg[self.monsterGroupID].ScenePath)
+end
+function BattleControllerChapterBase:OnLoadRecordFight()
+    _G.BattleManager:GetInstance():initAttackSids(
+        self:GetEmbattleSids(),
+        _G.EBattleType.NormalBattle,
+        self:CheckSceneLoad(),
+        1
+    )
+end
+---子类重写是否显示战斗回放按钮
+function BattleControllerChapterBase:CheckShowRecordBattle()
+    return true
+end
+return BattleControllerChapterBase

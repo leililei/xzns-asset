@@ -1,0 +1,410 @@
+---@class Net 网络通信接口
+_G.Net = {}
+
+-- 网络接口封装
+local pb = _G.pb
+local CS = _G.CS
+local AccessByLua = CS.DataAccess.AccessByLua
+local ReceiveMsgManagerCsListener = _G.ReceiveMsgManagerCsListener
+
+local isConnectNet = false
+local isReceiveLogin = false
+local generalNumber = 0
+local maxGeneralNumber = 32767
+---@type  ErlConnect  connect
+local connect
+---@type Timer timer 用于监听连接超时的消息
+local timer
+
+---@type number timeOutTime 用于监听发送消息超时timer
+local timeOutTime = 10
+
+---@type Timer timer 用于监听发送消息超时
+local outTimeTimer
+---@type number mIp
+local mIp
+---@type string mPort
+local mPort
+---@type Timer timer 用于发送心跳包
+local HeartPortTimer
+
+---@type number defaultPingTime 用于发送心跳包默认间隔时间
+local defaultPingTime = 40
+
+---@type number pingCmd 用于心跳包的cmd
+_G.Net.pingCmd = 1
+
+---@type number sign 用不便是是否是哪个connect的消息，由于是用的静态方法所以需要这个，就不传递connect对象
+_G.Net.sign = 0
+
+local heartGeneralNumber = -2
+-----函数功能注释
+---@return number 心跳包的流水号
+local function GetHeartGeneralNumber()
+    heartGeneralNumber = heartGeneralNumber - 1
+    if heartGeneralNumber <= -32768 then
+        heartGeneralNumber = -2
+    end
+    return heartGeneralNumber
+end
+
+local function GetGeneralNumber()
+    generalNumber = generalNumber + 1
+    if generalNumber > maxGeneralNumber then
+        generalNumber = 1
+    end
+    return generalNumber
+end
+
+---@type number SignNumber  用于每个net不同的Number
+local SignNumber = 0
+---@return number
+local function GetSign()
+    SignNumber = SignNumber + 1
+    return SignNumber
+end
+
+---获取当前时间(单位: 秒), 返回程序运行时间或系统时间戳
+---@return number
+local function GetNowTime()
+    return os.time()
+end
+
+---SendSocket 发送一条通信协议给服务器
+---@param _pbMap NetMapItem
+---@param _pbData table PB数据
+---@param _func function 发送信息返回正常状态时的回调
+---@param _fixFunc function 发送信息返回错误状态时的回调，可不填
+---@return number 流水号
+function _G.Net.SendSocket(_pbMap, _pbData, _func, sn)
+    local bytes = nil
+    if (not _G.string.IsNullOrEmpty(_pbData)) then
+        bytes = assert(pb.encode(_pbMap.SendPB, _pbData))
+    end
+    assert(_func ~= nil and type(_func) == "function", "Need to provide a function as func")
+    if _G.AppSetting.DEBUG and sn then
+        _G.Log(
+            _pbData,
+            string.format(
+                "<color=#00FF7F>重新发送</color>>> 流水号：%s  <color=cyan>%s</color>   发送时间为  %s\n\n",
+                sn,
+                _pbMap.Cmd,
+                GetNowTime()
+            )
+        )
+    end
+    --_G.Guard.NotNull(_pbData)
+    sn = sn or GetGeneralNumber()
+
+    --这里是代表有没有连上服务器
+    if not isConnectNet then
+        if _G.AppSetting.DEBUG then
+            _G.Log(
+                _pbData,
+                string.format(
+                    "<color=#00FF7F>断线后发送的消息</color>>> 流水号：%s  <color=cyan>%s</color>   发送时间为  %s\n\n",
+                    sn,
+                    _pbMap.Cmd,
+                    GetNowTime()
+                )
+            )
+        end
+        --_G.GameNetTipsManager:GetInstance():OnNotConnectMsg(reSendArgs)
+        return sn
+    end
+
+    ---保存一次原始数据，用于重发或验证
+    ---@field public sendPBData table PB数据
+    ---@field public pbMap NetMapItem
+    ---@field public func function 发送信息返回正常状态时的回调
+    ---@field public errFunc function 发送信息返回错误状态时的回调，可不填
+    ---@field public sign number
+    ---@class NetSendData
+    ---@field public timeOut 发送信息的超时时间
+    local reSendArgs = {
+        sendPBData = _pbData,
+        pbMap = _pbMap,
+        func = _func,
+        timeOut = GetNowTime() + timeOutTime,
+        sign = _G.Net.sign,
+        sn = sn
+    }
+
+    _G.Events:GetInstance():Broadcast(_G.eYKNetEvent.AccessMsg, reSendArgs)
+    ReceiveMsgManagerCsListener.AddCalls(sn, reSendArgs)
+
+    --这里如果登录成功的消息没有回来就不发送消息  用于断线重连的过程
+    if
+        not isReceiveLogin and
+            (_pbMap.Cmd ~= _G.ConfigManager.net_map.game_login.Cmd and
+                _pbMap.Cmd ~= _G.ConfigManager.net_map.game_trust.Cmd)
+     then
+        return sn
+    end
+    AccessByLua(_pbMap.PBCmd, sn, bytes, _G.Net.sign)
+    if _G.AppSetting.DEBUG then
+        _G.Log(
+            _pbData,
+            string.format(
+                "<color=#00FF7F>发送</color>>> 流水号：%s  <color=cyan>%s</color>   发送时间为  %s\n\n",
+                sn,
+                _pbMap.Cmd,
+                GetNowTime()
+            )
+        )
+    end
+    return sn
+end
+
+function _G.Net.CreatedSocket(ip, port)
+    local mSocket
+    if _G.AppSetting.IsEditor then
+        if _G.AppSetting.NoWebGl then
+            mSocket = CS.WechatGameCore.ProxyTcpSocket(ip, port)
+        else
+            mSocket = CS.WechatGameCore.ProxyWebSocket(ip, port,false)
+        end
+        return mSocket
+    else
+        if _G.AppSetting.IsWebGl and (not _G.AppSetting.IsWebGlWss) then
+            mSocket = CS.WechatGameCore.ProxyWebSocket(ip, port, false)
+        elseif _G.AppSetting.IsWebGl and _G.AppSetting.IsWebGlWss then
+            mSocket = CS.WechatGameCore.ProxyWebSocket(ip, port)
+        else
+            mSocket = CS.WechatGameCore.ProxyTcpSocket(ip, port)
+        end
+        return mSocket
+    end
+    
+end
+
+_G.CS.Connect.CreatorConnect = _G.Net.CreatedSocket
+
+---NewConnect 获取或新建一个连接
+---@param ip string ip
+---@param port number 端口号
+---@param func function 失败回调
+function _G.Net.NewConnect(ip, port)
+    if _G.string.IsNullOrEmpty(ip) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("IP is nil", "_G.Net.NewConnect")
+        end
+        return
+    end
+    local erlConnectFactory = _G.CS.ErlConnectFactory.GetInstance()
+    connect = erlConnectFactory:checkInstance(ip, port)
+    if connect ~= nil then
+        connect:CloseConnect()
+    end
+    _G.SDKManager:GetInstance():GameStepInfo(-60300)
+    connect = erlConnectFactory:openConnect(ip, port)
+    ---connect 只有一个的时候默认的标识就是一
+    _G.Net.sign = GetSign()
+    connect.ConnetSign = _G.Net.sign
+    -- 这里为断线重连后的sign设置新的sign
+    _G.CS.ConnectManager.manager().sign = _G.Net.sign
+    _G.Events:GetInstance():Broadcast(_G.eYKNetEvent.ConnectStart, ip, port)
+    mIp = ip
+    mPort = port
+    connect:OpenConnet()
+    if timer ~= nil then
+        timer:Stop()
+    end
+    timer = _G.TimerManager:GetInstance():GetTimer(6, _G.Net.ConnectFail, _G.Net, true, false, true)
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("开始了连接时间为  " .. GetNowTime() .. "  当前开启连接的 sign  为  " .. _G.Net.sign.. "  ip " .. ip .."   port ".. port)
+    end
+    timer:Start()
+end
+
+function _G.Net.ConnectFail()
+    if _G.AppSetting.DEBUG then
+        _G.Log("连接失败时间为    " .. GetNowTime())
+    end
+    _G.SDKManager:GetInstance():GameStepInfo(-60302)
+    _G.ServerManager:GetInstance().canClick = true
+    if timer then
+        timer:Stop()
+        timer = nil
+    end
+    _G.Events:GetInstance():Broadcast(_G.eYKNetEvent.ConnectFail, mIp, mPort)
+end
+
+function _G.Net.HeartProtTick()
+    if connect ~= nil and isConnectNet then
+        if _G.AppSetting.DEBUG then
+            _G.Log(" 当前connect的sign  " .. connect.ConnetSign)
+        end
+        _G.Net:SendSocketHeart()
+    end
+end
+
+function _G.Net.CheckSocketActive()
+    if connect ~= nil and isConnectNet then
+        _G.Events:GetInstance():Broadcast(_G.eYKNetEvent.ConnectedDis, mIp, mPort)
+    end
+end
+function _G.Net.CheckTcpSocketActive()
+    if connect ~= nil and isConnectNet and (not connect.CanSendMessage) then
+        if _G.AppSetting.DEBUG then
+            _G.Log("后台切回来发现socket断了，重连了")
+        end
+        _G.Events:GetInstance():Broadcast(_G.eYKNetEvent.ConnectFail, mIp, mPort)
+    end
+end
+
+function _G.Net.SendSocketHeart()
+    ---保存一次原始数据，用于重发或验证
+    ---@field public sendPBData table PB数据
+    ---@field public pbMap NetMapItem
+    ---@field public func function 发送信息返回正常状态时的回调
+    ---@field public errFunc function 发送信息返回错误状态时的回调，可不填
+    ---@class NetSendData
+    ---@field public timeOut 发送信息的超时时间
+    local reSendArgs = {
+        cmd = _G.Net.pingCmd,
+        timeOut = GetNowTime() + timeOutTime,
+        sign = _G.Net.sign
+    }
+    local sn = GetHeartGeneralNumber()
+    reSendArgs.sn = sn
+    AccessByLua(_G.Net.pingCmd, sn, nil, _G.Net.sign)
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("发送了心跳包", "<color=red>" .. "流水号  " .. sn .. "    时间是  " .. GetNowTime() .. "</color>")
+    end
+    ReceiveMsgManagerCsListener.AddCalls(sn, reSendArgs)
+end
+
+---函数功能注释
+---@param state boolean 是否登录成功
+function _G.Net.SetLoginState(state)
+    if _G.AppSetting.DEBUG then
+        _G.Log(" 设置了isconnectNet   " .. (state and "0" or "1"))
+    end
+    isConnectNet = state
+    if isConnectNet then
+        if outTimeTimer ~= nil then
+            outTimeTimer:Stop()
+        end
+        outTimeTimer = _G.TimerManager:GetInstance():GetTimer(1, _G.Net.UpdateMessage, _G.Net, false, false, true)
+        outTimeTimer:Start()
+        if HeartPortTimer ~= nil then
+            HeartPortTimer:Stop()
+        end
+        HeartPortTimer =
+            _G.TimerManager:GetInstance():GetTimer(defaultPingTime, _G.Net.HeartProtTick, _G.Net, false, false, true)
+        HeartPortTimer:Start()
+        --_G.Net.HeartProtTick()
+
+        _G.SDKManager:GetInstance():GameStepInfo(-60301)
+    end
+end
+function _G.Net.IsReceiveLogin(state)
+    isReceiveLogin = state
+end
+
+-- ---连接服务器成功
+-- function _G.Net:ConnectSucceed()
+--     --就在收到的时候去移除
+--     timer:Stop()
+-- end
+
+---超时检测
+function _G.Net.UpdateMessage()
+    ---@type  table<number,NetSendData>
+    local netPort = ReceiveMsgManagerCsListener.GetAllNetSendData()
+    if netPort ~= nil then
+        local nowTime = GetNowTime()
+        local istimeOut
+        for _, k in pairs(netPort) do
+            if k.timeOut < nowTime then
+                istimeOut = true
+
+                if _G.AppSetting.DEBUG then
+                    _G.Log(
+                        "当前超时消息   sign 为    " ..
+                            k.sign .. "<color=red>" .. "流水号为  " .. k.sn .. "  当前时间为   " .. nowTime .. "</color>"
+                    )
+                end
+                break
+            end
+        end
+        if istimeOut then
+            _G.Events:GetInstance():Broadcast(_G.eYKNetEvent.ConnectedDis, mIp, mPort)
+        end
+    end
+end
+
+---CloseAllConnects 关闭所有连接
+function _G.Net.CloseAllConnects()
+    if _G.AppSetting.DEBUG then
+        _G.Log("关闭所有连接")
+    end
+    _G.Net.CloseAllTimer()
+    isConnectNet = false
+    isReceiveLogin = false
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(" 设置了当前 isConnectNet false  ")
+    end
+    _G.Net.sign = 0
+    connect = nil
+    ---CS.GameNetBase.isReCounecting = true
+    ---CS.GameNetBase.isCounectEd = false
+    _G.CS.ErlConnectFactory.GetInstance():closeAllConnects()
+    --这里极低的可能性有消息没有处理，默认超时就什么消息也没有收到
+    -- CS.DataAccess.getInstance().clear()
+    --清除消息
+    ReceiveMsgManagerCsListener:ClearNetPortDic()
+end
+
+---ShowErrorTips 显示提示
+---@param msgType string 返回状态
+---@param content number 返回数据
+function _G.Net.ShowErrorTips(msgType, content)
+    if content == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(msgType, "msgType报错且content为nil,叫后台处理")
+        end
+        return
+    end
+
+    if msgType == "err" then
+        --普通错误提示
+        if type(content) == "table" then
+            _G.Events:GetInstance():Broadcast(_G.eMessageNames.NetReceiveMsgError, content[1])
+        else
+            _G.Events:GetInstance():Broadcast(_G.eMessageNames.NetReceiveMsgError, content[0].ValueString)
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("不支持的错误类型:" .. msgType)
+        end
+    end
+end
+
+---关闭socket超时连接监听
+function _G.Net.CloseTimer()
+    if timer then
+        timer:Stop()
+        timer = nil
+    end
+end
+
+---清除所有的timer
+function _G.Net.CloseAllTimer()
+    if timer then
+        timer:Stop()
+        timer = nil
+    end
+    if HeartPortTimer then
+        HeartPortTimer:Stop()
+        HeartPortTimer = nil
+    end
+    if outTimeTimer then
+        outTimeTimer:Stop()
+        outTimeTimer = nil
+    end
+end

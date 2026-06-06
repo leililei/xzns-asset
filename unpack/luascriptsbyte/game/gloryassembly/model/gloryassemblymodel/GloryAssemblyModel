@@ -1,0 +1,438 @@
+local base = require("ActivitySynTypeBase")
+local GloryAssemblyNet = require("GloryAssemblyNet")
+local ActivitySynManager = require("ActivitySynManager")
+local ActivitySynNet = require("ActivitySynNet")
+
+---@class GloryAssemblyModel : ActivitySynTypeBase 荣耀集结
+---@field activity ActivitySynBase
+---@field data activity_honor_gathering.i_activity_honor_gathering
+---@field cfgs table<number,activity_honor_gathering.i_cfg_list[]>              @进度配置: 1为个人, 2为全服
+---@field getAwards table<number,table<number,boolean>>                         @进度奖励: 已领取
+---@field topPlayers {role:role.i_role, value:number}[]                         @顶级玩家信息
+---@field coinSid number                                                        @当前活动代币sid
+---@field coinNum number                                                        @当前活动代币数量
+---@field viewInstance GloryAssemblyView                                        @主页面实例
+local GloryAssemblyModel = _G.BaseClass("GloryAssemblyModel", base)
+
+function GloryAssemblyModel:__init(activity)
+    self.activity = activity
+    self:InitActivityData(self.activity.cfg.self_info.honor_gathering)
+    self.curActivityClass:AddStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+
+    ActivitySynNet:GetInstance() --实例化ActivitySynNet, 注册服务器推送接口
+end
+
+---打开主界面
+function GloryAssemblyModel:OnEnterActivity()
+    if self.precast and self.precast[1] then
+        if _G.AppSetting.IsXzns then
+            require("RescueGoddessModel"):GetInstance():SetPlayingView(self.precast[1])
+        end
+        _G.UIManager:GetInstance():OpenWindow(self.precast[1], self.activity)
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GloryAssemblyView.Name, self.activity)
+    end
+    base.OnEnterActivity(self)
+end
+
+---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function GloryAssemblyModel:InitRedPointTree()
+    self.checkRedPointFunc = {
+        nil,
+        self.CheckRedPointDonate,
+        self.CheckRedPointAward,
+        self.CheckRedPointAward,
+    }
+    self.redpointTree = { { 2, 3, 4 }, false, false, false }
+end
+
+---获取子活动列表
+function GloryAssemblyModel:GetOtherActivityRedPointIds()
+    if self.precast and self.precast[1] and
+        self.precast[1] == _G.ConfigManager.ui_cfg.EasterGloryAssemblyView.Name
+    then
+        return {}
+    end
+    return { _G.ActivityMainType.Task }
+end
+
+---调用红点数检测方法
+function GloryAssemblyModel:CheckRedPointNumChild(index, param)
+    if _G.AppSetting.IsXzns and self.curActivityClass:GetJumpType() == 100170 then
+        if not _G.GlobalConditionManager.CheckConditionArrays(_G.ConfigManager.discrete_cfg[201008]) then
+            return 0
+        end
+    end
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self, index)
+    end
+    return 0
+end
+
+---主页面是否显示独立按钮
+function GloryAssemblyModel:IsShowBtn()
+    return false
+end
+
+---代币状态更新
+function GloryAssemblyModel:SetCoin(data)
+    if type(data) ~= "table" then
+        return
+    end
+    local sid, num = data.key, data.value
+    if not sid or not num or sid ~= self.coinSid then
+        return
+    end
+    self:ChangeCoinNumber(num)
+    self:RefreshRedPoint(nil) --刷新所有红点
+end
+
+---监听活动状态改变
+function GloryAssemblyModel:OnActivityStateChanged(_, state)
+    if state == ActivitySynManager.State.Close then
+        local viewName = _G.ConfigManager.ui_cfg.GloryAssemblyView.Name
+        if self.precast and self.precast[1] then
+            viewName = self.precast[1]
+        end
+        local view1 = _G.UIManager:GetInstance():GetWindowCtrl(viewName)
+        if view1 then
+            view1:Close()
+            --活动已关闭
+            _G.PopWindowManager:GetInstance():ShowAllTips(930101)
+        end
+    end
+end
+
+--初始化获取数据
+---@param msg activity_honor_gathering.i_activity_honor_gathering
+function GloryAssemblyModel:InitActivityData(msg)
+    self.precast = self.curActivityClass.cfg.info.front.precast ~= nil and _G.string.split(self.curActivityClass.cfg.info.front.precast, "#") or nil
+    self.data = msg
+    self.cfgs = {}
+    self.getAwards = {}
+    self.topPlayers = {}
+    self.coinSid = 0
+    self.coinNum = 0
+    if not msg then
+        return
+    end
+
+    --任务进度配置
+    if msg.cfg_list then
+        for _, v in ipairs(msg.cfg_list) do
+            local list = self.cfgs[v.type]
+            if not list then
+                list = {}
+                self.cfgs[v.type] = list
+            end
+            table.insert(list, v)
+        end
+        --排序
+        for _, list in pairs(self.cfgs) do
+            table.sort(list, function(a, b)
+                return a.condition < b.condition
+            end)
+        end
+    end
+    --已领取的奖励信息
+    if msg.award_list then
+        for _, v in ipairs(msg.award_list) do
+            local mapping = self.getAwards[v.type]
+            if not mapping then
+                mapping = {}
+                self.getAwards[v.type] = mapping
+            end
+            for _, sid in ipairs(v.award) do
+                mapping[sid] = true
+            end
+        end
+    end
+    --顶级玩家信息
+    if msg.rank_list then
+        for _, v in ipairs(msg.rank_list) do
+            table.insert(self.topPlayers, { value = v.curr, role = v.role_info })
+        end
+        table.sort(self.topPlayers, function(a, b)
+            if a.value ~= b.value then
+                return a.value > b.value
+            end
+            return a.role.power > a.role.power
+        end)
+    end
+    --货币信息
+    if msg.coin_list and #msg.coin_list > 0 then
+        local first = msg.coin_list[1]
+        self.coinSid = first.key
+        self.coinNum = first.value
+    end
+end
+
+---更新活动数据(推送)
+---@param msg activity_honor_gathering.p2c_change_curr
+function GloryAssemblyModel:UpdateActivityData(msg)
+    if not self.data then
+        return
+    end
+    --全服进度更新
+    if msg.curr then
+        self.data.group_curr = msg.curr
+    end
+    --顶级玩家信息更新
+    if msg.rank_list then
+        self.topPlayers = {}
+        for _, v in ipairs(msg.rank_list) do
+            table.insert(self.topPlayers, { value = v.curr, role = v.role_info })
+        end
+        table.sort(self.topPlayers, function(a, b)
+            if a.value ~= b.value then
+                return a.value > b.value
+            end
+            return a.role.power > a.role.power
+        end)
+    end
+    self:RefreshRedPoint(nil) --刷新所有红点
+
+    self:UpdateInstanceView()
+end
+
+---设置页面实例
+---@param instance GloryAssemblyView
+function GloryAssemblyModel:SetViewInstance(instance)
+    self.viewInstance = instance
+end
+
+---更新页面状态
+function GloryAssemblyModel:UpdateInstanceView()
+    if not self.viewInstance then
+        return
+    end
+    self.viewInstance:UpdateView()
+end
+
+--region =====================红点接口===================
+
+---检测是否有可捐献道具
+function GloryAssemblyModel:CheckRedPointDonate()
+    if self.activity:GetCurActivityState() ~= ActivitySynManager.State.Open then
+        return 0
+    end
+    --是否有可消耗的道具
+    if not self.coinNum or self.coinNum <= 0 then
+        return 0
+    end
+
+    --检测是否有未满足的目标节点
+    if not self.cfgs then
+        return 0
+    end
+    for type, list in pairs(self.cfgs) do
+        local value = type == 1 and self:GetSelfValue() or self:GetSelfValue()
+        for _, cfg in ipairs(list) do
+            if value < cfg.condition then
+                return 1
+            end
+        end
+    end
+
+    return 0
+end
+
+---检测是否可领取奖励
+function GloryAssemblyModel:CheckRedPointAward(index)
+    if self.activity:GetCurActivityState() ~= ActivitySynManager.State.Open then
+        return 0
+    end
+    local type, value, tasks
+    if index == 3 then
+        type = 1
+        value = self:GetSelfValue()
+        tasks = self:GetCfgs(type)
+    else
+        type = 2
+        value = self:GetServerValue()
+        tasks = self:GetCfgs(type)
+    end
+    if value > 0 and tasks and #tasks > 0 then
+        for _, v in ipairs(tasks) do
+            if v.condition <= value and not self:CheckAward(type, v.sid) then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---刷新红点
+---@param index? number @红点索引, 如不传则刷新所有节点
+function GloryAssemblyModel:RefreshRedPoint(index)
+    local redpointManager = require("RedPointManager"):GetInstance()
+    if index then
+        redpointManager:RefreshNode(self:GetRedpointIDByIndex(index))
+    elseif self.redpointTree then
+        if type(self.redpointTree[1]) == "table" then
+            for _, redpointId in ipairs(self.redpointTree[1]) do
+                redpointManager:RefreshNode(redpointId)
+            end
+        end
+        redpointManager:RefreshNode(self:GetRedpointIDByIndex(1))
+    end
+end
+
+--endregion
+
+
+--region =====================数据接口===================
+
+---获取自身进度值
+function GloryAssemblyModel:GetSelfValue()
+    return self.data and self.data.role_curr or 0
+end
+
+---获取全服进度值
+function GloryAssemblyModel:GetServerValue()
+    return self.data and self.data.group_curr or 0
+end
+
+---获取捐献进度配置
+---@param type number @类型: 1个人进度配置, 2全服进度配置
+---@return activity_honor_gathering.i_cfg_list[]
+function GloryAssemblyModel:GetCfgs(type)
+    if not self.cfgs then
+        return nil
+    end
+    return self.cfgs[type]
+end
+
+---获取进度奖励释放已被领取
+---@param type number       @类型: 1个人进度配置, 2全服进度配置
+---@param sid number        @进度节点sid
+---@return boolean
+function GloryAssemblyModel:CheckAward(type, sid)
+    if not self.getAwards then
+        return false
+    end
+    local mapping = self.getAwards[type]
+    if not mapping then
+        return false
+    end
+    return mapping[sid] or false
+end
+
+---获取顶级玩家数据
+---@param index number
+---@return role.i_role
+function GloryAssemblyModel:GetTopRoleInfo(index)
+    if not self.topPlayers then
+        return nil
+    end
+    local info = self.topPlayers[index]
+    if not info then
+        return nil
+    end
+    return info.role
+end
+
+---获取当前活动代币sid
+---@return number
+function GloryAssemblyModel:GetCoinSid()
+    return self.coinSid or 0
+end
+
+---获取当前活动代币数量
+---@return number
+function GloryAssemblyModel:GetCoinNumber()
+    return self.coinNum or 0
+end
+
+---变更当前活动代币数量
+---@param num number @变更数量
+function GloryAssemblyModel:ChangeCoinNumber(num)
+    self.coinNum = math.max(0, (self.coinNum or 0) + num)
+    self:UpdateInstanceView()
+
+    --广播事件
+    local tmp = {}
+    _G.table.insert(tmp, self.coinSid)
+    _G.table.insert(tmp, num)
+    _G.table.insert(tmp, self.coinNum)
+    _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, { { type = tmp } })
+end
+
+---获取活动时间
+---@return number,number    @(开始时间, 结束时间)
+function GloryAssemblyModel:GetTime()
+    if not self.activity then
+        return 0, 0
+    end
+    local startTime = self.activity.cfg.time.start_time
+    local endTime = startTime + self.activity.cfg.time.run_time
+    return startTime, endTime
+end
+
+---获取活动剩余时长(单位: 秒)
+---@return number
+function GloryAssemblyModel:GetRemainDuration()
+    local startTime, endTime = self:GetTime()
+    return math.max(0, endTime - startTime)
+end
+
+--endregion
+
+
+--region =====================网路接口===================
+
+---发起捐献请求
+---@param activityId number     @活动id
+---@param coinSid number        @捐献代币id
+---@param coinNum number        @捐献数量
+---@param callback fun(msg:public.s2c_common_ack):void
+function GloryAssemblyModel:Donate(coinSid, coinNum, callback)
+    GloryAssemblyNet:GetInstance():Donate(
+        { activity_id = self.activity:GetActivityID(), coin_sid = coinSid, coin_num = coinNum },
+        function(msg)
+            if msg and msg.ack == 1 then
+                if coinSid == self.coinSid then
+                    self:ChangeCoinNumber(-coinNum)
+                end
+                --进度累计(每个捐献累计增加1点)
+                if self.data then
+                    self.data.role_curr = (self.data.role_curr or 0) + coinNum
+                    self.data.group_curr = (self.data.group_curr or 0) + coinNum
+                end
+                self:RefreshRedPoint(nil) --刷新所有红点
+                --接收奖励
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            end
+            if callback then
+                callback(msg)
+            end
+        end)
+end
+
+---领取奖励
+---@param type number          @类型: 1个人奖励, 2全服奖励
+---@param sids number[]        @奖励sid列表
+---@param callback fun(msg:public.s2c_common_ack):void
+function GloryAssemblyModel:GetAward(type, sids, callback)
+    --params: 第一个参数为领取类型, 第二个及以后为奖励id
+    ActivitySynNet:GetInstance():GetAward(self.activity:GetActivityID(), { type, table.unpack(sids) }, function(msg)
+        if msg and msg.ack == 1 then
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            --变更任务状态
+            if not self.getAwards[type] then
+                self.getAwards[type] = {}
+            end
+            for _, v in pairs(sids) do
+                self.getAwards[type][v] = true
+            end
+            self:RefreshRedPoint(nil) --刷新所有红点
+        end
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+--endregion
+
+return GloryAssemblyModel

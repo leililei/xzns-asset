@@ -1,0 +1,1253 @@
+--region ==================工具类=========================
+
+--afk待机检查(点击事件监听)
+---@type boolean,function
+local clickRegisted, originalHandler = false, nil
+local function registeClickEvent()
+    if clickRegisted then
+        return
+    end
+    clickRegisted = true
+
+    ---@type function
+    originalHandler = _G.CS.Main.GlobalClickHandler
+    _G.CS.Main.GlobalClickHandler = function(...)
+        if originalHandler then
+            originalHandler(...)
+        end
+        ---@type MainView
+        local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+        if not mainView then
+            return
+        end
+        mainView:UpdateAfkIdel(false)
+    end
+end
+local function unregisteClickEvent()
+    if not clickRegisted then
+        return
+    end
+    clickRegisted = false
+    _G.CS.Main.GlobalClickHandler = originalHandler
+end
+
+--endregion
+
+local SociatyManager = require("SociatyManager")
+
+---@class MainView : UIBaseView    中文描述
+---@field public go_table MainView_GoTable GoTable
+---@field unlockAfkBackground boolean                       @是否已解锁afk后台战斗
+---@field afkFightingEff number|UnityEngine.Transform       @afk战斗特效
+---@field afkIdelEff number|UnityEngine.Transform           @afk待机特效
+---@field afkIdel boolean                                   @是否在afk待机状态
+---@field afkIdelTimer Timer                                @afk待机状态计时器
+---@field animator UnityEngine.Animator
+---@field animatorStopTimer Timer                           @动画停止计时器
+---@field animatorInit boolean                              @动画是否已初始化
+local MainView = _G.BaseClass("MainView", _G.UIBaseView)
+
+function MainView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.UpdateDrawIcon, self)
+    _G.Events:GetInstance():AddListener(_G.eSociatyBattle.ScoiatyBattleChallengeNum, self.UpdateSociatyIcon, self)
+    _G.Events:GetInstance():AddListener(_G.eSociatyBattle.SociatyBattleState, self.UpdateSociatyIcon, self)
+    _G.Events:GetInstance():AddListener(_G.eSociatyBattle.RefreshSociatyBattleView, self.UpdateSociatyIcon, self)
+    _G.Events:GetInstance():AddListener(_G.eSociatyEvent.BeKicked, self.CloseSociatyIcon, self)
+    _G.Events:GetInstance():AddListener(_G.eSociatyBattle.SociatyBattleBattle, self.UpdateSociatyIcon, self)
+    _G.Events:GetInstance():AddListener(_G.eAfkEvents.Pass, self.UpdateView, self)
+    _G.Events:GetInstance():AddListener(_G.ePlayerStatus.PlayerUpLevel, self.UpdateAfkIdelEffect, self)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnDeadsoulViewOpen, self)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnDeadsoulViewClosed, self)
+    _G.Events:GetInstance():AddListener(_G.DungeonChallengeBattleViewShow.Open, self.UpdateNewFunctionIcon, self)
+    _G.Events:GetInstance():AddListener(_G.CardHallViewShow.Open, self.UpdateSPNewFunctionIcon, self)
+    _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnFunctionOpenCall, self)
+end
+
+local PanelLuaFile = {
+    fort = "MainPanel",
+    wild = "ChangllengeView",
+    afk = "MainAfkPanel",
+    card = "MainCardPanel",
+    sociaty = "SociatyMainView"
+}
+
+local PanelPrefabs = {
+    fort = "UIH5/MainView/Panel/$_obj_mainPanel", --主界面
+    wild = "UIH5/ChallengeView/ChangllengeView", --野外
+    afk = _G.ConfigManager.ui_cfg.MainAfkPanel.PrefabPath, --主界面-AFK场景
+    card = "UIH5/MainView/Panel/$_obj_cardPanel", --卡牌
+    sociaty = "UIH5/Sociaty/SociatyMainView"               --公会
+}
+
+if _G.AppSetting.IsXzns then
+    PanelPrefabs.fort = "UIH5_xzns/MainView/Panel/$_obj_mainPanel"
+    PanelPrefabs.card = "UIH5_xzns/MainView/Panel/$_obj_cardPanel"
+    PanelPrefabs.wild = "UIH5_xzns/ChallengeView/ChangllengeView"
+end
+
+local unlockID = {
+    fort = 264,
+    wild = 265,
+    benefit = 266,
+    sociaty = 13
+}
+
+---界面的入口函数
+function MainView:OnCreate()
+    self:InitToggle()
+    self.panelInit = {}
+    self.panelLua = {}
+    self.panelLeaveTime = {}
+    self.toggleItem = {
+        fort = self.go_table.toggle_fort,
+        wild = self.go_table.toggle_wild,
+        afk = self.go_table.toggle_afk,
+        card = self.go_table.toggle_card,
+        sociaty = self.go_table.toggle_sociaty,
+        benefit = self.go_table.toggle_benefit
+    }
+    --ZHJH-1430
+    --【客户端】进入游戏后默认停留界面调整
+    --ZHJH-2123 又要改回去,但读离散表（条件与解锁不一致）
+    -- if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(unlockID["fort"]) then
+    if _G.GlobalConditionManager.CheckConditionArrays(_G.ConfigManager.discrete_cfg[119007]) and not require("DouyinModel"):GetInstance():DouyinFeedScene() then
+        self.go_table.toggle_fort.isOn = false
+        self.go_table.toggle_fort.isOn = true
+    else
+        self.go_table.toggle_afk.isOn = false
+        self.go_table.toggle_afk.isOn = true
+    end
+    self.defaultPanel = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(unlockID["fort"]) and "fort" or "afk"
+    self.leaveTimer = _G.TimerManager:GetInstance():GetTimer(1, self.CheckPanelLeave, self, false, false)
+    self.leaveTimer:Start()
+
+    _G.GameMain:ReportGamePlay()
+    if _G.tonumber(_G.SDKManager:GetInstance():GetChannelId()) == require("PlatformDef").RusChannel.IOS
+            and _G.TimeUtil.GetInterValDayByGame(_G.PlayerModel:GetInstance().create_time, _G.TimeUtil.GetServerUnixTime()) > 0
+            and _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.RusIOSNextDayLogin, 0) == 0
+    then
+        _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.RusIOSNextDayLogin, 1)
+        _G.SDKManager:GetInstance():AttTip(require("SDKDef").ATTEvents.NextDayLogin)
+    end
+end
+
+function MainView:OnEnable()
+    self:InitAfkIdel()
+    self:UpdateFloatMessages(true)
+
+    --如果上一次切换页签且面板实例未加载(或加载时因MainView隐藏销毁), 重新执行加载逻辑
+    if self.curTogKey and not self.panelInit[self.curTogKey] and self.curTogCall then
+        self.curTogCall(true)
+    end
+end
+
+function MainView:OnDisable()
+    if self.afkIdelTimer then
+        self.afkIdelTimer:Stop()
+        self.afkIdelTimer = nil
+    end
+
+    if self.animatorStopTimer then
+        self.animatorStopTimer:Stop()
+        self.animatorStopTimer = nil
+        self:StopAnimation()
+    elseif self.animatorInit then
+        self:StopAnimation()
+    end
+end
+
+---获取当前选中的页签，此变量一定要和当前使用的变量同步，否则会影响引导
+function MainView:GetTogKey()
+    return self.curTogKey
+end
+
+function MainView:CheckPanelLeave()
+    for key, time in pairs(self.panelLeaveTime) do
+        if key ~= "fort" then
+            if time > 10 and self.panelInit[key] == true then
+                self.go_table["obj_" .. key]:ClearChildren()
+                self.panelLua[key] = nil
+                self.panelLeaveTime[key] = nil
+                self.panelInit[key] = nil
+            else
+                self.panelLeaveTime[key] = time + 1
+            end
+        end
+    end
+end
+
+function MainView:InitToggle()
+    self.toggles = {
+        fort = _G.GetAutoGoTable(
+                self.go_table.toggle_fort,
+                _G.handlerbind(self, self.OnClickToggle, "fort", _G.handler(self, self.OnFort))
+        ),
+        sociaty = _G.GetAutoGoTable(
+                self.go_table.toggle_sociaty,
+                _G.handlerbind(self, self.OnClickToggle, "sociaty", _G.handler(self, self.OnSociaty))
+        ),
+        wild = _G.GetAutoGoTable(
+                self.go_table.toggle_wild,
+                _G.handlerbind(self, self.OnClickToggle, "wild", _G.handler(self, self.OnWild))
+        ),
+        card = _G.GetAutoGoTable(
+                self.go_table.toggle_card,
+                _G.handlerbind(self, self.OnClickToggle, "card", _G.handler(self, self.OnCard))
+        ),
+        benefit = _G.GetAutoGoTable(
+                self.go_table.toggle_benefit,
+                _G.handlerbind(self, self.OnClickToggle, "benefit", _G.handler(self, self.OnBenefit))
+        ),
+        afk = _G.GetAutoGoTable(
+                self.go_table.toggle_afk,
+                _G.handlerbind(self, self.OnClickToggle, "afk", _G.handler(self, self.OnAfk))
+        )
+    }
+    self.diBgColors = {
+        fort = "38425b",
+        sociaty = "282633",
+        sociaty_no = "8d8d9d",
+        wild = "222945",
+        card = "787895",
+        afk = "433e54",
+    }
+end
+
+function MainView:OnClickToggle(go, isOn, key, call)
+    local tb = self.toggles[key]
+    if not isOn then
+        --上一次切换标签还未来得及改变显示状态(call未调用), 直接清理并切换选中状态
+        if self.befTog and self.befTog ~= tb then
+            self:RefreshToggle(self.befTog, self.befTogCall, false)
+            self:RefreshToggle(tb, nil, true)
+        end
+        if key == "sociaty" then
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SociatyJoinView.Name)
+            if view then
+                view:Close()
+            end
+        end
+
+        if self.panelLeaveTime[key] == nil then
+            self.panelLeaveTime[key] = 0 --开始关闭计时
+        end
+        self.befTog = tb
+        self.befTogKey = key
+        self.befTogCall = call
+    else
+        if unlockID[key] then
+            if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(unlockID[key]) then
+                local lockStr, tipsId = _G.FunctionManager:GetInstance():GetTipsStr(unlockID[key])
+                _G.PopWindowManager:GetInstance():ShowAllTips(tipsId, lockStr)
+                self:CancelToggled()
+                return
+            end
+        end
+        if key ~= "afk" and require("AfkBattleManager"):GetInstance():IsFighting() then
+            --检查afk冒险后台战斗是否解锁
+            if not self.unlockAfkBackground then
+                self.unlockAfkBackground = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID
+                                                                                                    .AfkBattleBackground)
+                if not self.unlockAfkBackground then
+                    local lockStr
+                    local funopenCfg = _G.ConfigManager.function_open_cfg[_G.FunctionID.AfkBattleBackground]
+                    local sectCfg = _G.ConfigManager.afk_cfg[funopenCfg.condition_type[1][2]]
+                    if sectCfg then
+                        lockStr = _G.LangUtil.GetLangPackValue(90028010139, sectCfg.chapter, sectCfg.section)
+                    end
+                    _G.PopWindowManager:GetInstance():ShowAllTips(45, lockStr)
+                    self:CancelToggled()
+                    return
+                end
+            end
+            --检查是否处于特定关卡(关卡中战斗不允许切出)
+            ---@type number[][]
+            local afkLockCfg = _G.ConfigManager.discrete_cfg[119008]
+            if afkLockCfg then
+                local curSection = require("AfkModel"):GetInstance():GetCurSection()
+                if _G.table.indexof(afkLockCfg[1], curSection) then
+                    local afkCfg = _G.ConfigManager.afk_cfg[curSection]
+                    _G.PopWindowManager:GetInstance():ShowAllTips(47)
+                    self:CancelToggled()
+                    return
+                end
+            end
+        end
+        if _G.AppSetting.IsXzns then
+            if key ~= "wild" and require("SecretRealmModel"):GetInstance():IsFighting() then
+                --检查大秘境后台战斗是否解锁
+                if not self.unlockSecretRealmBackground then
+                    local maxId = require("SecretRealmModel"):GetInstance():GetMaxSid()
+                    local cfg = _G.ConfigManager.discrete_cfg[116134]
+                    self.unlockSecretRealmBackground = cfg and maxId >= cfg[1][1]
+                    if not self.unlockSecretRealmBackground then
+                        local secretRealmCfg = cfg and _G.ConfigManager.secret_realm_cfg[cfg[1][1]]
+                        local lockTipStr = _G.GetLangPackValue(90032800163, secretRealmCfg and secretRealmCfg.numb or 0)
+                        _G.PopWindowManager:GetInstance():ShowAllTips(1020014, lockTipStr)
+                        self:CancelToggled()
+                        return
+                    end
+                end
+            end
+            if key == "sociaty" then
+                _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, _G.ConfigManager.ui_cfg.SociatyMainView.audio)
+            elseif key == "fort" then
+                local musicid = _G.ConfigManager.season_cfg[require("SeasonModel"):GetInstance():GetCurSeasonId()].Audio
+                if musicid == nil or musicid == 0 then
+                    musicid = _G.ConfigManager.ui_cfg.MainView.audio
+                end
+                _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, musicid)
+            else
+                _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, _G.ConfigManager.ui_cfg.MainView.audio)
+            end
+            local color = self.diBgColors[key]
+            if key == "sociaty" then
+                local sociatySelf = require("SociatyModel"):GetInstance().SociatyRoleSelf
+                if sociatySelf.uid == 0 then
+                    color = self.diBgColors["sociaty_no"]
+                end
+            end
+            if color then
+                self.go_table.aorimage_diBg.color = _G.ColorTools.FormatColorByString(color)
+            end
+        end
+        self:ShowAfkBox(key)
+
+        self.curTog = tb
+        self.curTogKey = key
+        self.curTogCall = call
+        self.panelLeaveTime[key] = nil --清理关闭计时
+
+        if not self.panelInit[key] and call then
+            call(
+                    true,
+                    function()
+                        if self.curTogKey == key then
+                            self:RefreshToggleGroup()
+                            self:UpdateFloatMessages(false)
+                        end
+                    end
+            )
+        else
+            if call then
+                call(true)
+            end
+            self:RefreshToggleGroup()
+            self:UpdateFloatMessages(false)
+        end
+    end
+end
+
+function MainView:ShowAfkBox(key)
+    key = key or self.curTogKey
+    local showAfkBox = require("AfkModel"):GetInstance():GetAfkAwardBoxStatus()
+    local AfkBoxInPanelShow = key ~= "afk"
+    if key == "wild" and self.inTower then
+        AfkBoxInPanelShow = not self.inTower
+    end
+    if not self.afkAwardBoxEff then
+        _G.UIUtils.LoadEffectByCfg(
+                _G.ConfigManager.ui_effect_cfg.ef_fangzhibaoxiangqipao,
+                self.go_table.obj_afkAwardBox,
+                function(obj)
+                    if self:IsNil() then
+                        _G.UIUtils.RemoveEffect(obj)
+                        return
+                    end
+                    obj:SetSiblingIndexE(0)
+                    self.afkAwardBoxEff = obj
+                    self.go_table.obj_afkAwardBox:SetActiveE(key ~= "afk" and showAfkBox and 1 or 0)
+                end
+        )
+    else
+        self.go_table.obj_afkAwardBox:SetActiveE(AfkBoxInPanelShow and showAfkBox and 1 or 0)
+    end
+end
+
+---刷新表现层状态(切换toggleGroup选中状态显示)
+function MainView:RefreshToggleGroup()
+    if self.befTog and self.befTog ~= self.curTog then
+        self:RefreshToggle(self.befTog, self.befTogCall, false)
+        self.befTog = nil
+        self.befKey = nil
+        self.befTogCall = nil
+    end
+
+    self.curTog.aorimage_isOn:SetActiveE(1)
+    self.curTog.aorimage_isOff:SetActiveE(0)
+    self.panelLeaveTime[self.curTogKey] = nil
+
+    if not _G.GuideManager:GetInstance().IsGuideing then
+        _G.Events:GetInstance():Broadcast(_G.MianViewState.MainViewChangeTab)
+    end
+end
+
+---刷新toggle选中状态显示
+---@param callback function 回调函数
+function MainView:RefreshToggle(tog, callback, isOn)
+    tog.aorimage_isOn:SetActiveE(isOn and 1 or 0)
+    tog.aorimage_isOff:SetActiveE(isOn and 0 or 1)
+    if callback then
+        callback(isOn)
+    end
+end
+
+---判断当前是否选中目标页签
+---@param key string 页签名
+---@return boolean
+function MainView:IsToggled(key)
+    if _G.AppSetting.DEBUG and not self.toggleItem[key] then
+        _G.LogError("MainView.IsToggled = 传参无效的页签: " .. key)
+    end
+    return self.curTogKey == key
+end
+
+---切换到目标页签
+---@param key string 页签名
+---@return void
+function MainView:GotoToggle(key)
+    ---@type UnityEngine.UI.Toggle
+    local tog = self.toggleItem[key]
+    if not tog then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("MainView.GotoToggle = 传参无效的页签: " .. key)
+        end
+        return
+    end
+
+    --如果MainView被隐藏, 此时切换页签行为不一样: 需手动关闭之前的页签
+    if self.curTogKey and self.curTogKey ~= key and self.gameObject:GetctiveInHierarchy() ~= 1 then
+        local bTog = self.toggleItem[self.curTogKey]
+        if bTog then
+            bTog:SetIsOnWithoutNotify(false)
+            bTog.onValueChanged:Invoke(false)
+        end
+    end
+
+    --强制走当前toggle.isOn逻辑
+    --tog:SetIsOnWithoutNotify(true)
+    --tog.onValueChanged:Invoke(true)
+    tog:SetIsOnWithoutNotify(false)
+    tog.isOn = true
+end
+
+---获取窗口实例(如果未初始化或正在初始化, 返回nil)
+---@param key string? 页签名(不传表示获取当前选择页签)
+---@return Component|nil
+function MainView:GetToggledWindow(key)
+    if not key then
+        key = self.curTogKey
+    end
+    if self.panelInit[key] ~= true then
+        return nil
+    end
+    local panelLua = self.panelLua[key]
+    if not panelLua or _G.IsNil(panelLua.gameObject) then
+        return nil
+    end
+    return panelLua
+end
+
+---返回上一个选中的标签
+---@return void
+function MainView:BackBeforeToggle()
+    if not self.befTogKey then
+        return
+    end
+    self:GotoToggle(self.befTogKey)
+end
+
+---取消当前点击逻辑并返回上一个选项卡
+---@private
+---@return void
+function MainView:CancelToggled()
+    if not self.befTog then
+        return
+    end
+    self.befTog.aorimage_isOn:SetActiveE(1)
+    self.befTog.aorimage_isOff:SetActiveE(0)
+    self.toggleItem[self.befTogKey]:SetIsOnWithoutNotify(true)
+    self.curTogKey = self.befTogKey
+    self.panelLeaveTime[self.befTogKey] = nil
+    self.befTog = nil
+end
+
+function MainView:OnFort(isOn, callback)
+    self.go_table.obj_fort:SetActiveE(isOn and 1 or 0)
+    if not isOn then
+        if callback then
+            callback()
+        end
+        return
+    else
+        require("MallManager"):GetInstance():ReqMallData()
+    end
+    _G.Events:GetInstance():Broadcast(_G.eMainViewShow.Fort)
+    if not self.panelInit.fort then
+        self.panelInit.fort = 0
+        _G.PoolsManager:GetInstance():Spawn(
+                PanelPrefabs.fort,
+                _G.ePoolType.UIItem,
+                self.go_table.obj_fort,
+                function(trans)
+                    if not trans or trans:GetctiveInHierarchy() ~= 1 then
+                        self.panelInit.fort = nil
+                        _G.DestroyObject(trans)
+                        if callback then
+                            callback()
+                        end
+                        return
+                    end
+                    self.panelLua.fort = self:AddComponent(trans, require(PanelLuaFile.fort).New(trans))
+                    self.panelInit.fort = true
+                    if callback then
+                        callback()
+                    end
+                end
+        )
+    end
+end
+
+function MainView:OnSociaty(isOn, callback)
+    self.go_table.obj_sociaty:SetActiveE(isOn and 1 or 0)
+    if self.panelLua.sociaty then
+        self.panelLua.sociaty:ShowOrHideScene(isOn)
+    end
+    if not isOn then
+        return
+    end
+    if callback then
+        callback()
+    end
+    SociatyManager:GetInstance():SetParent(self.go_table.obj_sociaty)
+    SociatyManager:GetInstance():EnterSociaty()
+end
+
+function MainView:OpenSociaty(childView)
+    if AppSetting.IsXzns then
+        PanelPrefabs.sociaty = ConfigManager.ui_cfg.SociatyMainView.PrefabPath
+    end
+    if not self.panelInit.sociaty then
+        self.panelInit.sociaty = 0
+        _G.PoolsManager:GetInstance():Spawn(
+                PanelPrefabs.sociaty,
+                _G.ePoolType.UIItem,
+                self.go_table.obj_sociaty,
+                function(trans)
+                    if not trans or trans:GetctiveInHierarchy() ~= 1 then
+                        self.panelInit.sociaty = nil
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    self.panelLua.sociaty = self:AddComponent(trans, require(PanelLuaFile.sociaty).New(trans))
+                    self.panelInit.sociaty = true
+                    if childView then
+                        self:DoOpenWindow(childView)
+                    end
+                end
+        )
+    elseif childView then
+        self:DoOpenWindow(childView)
+    end
+end
+
+function MainView:OnWild(isOn, callback)
+    ---@type DeadsoulTowerManager
+    local towerManager = _G.DeadsoulTowerManager:GetInstance()
+    local secretRealmModel = require("SecretRealmModel"):GetInstance()
+    if towerManager:IsFighting() then
+        towerManager:SetFightView(isOn and towerManager:IsShowFighting())
+    elseif secretRealmModel:IsFighting() then
+        secretRealmModel:SetFightView(isOn)
+    end
+
+    self.go_table.obj_wild:SetActiveE(isOn and 1 or 0)
+    if not isOn then
+        if callback then
+            callback()
+        end
+        return
+    end
+
+    if self.panelInit.wild then
+        if self.panelLua.wild then
+            --面板已加载并初始化
+            local isFighting = towerManager:IsFighting() and towerManager:IsShowFighting() or
+                    secretRealmModel:IsFighting()
+            self.panelLua.wild.gameObject:SetActiveE(isFighting and 0 or 1)
+        end
+        if callback then
+            callback()
+        end
+        return
+    end
+
+    self.panelInit.wild = 0
+    _G.PoolsManager:GetInstance():Spawn(
+            PanelPrefabs.wild,
+            _G.ePoolType.UIItem,
+            self.go_table.obj_wild,
+            function(trans)
+                if not trans or trans:GetctiveInHierarchy() ~= 1 then
+                    self.panelInit.wild = nil
+                    _G.DestroyObject(trans)
+                    if callback then
+                        callback()
+                    end
+                    return
+                end
+                self.panelLua.wild = self:AddComponent(trans, require(PanelLuaFile.wild).New(trans))
+                self.panelInit.wild = true
+
+                if _G.AppSetting.IsXzns then
+                    local isFighting = towerManager:IsFighting() and towerManager:IsShowFighting() or
+                            secretRealmModel:IsFighting()
+                    if isFighting then
+                        self.panelLua.wild.gameObject:SetActiveE(0)
+                    end
+                else
+                    if towerManager:IsFighting() and towerManager:IsShowFighting() then
+                        self.panelLua.wild.gameObject:SetActiveE(0)
+                    end
+                end
+
+                if callback then
+                    callback()
+                end
+            end
+    )
+end
+
+function MainView:OnCard(isOn, callback)
+    self.go_table.obj_card:SetActiveE(isOn and 1 or 0)
+    if not isOn then
+        if callback then
+            callback()
+        end
+        return
+    end
+    if not self.panelInit.card then
+        self.panelInit.card = 0
+        _G.PoolsManager:GetInstance():Spawn(
+                PanelPrefabs.card,
+                _G.ePoolType.UIItem,
+                self.go_table.obj_card,
+                function(trans)
+                    if not trans or trans:GetctiveInHierarchy() ~= 1 then
+                        self.panelInit.card = nil
+                        _G.DestroyObject(trans)
+                        if callback then
+                            callback()
+                        end
+                        return
+                    end
+                    self.panelLua.card = self:AddComponent(trans, require(PanelLuaFile.card).New(trans))
+                    self.panelInit.card = true
+                    if self.clickToggleCall then
+                        self.clickToggleCall()
+                        self.clickToggleCall = nil
+                    end
+                    if callback then
+                        callback()
+                    end
+                end
+        )
+    elseif self.panelInit.card ~= 0 then
+        self.panelLua.card:UpdateView()
+        self.panelLua.card:RefreshCardList()
+        if self.clickToggleCall then
+            self.clickToggleCall()
+            self.clickToggleCall = nil
+        end
+        if callback then
+            callback()
+        end
+    end
+end
+
+function MainView:OnBenefit(isOn, callback)
+    self.go_table.obj_benefit:SetActiveE(isOn and 1 or 0)
+    if not isOn then
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.FuliView.Name)
+        return
+    end
+    if callback then
+        callback()
+    end
+    --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.FuliView.Name)
+    _G.MainManager:GetInstance():OnActivityBtnClick(_G.ConfigManager.ui_cfg.FuliView.Name)
+end
+
+function MainView:OnAfk(isOn, callback, notShowTips)
+    ---@type AfkBattleManager
+    local afkManager = require("AfkBattleManager"):GetInstance()
+    local isFighting = afkManager:IsFighting()
+    local isShowFighting = afkManager:IsShowFighting()
+    if isFighting then
+        local mId = require("AfkModel"):GetInstance():GetCurMonsterID()
+        local mCfg = _G.ConfigManager.monster_group_cfg[mId]
+        if mCfg then
+            _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, mCfg.audio)
+        end
+        afkManager:SetFightView(isOn and isShowFighting)
+    end
+
+    if _G.AppSetting.IsXzns and not isFighting and not notShowTips then
+        --星座在放置界面重复点击入口时弹tips
+        if isOn then
+            if self.isAfk then
+                _G.PopWindowManager:GetInstance():ShowAllTips(1, _G.GetLangPackValue(90049200101))
+            else
+                self.isAfk = true
+            end
+        else
+            self.isAfk = false
+        end
+    end
+    self.go_table.obj_afk:SetActiveE(isOn and 1 or 0)
+    if not isOn then
+        --切换bgm
+        local scene = _G.WorldManager:GetInstance().CurrentWorld
+        if scene then
+            _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, scene.Cfg.audio)
+        end
+        if callback then
+            callback()
+        end
+        return
+    end
+    if self.panelInit.afk then
+        if self.panelLua.afk then
+            --afk面板已加载并初始化
+            self.panelLua.afk.gameObject:SetActiveE(isFighting and isShowFighting and 0 or 1)
+            if not isFighting or not isShowFighting then
+                self.panelLua.afk:UpdateView()
+            end
+        end
+        if callback then
+            callback()
+        end
+        return
+    end
+    self.panelInit.afk = 0
+    _G.PoolsManager:GetInstance():Spawn(
+            PanelPrefabs.afk,
+            _G.ePoolType.UIItem,
+            self.go_table.obj_afk,
+            function(trans)
+                if not trans or trans:GetctiveInHierarchy() ~= 1 then
+                    self.panelInit.afk = nil
+                    _G.DestroyObject(trans)
+                    if callback then
+                        callback()
+                    end
+                    return
+                end
+                ---@type MainAfkPanel   AFK场景
+                self.panelLua.afk = self:AddComponent(trans, require(PanelLuaFile.afk).New(trans))
+                self.panelInit.afk = true
+                if afkManager:IsFighting() and afkManager:IsShowFighting() then
+                    self.panelLua.afk.gameObject:SetActiveE(0)
+                end
+                if callback then
+                    callback()
+                end
+            end
+    )
+end
+
+function MainView:SetToggleOn(key, call)
+    if not self.toggleItem[key] then
+        _G.LogError("MainView:请传入正确的Toggle的key")
+        return
+    end
+
+    self.clickToggleCall = call
+    self.toggleItem[key].isOn = true
+    self:OnClickBtn(self.toggleItem[key], true, call)
+end
+
+function MainView:UpdateView()
+    -- if self.panelInit.fort == true then
+    --     self.panelLua.fort:UpdateView()
+    -- end
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        if self.curTogKey == "fort" then
+            self:OnFort(true)
+        elseif self.curTogKey == "afk" then
+            self:OnAfk(true, nil, true)
+        else
+            if self.panelInit[self.defaultPanel] == true then
+                self.panelLua[self.defaultPanel]:UpdateView()
+            end
+        end
+        for k, v in pairs(unlockID) do
+            local bol = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(v)
+            local tb = self.toggles[k]
+            tb.obj_suoIcon:SetActiveE(not bol and 1 or 0)
+            tb.obj_redpoint:SetActiveE(bol and 1 or 0)
+        end
+        self:UpdateDrawIcon()
+        self:UpdateSociatyIcon()
+        self:UpdateNewFunctionIcon()
+        self:UpdateSPNewFunctionIcon()
+    end
+end
+
+---关闭公会战图标
+function MainView:CloseSociatyIcon()
+    self.toggles.sociaty.obj_drawIcon:SetActiveE(0)
+    self.toggles.sociaty.obj_guessIcon:SetActiveE(0)
+end
+
+---刷新公会战图标
+function MainView:UpdateSociatyIcon()
+    self.toggles.sociaty.obj_drawIcon:SetActiveE(0)
+    self.toggles.sociaty.obj_guessIcon:SetActiveE(0)
+
+    --- 判断玩家是否加入公会
+    if require("SociatyManager"):GetInstance():HasSociaty() then
+        local SociatyModel = require "SociatyModel":GetInstance()
+        local SociatyBattleModel = require "SociatyBattleModel":GetInstance()
+        local SociatyBattleLeagueModel = require "SociatyBattleLeagueModel":GetInstance()
+        local state = SociatyBattleModel:GetState()
+        if not SociatyBattleLeagueModel.MainViewUpdate then
+            SociatyBattleLeagueModel.MainViewUpdate = _G.handler(self, self.UpdateSociatyIcon)
+        end
+        local isShow = false
+        if SociatyBattleModel.enemySociatyBattleData and SociatyBattleModel.mySociatyBattleData then
+            if state == _G.SociatyBattleState.Battle then
+                if SociatyModel:GetTargetActivityTimes(_G.ScoaityActivityType.SociatyBattle) > 0 then
+                    isShow = require "SociatyBattleManager":GetInstance():CheckTime12()
+                end
+            end
+        end
+
+        local isShowLeague = false
+        if SociatyBattleLeagueModel.IsLeagueOpen then
+            if not self.LeagueModel then
+                self.LeagueModel = SociatyBattleLeagueModel
+            end
+            if not self.LeagueGuessItem then
+                self.LeagueGuessItem = _G.ConfigManager.guild_league_guess_cfg[1].gear[1][1]
+            end
+            state = self.LeagueModel:GetState()
+            if self.LeagueModel.enemySociatyBattleData and self.LeagueModel.mySociatyBattleData then
+                if state == _G.SociatyBattleLeagueState.Battle then
+                    if SociatyModel:GetTargetActivityTimes(_G.ScoaityActivityType.SociatyBattleLeague) > 0 then
+                        isShowLeague = require "SociatyBattleLeagueManager":GetInstance():CheckTime12()
+                    end
+                end
+            end
+            if state == _G.SociatyBattleLeagueState.Guess then
+                local canGuess = self.LeagueModel:CheckCanGuess(0) or self.LeagueModel:CheckCanGuess(1)
+                self.toggles.sociaty.obj_guessIcon:SetActiveE(canGuess and 1 or 0)
+            end
+        end
+
+        local isJoin = SociatyBattleLeagueModel.IsJoin
+
+        self.toggles.sociaty.obj_drawIcon:SetActiveE((isShow or (isShowLeague and isJoin)) and 1 or 0)
+    end
+end
+
+function MainView:UpdateNewFunctionIcon()
+    local isShow = false
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(54) == true then
+        if _G.PlayerPrefsManager.GetInt(_G.PlayerModel:GetInstance():GetPlayerUid() .. "NewFunctionWearBoss") == 0
+            or (_G.GameUtil.GetFunctionData(_G.FunctionBlock.game_type) ~= 1 and
+                _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.Nitpick .. "NewFunction") == 0)
+        then
+            isShow = true
+        end
+    end
+    if isShow == false and _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Rune) == true then
+        isShow = require("SecretRealmModel"):GetInstance():CheckOpenIndex()
+    end
+    self.toggles.wild.obj_newFunctionIcon:SetActiveE(isShow == true and 1 or 0)
+end
+
+function MainView:UpdateSPNewFunctionIcon()
+    local isShow = false
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.CardHall) then
+        if _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.CardHallOpen) == 0 then
+            isShow = true
+        end
+    end
+    self.toggles.fort.obj_newFunctionIcon:SetActiveE(isShow == true and 1 or 0)
+end
+
+function MainView:OnFunctionOpenCall(id)
+    if id == _G.FunctionID.CardHall then
+        _G.Events:GetInstance():Broadcast(_G.CardHallViewShow.Open)
+        _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnFunctionOpenCall, self)
+    end
+end
+
+---刷新十连招募图标
+function MainView:UpdateDrawIcon(data)
+    if _G.IsNil(data) then
+        local drawNormalCount = _G.StorageManager:GetInstance():GetItemCountBySid(203020100)
+        local drawProCount = _G.StorageManager:GetInstance():GetItemCountBySid(203020200)
+        self.toggles.fort.obj_drawIcon:SetActiveE((drawNormalCount >= 10 or drawProCount >= 10) and 1 or 0)
+        if _G.PlayerPrefsManager.HasKey("PetDrawRedPoint") then
+            local count = _G.PlayerPrefsManager.GetInt("PetDrawRedPoint") // 10
+            local hasCount = _G.StorageManager:GetInstance():GetItemCountBySid(203120100) // 10
+            if hasCount > count then
+                _G.PlayerPrefsManager.DeleteKey("PetDrawRedPoint")
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PetDraw.id)
+            end
+        end
+    else
+        for _, value in pairs(data) do
+            local sid = value.type[1]
+            if sid == 203020100 or sid == 203020200 then
+                local drawNormalCount = _G.StorageManager:GetInstance():GetItemCountBySid(203020100)
+                local drawProCount = _G.StorageManager:GetInstance():GetItemCountBySid(203020200)
+                self.toggles.fort.obj_drawIcon:SetActiveE((drawNormalCount >= 10 or drawProCount >= 10) and 1 or 0)
+            elseif sid == 203120100 then
+                if _G.PlayerPrefsManager.HasKey("PetDrawRedPoint") then
+                    local count = _G.PlayerPrefsManager.GetInt("PetDrawRedPoint") // 10
+                    local hasCount = _G.StorageManager:GetInstance():GetItemCountBySid(203120100) // 10
+                    if hasCount > count then
+                        _G.PlayerPrefsManager.DeleteKey("PetDrawRedPoint")
+                        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PetDraw.id)
+                    end
+                end
+            elseif self.LeagueGuessItem and sid == self.LeagueGuessItem and self.LeagueModel then
+                if self.LeagueModel:GetState() == _G.SociatyBattleLeagueState.Guess then
+                    local canGuess = self.LeagueModel:CheckCanGuess(0) or self.LeagueModel:CheckCanGuess(1)
+                    self.toggles.sociaty.obj_guessIcon:SetActiveE(canGuess and 1 or 0)
+                end
+            end
+        end
+    end
+end
+---用作塔战斗时屏蔽冒险挂机宝箱屏蔽解开
+function MainView:OnDeadsoulViewClosed(name)
+    if name ~= _G.ConfigManager.ui_cfg.DeadsoulView.Name then
+        return
+    end
+    self.inTower = false
+    self:ShowAfkBox("wild")
+end
+
+---用作塔战斗时屏蔽冒险挂机宝箱屏蔽
+function MainView:OnDeadsoulViewOpen(name)
+    if name ~= _G.ConfigManager.ui_cfg.DeadsoulView.Name then
+        return
+    end
+    self.inTower = true
+    self:ShowAfkBox("wild")
+end
+
+function MainView:UpdateHell()
+    if self.panelInit.fort == true then
+        self.panelLua.fort:UpdateHell()
+    end
+end
+
+function MainView:InitFunctions()
+    if self.panelInit.fort == true then
+        self.panelLua.fort:InitFunctions()
+    end
+end
+
+function MainView:ShowQuickBtn()
+    _G.Log("新主界面暂无此方法, 此为容错处理")
+end
+
+function MainView:ShowSeasonBtn()
+    _G.Log("新主界面暂无此方法, 此为容错处理")
+end
+
+function MainView:RefreshAfkBoxTip()
+    _G.Log("新主界面暂无此方法, 此为容错处理")
+end
+
+function MainView:Dispose()
+    self.afkAwardBoxEff = nil
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.UpdateDrawIcon, self)
+    _G.Events:GetInstance():RemoveListener(_G.eAfkEvents.Pass, self.UpdateView, self)
+    _G.Events:GetInstance():RemoveListener(_G.ePlayerStatus.PlayerUpLevel, self.UpdateAfkIdelEffect, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSociatyBattle.ScoiatyBattleChallengeNum, self.UpdateSociatyIcon, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSociatyBattle.SociatyBattleState, self.UpdateSociatyIcon, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSociatyBattle.RefreshSociatyBattleView, self.UpdateSociatyIcon, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSociatyBattle.SociatyBattleBattle, self.UpdateSociatyIcon, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSociatyEvent.BeKicked, self.CloseSociatyIcon, self)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnDeadsoulViewOpen, self)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnDeadsoulViewClosed, self)
+    _G.Events:GetInstance():RemoveListener(_G.DungeonChallengeBattleViewShow.Open, self.UpdateNewFunctionIcon, self)
+    _G.Events:GetInstance():RemoveListener(_G.CardHallViewShow.Open, self.UpdateSPNewFunctionIcon, self)
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnFunctionOpenCall, self)
+    self:RemoveAllListener()
+end
+
+---按钮点击事件在这里派发
+function MainView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_afkAwardBox then
+        require "RequestSubscribeModel":GetInstance():DoRS(1)
+        self:GotoToggle("afk")
+    end
+end
+
+---初始化AFK待机状态
+function MainView:InitAfkIdel()
+    local isShowIdelEffect = false
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        --n关卡后不再展示待机特效
+        local cfg = _G.ConfigManager.discrete_cfg[120007]
+        if cfg then
+            isShowIdelEffect = require("AfkModel"):GetInstance():GetCurSection() <= cfg[1][1]
+        end
+    end
+    --注册全局监听
+    if isShowIdelEffect then
+        registeClickEvent()
+    else
+        unregisteClickEvent()
+    end
+    self:UpdateAfkIdel(false)
+end
+
+---更新Afk待机状态
+---@param newState boolean
+function MainView:UpdateAfkIdel(newState)
+    if not newState then
+        if self.afkIdelTimer then
+            self.afkIdelTimer:Stop()
+            self.afkIdelTimer = nil
+        end
+        ---检查是否展示特效(n关卡之前), 并获取延迟时间
+        local cfg1, cfg2 = _G.ConfigManager.discrete_cfg[120006], _G.ConfigManager.discrete_cfg[120007]
+        if cfg1 and cfg2 and require("AfkModel"):GetInstance():GetCurSection() <= cfg2[1][1] then
+            if not self.updateAfkIdelTrue then
+                self.updateAfkIdelTrue = function()
+                    self:UpdateAfkIdel(true)
+                end
+            end
+            --等待n秒后显示待机特效
+            local duration = cfg1[1][1]
+            self.afkIdelTimer = _G.TimerManager:GetInstance():GetTimer(duration, self.updateAfkIdelTrue, self, true,
+                    false, true)
+            self.afkIdelTimer:Start()
+        else
+            unregisteClickEvent()
+        end
+    end
+    if self.afkIdel == newState then
+        return
+    end
+    self.afkIdel = newState
+    self:UpdateAfkIdelEffect()
+end
+
+---更新AFK战斗特效
+function MainView:UpdateAfkFightingEffect()
+    if self.afkFightingEff == 0 then
+        --特效正在加载中
+        return
+    end
+    --获取afk战斗状态
+    local model = require("AfkBattleManager"):GetInstance()
+    if not model:IsFighting() then
+        if self.afkFightingEff then
+            self.afkFightingEff:SetActiveE(0)
+        end
+        if not _G.AppSetting.IsXzns then
+            self.toggles.afk.obj_icon:SetActiveE(1)
+        end
+        return
+    end
+
+    --显示特效
+    if self.afkFightingEff then
+        self.afkFightingEff:SetActiveE(1)
+        if not _G.AppSetting.IsXzns then
+            self.toggles.afk.obj_icon:SetActiveE(0)
+        end
+    else
+        self.afkFightingEff = 0
+        _G.UIUtils.LoadEffectByCfg(
+                _G.ConfigManager.ui_effect_cfg.ef_maoxianbtn,
+                self.go_table.toggle_afk,
+                function(trans)
+                    if self:IsNil() then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    local isShow = model:IsFighting()
+                    self.afkFightingEff = trans
+                    self.afkFightingEff:SetActiveE(isShow and 1 or 0)
+                    if not _G.AppSetting.IsXzns then
+                        self.toggles.afk.obj_icon:SetActiveE(isShow and 0 or 1)
+                    end
+                end
+        )
+    end
+end
+
+---更新Afk待机特效
+function MainView:UpdateAfkIdelEffect()
+    if self.afkIdelEff == 0 then
+        --特效正在加载中
+        return
+    end
+    --获取待机状态(未选中afk选项卡且未处于战斗中)
+    local model = require("AfkBattleManager"):GetInstance()
+    local isFighting = model:IsFighting() == true
+    if _G.AppSetting.IsXzns then
+        if _G.GuideManager:GetInstance().IsGuideing == true then
+            --在引导中不显示
+            return
+        end
+        --星座在爬塔时也不显示
+        isFighting = isFighting or
+                _G.DeadsoulTowerManager:GetInstance():IsFighting() or
+                require("SecretRealmModel"):GetInstance():IsFighting()
+    end
+    local isShow = self.afkIdel and not self:IsToggled("afk") and not isFighting
+    if not isShow then
+        if self.afkIdelEff then
+            self.afkIdelEff:SetActiveE(0)
+        end
+        return
+    end
+
+    local pass = require("AfkModel"):GetInstance():CheckNextSectionCondition()
+    if not pass then
+        if self.afkIdelEff then
+            self.afkIdelEff:SetActiveE(0)
+        end
+        return
+    end
+
+    --显示特效
+    if self.afkIdelEff then
+        self.afkIdelEff:SetActiveE(1)
+    else
+        local cfg = _G.ConfigManager.ui_effect_cfg.ef_maoxiankonxian
+        if AppSetting.IsXzns then
+            cfg = _G.ConfigManager.ui_effect_cfg.Ef_yindaoshoushi_6
+        end
+        self.afkIdelEff = 0
+        _G.UIUtils.LoadEffectByCfg(
+                _G.ConfigManager.ui_effect_cfg.ef_maoxiankonxian,
+                self.go_table.toggle_afk,
+                function(trans)
+                    if self:IsNil() then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    local isShow = self.afkIdel and not self:IsToggled("afk") and not model:IsFighting()
+                    self.afkIdelEff = trans
+                    self.afkIdelEff:SetActiveE(isShow and 1 or 0)
+                end
+        )
+    end
+end
+
+function MainView:DoOpenWindow(name)
+    if self.panelLua.sociaty then
+        self.panelLua.sociaty:OpenWindow(name)
+    end
+end
+
+---离开公会时关闭公会界面
+---@param uid number
+function MainView:LeaveAndCloseSociaty(uid)
+    if uid == _G.PlayerModel:GetInstance().role_uid then
+        if self.panelLua.sociaty then
+            self.panelLua.sociaty:Close()
+            _G.UIUtils.RemoveChildren(self.go_table.obj_sociaty)
+
+            self.go_table.toggle_sociaty.isOn = false
+            self.go_table.toggle_fort.isOn = true
+
+            self.panelInit.sociaty = nil
+        end
+    end
+end
+
+---更新弹幕视图状态
+---@param checkEnabled? boolean
+---@return boolean
+function MainView:UpdateFloatMessages(checkEnabled)
+    ---@type FloatMessagesView
+    local window = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.FloatMessagesView.Name)
+    if checkEnabled then
+        local enabled = require("ChatManager"):GetInstance():CheckFloatMessageEnabled()
+        if enabled and not window then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.FloatMessagesView.Name)
+        elseif not enabled and window then
+            window:Close()
+            window = nil
+        end
+    end
+    if window then
+        window:Show()
+        window:OnWindowChange()
+    end
+end
+
+---初始化淡入动画
+---@return void
+function MainView:InitAnimation()
+    -- if self:IsNil() then
+    --     return
+    -- end
+    -- if not self.animator then
+    --     self.animator = self.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+    -- end
+    -- if _G.IsNil(self.animator) then
+    --     return
+    -- end
+    -- self:StopAnimation(false)
+    -- -- self.animator.enabled = true
+    -- self.animator:Play("ani_buzhengqieyexia", true)
+    -- self.animator:Update(0)
+    -- self.animator.enabled = false
+    -- self.animatorInit = true
+end
+
+---播放淡入动画
+---@return void
+function MainView:PlayAnimation()
+    -- if not self.animator then
+    --     self.animator = self.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+    -- end
+    -- if _G.IsNil(self.animator) then
+    --     return
+    -- end
+    -- self.animator.enabled = false
+    -- self.animator.enabled = true
+    -- --延迟停止动画组件
+    -- self.animatorStopTimer = _G.TimerManager:GetInstance():GetTimer(1, self.StopAnimation, self, true, false)
+    -- self.animatorStopTimer:Start()
+end
+
+---停止播放动画
+---@param changeAnimation? boolean 改变animation状态, 默认为true
+---@return void
+function MainView:StopAnimation(changeAnimation)
+    -- self.animatorInit = false
+    -- if self.animatorStopTimer then
+    --     self.animatorStopTimer:Stop()
+    --     self.animatorStopTimer = nil
+    -- end
+    -- if self:IsNil() or changeAnimation == false then
+    --     return
+    -- end
+    -- if not self.animator then
+    --     self.animator = self.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+    -- end
+    -- if _G.IsNil(self.animator) then
+    --     return
+    -- end
+    -- self.animator:Play("ani_buzhengqieyexia", true)
+    -- self.animator:Update(1)
+    -- self.animator.enabled = false
+end
+
+return MainView

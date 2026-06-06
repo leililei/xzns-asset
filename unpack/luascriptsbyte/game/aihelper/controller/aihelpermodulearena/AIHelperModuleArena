@@ -1,0 +1,344 @@
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleArena : AIHelperModuleBaseNumberMock	    @AI助手-普通竞技场
+---@field index number                  @已执行次数
+---@field isOpen boolean                @竞技场是否开启
+---@field freeNum number                @竞技场剩余免费次数
+local AIHelperModuleArena = _G.BaseClass("AIHelperModuleArena", base)
+
+function AIHelperModuleArena:__init()
+    if self:CheckMultiplyChallenge() then
+        self.mock = false
+        self.number = self:ReadSettings(99)
+        local _, max = self:GetCountRange()
+        self.number = math.min(self.number, max)
+    end
+end
+
+---是否满足模块使用条件
+function AIHelperModuleArena:IsActive()
+    return self.index <= self.number and self.isOpen
+end
+
+---重置状态
+---@return void
+function AIHelperModuleArena:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.isOpen = true
+    self.freeNum = 1
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleArena:Check(callback)
+    self.index = 1
+    self.isOpen = false
+    self.freeNum = 0
+    self:CheckFucntion()
+
+    local ArenaManager = require("ArenaManager")
+    local arenaClass = self.isOpen and ArenaManager:GetInstance():GetArenaClass(ArenaManager.arenaType.normal)
+    if self.isOpen and arenaClass then
+        local wait = true
+        --强制刷新一下对战列表
+        arenaClass:RefreshEnemy(function()
+            if not wait then
+                return
+            end
+            wait = false
+
+            _G.DelayFrameDo(function()
+                --延迟一帧回调,
+                --其ArenaSingleClass:RefreshEnemy和ArenaManager:GetEnemyArray使用用一个字段记录callback信息,
+                --立即回调将导致ArenaManager:GetEnemyArray的callback异常
+                if callback then
+                    callback(true)
+                end
+            end)
+        end)
+
+        --刷新cd或无刷新次数, 超时处理
+        _G.DelayDo(1, function()
+            if not wait then
+                return
+            end
+            wait = false
+            if callback then
+                callback(true)
+            end
+        end)
+    else
+        if callback then
+            callback(true)
+        end
+    end
+end
+
+---获取当前执行状态
+---@return any
+function AIHelperModuleArena:GetExecuteState()
+    return {
+        total = self.number,
+        index = self.index
+    }
+end
+
+---执行逻辑
+function AIHelperModuleArena:Execute(callback)
+    self.index = self.index + 1
+    self:CheckFucntion()
+
+    --检查能否进行战斗(功能未开放或没有免费次数)
+    if not self.isOpen or self.freeNum <= 0 then
+        if callback then
+            callback(false, self.isOpen and self:CreateFailureResults(self.cfg.fail_tip) or nil)
+        end
+        return
+    end
+
+    local ArenaNet = require("ArenaNet")
+    local ArenaManager = require("ArenaManager")
+    local ArenaController = require("ArenaController")
+
+    local function response(success, results)
+        if not callback then
+            return
+        end
+        callback(success, results)
+    end
+    --初始化参数
+    local enemyUid = 0
+    local arenaType = ArenaManager.arenaType.normal
+    ---@type ArenaSingleClassNormal
+    local arenaClass = ArenaManager:GetInstance():GetArenaClass(arenaType)
+
+    ---拉取敌方团队信息(判断是否为空队伍)
+    ---@param _callback fun(data:any, isEmpty:boolean):void
+    local function getEnemyState(_callback)
+        ArenaManager:GetInstance():GetEnemyEmbattleArray(
+            arenaType,
+            enemyUid,
+            function(teamData)
+                local isEmpty = true
+                local data = {false, false, false, false, false}
+                if teamData then
+                    for index, v in pairs(teamData) do
+                        if v then
+                            data[index] = {
+                                uid = v.sid,
+                                sid = v.sid,
+                                level = v.lv or 0,
+                                star = v.star or 0,
+                                soulLink_lv = v.soulLV or 0,
+                                soulLink_IsActivate = v.soulState or 0,
+                                open_inborn = v.talents or 0
+                            }
+                            if v.sid > 0 then
+                                isEmpty = false
+                                break
+                            end
+                        end
+                    end
+                end
+                if _callback then
+                    _callback(data, isEmpty)
+                end
+            end,
+            true
+        )
+    end
+
+    ---战斗结束后处理一些事件
+    ---@return void
+    local function finish()
+        ArenaController:GetInstance():RefreshBoxRedPoint()
+        ArenaController:GetInstance():RefreshRePort(
+            function()
+                ArenaController:GetInstance():GetEnemyArray(nil, true)
+            end
+        )
+    end
+    ---提交战斗结束
+    ---@param isEmptyEnemy boolean 敌方是否为空队伍
+    ---@return void
+    local function fightResult(msg, isEmptyEnemy)
+        if not msg or msg.ack ~= 1 then
+            response(false, nil)
+            return
+        end
+        ArenaNet:GetInstance():FightResult(
+            nil,
+            function(_msg)
+                ArenaController:GetInstance():ChangesChallengeTimes()
+                if not _msg or _msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+                local isWin = _msg.winner or false
+                --解析奖励信息
+                _G.StorageManager:GetInstance():ReceiveAwardData(_msg)
+
+                if isEmptyEnemy then
+                    ArenaController:GetInstance():FreshArenaInfo(finish)
+                else
+                    arenaClass:InitInfo(finish, true)
+                    _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.Arena, 2}, 1)
+
+                    if isWin then
+                        _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.Arena, 1}, 1)
+                    end
+                end
+
+                --战斗结束参数
+                _msg.params = {
+                    isWin,
+                    _msg.info[1],
+                    _msg.info[2]
+                }
+                response(true, _msg)
+            end
+        )
+    end
+    ---发起战斗请求
+    ---@param isEmptyEnemy boolean 敌方是否为空队伍
+    ---@return void
+    local function fight(isEmptyEnemy)
+        local enemyData = ArenaManager:GetInstance():GetEnemyDataByUid(arenaType, enemyUid)
+        ArenaNet:GetInstance():Fight(
+            arenaType,
+            enemyUid,
+            enemyData.mType,
+            function(_msg)
+                fightResult(_msg, isEmptyEnemy)
+            end
+        )
+    end
+    ---更新自己的团队队伍
+    ---@param data any  敌方队伍数据
+    ---@param isEmptyEnemy boolean 敌方是否为空队伍
+    ---@return void
+    local function updateEmbattle(data, isEmptyEnemy)
+        if isEmptyEnemy then
+            require("EmbattleController"):GetInstance():SaveByEnemyEmpty(
+                _G.EmbattleType.arenaAttack,
+                _G.EmbattleSaveType.server,
+                nil,
+                _G.EmbattleControllerItemType.arenaAttack,
+                _G.ConfigManager.arena_info_cfg[1].battle_sences,
+                data
+            )
+            fight(isEmptyEnemy)
+        else
+            ---@type EmbattleItemArenaAttack
+            local item =
+                require(_G.EmbattleControllerItemType.arenaAttack).New(
+                _G.EmbattleType.arenaAttack,
+                _G.EmbattleSaveType.server,
+                nil,
+                _G.ConfigManager.arena_info_cfg[1].battle_sences,
+                data
+            )
+            item:SaveEmbattle(
+                function()
+                    fight(isEmptyEnemy)
+                end,
+                true
+            )
+        end
+    end
+
+    --拉取敌方列表
+    ArenaController:GetInstance().curChooseArenaSid = arenaType
+    ArenaManager:GetInstance():GetEnemyArray(
+        arenaType,
+        function(list)
+            if not list or #list <= 0 then
+                response(false, nil)
+                return
+            end
+            --当前挑战的uid
+            enemyUid = list[#list].uid
+            require("ArenaController"):GetInstance():SetChallengeUid(enemyUid)
+            --拉取敌方团队信息
+            getEnemyState(updateEmbattle)
+        end,
+        true
+    )
+end
+
+---设置mock开关
+---@param enable boolean
+function AIHelperModuleArena:SetMock(enable)
+    if self:CheckMultiplyChallenge() then
+        base.SetMock(self, false) --30天以上, 默认开启选次数
+    else
+        base.SetMock(self, enable)
+    end
+end
+
+---获取Number范围
+function AIHelperModuleArena:GetCountRange()
+    if self:CheckMultiplyChallenge() then
+        self:CheckFucntion()
+        return 0, self.freeNum or 0
+    else
+        return base.GetCountRange(self)
+    end
+end
+
+---显示执行状态
+function AIHelperModuleArena:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    if results and results.params then
+        local isWin, change, total = results.params[1], results.params[2], results.params[3]
+        if isWin then
+            change = "<color=green>+" .. change .. "</color>"
+        else
+            change = "<color=red>-" .. change .. "</color>"
+        end
+        item.aortext_tip.text = _G.GetLangPackValue(90022100279, total, change)
+    else
+        item.aortext_tip.text = ""
+    end
+end
+
+---显示执行结束UI状态
+function AIHelperModuleArena:ShowExecuteResult(item, success, results)
+    base.ShowExecuteResult(self, item, success, results)
+    if not success then
+        return
+    end
+    self.Util.ShowAwardListOfMsg(item, results)
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleArena:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+---检查竞技场功能是否开放以及是否有免费次数
+---@return void
+function AIHelperModuleArena:CheckFucntion()
+    local ArenaManager = require("ArenaManager")
+
+    --检查竞技场是否开启中
+    ---@type ArenaSingleClassNormal
+    local arenaClass = ArenaManager:GetInstance():GetArenaClass(ArenaManager.arenaType.normal)
+    if arenaClass and arenaClass:GetCurArenaState() == ArenaManager.State.open then
+        self.isOpen = true
+    end
+    --获取剩余免费次数
+    if arenaClass then
+        self.freeNum = arenaClass:GetFreeFightTimes() or 0
+    end
+end
+
+---是否开启多次挑战(30天以上)
+---@return boolean
+function AIHelperModuleArena:CheckMultiplyChallenge()
+    local duration = _G.PlayerModel:GetInstance():GetServerOpenDuration()
+    return math.ceil(duration / 86400) >= 30
+end
+
+return AIHelperModuleArena

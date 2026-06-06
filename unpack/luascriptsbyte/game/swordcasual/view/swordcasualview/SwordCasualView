@@ -1,0 +1,1743 @@
+local ObjectFactory = require("ObjectFactory")
+local SwordCasual_BoxItem = require("SwordCasual_BoxItem")
+local SwordCasual_SwordItem = require("SwordCasual_SwordItem")
+local SwordCasual_BulletItem = require("SwordCasual_BulletItem")
+local SwordCasual_MasterItem = require("SwordCasual_MasterItem")
+local SwordCasual_MonsterItem = require("SwordCasual_MonsterItem")
+local SwordCasual_MonsterShooterItem = require("SwordCasual_MonsterShooterItem")
+local SwordCasual_MapControll = require("SwordCasual_MapControll")
+
+local SwordCasual_Utils = require("SwordCasual_Utils")
+
+---武器击退距离
+local SWORD_BEATBACK_DISTANCE = 100
+---子弹击退距离
+local BULLET_BEATBACK_DISTANCE = 20
+---(受伤后)无敌时间
+local SUPER_ARMOR_TIME = 0.2
+---主角最多持有的刀数量
+local MAX_SWORD_COUNT = 10
+
+---@class SwordCasualView : UIBaseView	剑之修行_战斗页面
+---@field go_table SwordCasualView_GoTable
+-----------------------------------------------------------------------
+---@field cfg jzxx_stage_cfg
+---@field stageIndex number
+---@field callback fun(win:boolean,num:number,time:number,score:number):void
+---@field time number                               @总耗时时间
+---@field score number                              @当前得分(初始小于0, 则表示不统计分数)
+---@field createCfg SwordCasual_CreateMonster[]     @怪物生成配置
+---@field createFinish boolean                      @怪物生成是否已结束
+---@field kill number                               @当前击杀数量
+---@field boxUpdateInterval number                  @掉落物更新间隔
+---@field boxCollectInterval number                 @掉落物拾取更新间隔
+---@field effectCfgs jzxx_event_cfg[]                @buff配置
+-----------------------------------------------------------------------
+---@field isPayment boolean                         @是否显示支付模块(提审模式下使用)
+---@field pointItem CommonRsItem_GoTable            @点数货币栏实例(提审模式)
+-----------------------------------------------------------------------
+---@field mainLoop Timer                            @主循环定时器
+---@field pause boolean                             @是否暂停游戏
+---@field joystick ETCJoystick                      @移动摇杆组件
+---@field isMoveJoystick boolean                    @是否在移动摇杆组件
+---@field direction {x:number,y:number}             @摇杆方向
+---@field mapControll SwordCasual_MapControll       @地图控制器
+---@field masterItem SwordCasual_MasterItem         @主角实例
+---@field monsterItems SwordCasual_MonsterItem[]    @所有怪物实例
+---@field monsterUpdateSiblingInterval number       @怪物层级更新间隔
+---@field bulletItems SwordCasual_BulletItem[]      @所有子弹实例
+---@field boxItems SwordCasual_BoxItem[]            @所有掉落物实例
+---@field boxPool ObjectFactory<SwordCasual_BoxItem>            @掉落物实例对象池
+---@field swordPool ObjectFactory<SwordCasual_SwordItem>        @刀剑实例对象池
+---@field bulletPool ObjectFactory<SwordCasual_BulletItem>      @子弹实例对象池
+---@field monsterPool ObjectFactory<SwordCasual_MonsterItem>    @怪物实例对象池
+---@field monsterShooterPool ObjectFactory<SwordCasual_MonsterShooterItem>    @(射击手)怪物实例对象池
+-----------------------------------------------------------------------
+local base=_G.UIBaseView
+---@field closeCallback fun():void @关闭回调
+local SwordCasualView = _G.BaseClass("SwordCasualView", base)
+
+function SwordCasualView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+
+    self:AddListener(_G.ArraignedMall.PointUpdate, self.UpdateView)
+end
+
+function SwordCasualView:OnDestroy()
+    self:RemoveAllListener()
+end
+
+function SwordCasualView:OnDestroy()
+    --移除摇杆事件
+    -- if self.joystick then
+    --     self.joystick.onMove:RemoveAllListeners()
+    --     self.joystick.onMoveEnd:RemoveAllListeners()
+    --     self.joystick = nil
+    -- end
+    --移除定时器
+    if self.mainLoop then
+        self.mainLoop:Stop()
+        self.mainLoop = nil
+    end
+end
+
+---界面的入口函数
+---@param stageIndex number @关卡序号
+---@param cfg jzxx_stage_cfg
+---@param callback fun(win:boolean,num:number,time:number,score:number):void     @是否胜利/击杀数量/总耗时时间
+---@param showScore boolean @是否显示得分
+---@param isPayment boolean @是否显示支付模块
+function SwordCasualView:OnCreate(stageIndex, cfg, callback, showScore, isPayment)
+    self.stageIndex = stageIndex
+    self.cfg = cfg
+    self.callback = callback
+    self.time = 0
+    self.kill = 0
+    self.boxUpdateInterval = 0
+    self.boxCollectInterval = 0
+
+    --初始化怪物波次
+    self.createFinish = false
+    self.createCfg = {}
+    for _, v in ipairs(self.cfg.monster_config) do
+        local startTime, endTime, interval, count, monsterId = v[1], v[2], v[3], v[4], v[5]
+        table.insert(
+            self.createCfg,
+            {
+                time = 0,
+                startTime = startTime,
+                endTime = endTime,
+                interval = interval,
+                count = count,
+                monsterIds = { monsterId }
+            }
+        )
+    end
+
+    --初始事件
+    self.effectCfgs = {}
+    if self.cfg.event_config and #self.cfg.event_config > 0 then
+        for _, eventId in ipairs(self.cfg.event_config[1]) do
+            local cfg = _G.ConfigManager.jzxx_event_cfg[eventId]
+            if cfg then
+                table.insert(self.effectCfgs, cfg)
+            end
+        end
+    end
+
+    self:InitView()
+    --初始化摇杆
+    self:InitJoystick()
+    --初始化对象池
+    self:InitPools()
+
+    local jssc = _G.ConfigManager.jzxx_stage_show_cfg[1000 + self.cfg.type]
+    if jssc then
+        local mrgotable = _G.GetAutoGoTable(self.go_table.obj_mapRoot)
+        mrgotable.obj_rendererBlock:GetComponentE(_G.typeof(_G.CS.AorRawImage)):LoadImage(jssc.bg, function()
+                --初始化组件
+            self.mapControll =
+            self:AddComponent(self.go_table.obj_mapRoot, SwordCasual_MapControll.New(self.go_table.obj_mapRoot))
+
+            self:DoStartGame(showScore, isPayment)
+        end)
+    else
+        --初始化组件
+        self.mapControll =
+        self:AddComponent(self.go_table.obj_mapRoot, SwordCasual_MapControll.New(self.go_table.obj_mapRoot))
+        self:DoStartGame(showScore, isPayment)
+    end
+end
+
+    ---主循环事件
+function SwordCasualView:DoStartGame(showScore, isPayment)
+
+    self.masterItem = self:CreateMasterItem()
+    self.monsterItems = {}
+    self.monsterUpdateSiblingInterval = 0
+    self.bulletItems = {}
+    self.boxItems = {}
+
+    --初始化主循环
+    self.mainLoop = _G.TimerManager:GetInstance():GetTimer(1, self.Update, self, false, true)
+    self.mainLoop:Start()
+
+    self:UpdateTime()
+
+    --积分信息
+    self.score = showScore and 0 or -1
+    self.go_table.obj_score:SetActiveE(showScore and 1 or 0)
+    if showScore then
+        self:UdpateScore()
+    end
+
+    self.go_table.obj_tip:SetActiveE(0)
+
+    --(提审)支付模块
+    self.isPayment = isPayment
+    if isPayment then
+        require("ArraignedMallModel"):GetInstance():LoadPointItem(
+            self.go_table.obj_goldInfo,
+            function(item)
+                self.pointItem = item
+            end,
+            function()
+                --打开商城页面
+                self:SetPause(true)
+                self:SetPauseRenderer(true)
+                _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.ArraignedMallView.Name,
+                    function()
+                        self:SetPause(false)
+                        self:SetPauseRenderer(false)
+                    end)
+            end
+        )
+    end
+end
+
+---主循环事件
+function SwordCasualView:Update()
+    if self:IsPause() then
+        return
+    end
+
+    local dt = _G.Time.deltaTime
+
+    --时间计数
+    self.time = self.time + dt
+    self:UpdateTime()
+
+    --主角移动
+    if self.direction.x ~= 0 or self.direction.y ~= 0 then
+        local delta = self.masterItem:GetSpeed() * dt
+        self.mapControll:UpdatePosition(delta)
+        --self.roleItem:UpdatePosition(delta)
+    end
+    --物理逻辑更新
+    self.masterItem:Update(dt)
+    for i = #self.monsterItems, 1, -1 do
+        self.monsterItems[i]:Update(dt)
+    end
+    for i = #self.bulletItems, 1, -1 do
+        self.bulletItems[i]:Update(dt)
+    end
+    --计算掉落物过期
+    self.boxUpdateInterval = self.boxUpdateInterval + dt
+    if self.boxUpdateInterval >= 0.1 then
+        local _dt = self.boxUpdateInterval
+        self.boxUpdateInterval = 0
+        for i = #self.boxItems, 1, -1 do
+            self.boxItems[i]:Update(_dt)
+            --进入选事件界面
+            if self:IsPause() then
+                return
+            end
+        end
+    end
+
+    --更新怪物层级(定时)
+    -- self.monsterUpdateSiblingInterval = self.monsterUpdateSiblingInterval - dt
+    -- if self.monsterUpdateSiblingInterval <= 0 then
+    --     self.monsterUpdateSiblingInterval = 0.1
+    --     self:UpdateMonsterSibling()
+    -- end
+    self:UpdateMonsterSibling()
+
+    --计算角色/武器碰撞
+    for i = #self.monsterItems, 1, -1 do
+        self:UpdateRoleOverlap(self.masterItem, self.monsterItems[i])
+
+        --如果怪物死亡, 播放死亡动画
+        if self.monsterItems[i]:IsDeath() then
+            local monsterItem = self.monsterItems[i]
+            table.remove(self.monsterItems, i)
+            self:OnMonsterDeath(monsterItem)
+        end
+
+        --如果玩家死亡, 则结束游戏
+        if self.masterItem:IsDeath() then
+            self:OnMasterDeath()
+            return
+        end
+    end
+
+    --计算子弹碰撞
+    self:UpdateBulletOverlap(self.masterItem, self.bulletItems)
+    if self.masterItem:IsDeath() then
+        self:OnMasterDeath()
+        return
+    end
+    local masterBullets = self.masterItem:GetBulletItems()
+    if masterBullets and #masterBullets > 0 then --主角发出的子弹
+        for i = #self.monsterItems, 1, -1 do
+            self:UpdateBulletOverlap(self.monsterItems[i], masterBullets)
+            --如果怪物死亡, 播放死亡动画
+            if self.monsterItems[i]:IsDeath() then
+                local monsterItem = self.monsterItems[i]
+                table.remove(self.monsterItems, i)
+                self:OnMonsterDeath(monsterItem)
+            end
+        end
+    end
+
+    --计算物品拾取
+    self.boxCollectInterval = self.boxCollectInterval + dt
+    if self.boxCollectInterval >= 0.1 then
+        self.boxCollectInterval = 0
+        for i = #self.boxItems, 1, -1 do
+            if SwordCasual_Utils.Physics:rectOverlapOBB(self.masterItem:GetRect(), self.boxItems[i]:GetRect()) then
+                self:OnBoxCollect(self.masterItem, self.boxItems[i])
+                self.boxPool:Release(self.boxItems[i])
+                table.remove(self.boxItems, i)
+            end
+        end
+    end
+
+    --生成怪物实例
+    self.createFinish = true
+    for _, v in pairs(self.createCfg) do
+        if self.time >= v.startTime and self.time <= v.endTime then
+            v.time = v.time - dt
+            if v.time <= 0 then
+                v.time = v.interval
+                local mx, my = self.masterItem:GetPosition()
+                for _ = 1, v.count do
+                    local monsterId = v.monsterIds[math.random(1, #v.monsterIds)]
+                    local cfg = _G.ConfigManager.jzxx_role_cfg[monsterId]
+                    local monsterItem = self:CreateMonsterItem(mx, my, cfg)
+                    table.insert(self.monsterItems, monsterItem)
+                end
+            end
+        end
+        if self.time <= v.endTime then
+            self.createFinish = false
+        end
+    end
+
+    --通关WASD或方向键, 控制玩家行进
+    if _G.AppSetting.IS_EDITOR and not self.isMoveJoystick then
+        local horizontal = _G.CS.UnityEngine.Input.GetAxis("Horizontal")
+        local vertical = _G.CS.UnityEngine.Input.GetAxis("Vertical")
+
+        --归一化处理
+        local len = math.sqrt(horizontal ^ 2 + vertical ^ 2)
+        if len > 0.0001 then
+            self.direction.x = horizontal / len
+            self.direction.y = vertical / len
+        else
+            self.direction.x = 0
+            self.direction.y = 0
+        end
+
+        if not self:IsPause() then
+            self:UpdateDirection()
+        end
+    end
+end
+
+---更新页面状态
+function SwordCasualView:UpdateView()
+    if self.pointItem then
+        require("ArraignedMallModel"):GetInstance():UpdatePointItem(self.pointItem)
+    end
+end
+
+--region ===================初始化处理===================
+
+--初始化页面信息
+function SwordCasualView:InitView()
+    self.go_table.aortext_name.text = _G.GetLangPackValue(90049100011, self.stageIndex)
+end
+
+---初始化摇杆组件
+function SwordCasualView:InitJoystick()
+    self.direction = { x = 0, y = 0 }
+
+    --虚拟摇杆在APP线上版本不可用
+    -- local joystick = self.go_table.obj_move:GetComponentE(_G.typeof(_G.CS.ETCJoystick))
+    -- self.joystick = joystick
+    -- joystick.onMove:AddListener(
+    --     function(vec2)
+    --         self.direction.x = vec2.x
+    --         self.direction.y = vec2.y
+    --         --归一化处理
+    --         local len = math.sqrt(self.direction.x ^ 2 + self.direction.y ^ 2)
+    --         if len > 0.0001 then
+    --             self.direction.x = self.direction.x / len
+    --             self.direction.y = self.direction.y / len
+    --         else
+    --             self.direction.x = 0
+    --             self.direction.y = 0
+    --         end
+    --         if not self:IsPause() then
+    --             self:UpdateDirection()
+    --         end
+    --         --_G.LogError("onMove: " .. self.direction.x .. ", " .. self.direction.y)
+    --     end
+    -- )
+    -- joystick.onMoveEnd:AddListener(
+    --     function()
+    --         self.direction.x = 0
+    --         self.direction.y = 0
+    --         if not self:IsPause() then
+    --             self:UpdateDirection()
+    --         end
+    --         --_G.LogError("onMoveEnd: ")
+    --     end
+    -- )
+
+    ---创建事件触发条目
+    ---@param eventType UnityEngine.EventSystems.EventTriggerType @事件类型
+    ---@param callback fun(data:UnityEngine.EventSystems.PointerEventData):void @回调函数
+    local function createTriggerEntry(eventType, callback)
+        local entry = _G.CS.UnityEngine.EventSystems.EventTrigger.Entry()
+        entry.eventID = eventType
+        entry.callback:AddListener(callback)
+        return entry
+    end
+
+
+    local dragRadius = self.go_table.obj_move:GetRectTransformWidthHeight() * 0.5
+    local clickPosition
+
+    local eventTriggers = self.go_table.obj_move:GetComponentE(_G.typeof(_G.CS.UnityEngine.EventSystems.EventTrigger))
+    eventTriggers.triggers:Add(createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.PointerDown,
+        function(data)
+            clickPosition = data.position
+            self.isMoveJoystick = true
+        end)
+    )
+    eventTriggers.triggers:Add(createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.Drag,
+        function(data)
+            if not clickPosition then
+                return
+            end
+            local x, y = self.go_table.obj_movePoint:GetLocalPosition()
+            self.direction.x = x
+            self.direction.y = y
+            --归一化处理
+            local len = math.sqrt(self.direction.x ^ 2 + self.direction.y ^ 2)
+            if len > 0.0001 then
+                self.direction.x = self.direction.x / len
+                self.direction.y = self.direction.y / len
+            else
+                self.direction.x = 0
+                self.direction.y = 0
+            end
+            if not self:IsPause() then
+                self:UpdateDirection()
+            end
+
+            --thumb位置计算
+            local offsetX = data.position.x - clickPosition.x
+            local offsetY = data.position.y - clickPosition.y
+            local offsetDistance = math.sqrt(offsetX ^ 2 + offsetY ^ 2)
+            if offsetDistance > dragRadius then
+                offsetX = offsetX / offsetDistance * dragRadius
+                offsetY = offsetY / offsetDistance * dragRadius
+            end
+            self.go_table.obj_moveThumb:SetLocalPosition(
+                offsetX - x,
+                offsetY - y,
+                0
+            )
+        end)
+    )
+    eventTriggers.triggers:Add(createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.PointerUp,
+        function(data)
+            self.direction.x = 0
+            self.direction.y = 0
+            if not self:IsPause() then
+                self:UpdateDirection()
+            end
+
+            self.go_table.obj_movePoint:SetLocalPositionToZero()
+            self.go_table.obj_moveThumb:SetLocalPositionToZero()
+            clickPosition = nil
+            self.isMoveJoystick = true
+        end)
+    )
+end
+
+---初始化对象池
+function SwordCasualView:InitPools()
+    self.boxPool =
+        ObjectFactory.New(
+            function()
+                --create
+                local instance = _G.InstantiateObject(self.go_table.trans_box, self.go_table.obj_mapRoot)
+                instance:SetActiveE(1)
+
+                ---@type SwordCasual_BoxItem
+                local boxItem = self:AddComponent(instance, SwordCasual_BoxItem.New(instance))
+                if self.mapControll then
+                    self.mapControll:AddBoxItem(boxItem)
+                elseif _G.AppSetting.DEBUG then
+                    _G.LogError("地图控制器尚未初始化")
+                end
+                return boxItem
+            end,
+            ---@param item SwordCasual_BoxItem
+            function(item)
+                --active
+                item.gameObject:SetActiveE(1)
+            end,
+            ---@param item SwordCasual_BoxItem
+            function(item)
+                --release
+                item:HideAllEff()
+                item.gameObject:SetActiveE(0)
+                item:StopAnimationFlash()
+            end
+        )
+    self.swordPool =
+        ObjectFactory.New(
+            function()
+                --create
+                local instance = _G.InstantiateObject(self.go_table.trans_sword, self.go_table.obj_mapRoot)
+                instance:SetActiveE(1)
+                ---@type SwordCasual_SwordItem
+                local swordItem = self:AddComponent(instance, SwordCasual_SwordItem.New(instance))
+                return swordItem
+            end,
+            ---@param item SwordCasual_SwordItem
+            function(item)
+                --active
+                item:SetHp(1)
+                item.gameObject:SetActiveE(1)
+            end,
+            ---@param item SwordCasual_SwordItem
+            function(item)
+                --release
+                item:HideAllEff()
+                item.gameObject:SetActiveE(0)
+                item.gameObject:SetParentE(self.go_table.obj_mapRoot)
+                item:StopRotateAnimation()
+            end
+        )
+    self.bulletPool =
+        ObjectFactory.New(
+            function()
+                --create
+                local instance = _G.InstantiateObject(self.go_table.trans_bullet, self.go_table.obj_mapRoot)
+                instance:SetActiveE(1)
+
+                ---@type SwordCasual_BulletItem
+                local bulletItem = self:AddComponent(instance, SwordCasual_BulletItem.New(instance))
+                if self.mapControll then
+                    self.mapControll:AddBulletItem(bulletItem)
+                elseif _G.AppSetting.DEBUG then
+                    _G.LogError("地图控制器尚未初始化")
+                end
+                return bulletItem
+            end,
+            ---@param item SwordCasual_BulletItem
+            function(item)
+                --active
+                item:SetTraceTarget(nil)
+                item.gameObject:SetActiveE(1)
+            end,
+            ---@param item SwordCasual_BulletItem
+            function(item)
+                --release
+                item.gameObject:SetActiveE(0)
+                item:StopMoveAnimation()
+            end
+        )
+
+    self.monsterPool =
+        ObjectFactory.New(
+            function()
+                --create
+                local instance = _G.InstantiateObject(self.go_table.trans_role, self.go_table.obj_mapRoot)
+                instance:SetActiveE(1)
+
+                ---@type SwordCasual_MonsterItem
+                local roleItem = self:AddComponent(instance, SwordCasual_MonsterItem.New(instance))
+                if self.mapControll then
+                    self.mapControll:AddRoleItem(roleItem)
+                elseif _G.AppSetting.DEBUG then
+                    _G.LogError("地图控制器尚未初始化")
+                end
+                return roleItem
+            end,
+            ---@param item SwordCasual_MonsterItem
+            function(item)
+                --active
+                item:SetHp(1)
+                --角色随机朝向
+                local d = { x = math.random() > 0.5 and 1 or -1, y = 0 }
+                item:SetDirection(d, true)
+                item.gameObject:SetActiveE(1)
+            end,
+            ---@param item SwordCasual_MonsterItem
+            function(item)
+                --release
+                item:HideAllEff()
+                item.gameObject:SetActiveE(0)
+                item:RemoveModel()
+                item:SetSuperArmor(-1)
+            end
+        )
+    self.monsterShooterPool =
+        ObjectFactory.New(
+            function()
+                --create
+                local instance = _G.InstantiateObject(self.go_table.trans_role, self.go_table.obj_mapRoot)
+                instance:SetActiveE(1)
+
+                ---@type SwordCasual_MonsterShooterItem
+                local roleItem = self:AddComponent(instance, SwordCasual_MonsterShooterItem.New(instance))
+                if self.mapControll then
+                    self.mapControll:AddRoleItem(roleItem)
+                elseif _G.AppSetting.DEBUG then
+                    _G.LogError("地图控制器尚未初始化")
+                end
+                return roleItem
+            end,
+            ---@param item SwordCasual_MonsterShooterItem
+            function(item)
+                --active
+                item:SetHp(1)
+                --角色随机朝向
+                local d = { x = math.random() > 0.5 and 1 or -1, y = 0 }
+                item:SetDirection(d, true)
+                item.gameObject:SetActiveE(1)
+            end,
+            ---@param item SwordCasual_MonsterShooterItem
+            function(item)
+                --release
+                item.gameObject:SetActiveE(0)
+                item:SetSuperArmor(-1)
+                item:RemoveModel()
+            end
+        )
+end
+
+--endregion
+
+--region ===================逻辑处理===================
+
+---更新剑与其他角色的重叠碰撞(a->b发动攻击)
+---@param a SwordCasual_RoleItem @主角色实例
+---@param b SwordCasual_RoleItem @其他角色实例列表
+function SwordCasualView:UpdateRoleOverlap(a, b)
+    local aSwords = a:GetSwordItems()
+    local bSwords = b:GetSwordItems()
+
+    local isAttackA, isAttackB = false, false
+    --计算a->b攻击逻辑
+    if aSwords then
+        local isDestroyed = false
+        for i = #aSwords, 1, -1 do
+            --a武器 -> b武器
+            isDestroyed = false
+            if bSwords then
+                for j = #bSwords, 1, -1 do
+                    if SwordCasual_Utils.Physics:rectOverlapOBB(aSwords[i]:GetRect(), bSwords[j]:GetRect()) then
+                        local val = math.max(1, math.min(aSwords[i]:GetHp(), bSwords[j]:GetHp()))
+                        aSwords[i]:ChangeHp(-val)
+                        bSwords[j]:ChangeHp(-val)
+                        aSwords[i]:PlayHitEff()
+                        if aSwords[i]:IsDeath() then
+                            local delayItem = aSwords[i] --防止延迟销毁多把刀时i变化
+                            _G.DelayDo(
+                                0.5,
+                                function()
+                                    if self:IsNil() then
+                                        return
+                                    end
+                                    self.swordPool:Release(delayItem)
+                                end
+                            )
+                            a:RemoveSwordItem(aSwords[i])
+                            isDestroyed = true --武器损毁
+                        end
+                        if bSwords[j]:IsDeath() then
+                            self.swordPool:Release(bSwords[j])
+                            b:RemoveSwordItem(bSwords[j])
+                        end
+                        break
+                    end
+                end
+            end
+            --a武器 -> b角色
+            if not isDestroyed and not b:IsSuperArmor() and SwordCasual_Utils.Physics:rectOverlapOBB(aSwords[i]:GetRect(), b:GetRect()) then
+                b:ChangeHp(-aSwords[i]:GetAttack())
+                if b:IsBeatback() then
+                    b:Beatback(
+                        SwordCasual_Utils.Physics:direction(a, b),
+                        SWORD_BEATBACK_DISTANCE *
+                        (1 + a:GetEffectValue(SwordCasual_Utils.Effects.BeatbackPercent) * 0.0001),
+                        0.2
+                    )
+                end
+                isAttackB = true
+                if b:IsDeath() then
+                    self:ClearSwordOrBullet(b)
+                    break
+                end
+            end
+        end
+    end
+    --计算b->a攻击逻辑
+    if bSwords and not a:IsSuperArmor() then
+        for i = #bSwords, 1, -1 do
+            if SwordCasual_Utils.Physics:rectOverlapOBB(bSwords[i]:GetRect(), a:GetRect()) then
+                a:ChangeHp(-bSwords[i]:GetAttack())
+                if a:IsBeatback() then
+                    a:Beatback(
+                        SwordCasual_Utils.Physics:direction(b, a),
+                        SWORD_BEATBACK_DISTANCE *
+                        (1 + b:GetEffectValue(SwordCasual_Utils.Effects.BeatbackPercent) * 0.0001),
+                        0.2
+                    )
+                end
+                isAttackA = true
+                if a:IsDeath() then
+                    self:ClearSwordOrBullet(a)
+                    break
+                end
+            end
+        end
+    end
+    --计算a <-> b本体重叠攻击
+    if not a:IsSuperArmor() and not b:IsSuperArmor() and SwordCasual_Utils.Physics:rectOverlapOBB(a:GetRect(), b:GetRect()) then
+        a:ChangeHp(-b:GetAttack())
+        b:ChangeHp(-a:GetAttack())
+        if a:IsBeatback() then
+            a:Beatback(
+                SwordCasual_Utils.Physics:direction(b, a),
+                SWORD_BEATBACK_DISTANCE *
+                (1 + b:GetEffectValue(SwordCasual_Utils.Effects.BeatbackPercent) * 0.0001),
+                0.2
+            )
+        end
+        if b:IsBeatback() then
+            b:Beatback(
+                SwordCasual_Utils.Physics:direction(a, b),
+                SWORD_BEATBACK_DISTANCE *
+                (1 + a:GetEffectValue(SwordCasual_Utils.Effects.BeatbackPercent) * 0.0001),
+                0.2
+            )
+        end
+        isAttackA = true
+        isAttackB = true
+    end
+
+    if isAttackA then
+        a:SetSuperArmor(SUPER_ARMOR_TIME)
+    end
+    if isAttackB then
+        b:SetSuperArmor(SUPER_ARMOR_TIME)
+    end
+end
+
+---更新子弹与角色的重叠碰撞(a->b发射子弹)
+---@param item SwordCasual_RoleItem @主角色实例
+---@param bullets SwordCasual_BulletItem[]
+function SwordCasualView:UpdateBulletOverlap(item, bullets)
+    local swords = item:GetSwordItems()
+    local team = item:GetTeam()
+
+    local isDestroyed = false
+    for i = #bullets, 1, -1 do
+        if bullets[i]:GetTeam() ~= team then
+            --检测子弹是否被武器格挡
+            isDestroyed = false
+            if swords and bullets[i]:IsBlocked() then
+                for j = #swords, 1, -1 do
+                    if SwordCasual_Utils.Physics:rectOverlapOBB(bullets[i]:GetRect(), swords[j]:GetRect()) then
+                        self:OnBulletDestroyed(bullets[i])
+                        isDestroyed = true
+                        break
+                    end
+                end
+            end
+            --检测子弹是否击中目标
+            if
+                not isDestroyed and not item:IsSuperArmor() and
+                SwordCasual_Utils.Physics:rectOverlapOBB(bullets[i]:GetRect(), item:GetRect())
+            then
+                item:ChangeHp(-bullets[i]:GetAttack())
+                item:SetSuperArmor(SUPER_ARMOR_TIME)
+                if item:IsBeatback() then
+                    local parent = bullets[i]:GetParent()
+                    local percent = parent and
+                        (parent:GetEffectValue(SwordCasual_Utils.Effects.BeatbackPercent) * 0.0001) or 0
+                    item:Beatback(
+                        bullets[i]:GetDirection(),
+                        BULLET_BEATBACK_DISTANCE * (1 + percent),
+                        0.2
+                    )
+                end
+                --子弹穿透
+                bullets[i]:ChangeHp(-1)
+                if bullets[i]:IsDeath() then
+                    self:OnBulletDestroyed(bullets[i])
+                end
+
+                if item:IsDeath() then
+                    self:ClearSwordOrBullet(item)
+                    break
+                end
+            end
+        end
+    end
+end
+
+---更新地图与主角色方向
+function SwordCasualView:UpdateDirection()
+    self.mapControll:SetDirection(self.direction)
+    if self.masterItem then
+        self.masterItem:SetDirection(self.direction)
+    end
+end
+
+---更新Monster列表层级顺序
+function SwordCasualView:UpdateMonsterSibling()
+    table.sort(
+        self.monsterItems,
+        function(a, b)
+            return a:GetOrderPosition() > b:GetOrderPosition()
+        end
+    )
+    local criticalOrderPosition = self.masterItem:GetOrderPosition()
+
+    local n = #self.monsterItems
+    for i = n, 1, -1 do
+        local orderPosition = self.monsterItems[i]:GetOrderPosition()
+        if orderPosition < criticalOrderPosition then
+            break
+        end
+        self.monsterItems[i].transform:SetAsFirstSiblingE()
+    end
+    for i = 1, n do
+        local orderPosition = self.monsterItems[i]:GetOrderPosition()
+        if orderPosition >= criticalOrderPosition then
+            break
+        end
+        self.monsterItems[i].transform:SetAsLastSiblingE()
+    end
+end
+
+---是否暂停游戏
+---@return boolean
+function SwordCasualView:IsPause()
+    return self.pause or not self.masterItem
+end
+
+---设置是否暂停游戏
+---@param pause boolean
+function SwordCasualView:SetPause(pause)
+    self.pause = pause
+end
+
+---设置渲染表现层暂停(DOTween动画)
+function SwordCasualView:SetPauseRenderer(pause)
+    local masterSwords = self.masterItem:GetSwordItems()
+    if masterSwords then
+        for _, swordItem in ipairs(masterSwords) do
+            if pause then
+                swordItem:StopRotateAnimation()
+            else
+                swordItem:UpdateRotateAnimation()
+            end
+        end
+    end
+    for _, monsterItem in ipairs(self.monsterItems) do
+        local monsterSwords = monsterItem:GetSwordItems()
+        if monsterSwords then
+            for _, swordItem in ipairs(monsterSwords) do
+                if pause then
+                    swordItem:StopRotateAnimation()
+                else
+                    swordItem:UpdateRotateAnimation()
+                end
+            end
+        end
+    end
+    for _, bulletItem in ipairs(self.bulletItems) do
+        if pause then
+            bulletItem:StopMoveAnimation()
+        else
+            bulletItem:UpdateMoveAnimation()
+        end
+    end
+end
+
+---战斗是否已结束
+function SwordCasualView:IsFinish()
+    --出怪阶段是否已结束
+    if not self.createFinish then
+        return false
+    end
+
+    --怪物是否已被歼灭
+    if self.monsterItems and #self.monsterItems > 0 then
+        return false
+    end
+    return true
+end
+
+--endregion
+
+--region ===================事件监听===================
+
+---监听子弹发射事件
+---@param shooter SwordCasual_MonsterShooterItem @射击手实例
+---@param target SwordCasual_RoleItem @目标实例
+---@return SwordCasual_BulletItem
+function SwordCasualView:OnShoot(shooter, target)
+    --初始位置和方向
+    local x, y = shooter:GetPosition()
+    local tx, ty = target:GetPosition()
+    local offsetX, offsetY = tx - x, ty - y
+    --为子弹朝向添加一个随机偏移值
+    offsetX = offsetX + math.random(-5, 5)
+    offsetY = offsetY + math.random(-10, 10)
+
+    local distance = math.sqrt(offsetX * offsetX + offsetY * offsetY)
+    if distance < 0.001 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("目标与射击手距离过近: 位置重叠")
+        end
+        return
+    end
+    local direction = { x = offsetX / distance, y = offsetY / distance }
+
+    ---@type SwordCasual_BulletItem
+    local bulletItem = self.bulletPool:Get()
+    shooter:AddBulletItem(bulletItem)
+    bulletItem:SetDirection(direction)
+    bulletItem:SetPosition(x, y)
+    --子弹配置
+    local d = shooter:GetData()
+    if d then
+        local cfg = _G.ConfigManager.jzxx_bullet_cfg[d.bullet_id]
+        bulletItem:SetData(cfg)
+        --bulletItem:SetTraceTarget(target)   --追踪弹
+    end
+
+    --注册子弹销毁事件
+    local onBulletDestroyed = self[self.OnBulletDestroyed]
+    if not onBulletDestroyed then
+        onBulletDestroyed = _G.handler(self, self.OnBulletDestroyed)
+        self[self.OnBulletDestroyed] = onBulletDestroyed
+    end
+    bulletItem:OnDestroyed(onBulletDestroyed)
+
+    table.insert(self.bulletItems, bulletItem)
+end
+
+---监听主角射击事件
+---@param shooter SwordCasual_MasterItem @射击手实例
+function SwordCasualView:OnMasterShoot(shooter)
+    if not self.monsterItems or #self.monsterItems <= 0 then
+        return
+    end
+
+    --寻找最近的目标
+    local target = self.monsterItems[1]
+    local distance = SwordCasual_Utils.Physics:magnitude(shooter:GetRect(), target:GetRect())
+    for i = 2, #self.monsterItems do
+        local _d = SwordCasual_Utils.Physics:magnitude(shooter:GetRect(), self.monsterItems[i]:GetRect())
+        if _d < distance then
+            distance = _d
+            target = self.monsterItems[i]
+        end
+    end
+
+    self:OnShoot(shooter, target)
+end
+
+---监听子弹销毁事件
+---@param bulletItem SwordCasual_BulletItem @子弹实例
+function SwordCasualView:OnBulletDestroyed(bulletItem)
+    local parent = bulletItem:GetParent()
+    if parent then
+        parent:RemoveBulletItem(bulletItem)
+    end
+    self.bulletPool:Release(bulletItem)
+    --从全局列表中移除
+    for i = #self.bulletItems, 1, -1 do
+        if self.bulletItems[i] == bulletItem then
+            table.remove(self.bulletItems, i)
+            break
+        end
+    end
+end
+
+---监听剑创建事件
+---@param roleItem SwordCasual_RoleItem @角色实例
+---@param swordItem SwordCasual_SwordItem @剑实例
+function SwordCasualView:OnSwordCreated(roleItem, swordItem)
+    local d = roleItem:GetData()
+    swordItem:SetHp(1)
+    swordItem:SetSpeed(d.rota_speed)
+    swordItem:SetAttack(d.sword_atk)
+    swordItem:SetModelCfgs(d.sword_png)
+    --非主角使用指定模型
+    if not roleItem:instanceof(SwordCasual_MasterItem) then
+        if d.sword_png and #d.sword_png > 0 then
+            swordItem:SetModel(d.sword_png[1])
+        end
+    end
+
+    --注册剑生命值改变事件
+    local onHpChange = self[self.OnSwordHpChange]
+    if not onHpChange then
+        onHpChange = _G.handler(self, self.OnSwordHpChange)
+        self[self.OnSwordHpChange] = onHpChange
+    end
+    swordItem:OnHpChange(onHpChange)
+
+    --角色buff状态处理
+    local swordDirection = roleItem:GetEffectOverlay(SwordCasual_Utils.Effects.SwordDirection)
+    if swordDirection % 2 == 1 then
+        --刀的方向改变
+        swordItem:SetSpeed(swordItem:GetSpeed() * -1)
+    end
+    local swordSpeedScale = roleItem:GetEffectValue(SwordCasual_Utils.Effects.SwordRotateSpeed)
+    if swordSpeedScale > 0 then
+        --刀的速度改变
+        local speedScale = math.max(1 + swordSpeedScale * 0.0001, 0.1)
+        swordItem:SetSpeedScale(speedScale)
+    end
+end
+
+---监听剑生命值改变事件
+---@param swordItem SwordCasual_SwordItem @剑实例
+---@param newValue number @新生命值
+---@param offset number @改变值
+function SwordCasualView:OnSwordHpChange(swordItem, newValue, offset)
+    if newValue <= 0 then
+        return
+    end
+    local parent = swordItem:GetParent()
+    if not parent or not parent:GetEffect(SwordCasual_Utils.Effects.SwordAddAttack) then
+        --角色身上不带增加剑的buff, 不作处理
+        return
+    end
+    local changeAttack = parent:GetEffectOverlay(SwordCasual_Utils.Effects.SwordAddAttack)
+    local oldValue = newValue - offset
+    if oldValue <= 1 and newValue >= 2 then
+        --增加剑的攻击
+        swordItem:SetAttack(swordItem:GetAttack() + changeAttack)
+    elseif oldValue >= 2 and newValue <= 1 then
+        --减少剑的攻击
+        swordItem:SetAttack(swordItem:GetAttack() - changeAttack)
+    end
+end
+
+---监听主角死亡事件
+function SwordCasualView:OnMasterDeath()
+    -- if true then
+    --     --TODO: 测试数据
+    --     self.masterItem:SetHp(99)
+    --     self.masterItem:SetShowHp(true)
+    --     return
+    -- end
+    self:SetPause(true)
+
+    ---更新所有monster动作为idle
+    local direction = { x = 0, y = 0 }
+    for i = 1, #self.monsterItems do
+        self.monsterItems[i]:SetDirection(direction, true)
+    end
+
+    --延迟回收实例(等待动画完成)
+    _G.DelayDo(
+        SUPER_ARMOR_TIME,
+        function()
+            if self:IsNil() then
+                return
+            end
+            --self.masterItem:SetSuperArmor(-1) --关闭闪烁
+            self.masterItem:PlayDeathAnimation(
+                function()
+                    --战斗失败结算
+                    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SwordCasualEventView.Name)
+                    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArraignedMallView.Name)
+
+                    local jssc = _G.ConfigManager.jzxx_stage_show_cfg[1000 + self.cfg.type]
+
+                    if self.callback then
+                        self.callback(false, self.kill, self.time, self.score, jssc)
+                        self.callback = nil
+                    end
+                end
+            )
+        end
+    )
+end
+
+---监听处理怪物死亡事件
+---@param roleItem SwordCasual_RoleItem @角色实例
+function SwordCasualView:OnMonsterDeath(monsterItem)
+    self.kill = self.kill + 1
+
+    --分数
+    local cfg = monsterItem:GetData()
+    if cfg then
+        if self.score >= 0 then
+            self.score = self.score + cfg.score
+            self:UdpateScore()
+        end
+    end
+
+    --延迟回收实例(等待动画完成)
+    _G.DelayDo(
+        SUPER_ARMOR_TIME,
+        function()
+            if self:IsNil() then
+                return
+            end
+            monsterItem:PlayDeathAnimation(
+                function()
+                    --生成掉落物
+                    ---@type jzxx_role_cfg
+                    local cfg = monsterItem:GetData()
+                    if cfg then
+                        local drop = 0
+                        if cfg.drop_rate > 0 and math.random() <= cfg.drop_rate then
+                            drop = drop + 1
+                            local cx, cy = monsterItem:GetPosition()
+                            ---@type SwordCasual_BoxItem
+                            local boxItem = self:CreateBoxItem(1, cfg, cx, cy)
+                            boxItem:SetDuration(30) --保留30秒
+                            table.insert(self.boxItems, boxItem)
+                        end
+                        if cfg.event_rate > 0 and math.random() <= cfg.event_rate and self.effectCfgs and #self.effectCfgs > 0 then
+                            local cx, cy = monsterItem:GetPosition()
+                            if drop > 0 then
+                                cx = cx + math.random(-20, 20)
+                                cy = cy - 50
+                            end
+                            cx = cx + math.random(-10, 10)
+                            cy = cy + math.random(-10, 10)
+                            ---@type SwordCasual_BoxItem
+                            local boxItem = self:CreateBoxItem(2, cfg, cx, cy)
+                            boxItem:SetDuration(30) --保留30秒
+                            table.insert(self.boxItems, boxItem)
+                        end
+                    end
+
+                    --回收节点
+                    self:ReleaseMonsterItem(monsterItem)
+                    --战斗胜利结算
+                    if self:IsFinish() then
+                        self:SetPause(true)
+                        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SwordCasualEventView.Name)
+                        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArraignedMallView.Name)
+
+                        local jssc = _G.ConfigManager.jzxx_stage_show_cfg[1000 + self.cfg.type]
+
+                        if self.callback then
+                            self.callback(not self.masterItem:IsDeath(), self.kill, self.time, self.score, jssc)
+                            self.callback = nil
+                        end
+                    end
+                end
+            )
+        end
+    )
+end
+
+---监听处理盒子销毁事件
+---@param boxItem SwordCasual_BoxItem @盒子实例
+function SwordCasualView:OnBoxDestroyed(boxItem)
+    self.boxPool:Release(boxItem)
+    --从全局列表中移除
+    for i = #self.boxItems, 1, -1 do
+        if self.boxItems[i] == boxItem then
+            table.remove(self.boxItems, i)
+            break
+        end
+    end
+end
+
+---监听处理收集掉落物事件
+---@param roleItem SwordCasual_RoleItem @角色实例
+---@param boxItem SwordCasual_BoxItem @盒子实例
+function SwordCasualView:OnBoxCollect(roleItem, boxItem)
+    if boxItem:GetType() == 1 then
+        ---@type jzxx_role_cfg
+        local data = boxItem:GetData()
+        if not data then
+            return
+        end
+
+        local addSwordCount = math.max(1, data.sword_num) --新增道具数量
+        self:AddSwords(roleItem, addSwordCount)
+        roleItem:PlayAddSwordEff()
+    else
+        if not self.effectCfgs or #self.effectCfgs == 0 then
+            return
+        end
+        self:OnEventCollect(roleItem, false)
+    end
+end
+
+---监听处理事件收集事件
+---@param roleItem SwordCasual_RoleItem @角色实例
+---@param removeResetEvent? boolean @是否移除重置事件
+function SwordCasualView:OnEventCollect(roleItem, removeResetEvent)
+    if not self.effectCfgs or #self.effectCfgs == 0 then
+        return
+    end
+
+    --主角拾取事件
+    if roleItem:instanceof(SwordCasual_MasterItem) then
+        --过滤重置事件(不要连续刷出重置事件)
+        local events = { table.unpack(self.effectCfgs) }
+        if removeResetEvent then
+            for i = #events, 1, -1 do
+                if events[i].id == SwordCasual_Utils.Effects.Reset then
+                    table.remove(events, i)
+                end
+            end
+        end
+
+        --随机获取2~3个事件
+        local count = math.random() > 0.8 and 3 or 2
+        events = SwordCasual_Utils.randomCfgs(events, count)
+        if not events or #events == 0 then
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SwordCasualEventView.Name)
+            --如果当前处于暂停中, 还原状态
+            if self:IsPause() then
+                self:SetPause(false)
+                self:SetPauseRenderer(false)
+            end
+            return
+        end
+
+        --暂停游戏, 进入选择面板
+        if not self:IsPause() then
+            self:SetPause(true)
+            self:SetPauseRenderer(true)
+            --暂停动作
+            roleItem:SetDirection({ x = 0, y = 0 })
+        end
+
+        ---@type SwordCasualEventView
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SwordCasualEventView.Name)
+        if view then
+            view:Set(events)
+            if self.isPayment then
+                view:SetPayConsume(math.max(1, view:GetPayConsume() * 2)) --消耗呈现: 1/2/4/8/....规律增加
+            else
+                view:SetPayConsume(-1)
+            end
+        else
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.SwordCasualEventView.Name,
+                events,
+                ---@param cfg jzxx_event_cfg
+                function(cfg)
+                    if cfg.id == SwordCasual_Utils.Effects.Reset then
+                        self:OnAddEffect(roleItem, cfg)
+                        return
+                    end
+                    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SwordCasualEventView.Name)
+                    self:SetPause(false)
+                    self:SetPauseRenderer(false)
+
+                    self:OnAddEffect(roleItem, cfg)
+                end,
+                self.isPayment and 1 or -1,
+                function(num)
+                    if num <= 0 then
+                        return
+                    end
+                    local model = require("ArraignedMallModel"):GetInstance()
+                    if model:GetPointNum() < num then
+                        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArraignedMallView.Name) --此时游戏已处于暂停状态, 无需额外处理
+                        return
+                    end
+
+                    model:UsePointNum(num)
+                    self:OnEventCollect(roleItem, false) --重新刷新列表
+                end
+            )
+        end
+    else
+        local cfg = self.effectCfgs[math.random(1, #self.effectCfgs)]
+        if cfg.id == SwordCasual_Utils.Effects.Reset then
+            return
+        end
+        self:OnAddEffect(roleItem, cfg)
+    end
+end
+
+---为目标角色添加buff
+---@param roleItem SwordCasual_RoleItem @角色实例
+---@param cfg jzxx_event_cfg
+function SwordCasualView:OnAddEffect(roleItem, cfg)
+    ---如果选择了唯一事件, 从事件列表中移除
+    if cfg.isOnly then
+        for i = #self.effectCfgs, 1, -1 do
+            if cfg == self.effectCfgs[i] then
+                table.remove(self.effectCfgs, i)
+            end
+        end
+    end
+
+    ---@type table<number,function>
+    local effectAdds = self.__EffectAdds
+    if not effectAdds then
+        effectAdds = {
+            ---增加速度
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.Speed] = function(roleItem, cfg)
+                roleItem:AddEffect(SwordCasual_Utils.Effects.Speed, cfg.value)
+            end,
+            ---击退距离增加百分比
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.BeatbackPercent] = function(roleItem, cfg)
+                roleItem:AddEffect(SwordCasual_Utils.Effects.BeatbackPercent, cfg.value)
+            end,
+            ---刀刃反向旋转(额外增加一把刀)
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.SwordDirection] = function(roleItem, cfg)
+                roleItem:AddEffect(SwordCasual_Utils.Effects.SwordDirection, 1)
+                self:AddSwords(roleItem, 1)
+            end,
+            ---额外增加两把刀
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.AddSword2] = function(roleItem, cfg)
+                self:AddSwords(roleItem, 2)
+                roleItem:PlayAddSwordEff()
+            end,
+            ---刀转速增加
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.SwordRotateSpeed] = function(roleItem, cfg)
+                roleItem:AddEffect(SwordCasual_Utils.Effects.SwordRotateSpeed, cfg.value)
+            end,
+            ---重置效果列表
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.Reset] = function(roleItem, cfg)
+                self:OnEventCollect(roleItem, true)
+            end,
+            ---概率加减刀: 50%加两把刀, 50%失去两把刀
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.ProbAddSword] = function(roleItem, cfg)
+                if math.random() > 0.5 then
+                    --添加刀
+                    self:AddSwords(roleItem, 4)
+                    roleItem:PlayAddSwordEff()
+                else
+                    --损失刀
+                    local swords = roleItem:GetSwordItems()
+                    if swords then
+                        local n = 2
+                        while #swords > 0 and n > 0 do
+                            local randomSword = swords[math.random(1, #swords)]
+                            if randomSword:GetHp() > n then
+                                randomSword:ChangeHp(-n)
+                                n = 0
+                            else
+                                --randomSword:SetHp(0)
+                                n = n - randomSword:GetHp()
+                                self.swordPool:Release(randomSword)
+                                roleItem:RemoveSwordItem(randomSword)
+                            end
+                        end
+                    end
+                end
+            end,
+            ---发射飞刀(子弹)
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.Shooter] = function(roleItem, cfg)
+                roleItem:AddEffect(SwordCasual_Utils.Effects.Shooter, 1)
+            end,
+            ---2级以上刀增加攻击力
+            ---@param roleItem SwordCasual_RoleItem
+            ---@param cfg jzxx_event_cfg
+            [SwordCasual_Utils.Effects.SwordAddAttack] = function(roleItem, cfg)
+                roleItem:AddEffect(SwordCasual_Utils.Effects.SwordAddAttack, 1)
+            end,
+
+        }
+        self.__EffectAdds = effectAdds
+    end
+
+    local add = effectAdds[cfg.id]
+    if add then
+        add(roleItem, cfg)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未实现的效果处理:" .. tostring(cfg.id))
+        end
+    end
+end
+
+---监听处理角色效果变化事件
+---@param roleItem SwordCasual_MasterItem
+---@param effect SwordCasual_Effect
+---@param beforeOverlay number
+---@param afterOverlay number
+function SwordCasualView:OnEffectChange(roleItem, effect, beforeOverlay, afterOverlay)
+    ---@type table<number,function>
+    local effectResolves = self.__EffectResolves
+    if not effectResolves then
+        effectResolves = {
+            ---增加移动速度
+            ---@param roleItem SwordCasual_MasterItem
+            ---@param effect SwordCasual_Effect
+            ---@param beforeOverlay number
+            ---@param afterOverlay number
+            [SwordCasual_Utils.Effects.Speed] = function(roleItem, effect, beforeOverlay, afterOverlay)
+                local speedScale = math.max(1 + afterOverlay * effect.value * 0.0001, 0.1)
+                roleItem:SetSpeedScale(speedScale, true)
+            end,
+            ---刀旋转改向
+            ---@param roleItem SwordCasual_MasterItem
+            ---@param effect SwordCasual_Effect
+            ---@param beforeOverlay number
+            ---@param afterOverlay number
+            [SwordCasual_Utils.Effects.SwordDirection] = function(roleItem, effect, beforeOverlay, afterOverlay)
+                if math.abs(afterOverlay - beforeOverlay) % 2 ~= 1 then
+                    --旋转方向未曾改变
+                    return
+                end
+                local swords = roleItem:GetSwordItems()
+                if not swords then
+                    return
+                end
+                for _, swordItem in ipairs(swords) do
+                    swordItem:SetSpeed(swordItem:GetSpeed() * -1)
+                end
+            end,
+            ---增加刀旋转速度
+            ---@param roleItem SwordCasual_MasterItem
+            ---@param effect SwordCasual_Effect
+            ---@param beforeOverlay number
+            ---@param afterOverlay number
+            [SwordCasual_Utils.Effects.SwordRotateSpeed] = function(roleItem, effect, beforeOverlay, afterOverlay)
+                local swords = roleItem:GetSwordItems()
+                if not swords then
+                    return
+                end
+                local speedScale = math.max(1 + afterOverlay * effect.value * 0.0001, 0.1)
+                for _, swordItem in ipairs(swords) do
+                    swordItem:SetSpeedScale(speedScale)
+                end
+            end,
+            ---增加攻击值
+            ---@param roleItem SwordCasual_MasterItem
+            ---@param effect SwordCasual_Effect
+            ---@param beforeOverlay number
+            ---@param afterOverlay number
+            [SwordCasual_Utils.Effects.SwordAddAttack] = function(roleItem, effect, beforeOverlay, afterOverlay)
+                local swords = roleItem:GetSwordItems()
+                if not swords then
+                    return
+                end
+                local offset = afterOverlay - beforeOverlay
+                for _, swordItem in ipairs(swords) do
+                    if swordItem:GetLevel() >= 2 then
+                        swordItem:SetAttack(math.max(1, swordItem:GetAttack() + offset))
+                    end
+                end
+            end,
+        }
+        self.__EffectResolves = effectResolves
+    end
+    local resolve = effectResolves[effect.id]
+    if resolve then
+        resolve(roleItem, effect, beforeOverlay, afterOverlay)
+    end
+end
+
+--endregion
+
+--region ===================实例创建/回收/清理===================
+
+---创建主角实例
+---@return SwordCasual_RoleItem
+function SwordCasualView:CreateMasterItem()
+    ---@type jzxx_role_cfg
+    local cfg = self.cfg.role_id and self.cfg.role_id > 0 and _G.ConfigManager.jzxx_role_cfg[self.cfg.role_id] or
+        _G.ConfigManager.jzxx_role_cfg[101]
+    if not cfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("主角配置不存在")
+        end
+        return nil
+    end
+
+    local instance = _G.InstantiateObject(self.go_table.trans_role, self.go_table.obj_mapRoot)
+    instance:SetActiveE(1)
+
+    ---@type SwordCasual_MasterItem
+    local roleItem = self:AddComponent(instance, SwordCasual_MasterItem.New(instance))
+    if self.mapControll then
+        self.mapControll:AddRoleItem(roleItem)
+    elseif _G.AppSetting.DEBUG then
+        _G.LogError("地图控制器尚未初始化")
+    end
+    --角色随机朝向
+    local d = { x = math.random() > 0.5 and 1 or -1, y = 0 }
+    roleItem:SetDirection(d, true)
+    d.x = 0
+    roleItem:SetDirection(d, true)
+
+    --设置基础属性
+    roleItem:SetTeam(1) --阵营id
+    roleItem:SetData(cfg)
+    roleItem:OnEffectChange(_G.handler(self, self.OnEffectChange))
+    roleItem:OnShoot(_G.handler(self, self.OnMasterShoot))
+
+    --角色近战武器
+    local swordNum = cfg.sword_num
+    local douyinModel = require("DouyinModel"):GetInstance()
+    if douyinModel:GetIsDouYinArraigned() then--抖小提审领取入口有礼后初始增加4把刀
+        if douyinModel:CheckReturnBySideBar() or true then
+            swordNum = swordNum + 4
+        end
+    end
+    for _ = 1, swordNum do
+        ---@type SwordCasual_SwordItem
+        local swordItem = self.swordPool:Get()
+        self:OnSwordCreated(roleItem, swordItem)
+        roleItem:AddSwordItem(swordItem)
+        self:OnSwordHpChange(swordItem, swordItem:GetHp(), swordItem:GetHp())
+    end
+
+    return roleItem
+end
+
+---创建怪物实例
+---@param cx number @中心x坐标
+---@param cy number @中心y坐标
+---@param cfg jzxx_role_cfg @怪物配置
+---@return SwordCasual_MonsterItem
+function SwordCasualView:CreateMonsterItem(cx, cy, cfg)
+    ---@type SwordCasual_MonsterItem|SwordCasual_MonsterShooterItem
+    local monsterItem
+    if cfg.role_type == 1 then
+        --远程怪
+        monsterItem = self.monsterShooterPool:Get()
+        --注册射击事件
+        local onShoot = self[self.OnShoot]
+        if not onShoot then
+            onShoot = _G.handler(self, self.OnShoot)
+            self[self.OnShoot] = onShoot
+        end
+        monsterItem:OnShoot(onShoot)
+    else
+        --近战怪
+        monsterItem = self.monsterPool:Get()
+    end
+    --设置基础属性
+    monsterItem:SetTraceTarget(self.masterItem) --追踪目标
+    monsterItem:SetTeam(2)                      --阵营id
+    monsterItem:SetData(cfg)
+
+    --以当前角色为中心点作圆, 在边上随机一点处生成
+    local radAngle = math.rad(math.random(-180, 180))
+    local radius = 1000
+    monsterItem:SetPosition(cx + radius * _G.math.sin(radAngle), cy + radius * _G.math.cos(radAngle))
+
+    --角色近战武器
+    for _ = 1, cfg.sword_num do
+        ---@type SwordCasual_SwordItem
+        local swordItem = self.swordPool:Get()
+        self:OnSwordCreated(monsterItem, swordItem)
+        monsterItem:AddSwordItem(swordItem)
+    end
+
+    return monsterItem
+end
+
+---回收怪物实例
+---@param roleItem SwordCasual_MonsterItem @角色实例
+function SwordCasualView:ReleaseMonsterItem(roleItem)
+    if roleItem.__cname == SwordCasual_MonsterItem.__cname then
+        self.monsterPool:Release(roleItem)
+    elseif roleItem.__cname == SwordCasual_MonsterShooterItem.__cname then
+        self.monsterShooterPool:Release(roleItem)
+    else
+        _G.DestroyObject(roleItem.gameObject)
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未知的实例类型: " .. tostring(roleItem.__cname))
+        end
+    end
+end
+
+---回收角色实例的所有武器/子弹实例
+---@param roleItem SwordCasual_RoleItem @角色实例
+function SwordCasualView:ClearSwordOrBullet(roleItem)
+    local swords = roleItem:GetSwordItems()
+    if swords then
+        for i = #swords, 1, -1 do
+            self.swordPool:Release(swords[i])
+        end
+        roleItem:ClearSwordItems()
+    end
+
+    local bullets = roleItem:GetBulletItems()
+    if bullets then
+        for i = #bullets, 1, -1 do
+            --self.bulletPool:Release(bullets[i])
+            bullets[i]:SetParent(nil)
+        end
+        roleItem:ClearBulletItems()
+    end
+end
+
+---为角色添加x把近战武器
+---@param roleItem SwordCasual_RoleItem @角色实例
+---@param addSwordCount number @增加刀的数量
+function SwordCasualView:AddSwords(roleItem, addSwordCount)
+    local swards = roleItem:GetSwordItems()
+    local swordCount = swards and #swards or 0
+
+    --直接创建的刀剑实例
+    local create = MAX_SWORD_COUNT - swordCount
+    if create > 0 then
+        if create > addSwordCount then
+            create = addSwordCount
+        end
+        addSwordCount = addSwordCount - create
+        for _ = 1, create do
+            ---@type SwordCasual_SwordItem
+            local swordItem = self.swordPool:Get()
+            self:OnSwordCreated(roleItem, swordItem)
+            roleItem:AddSwordItem(swordItem)
+            self:OnSwordHpChange(swordItem, swordItem:GetHp(), swordItem:GetHp())
+        end
+    end
+    --往剩下的刀剑上添加生命值(随机)
+    if addSwordCount > 0 then
+        ---@type SwordCasual_SwordItem[]
+        local swards = { table.unpack(roleItem:GetSwordItems()) }
+        for _ = 1, addSwordCount do
+            table.sort(
+                swards,
+                function(a, b)
+                    return a:GetHp() < b:GetHp()
+                end
+            )
+            swards[1]:ChangeHp(1)
+        end
+    end
+end
+
+---创建掉落物实例
+---@param type number @宝箱类型: 1增加刀刃, 2随机事件
+---@param data any @自定义数据
+---@param cx number @中心x坐标
+---@param cy number @中心y坐标
+---@return SwordCasual_BoxItem
+function SwordCasualView:CreateBoxItem(type, data, cx, cy)
+    ---@type SwordCasual_BoxItem
+    local boxItem = self.boxPool:Get()
+    boxItem:SetPosition(cx, cy)
+    boxItem:SetData(type, data)
+
+    --注册销毁事件
+    local onBoxDestroyed = self[self.OnBoxDestroyed]
+    if not onBoxDestroyed then
+        onBoxDestroyed = _G.handler(self, self.OnBoxDestroyed)
+        self[self.OnBoxDestroyed] = onBoxDestroyed
+    end
+    boxItem:OnDestroyed(onBoxDestroyed)
+    return boxItem
+end
+
+--endregion
+
+---更新显示时间UI
+function SwordCasualView:UpdateTime()
+    self.go_table.aortext_time.text = _G.TimeUtil.TimeToString(math.floor(self.time), 2)
+end
+
+---更新显示分数
+function SwordCasualView:UdpateScore()
+    self.go_table.aortext_score.text = tostring(self.score)
+end
+
+function SwordCasualView:Close()
+    base.Close(self)
+
+    if self.closeCallback then
+        self.closeCallback()
+    end
+end
+
+---帮助按钮是否显示
+---@param isActive boolean @是否显示
+function SwordCasualView:SetHelpButtonActive(isActive)
+    self.go_table.aorbtn_help:SetActiveE(isActive and 1 or 0)
+end
+
+---设置按钮是否显示
+---@param isActive boolean @是否显示
+function SwordCasualView:SetSettingsButtonActive(isActive)
+    self.go_table.aorbtn_settings:SetActiveE(isActive and 1 or 0)
+end
+
+---关闭按钮是否显示
+---@param isActive boolean @是否显示
+function SwordCasualView:SetCloseButtonActive(isActive)
+    self.go_table.aorbtn_CloseView:SetActiveE(isActive and 1 or 0)
+end
+
+--设置关闭按钮回调
+function SwordCasualView:SetCloseCallback(callback)
+    self.closeCallback = callback
+end
+
+---设置tip内容
+---@param content string @内容
+function SwordCasualView:SetScoreTip(content)
+    self.go_table.obj_tip:SetActiveE(content and #content > 0 and 1 or 0)
+    if content then
+        self.go_table.aortext_scoreTip.text = content
+    end
+end
+
+---按钮点击事件在这里派发
+function SwordCasualView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_CloseView or go == self.go_table.aorbtn_settings then
+        if self:IsFinish() and go == self.go_table.aorbtn_CloseView then
+            self:Close()
+        else
+            --弹窗确认
+            self:SetPause(true)
+            self:SetPauseRenderer(true)
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                1140004,
+                nil,
+                _G.handler(self, self.Close),
+                function()
+                    self:SetPause(false)
+                    self:SetPauseRenderer(false)
+                end
+            )
+        end
+    elseif go == self.go_table.aorbtn_help then
+        self:SetPause(true)
+        self:SetPauseRenderer(true)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 186, function()
+            self:SetPause(false)
+            self:SetPauseRenderer(false)
+        end)
+    end
+end
+
+return SwordCasualView

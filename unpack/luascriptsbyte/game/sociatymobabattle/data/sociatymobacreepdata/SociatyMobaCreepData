@@ -1,0 +1,377 @@
+-------------------------------------------------------------------------
+-- D:.ClientTrunk.Assets.Resources.LuaScripts.Game.SociatyMobaBattle.self.SociatyMobaCreepData	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/08/15
+-- Description: 野怪数据类
+-----------------------------------------------------------------------
+
+---@class SociatyMobaCreepData    中文描述
+---@field cfg guild_moba_campsite_cfg
+---@field ourMoving guild_moba.i_wild_march[]
+---@field enemyMoving guild_moba.i_wild_march[]
+---@field ourArrive guild_moba.i_wild_march[]
+---@field enemyArrive guild_moba.i_wild_march[]
+local SociatyMobaCreepData = _G.BaseClass("SociatyMobaCreepData")
+
+local CreepState = require("SociatyMobaBattleModel").CreepState
+
+---类的构造函数
+function SociatyMobaCreepData:__init(abOur, abEnemy)
+    self.SociatySelf = require("SociatyModel"):GetInstance().SociatySelf
+    self.abOur = abOur
+    self.abEnemy = abEnemy
+end
+
+---@param msg guild_moba.i_fight_wild
+function SociatyMobaCreepData:Parse(msg)
+    self.sid = msg.sid
+    self.cfg = _G.ConfigManager.guild_moba_campsite_cfg[self.sid]
+    self.maxHold = self.cfg.resource
+    self.ourHold = msg[self.abOur .. "_hold"] / 1000
+    self.enemyHold = msg[self.abEnemy .. "_hold"] / 1000
+    self.lastTime = msg.last_time
+    self.use = msg.args --0未使用1上路2中路3下路
+    self.ourMoving = {}
+    self.enemyMoving = {}
+    self.ourArrive = {}
+    self.enemyArrive = {}
+
+    local now = _G.TimeUtil.GetServerUnixTime()
+    if msg["m_" .. self.abOur] then
+        for _, v in pairs(msg["m_" .. self.abOur]) do
+            if now >= v.e_time then
+                _G.table.insert(self.ourArrive, v)
+            else
+                _G.table.insert(self.ourMoving, v)
+            end
+        end
+    end
+    if msg["m_" .. self.abEnemy] then
+        for _, v in pairs(msg["m_" .. self.abEnemy]) do
+            if now >= v.e_time then
+                _G.table.insert(self.enemyArrive, v)
+            else
+                _G.table.insert(self.enemyMoving, v)
+            end
+        end
+    end
+
+    if msg.state == -1 then --前台定义的非战斗中状态
+        self.state = CreepState.Idle
+    elseif msg.state == 0 then
+        self.state = CreepState.UnRefresh
+    elseif msg.state == 1 then
+        self:UpdateBattleState()
+    elseif msg.state == self.SociatySelf.Uid then
+        self.state = CreepState.OurWin
+    else
+        self.state = CreepState.EnemyWin
+    end
+    self:InitIncreaseDic()
+end
+
+function SociatyMobaCreepData:InitIncreaseDic()
+    local num = require("SociatyMobaBattleModel"):GetInstance().maxPlayerNum
+    self.increaseDic = {}
+    self.increaseDic[0] = 0
+    local pre = self.cfg.increase[1]
+    local rate
+    for _, v in pairs(self.cfg.increase) do
+        rate = 1 + pre[2] / 10000
+        for i = pre[1], v[1] - 1 do
+            self.increaseDic[i] = rate
+        end
+        pre = v
+    end
+    rate = 1 + pre[2] / 10000
+    for i = pre[1], num do
+        self.increaseDic[i] = rate
+    end
+end
+
+function SociatyMobaCreepData:ChangeState(state)
+    self.state = state
+end
+
+---基于到达队伍更新状态
+function SociatyMobaCreepData:UpdateBattleState()
+    if self.state == CreepState.OurWin or self.state == CreepState.EnemyWin then
+        return
+    end
+    local ourNum = #self.ourArrive
+    local enemyNum = #self.enemyArrive
+    if ourNum > 0 then
+        if enemyNum > 0 then
+            self.state = CreepState.InBattle
+        else
+            self.state = CreepState.OurOccupy
+        end
+    else
+        if enemyNum > 0 then
+            self.state = CreepState.EnemyOccupy
+        else
+            self.state = CreepState.NoOccupy
+        end
+    end
+end
+
+---@param msg guild_moba.i_action_wild_hold
+function SociatyMobaCreepData:UpdateHold(msg)
+    self.ourHold = msg[self.abOur .. "_point"] / 1000
+    self.enemyHold = msg[self.abEnemy .. "_point"] / 1000
+    self.lastTime = msg.last_time
+end
+
+---获取我方占领进度
+function SociatyMobaCreepData:GetOurProcess()
+    if self.lastTime == 0 then
+        return 0
+    end
+    local process
+    local delta = 0
+    if self.lastTime > 0 then
+        delta = _G.TimeUtil.GetServerUnixTime() - self.lastTime
+        if delta < 0 then
+            delta = 0
+        end
+    end
+    if self.state == CreepState.OurOccupy then
+        local rate = self.increaseDic[self:GetArriveTeamNum(true)] or 1
+        process = (self.ourHold - self.enemyHold + delta * rate) / self.maxHold
+    elseif self.state == CreepState.EnemyOccupy then
+        local rate = self.increaseDic[self:GetArriveTeamNum()] or 1
+        process = (self.ourHold - delta * rate) / self.maxHold
+    else
+        process = self.ourHold / self.maxHold
+    end
+    if process < 0 then
+        process = 0
+    end
+    return process
+end
+
+---获取敌方占领进度
+function SociatyMobaCreepData:GetEnemyProcess()
+    if self.lastTime == 0 then
+        return 0
+    end
+    local process
+    local delta = 0
+    if self.lastTime > 0 then
+        delta = _G.TimeUtil.GetServerUnixTime() - self.lastTime
+        if delta < 0 then
+            delta = 0
+        end
+    end
+    if self.state == CreepState.EnemyOccupy then
+        local rate = self.increaseDic[self:GetArriveTeamNum()] or 1
+        process = (self.enemyHold - self.ourHold + delta * rate) / self.maxHold
+    elseif self.state == CreepState.OurOccupy then
+        local rate = self.increaseDic[self:GetArriveTeamNum(true)] or 1
+        process = (self.enemyHold - delta * rate) / self.maxHold
+    else
+        process = self.enemyHold / self.maxHold
+    end
+    if process < 0 then
+        process = 0
+    end
+    return process
+end
+
+---获取我方占领还需多久
+---@return number, number, number, number 速率，总时间，清除对方条时间，我方读条时间
+function SociatyMobaCreepData:GetOurWinTime()
+    if self.state ~= CreepState.OurOccupy then
+        return 0, 0, 0, 0
+    end
+    local rate = self.increaseDic[self:GetArriveTeamNum(true)] or 1
+    local clearTime = self.enemyHold / rate
+    local holdTime = (self.maxHold - self.ourHold) / rate
+    local delta
+    if self.lastTime == 0 then
+        delta = 0
+    else
+        delta = _G.TimeUtil.GetServerUnixTime() - self.lastTime
+    end
+    local totalTime = clearTime + holdTime - delta
+    if delta >= clearTime then
+        return rate, totalTime, 0, totalTime
+    end
+    return rate, totalTime, clearTime - delta, holdTime
+end
+
+---获取敌方占领还需多久
+function SociatyMobaCreepData:GetEnemyWinTime()
+    local CreepState = require("SociatyMobaBattleModel").CreepState
+    if self.state ~= CreepState.EnemyOccupy then
+        return 0, 0, 0, 0
+    end
+    local rate = self.increaseDic[self:GetArriveTeamNum()] or 1
+    local clearTime = self.ourHold / rate
+    local holdTime = (self.maxHold - self.enemyHold) / rate
+    local delta = _G.TimeUtil.GetServerUnixTime() - self.lastTime
+    local totalTime = clearTime + holdTime - delta
+    if delta >= clearTime then
+        return rate, totalTime, 0, holdTime - delta + clearTime
+    end
+    return rate, totalTime, clearTime - delta, holdTime
+end
+
+---获取到达队伍数量
+function SociatyMobaCreepData:GetArriveTeamNum(isOur)
+    if isOur then
+        return #self.ourArrive
+    else
+        return #self.enemyArrive
+    end
+end
+
+
+---添加移动中队伍
+function SociatyMobaCreepData:AddMovingTeam(data, isOur)
+    if isOur then
+        _G.table.insert(self.ourMoving, data)
+    else
+        _G.table.insert(self.enemyMoving, data)
+    end
+end
+
+function SociatyMobaCreepData:RemoveMovingTeam(uid, isOur)
+    if isOur then
+        for i = 1, #self.ourMoving do
+            if self.ourMoving[i].team.uid == uid then
+                return _G.table.remove(self.ourMoving, i)
+            end
+        end
+    else
+        for i = 1, #self.enemyMoving do
+            if self.enemyMoving[i].team.uid == uid then
+                return _G.table.remove(self.enemyMoving, i)
+            end
+        end
+    end
+end
+
+---添加已到达队伍
+function SociatyMobaCreepData:AddArriveTeam(data, isOur)
+    if self.state == CreepState.OurWin or self.state == CreepState.EnemyWin then
+        return
+    end
+    local uidSort = require("SociatyMobaBattleModel"):GetInstance():GetCreepUidSort(self.sid)
+    local sort = uidSort[data.team.uid]
+    local index = 1
+    if isOur then
+        local count = #self.ourArrive
+        if count == 0 then
+            _G.table.insert(self.ourArrive, data)
+            return
+        end
+        for i = 1, count do
+            if sort < uidSort[self.ourArrive[i].team.uid] then
+                index = i
+                _G.table.insert(self.ourArrive, index, data)
+                return
+            end
+            if i == count then
+                _G.table.insert(self.ourArrive, data)
+                return
+            end
+        end
+    else
+        local count = #self.enemyArrive
+        if count == 0 then
+            _G.table.insert(self.enemyArrive, data)
+            return
+        end
+        for i = 1, count do
+            if sort < uidSort[self.enemyArrive[i].team.uid] then
+                index = i
+                _G.table.insert(self.enemyArrive, index, data)
+                return
+            end
+            if i == count then
+                _G.table.insert(self.enemyArrive, data)
+                return
+            end
+        end
+    end
+end
+
+function SociatyMobaCreepData:RemoveArriveTeam(uid, isOur)
+    if isOur then
+        for i = 1, #self.ourArrive do
+            if self.ourArrive[i].team.uid == uid then
+                return _G.table.remove(self.ourArrive, i)
+            end
+        end
+    else
+        for i = 1, #self.enemyArrive do
+            if self.enemyArrive[i].team.uid == uid then
+                return _G.table.remove(self.enemyArrive, i)
+            end
+        end
+    end
+end
+
+---战斗失败移除
+function SociatyMobaCreepData:RemoveFirstArriveTeam(isOur)
+    if isOur then
+        if #self.ourArrive > 0 then
+            return _G.table.remove(self.ourArrive, 1)
+        end
+    else
+        if #self.enemyArrive > 0 then
+            return _G.table.remove(self.enemyArrive, 1)
+        end
+    end
+    return nil
+end
+
+function SociatyMobaCreepData:OnTeamArrive(uid, isOur)
+    local data = self:RemoveMovingTeam(uid, isOur)
+    if data == nil then
+        if _G.AppSetting.DEBUG then
+            -- local str = isOur and "yes" or "no"
+            -- _G.LogError("未找到移动中队伍：" .. uid .. "是我方？" .. str)
+        end
+        return
+    end
+    self:AddArriveTeam(data, isOur)
+end
+
+---获取移动队伍数据
+function SociatyMobaCreepData:GetMovingTeam(isOur)
+    if isOur then
+        return self.ourMoving
+    else
+        return self.enemyMoving
+    end
+end
+
+---是否是我方打野队伍
+function SociatyMobaCreepData:CheckIsOurTeam(uid)
+    for _, v in pairs(self.ourArrive) do
+        if v.team.uid == uid then
+            return true
+        end
+    end
+    for _, v in pairs(self.ourMoving) do
+        if v.team.uid == uid then
+            return true
+        end
+    end
+    return false
+end
+
+function SociatyMobaCreepData:ClearTeam()
+    self.ourMoving = {}
+    self.enemyMoving = {}
+    self.ourArrive = {}
+    self.enemyArrive = {}
+end
+
+---类的析构函数
+function SociatyMobaCreepData:Dispose()
+end
+
+return SociatyMobaCreepData

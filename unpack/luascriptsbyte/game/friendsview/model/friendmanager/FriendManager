@@ -1,0 +1,945 @@
+-----------------------------------------------------------------------
+-- E:.01.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.FriendsView.Model.FriendManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/09/28
+-- Description 此处填写描述
+--------------------------------------------------------------------------
+---@class FriendManager : GameDataModelBase    中文描述
+---@field GetInstance fun():FriendManager
+---@field Friendlist table<number,FriendData> 好友列表
+local FriendManager = _G.BaseClass("FriendManager", _G.GameDataModelBase)
+
+local TipsID = {
+    RefuseTime = 100101,
+    NotFindPlayer = 100102,
+    IsFriend = 100103,
+    AtBlack = 100104,
+    OppFriendsFill = 100105,
+    OppApplyFill = 100106,
+    NotOneServer = 100107,
+    ApplySuc = 100108,
+    NotAccept = 100109,
+    AcceptApply = 100110,
+    FriendsFill = 100111,
+    AddBlcakListSuc = 100112,
+    BlcakListFill = 100113,
+    DelFriendSuc = 100114,
+    FriendShipFill = 100115,
+    AllGetOrGiveSuc = 100116,
+    GetOrGiveFill = 100117,
+    NotGetOrGive = 100118,
+    GetHeartSuc = 100119,
+    SendHeartSuc = 100120,
+    NoApplySelf = 100121,
+    DelFriend = 100301,
+    FriendToBlackList = 100302,
+    AddBlcakList = 100303,
+    RemoveBlackList = 100304,
+    InOppBlacklist = 100122
+}
+---@return FriendManager FriendManager
+function FriendManager:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function FriendManager:__init()
+    self.curFunctionOpenID = 55
+    self.Friendlist = {}
+    self.BlackList = {}
+    self.ApplyList = {}
+    self.AddFriend = {}
+    self.RecentChat = {}
+    self.RecentChatList = {}
+    self.FriendShip = 0
+    self.Friendaccept = 0
+    self.JieXiZi = false
+    ---接收的好友申请
+    self.ZaiXianHaoYou = 0
+    ---友情点更新
+    self.YouQingDianGengXing = 0
+    ---友情点更新（可赠送）
+    self.g_result = 0
+    ---纪录已经写入本地的UID(用于红点判断)
+    self.RedDotRecentChat = {}
+    ---赠送或领取好友点数
+    self.getFriendPoint = _G.ConfigManager.discrete_cfg[100309][1][2]
+end
+
+function FriendManager:GetDataFormServer()
+    self.RecentChat = _G.PlayerPrefsManager.GetTable("RecentChat")
+    if self.RecentChat == nil then
+        self.RecentChat = {}
+    else
+        self:GetRecentChatListInServer()
+    end
+
+    local initCallcount = 3
+    --- 列表都加载初始化完
+    --- 防止聊天系统 获取黑名单时 未初始化
+    local function R_call()
+        initCallcount = initCallcount - 1
+        if initCallcount == 0 then
+            self:ParseData()
+        end
+    end
+
+    require("FriendsNet"):GetInstance():PushPlayerAccess(_G.handlerbind(self, self.ParseApplyData, R_call))
+    require("FriendsNet"):GetInstance():GetBlackListAccess(_G.handlerbind(self, self.ParseBlackData, R_call))
+    require("FriendsNet"):GetInstance():FriendListAccess(_G.handlerbind(self, self.ParseServerData, R_call))
+    ---@type FriendsView
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.FriendsView.Name)
+    if view then
+        if view.IsFriendView then
+            view:UpdateFriendPanel()
+        end
+        view:CheckSworn()
+    else
+        --self:GetFriendListInServer()
+        -- self:GetFriendListInServer(
+        --     function()
+        --         require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FriendApplication.id)
+        --     end
+        -- )
+    end
+    self:GetApplyListInServer(_G.handler(self, self.haoYouShengCeng))
+    self:RedDotRecentChatNew()
+end
+
+function FriendManager:haoYouShengCeng(data)
+    self.ZaiXianHaoYou = _G.table.count(data)
+end
+
+---查询当前在线好友
+function FriendManager:FriendListOnLien(call)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        call({})
+        return
+    end
+    local OnLien = {}
+    require("FriendsNet"):GetInstance():FriendListAccess(
+        function(data)
+            if data ~= nil and data.friends ~= nil then
+                for _, v in pairs(data.friends) do
+                    if v.time == 0 then
+                        _G.table.insert(OnLien, v)
+                    end
+                end
+            end
+            call(OnLien)
+        end
+    )
+end
+
+---解析推荐/搜索好友列表
+function FriendManager:ParseAddFriendData(data, call)
+    self.AddFriend = {}
+    if data ~= nil and data.r_friend ~= nil then
+        for _, v in pairs(data.r_friend) do
+            if self.AddFriend[v.uid] == nil then
+                self.AddFriend[v.uid] = require "FriendData".New()
+            end
+            self.AddFriend[v.uid]:Init(v)
+        end
+    end
+    if call ~= nil then
+        call()
+    end
+end
+
+---解析黑名单列表
+function FriendManager:ParseBlackData(data, call)
+    self.BlackList = {}
+    if data ~= nil and data.blacklist ~= nil then
+        for _, v in pairs(data.blacklist) do
+            if self.BlackList[v.uid] == nil then
+                self.BlackList[v.uid] = require "FriendData".New()
+            end
+            self.BlackList[v.uid]:Init(v)
+        end
+    end
+    if call ~= nil then
+        call()
+    end
+end
+
+---解析好友列表
+function FriendManager:ParseServerData(data, call)
+    self.JieXiZi = true
+    self.Friendlist = {}
+    self.g_result = 0
+    if data ~= nil and data.friends ~= nil then
+        for _, v in pairs(data.friends) do
+            if self.Friendlist[v.uid] == nil then
+                self.Friendlist[v.uid] = require "FriendData".New()
+            end
+            self.Friendlist[v.uid]:Init(v)
+            if v.send_friendcoin == 0 then
+                self.g_result = self.g_result + 1
+            end
+        end
+    end
+    if data.accept_time ~= nil then
+        self.Friendaccept = data.accept_time
+    end
+    if data.send_time ~= nil then
+        self.FriendShip = data.send_time
+    end
+    if call ~= nil then
+        call()
+    end
+end
+
+---从服务器获取好友列表
+function FriendManager:GetFriendListInServer(call)
+    require("FriendsNet"):GetInstance():FriendListAccess(
+        _G.handlerbind(
+            self,
+            self.ParseServerData,
+            function()
+                if call ~= nil then
+                    call(self.Friendlist)
+                end
+            end
+        )
+    )
+end
+
+---获取今日领取友情点
+function FriendManager:GetFriendShipToday()
+    return self.Friendaccept * self.getFriendPoint
+end
+
+---获取好友列表
+function FriendManager:GetFriendList()
+    return self.Friendlist
+end
+
+---检测是否是好友
+function FriendManager:CheckIsFriend(uid)
+    return self.Friendlist[uid] ~= nil
+end
+
+---查看是否在黑名单列表
+function FriendManager:CheckInBlackList(uid)
+    return self.BlackList[uid] ~= nil
+end
+
+---获取黑名单列表
+function FriendManager:GetBlackList()
+    return self.BlackList
+end
+
+---从服务器获取黑名单列表
+function FriendManager:GetBlackListInServer(call)
+    require("FriendsNet"):GetInstance():GetBlackListAccess(
+        _G.handlerbind(
+            self,
+            self.ParseBlackData,
+            function()
+                if call ~= nil then
+                    call(self.BlackList)
+                end
+            end
+        )
+    )
+end
+
+---移除黑名单
+function FriendManager:RemoveBlackList(uid, call)
+    local msg = {}
+    msg.f_uid = uid
+    require("FriendsNet"):GetInstance():RemoveBlackListAccess(
+        msg,
+        _G._G.handlerbind(self, self.RemoveBlackListSuc, call)
+    )
+end
+
+---移除黑名单成功
+function FriendManager:RemoveBlackListSuc(data, call)
+    if data == nil or table.isEmptyOrNil(data.result) then
+        return
+    end
+    local ack = data.result.ack
+    local uid = data.result.f_uid
+    if ack == 1 then
+        if self.BlackList[uid] ~= nil then
+            self.BlackList[uid] = nil
+        end
+    end
+    if call ~= nil then
+        call(ack)
+    end
+end
+
+---获取单个好友信息
+---@return FriendData
+function FriendManager:GetFriendInfoByUid(uid)
+    return self.Friendlist[uid]
+end
+
+---删除好友
+function FriendManager:DelFriend(msg, call)
+    require("FriendsNet"):GetInstance():DelFriendAccess(msg, _G.handlerbind(self, self.DelFriendSuc, call))
+end
+
+---删除好友成功
+function FriendManager:DelFriendSuc(data, call, isOther)
+    if data == nil or data.result == nil then
+        return
+    end
+    local uidLis = {}
+    local ack, uid, flag
+    for _, v in pairs(data.result) do
+        ack = v.ack
+        uid = v.f_uid
+        self.g_result = self.g_result - 1
+        if ack == 1 then
+            self.Friendlist[uid] = nil
+            flag = true
+            _G.table.insert(uidLis, uid)
+            -- _G.ChatManager:GetInstance().DelFriendChatRecord(uid)
+        end
+    end
+    if not isOther and flag then
+        _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.DelFriendSuc)
+    end
+    local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.FriendsView.Name)
+    if view ~= nil then
+        view.View:DelFriendSuc(uidLis)
+    end
+    if call ~= nil then
+        call()
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FriendApplication.id)
+end
+
+---添加黑名单
+function FriendManager:AddBlackList(msg, call)
+    if msg.f_uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+        return
+    end
+    require("FriendsNet"):GetInstance():AddBlackListAccess(msg, _G.handlerbind(self, self.AddBlackListSuc, call))
+end
+
+---添加黑名单成功
+function FriendManager:AddBlackListSuc(data, call)
+    if data == nil or data.result == nil then
+        return
+    end
+    local ack = data.result.ack
+    local uid = data.result.f_uid
+    if ack == 1 then
+        require("FriendsNet"):GetInstance():GetBlackListAccess(
+            _G.handlerbind(
+                self,
+                self.ParseBlackData,
+                function()
+                    if ack == 1 then
+                        _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.AddBlcakListSuc)
+                        local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.FriendsView.Name)
+                        for key, value in pairs(self.Friendlist) do
+                            if value.uid == uid then
+                                value.accept = 0
+                            end
+                        end
+                        if view ~= nil then
+                            view.View:S2C_Friendship(uid)
+                        end
+                    end
+                    if call ~= nil then
+                        call()
+                    end
+                end
+            )
+        )
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(ack)
+    end
+end
+
+---点击赠送或获得友情点
+function FriendManager:ClickFriendShip(uid, type, call)
+    local msg = {}
+    if type == 1 then
+        msg.a_uid = uid
+    elseif type == 2 then
+        msg.g_uid = uid
+    end
+    require("FriendsNet"):GetInstance():GiveFriendshipAccess(msg, _G.handlerbind(self, self.GetFriendShip, msg, call))
+end
+
+---一键赠送或获得友情点
+function FriendManager:ClickAllFriendShip(msg, call)
+    require("FriendsNet"):GetInstance():GiveFriendshipAccess(msg, _G.handlerbind(self, self.GetFriendShip, msg, call))
+end
+
+---友情点操作成功，获得友情点
+function FriendManager:GetFriendShip(data, msg, call)
+    if data == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("data is nil at GetFriendShip of friendmanager")
+        end
+        return
+    end
+    local tmp = false
+    local ack = 1
+    local ack_tu = 1
+
+    --- 获得数量
+    local acceptCount = 0
+    ---赠送数量
+    local sendCount = 0
+
+    if data.a_result ~= nil then
+        for _, v in pairs(data.a_result) do
+            if v.ack == 1 then
+                tmp = true
+
+                self.YouQingDianGengXing = self.YouQingDianGengXing - 1
+                self.Friendlist[v.f_uid].accept = 2
+                acceptCount = acceptCount + 10
+                self.Friendaccept = self.Friendaccept + 1
+            else
+                ack = v.ack
+            end
+        end
+    end
+    if data.g_result ~= nil then
+        for _, v in pairs(data.g_result) do
+            if v.ack == 1 then
+                tmp = true
+                self.g_result = self.g_result - 1
+                self.Friendlist[v.f_uid].send = 1
+                sendCount = sendCount + 10
+                self.FriendShip = self.FriendShip + 1
+            else
+                ack_tu = v.ack
+            end
+        end
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FriendApplication.id)
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    if call ~= nil then
+        call(ack, ack_tu)
+    end
+end
+
+---获取推荐好友列表
+function FriendManager:GetRecPlayerList()
+    return self.AddFriend
+end
+
+---从服务器获取推荐好友列表
+function FriendManager:GetRecPlayerListInServer(call)
+    require("FriendsNet"):GetInstance():PushPlayerAccess(
+        _G.handlerbind(
+            self,
+            self.ParseAddFriendData,
+            function()
+                if call ~= nil then
+                    call(self.AddFriend, false, true)
+                end
+            end
+        )
+    )
+end
+
+---获取好友申请列表
+function FriendManager:GetApplyList()
+    return self.ApplyList
+end
+
+---获取好友申请
+function FriendManager:GetApplyListInServer(call)
+    require("FriendsNet"):GetInstance():SeekApplyAccess(
+        _G.handlerbind(
+            self,
+            self.ParseApplyData,
+            function()
+                if call ~= nil then
+                    call(self.ApplyList)
+                end
+            end
+        )
+    )
+end
+
+---解析好友申请
+function FriendManager:ParseApplyData(data, call)
+    self.ApplyList = {}
+    if data ~= nil and data.request_friend ~= nil then
+        for _, v in pairs(data.request_friend) do
+            local time = _G.TimeUtil.GetServerUnixTime() - v.request_time
+            local keepTime = _G.ConfigManager.discrete_cfg[100303][1][1]
+            if time > keepTime then
+                local msg = {}
+                msg.type = 0
+                msg.f_uid = v.f_uid
+                self:DealApply(msg)
+            else
+                if self.ApplyList[v.uid] == nil then
+                    self.ApplyList[v.uid] = require "FriendData".New()
+                end
+                self.ApplyList[v.uid]:Init(v)
+            end
+        end
+    end
+    if call ~= nil then
+        call()
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SupportPage.id)
+end
+
+---查询玩家
+function FriendManager:SeekPlayer(msg, call)
+    require("FriendsNet"):GetInstance():SeekPlayerAccess(msg, _G.handlerbind(self, self.SeekPlayerSuc, call))
+end
+
+---查询玩家结果
+function FriendManager:SeekPlayerSuc(data, call)
+    if not self.AddFriend then
+        self.AddFriend = {}
+    end
+    if data ~= nil and data.friend ~= nil then
+        for _, v in pairs(data.friend) do
+            if self.AddFriend[v.uid] == nil then
+                self.AddFriend[v.uid] = require "FriendData".New()
+            end
+            self.AddFriend[v.uid]:Init(v)
+        end
+        self.IsContinue = true
+    else
+        self.IsContinue = false
+    end
+    if call ~= nil then
+        call(data)
+    end
+end
+
+---查询是否能够继续滑动刷新玩家列表
+function FriendManager:CheckIsContinue()
+    return self.IsContinue or false
+end
+
+---向对方申请好友
+function FriendManager:AddFriendApply(msg, call)
+    require("FriendsNet"):GetInstance():ApplyFriendAccess(msg, _G.handlerbind(self, self.AddFriendSuc, call))
+end
+
+---向对方申请好友请求回调
+function FriendManager:AddFriendSuc(data, call)
+    if data == nil then
+        return
+    end
+    local result = data.result
+    local ack = 0
+    for _, v in pairs(result) do
+        if v.ack == 1 or v.ack == 701 then
+            if self.AddFriend[v.f_uid] ~= nil then
+                self.AddFriend[v.f_uid]:SetApplySuc()
+            end
+        else
+        end
+        if ack ~= 1 then
+            ack = v.ack
+        end
+    end
+    if ack == 1 then
+        -- elseif ack == "in_friend" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.IsFriend)
+        -- elseif ack == "friend_max" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.FriendsFill)
+        -- elseif ack == "in_self_blancklist" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.AtBlack)
+        -- elseif ack == "in_role_blancklist" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.InOppBlacklist)
+        -- elseif ack == "other_friend_max" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.OppFriendsFill)
+        -- elseif ack == "other_request_max" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.OppApplyFill)
+        -- elseif ack == "no_apply_self" then
+        --     --TODO 跨区预留
+        --     --elseif ack == "other_request_max" then
+        --     --    _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.ApplySuc)
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.NoApplySelf)
+        _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.ApplySuc)
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(ack)
+    end
+
+    if call ~= nil then
+        call(ack)
+    end
+end
+
+---处理申请
+function FriendManager:DealApply(msg, call)
+    require("FriendsNet"):GetInstance():DealApplyAccess(msg, _G.handlerbind(self, self.DealApplySuc, msg, call))
+end
+
+---处理申请返回
+function FriendManager:DealApplySuc(data, msg, call)
+    if data == nil or data.ack == nil or msg.type == nil then
+        return
+    end
+    if data.ack == 1 then
+        -- elseif data.ack == "in_friend" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.IsFriend)
+        -- elseif data.ack == "in_self_blancklist" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.AtBlack)
+        -- elseif data.ack == "in_role_blancklist" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.InOppBlacklist)
+        -- elseif data.ack == "other_friend_max" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.OppFriendsFill)
+        -- elseif data.ack == "friend_max" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.FriendsFill)
+        ---跨区预留
+        -- elseif ack == "friend_max" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.FriendsFill)
+        if data.type == 0 then
+            _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.NotAccept)
+        elseif data.type == 1 then
+            _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.AcceptApply)
+        end
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(data.ack)
+    end
+    self.ZaiXianHaoYou = self.ZaiXianHaoYou - 1
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SupportPage.id)
+    if call ~= nil then
+        call()
+    end
+end
+
+---处理所有好友请求
+function FriendManager:DealAllApply(msg, call)
+    require("FriendsNet"):GetInstance():DealAllApplyAccess(msg, _G.handlerbind(self, self.DealAllApplySuc, msg, call))
+end
+
+---处理所有好友请求回调
+function FriendManager:DealAllApplySuc(data, msg, call)
+    if data == nil then
+        return
+    end
+    local ack = 0
+    if data.result ~= nil then
+        for _, v in pairs(data.result) do
+            if msg.type == 1 then
+                -- body
+                if v.ack == 1 or ack == 100322 then
+                    ack = 100322
+                    break
+                else
+                    ack = v.ack
+                end
+            end
+        end
+    end
+    if msg.type == 1 then
+        if ack == 100322 then
+            _G.PopWindowManager:GetInstance():ShowAllTips(100322)
+        else
+            _G.PopWindowManager:GetInstance():ShowAllTips(ack)
+        end
+    end
+    self.ZaiXianHaoYou = 0
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SupportPage.id)
+    if call ~= nil then
+        call(ack, msg.type)
+    end
+end
+
+---对外接口：与他人聊天
+function FriendManager:GoChatOfFriendView(uid)
+    if uid == _G.PlayerModel:GetInstance().role_uid then
+        return
+    end
+    local I
+    for i, v in pairs(self.RecentChat) do
+        if v == uid then
+            I = i
+        end
+    end
+    if I ~= nil then
+        table.remove(self.RecentChat, I)
+    end
+    table.insert(self.RecentChat, 1, uid)
+    for i, v in pairs(self.RecentChat) do
+        if i > _G.ConfigManager.discrete_cfg[100304][1][1] then
+            self.RecentChat[i] = nil
+        end
+    end
+    _G.PlayerPrefsManager.SetTable("RecentChat", self.RecentChat)
+
+    self:GetRecentChatListInServer(
+        function()
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.FriendsView.Name, "ToChat")
+        end
+    )
+end
+
+---本地保存最近聊天人的id列表
+function FriendManager:GetRecentChat()
+    return self.RecentChat
+end
+
+---运行状态下获取最近聊天人
+function FriendManager:GetRecentChatList()
+    return self.RecentChatList
+end
+
+---运行状态下通过UID获取最近聊天人
+function FriendManager:GetRecentChatListByUID(UID)
+    return self.RecentChatList[UID]
+end
+
+---通过本地数据初始化聊天数据
+function FriendManager:GetRecentChatListInServer(call)
+    self.RecentChatList = {}
+    for i = 1, #self.RecentChat - 1 do
+        local msg = {}
+        msg.condition = tostring(self.RecentChat[i])
+        require("FriendsNet"):GetInstance():SeekPlayerAccess(msg, _G.handlerbind(self, self.GetRecentChatListSuc))
+    end
+    local msg = {}
+    msg.condition = tostring(self.RecentChat[#self.RecentChat])
+    require("FriendsNet"):GetInstance():SeekPlayerAccess(msg, _G.handlerbind(self, self.GetRecentChatListSuc, call))
+end
+
+---成功的返回
+function FriendManager:GetRecentChatListSuc(data, call)
+    if data == nil then
+        return
+    end
+    if data.ack == 1 then
+        for _, v in pairs(data.friend) do
+            self.RecentChatList[v.uid] = require "FriendData".New()
+            self.RecentChatList[v.uid]:Init(v)
+        end
+    end
+
+    if call ~= nil then
+        call(self.RecentChatList)
+    end
+end
+
+---有新消息发给我
+function FriendManager:MsgToMe(Uid, time)
+    if Uid == nil or Uid == _G.PlayerModel:GetInstance().role_uid then
+        return
+    end
+
+    local I
+    for i, v in pairs(self.RecentChat) do
+        if v == Uid then
+            I = i
+        end
+    end
+    if I ~= nil then
+        table.remove(self.RecentChat, I)
+    end
+    table.insert(self.RecentChat, 1, Uid)
+    for i, v in pairs(self.RecentChat) do
+        -- if i > _G.ConfigManager.discrete_cfg[100304][1][1] then
+        self.RecentChat[i] = nil
+        -- end
+    end
+    _G.PlayerPrefsManager.SetTable("RecentChat", self.RecentChat)
+    local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ChatView.Name)
+    if not time then
+        time = _G.TimeUtil.GetServerUnixTime()
+    end
+    if view ~= nil then
+        --view.View:UpdateChatViewPanel(Uid, self.RecentChat, time)
+    else
+    end
+    local expireTime = _G.TimeUtil.GetServerUnixTime() - 604800 --以往消息最大期限
+    if time >= expireTime then
+        self:RedDotChat(Uid, time)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PrivateChat.id)
+    else
+        self:RedDotnil(Uid, time)
+    end
+end
+
+---发送消息
+function FriendManager:SendMsg(msg, call)
+    require("ChatViewNet"):GetInstance():FriendSendCHAT(msg, _G.handlerbind(self, self.SendMsgSuc, msg, call))
+end
+
+---发送消息返回
+function FriendManager:SendMsgSuc(data, msg, call)
+    if data == nil or data.ack ~= 1 then
+        -- if data.ack == "yet_black" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(TipsID.InOppBlacklist)
+        -- end
+        return
+    end
+    local I
+    for i, v in pairs(self.RecentChat) do
+        if v == msg.f_uid then
+            I = i
+        end
+    end
+    if I ~= nil then
+        table.remove(self.RecentChat, I)
+    end
+    table.insert(self.RecentChat, 1, msg.f_uid)
+    for i, v in pairs(self.RecentChat) do
+        if i > _G.ConfigManager.discrete_cfg[100304][1][1] then
+            self.RecentChat[i] = nil
+        end
+    end
+    if call ~= nil then
+        call(data)
+    end
+end
+
+---接受好友赠送（推送）
+function FriendManager:S2C_Friendship(uid)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.FriendsView.Name)
+    for key, value in pairs(self.Friendlist) do
+        if value.uid == uid then
+            value.accept = 1
+        end
+    end
+    if view ~= nil then
+        view:S2C_Friendship(uid)
+    end
+
+    self.YouQingDianGengXing = self.YouQingDianGengXing + 1
+
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FriendApplication.id)
+end
+
+---接受好友申请（推送）
+function FriendManager:S2C_Apply(uid)
+    self:GetApplyListInServer(
+        function()
+            local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.FriendsView.Name)
+            for key, value in pairs(self.ApplyList) do
+                if value.uid == uid then
+                    self.ZaiXianHaoYou = self.ZaiXianHaoYou - 1
+                end
+            end
+            self.ZaiXianHaoYou = self.ZaiXianHaoYou + 1
+
+            if view ~= nil then
+                view.View:UpdateApplyListPanel()
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SupportPage.id)
+        end
+    )
+end
+
+---对方同意好友申请（推送）
+function FriendManager:S2C_tongYi(uid)
+    local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.FriendsView.Name)
+
+    if view ~= nil then
+        view.View:S2C_Friendship(uid)
+        view.View:UpdateAddFriendPanel()
+        view.View:UpdateApplyListPanel()
+    else
+        self:GetFriendListInServer()
+    end
+
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FriendApplication.id)
+end
+
+--region 红点信息纪录
+---从本地获取已记录的红点信息
+function FriendManager:RedDotRecentChatNew()
+    self.RedDotRecentChat = _G.PlayerPrefsManager.GetTable("RedDotRecentChat", false)
+
+    if self.RedDotRecentChat == nil then
+        self.RedDotRecentChat = {}
+    end
+end
+
+---根据Uid判断数据写入
+function FriendManager:RedDotChat(UID, time)
+    if self.RedDotRecentChat[UID] == nil or self.RedDotRecentChat[UID].time < time then
+        self.RedDotRecentChat[UID] = {}
+        self.RedDotRecentChat[UID].time = time
+        self.RedDotRecentChat[UID].bool = true
+        _G.PlayerPrefsManager.SetTable("RedDotRecentChat", self.RedDotRecentChat, true)
+    end
+end
+
+---根据Uid判断数据删除
+function FriendManager:RedDotnil(UID, time)
+    if self.RedDotRecentChat[UID] ~= nil and self.RedDotRecentChat[UID].bool == true then
+        self.RedDotRecentChat[UID].time = time
+        self.RedDotRecentChat[UID].bool = false
+        _G.PlayerPrefsManager.SetTable("RedDotRecentChat", self.RedDotRecentChat, false)
+    end
+end
+
+---最近聊天红点更新
+function FriendManager:RedDotBool()
+    for key, value in pairs(self.RedDotRecentChat) do
+        if value.bool ~= nil and value.bool then
+            return true
+        end
+    end
+
+    return false
+end
+
+---好友列表红点显示判断
+function FriendManager:RedDotApplylist()
+    if _G.table.count(self.ApplyList) > 0 then
+        return true
+    end
+    return false
+end
+
+---友情点红点更新
+function FriendManager:YouQingDian()
+    if self.YouQingDianGengXing <= 0 then
+        self.YouQingDianGengXing = 0
+    end
+    local maxNum = _G.ConfigManager.discrete_cfg[100308][1][1]
+    local result = _G.ConfigManager.discrete_cfg[100307][1][1]
+
+    if self.JieXiZi then
+        self.YouQingDianGengXing = 0
+        for key, value in pairs(self.Friendlist) do
+            if value.accept == 1 then
+                self.YouQingDianGengXing = self.YouQingDianGengXing + 1
+            end
+        end
+    end
+    -- self.YouQingDianGengXing = 0
+    -- for key, value in pairs(self.Friendlist) do
+    --     if value.accept == 1 then
+    --         self.YouQingDianGengXing = self.YouQingDianGengXing + 1
+    --     end
+    -- end
+    if self.Friendaccept == nil then
+        self.Friendaccept = 0
+    end
+    if self.FriendShip == nil then
+        self.FriendShip = 0
+    end
+    if self.YouQingDianGengXing > 0 and self.Friendaccept < maxNum then
+        return true
+    elseif self.g_result > 0 and self.FriendShip < result then
+        -- body
+        return true
+    end
+    return false
+end
+
+--endregion
+
+---销毁对象时,析构函数
+function FriendManager:Dispose()
+    if self.timer ~= nil then
+        self.timer:Stop()
+    end
+end
+
+return FriendManager

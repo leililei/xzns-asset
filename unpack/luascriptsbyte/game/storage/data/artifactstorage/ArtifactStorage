@@ -1,0 +1,347 @@
+-----------------------------------------------------------------------
+-- UI.Storage.Data.ArtifactStorage.lua
+-- Created by sj
+-- DateTime: 2023/11/09
+-- Description 神器仓库
+-----------------------------------------------------------------------
+
+local ArtifactData = require("ArtifactData")
+local base = require "BaseStorage"
+---@class ArtifactStorage:BaseStorage	装备仓库
+---@field wearList table 穿戴中列表(注：若该神器原本是可堆叠神器，则key使用穿戴卡牌的uid）
+---@field noWearList table 未穿戴列表
+local ArtifactStorage = _G.BaseClass("ArtifactStorage", base)
+local table = _G.table
+---构造函数
+function ArtifactStorage:__init()
+    self.sidTable = {}
+    self.wearList = {}
+    self.noWearList = {}
+    self.timerList = {}
+end
+---类的析构函数
+function ArtifactStorage:Dispose()
+    self.sidTable = nil
+end
+
+function ArtifactStorage:Init()
+    self.isU = true
+end
+---仓库数据解析(类重写数据解析)
+---@param msg storage.c2s_storage_get["types"] 物品PB数据
+function ArtifactStorage:ParseInit(msg)
+    local props = msg.artifact
+    if props ~= nil then
+        for _, value in pairs(props) do
+            self:AddItemByData(value)
+        end
+    end
+end
+
+---重连进来
+function ArtifactStorage:ParseReconnectInit(msg)
+    local props = msg.Artifact
+    if props ~= nil then
+        for _, value in pairs(props) do
+            if nil == self:GetItemByKey(value.uid) then
+                self:AddItemByData(value)
+            end
+        end
+    end
+end
+
+---解析单条奖励
+---@param msg award.i_award_item 单条装备数据
+function ArtifactStorage:ParseSingle(msg)
+    --msg[神器sid,神器uid,数量]
+    local data = {}
+    data.sid = msg[1]
+    data.uid = msg[2]
+    data.num = msg[3] or 1
+
+    local prop = self.list[data.uid]
+    if not prop then ---新增
+        self:AddItemByData(data)
+    else ---数量变动 双倍奖励装备不
+        self:ChangeCount(data.uid, data.num)
+    end
+
+    if table.count(self.sidTable[data.sid]) <= 1 then
+        self.list[data.uid].isNew = true
+    end
+    return self.list[data.uid]
+end
+
+---@private
+---@param artifact ArtifactData
+function ArtifactStorage:AddItemToSidTable(artifact)
+    if not self.sidTable[artifact.sid] then
+        self.sidTable[artifact.sid] = {}
+    end
+    self.sidTable[artifact.sid][artifact.uid] = true
+end
+
+---新增物品
+---@param data table 动态参数
+---@return number, BaseItemData, boolean 返回添加的对象ID(0 为失败)|数据对象|是否穿戴
+function ArtifactStorage:AddItem(data)
+    local artifact = ArtifactData.New()
+    artifact:Parse(data)
+    self:AddItemToSidTable(artifact)
+    if artifact.cardUid > 0 and artifact.uid == artifact.sid then
+        return artifact.cardUid, artifact, true
+    end
+    return artifact.uid, artifact, false
+end
+
+function ArtifactStorage:RemoveItem(id)
+    local item = self.list[id]
+    item:Dispose()
+    self.list[id] = nil
+    self.wearList[id] = nil
+    self.noWearList[id] = nil
+    self.timerList[id] = nil
+    for i = 1, #self.idList do
+        if id == self.idList[i] then
+            table.remove(self.idList, i)
+            break
+        end
+    end
+end
+
+---获得仓库剩余空间
+function ArtifactStorage:GetFreeSize()
+    return self.capacity - _G.table.count(self.noWearList)
+end
+
+---获取仓库所有道具数据
+---@param conTimer boolean 是否包含限时神器
+---@return table 道具组
+function ArtifactStorage:GetAllItems(type, conTimer)
+    if type == _G.ArtifactType.Wear then
+        if conTimer then
+            local tb = _G.table.ValuesToTable(self.wearList)
+            for _, v in pairs(self.timerList) do
+                if v.cardUid ~= 0 then
+                    _G.table.insert(tb, v)
+                end
+            end
+            return tb
+        end
+        return self.wearList
+    elseif type == _G.ArtifactType.NoWear then
+        if conTimer then
+            local tb = _G.table.ValuesToTable(self.noWearList)
+            for _, v in pairs(self.timerList) do
+                if v.cardUid == 0 then
+                    _G.table.insert(tb, v)
+                end
+            end
+            return tb
+        end
+        return self.noWearList
+    else
+        return self.list
+    end
+end
+---添加物品
+---@param ... any 动态参数
+---@return boolean 是否添加成功
+function ArtifactStorage:AddItemByData(...)
+    local id, item, isWear = self:AddItem(...)
+    if id > 0 then
+        self.list[id] = item
+        if isWear then
+            self.wearList[id] = item
+        else
+            self.noWearList[id] = item
+        end
+        table.insert(self.idList, id)
+        if not item.isTemp then
+            self:OnRefreshRedPoint({self:GetRedPointFreshData(id)})
+        end
+    end
+    return id > 0, item
+end
+
+---新增实体对象
+---@param Artifact ArtifactData 动态参数
+---@return number|BaseItemData 返回添加的对象ID(0 为失败)|数据对象
+function ArtifactStorage:AddItemByEntity(Artifact, newUid, cardUid)
+    local uid = newUid or Artifact.uid
+    local sid = Artifact.sid
+    local count = Artifact.count
+    local id = uid
+    if uid == sid then
+        id = cardUid or sid
+    end
+    local prop = self.list[id]
+    local msg = ArtifactData.GetMsg(Artifact)
+    msg.uid = uid
+    msg.cardUid = cardUid
+    if not prop then ---新增
+        self:AddItemByData(msg)
+    else ---数量变动
+        self:ChangeCount(uid, count)
+    end
+
+    if table.count(self.sidTable[sid]) <= 1 then
+        self.list[uid].isNew = true
+    end
+    return self.list[uid]
+end
+
+---新增神器对象
+---@param artifactData ArtifactData 神器对象
+function ArtifactStorage:AddItemByArtifactData(artifactData)
+    local prop
+    if artifactData.sid == artifactData.uid then
+        if artifactData.cardUid ~= 0 then
+            prop = self.list[artifactData.cardUid]
+            if prop ~= nil then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("神器入库失败，重复的穿戴卡牌uid")
+                end
+                return
+            end
+            self.list[artifactData.cardUid] = artifactData
+            self.wearList[artifactData.cardUid] = artifactData
+            table.insert(self.idList, artifactData.cardUid)
+        else
+            prop = self.list[artifactData.sid]
+            if prop == nil then
+                self.list[artifactData.sid] = artifactData
+                self.noWearList[artifactData.sid] = artifactData
+                table.insert(self.idList, artifactData.sid)
+            else
+                self:ChangeCount(artifactData.sid, artifactData:GetCount())
+            end
+        end
+    else
+        prop = self.list[artifactData.uid]
+        if prop ~= nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("神器入库失败，重复的神器uid")
+            end
+            return
+        else
+            self.list[artifactData.uid] = artifactData
+            if artifactData.cardUid == 0 then
+                self.noWearList[artifactData.uid] = artifactData
+            else
+                self.wearList[artifactData.uid] = artifactData
+            end
+            table.insert(self.idList, artifactData.uid)
+        end
+    end
+    self:AddItemToSidTable(artifactData)
+end
+
+---穿上独立uid神器处理
+---@param artifact ArtifactData
+function ArtifactStorage:OnPutOnArtifact(artifact)
+    local id = artifact.uid
+    if artifact.uid == artifact.sid then
+        id = artifact.cardUid
+    end
+    if artifact.type == _G.ArtifactDataType.Normal then
+        self.wearList[id] = artifact
+        self.noWearList[id] = nil
+    end
+end
+
+---脱下神器处理
+---@param artifact ArtifactData
+function ArtifactStorage:OnTakeOffArtifact(artifact)
+    local id = artifact.uid
+    if artifact.uid == artifact.sid then
+        id = artifact.cardUid
+    end
+    artifact:UnbindCard()
+    if artifact.type == _G.ArtifactDataType.Normal then
+        self.wearList[id] = nil
+        self.noWearList[id] = artifact
+    end
+end
+
+---计算道具数量
+---@param sid number sid
+---@return number 相同SID的装备数量
+function ArtifactStorage:CalulateItemCount(sid)
+    return self.sidTable[sid] and table.count(self.sidTable[sid]) or 0
+end
+
+---使用装备
+---@param data table 使用返回数据
+function ArtifactStorage:OnUseProp(data)
+    local uids = data.uids
+    local sid
+    local Artifact
+    local remUids = {}
+    for _, v in pairs(uids) do
+        Artifact = self.list[v]
+        if Artifact then
+            sid = Artifact.sid
+            if self.sidTable[sid] then
+                for i = 1, #self.sidTable[sid] do
+                    if self.sidTable[sid][i] == v then
+                        --table.remove(self.sidTable[sid], i)
+                    end
+                end
+            end
+            table.insert(remUids, self:GetRedPointFreshData(v))
+            --self:RemoveItem(v)
+        end
+    end
+    self:OnRefreshRedPoint(nil, remUids)
+end
+
+function ArtifactStorage:GetRedPointFreshData(uid)
+    return {uid, self.list[uid].sid}
+end
+
+---刷新红点
+---@param add table 新增id数组
+---@param rem table 移除id数组
+---@param change table 改变id数组
+function ArtifactStorage:RefreshRedPoint(add, rem, change)
+    if _G.AppSetting.DEBUG then
+        _G.Log("仓库数据更新   " .. self.__cname)
+    end
+    require("CardInfoManager"):GetInstance():RedPointRefreshArtifactStorage(add, rem, change)
+end
+
+--region 对外接口
+
+---获取同一SID的装备列表
+---@param sid number 装备sid
+---@return table|ArtifactData 装备数组
+function ArtifactStorage:GetArtifactsBySid(sid)
+    local Artifacts = {}
+    if self.sidTable[sid] then
+        return table.values(self.sidTable[sid])
+    end
+    return Artifacts
+end
+---获取所有的装备sid数组
+---@return table 装备sid数组
+function ArtifactStorage:GetAllArtifactsSids()
+    return table.keys(self.sidTable)
+end
+
+---添加其他类型的卡牌
+function ArtifactStorage:AddOtherTypeArtifact(artifactData)
+    self.timerList[artifactData.uid] = artifactData
+    self.list[artifactData.uid] = artifactData
+end
+
+---移除其他类型的卡牌
+---@param uid number 卡牌uid
+function ArtifactStorage:RemoveOtherTypeArtifact(uid)
+    self.timerList[uid] = nil
+    self.list[uid] = nil
+end
+
+--endregion
+
+return ArtifactStorage

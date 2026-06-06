@@ -1,0 +1,538 @@
+-----------------------------------------------------------------------
+-- Created by lsy 03.11
+--
+-- @Description 对话界面
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+---@class DialogueNewView : UIBaseView
+local DialogueNewView = _G.BaseClass("DialogueNewView", _G.UIBaseView)
+---@type number 通用时间 用作角色的渐显 渐隐
+local COMMON_TIME = 0.5
+local MainViewGiftModel
+local giftCfg = _G.ConfigManager.gift_npc_cfg
+local dialogueCfg = _G.ConfigManager.gift_dialogue_cfg
+--- 初始化数据      DialogueOptionAction.ShowDialogueCfg 时会调用
+function DialogueNewView:InitData()
+    self.choiceData ={}
+    --- 关闭类型 1点击跳过关闭
+    self.CloseType = nil
+    --- 允许点击选项按钮 一个选项点击过后 需要事情做完之后才能再次点击
+    ---@type boolean
+    self.EnableClick = true
+    --- 左 (0) 右 (1) 两个位置显示的模型对应的资源名字
+    ---@type string[]
+    self.RoleRes = {
+        [0] = "",
+        [1] = ""
+    }
+    --- 目前说话的角色 3D 模型
+    ---@type number
+    self.CurSpeakingRole3DShowIndex = -1
+
+    --- 本次对话的所有段落 Sid 每个 Sid 对应 dialogue_script_cfg 配表中的一行数据
+    ---@type number[]
+    self.ScriptSids = nil
+    --- 打字效果 Tweener
+    ---@type DG.Tweening.Tweener
+    self.ContentTweener = nil
+
+    --- 预加载完成的角色模型数量 预加载完成一个就可以 完后进行对话内容的显示了
+    ---@type number
+    self.PreLoadModelNum = 0
+
+    --- 是否正在跳过本次对话
+    ---@type boolean
+    self.SkippingAll = false
+
+    -- 正常速度
+    self.ratio_speed1 = 0.011
+    if _G.DialogueNewView_speed ~= nil then
+        self.ratio_speed1 = _G.DialogueNewView_speed
+    end
+    -- 快速
+    self.ratio_speed2 = self.ratio_speed1 --  / 2
+    ---文字显示速度  值越小 文字显示越快
+    self.ratio = self.ratio_speed1
+
+    ---说台词时  点击   文字全部显示 并暂停
+    self.clickStop = false
+
+    --- 任务对话相关
+
+    --- 对话完成回调  只有点击任务按钮  才会执行回调 (临时存储FinishCallback  )
+    self.taskTempCall = nil
+    --- 本次是否选项对话
+    self.isOptionDialogue = nil
+
+    ---本次对话是否 控制了世界的显示  nil没有   优先上次记录(防止对话 选项 又对话)
+    if self.IsShowWorld == nil then
+        self.IsShowWorld = nil
+    else
+        self.IsShowWorld = self.IsShowWorld
+    end
+end
+
+---
+function DialogueNewView:Awake()
+    --- 快进 自动跳过  -- 防止初始化
+    ---@type boolean
+    self.SkippingAuto = false
+    -- 物品展示 预制体
+    self.itemShow_Item = nil
+    self.Audio = {
+        ---对话音效  单个
+        acoustics = nil,
+        ---对话台词 单个
+        voice = nil
+    }
+    self.curCfg = nil
+    self.dialogueCfg = nil
+    self.textEnd = true
+    -- --- 初始化成员变量 可能会多次初始
+    self:InitData()
+    self:CacheComponent()
+    --- 添加按钮响应事件
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    ---自动播放特效的动画控制器  effect -> @_obj_effectAuto
+    self.effAutoAni = nil
+    if self.go_table.obj_effectAuto ~= nil then
+        self.effAutoAni = self.go_table.obj_effectAuto:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+        self.effAutoAni.speed = 0
+    end
+
+    self.obj_itemShowAnimator =
+        self.go_table.obj_itemShow:GetChildE(0):GetComponentE(_G.typeof(CS.UnityEngine.Animator))
+
+    ---为了 防止新手关 无角色 所以用账号来标识
+    ---@type SDKServerShowInfo
+    local info = _G.ServerManager:GetInstance().CurServer
+
+    --- 保存记录 是否自动播放 key
+    self.Key_isAuto = "DialogueIsAuto" .. info.AccountName
+end
+--- 启动
+---@param dialogueCfgSid number gift_npc 配表里的 Sid
+---@param finishCallback fun(dialogueCfgSid:string) 对话完成回调
+---@param Data Params_DialogueNewView
+function DialogueNewView:OnCreate(callback)
+    MainViewGiftModel = require("MainViewGiftModel"):GetInstance()
+    self:InitCfgData()
+    -- --- 初始化成员变量 可能会多次初始
+    -- self:InitData()
+    -- self:CacheComponent()
+
+    --- 当前是否有显示主界面  防止对话完毕 擅自打开
+    self.FinishCallback = callback
+    if self.isStartShowMain == nil then
+        local isActive = _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        if isActive == true then
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+            self.isStartShowMain = true
+        end
+    end
+
+    local cam_3d = _G.GraphicsManager.Instance:GetSubCamera("3DUICam")
+    if not _G.IsNil(cam_3d) then
+        --- 对话中不显示血条  免得层级错误
+        cam_3d:SetActiveE(0)
+    end
+    self:SetIsEnterWorld()
+    self:SetCurrentWorldVisible(true)
+    _G.GraphicsManager.Instance:CaptureFrameAndBlur(
+        function()
+            _G.StoryManager:GetInstance():RestorCameraFov()
+            _G.GameUtil.SetActiveByCondition(_G.StoryManager:GetInstance().DialogueRootTranDic.SceneBlurTran, true)
+            _G.StoryManager:GetInstance():ShowDialoguseCamera()
+        end
+    )
+    self:ShowIconAndName(self.curCfg)
+    self:ShowRoles()
+    self:ShowOptions()
+    local text = _G.GetLangPackValue(self.dialogueCfg.npc_conv[1])
+    self.curText = text
+    self.textEnd = false
+    if MainViewGiftModel.type == 2 then
+        self.getAward = true
+        self.choiceData.type = 2
+    end
+    self.ScriptRootGoTable.aortext_Content:DOText(text, 1.5):OnComplete(
+        function()
+            self.textEnd = true
+            if self.getAward and self.choiceData.type then
+                MainViewGiftModel:GetAward(self.choiceData,_G.handler(self,self.GetAwardCallBack))
+            end
+        end
+    )
+    self.go_table.aorbtn_close_mask:SetActiveE(1)
+end
+
+function DialogueNewView:InitCfgData()
+    for k,v in pairs(giftCfg) do
+        if v.sid == MainViewGiftModel.npc_sid then
+            self.curCfg = v
+            break
+        end
+    end
+    for k,v in pairs(dialogueCfg) do
+        if v.id == MainViewGiftModel.conv_id then
+            self.dialogueCfg = v
+            break
+        end
+    end
+end
+
+function DialogueNewView:ShowOptions()
+    for i =2 , #self.dialogueCfg.npc_conv do
+        local data = self.dialogueCfg
+        local table = _G.GetAutoGoTable(self.go_table["obj_OptionItemPref" .. i-1],_G._G.handlerbind(self, self.OnClickBtn,data.npc_conv[i],i-1))
+        table.gameObject:SetActiveE(1)
+        table.aortext_Desc.text = _G.GetLangPackValue(data.option[i-1][2])
+    end
+end
+
+--- 按钮单击事件
+---@param go CS.UnityEngine.GameObject
+function DialogueNewView:OnClickBtn(go,isOn,Dialogue,index)
+    local name = go:GetName()
+    if name == "@_aorbtn_close_mask" then
+        if not self.textEnd then
+            self.textEnd = true
+            self.ScriptRootGoTable.aortext_Content:DOKill()
+            self.ScriptRootGoTable.aortext_Content.text = self.curText
+            if self.getAward then
+                if self.choiceData.type then
+                    MainViewGiftModel:GetAward(self.choiceData,_G.handler(self,self.GetAwardCallBack))
+                end
+            end
+        end
+    elseif name == "@_aorbtn_SkipDialogue" then
+        self:CloseView()
+    elseif  name == "@_aorbtn_Select" then
+        self.go_table.obj_EasyListV_Options:SetActiveE(0)
+        self.ScriptRootGoTable.aortext_Content:DOKill()
+        self.ScriptRootGoTable.aortext_Content.text = ""
+        local text = _G.GetLangPackValue(Dialogue)
+        self.curText = text
+        self.textEnd = false
+        self.getAward = true
+        self.choiceData.index = index
+        self.choiceData.type = 1
+        self.ScriptRootGoTable.aortext_Content:DOText(text,1.5):OnComplete(
+            function()
+                self.textEnd = true
+                self.getAward = false
+                MainViewGiftModel:GetAward(self.choiceData,_G.handler(self,self.GetAwardCallBack))
+            end
+        )
+    end
+end
+
+function DialogueNewView:GetAwardCallBack(isAdventure,convId)
+    self.choiceData = {}
+    self.convId = convId
+    if isAdventure then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MainViewGiftAdventureView.Name,_G.handler(self,self.AdventureCall))
+    else
+        self:CloseView()
+    end
+end
+
+
+function DialogueNewView:AdventureCall()
+    local data = dialogueCfg[self.convId]
+    self.ScriptRootGoTable.aortext_Content.text = ""
+    local text = _G.GetLangPackValue(data.npc_conv[1])
+    self.curText = text
+    self.textEnd = false
+    self.getAward = true
+    self.choiceData.type = 2
+    self.ScriptRootGoTable.aortext_Content:DOText(text,1.5):OnComplete(
+        function()
+            self.textEnd = true
+            self.getAward = false
+            MainViewGiftModel:GetAward(self.choiceData,_G.handler(self,self.GetAwardCallBack))
+        end
+    )
+end
+--- 缓存需要使用到的组件
+function DialogueNewView:CacheComponent()
+    if not table.isEmptyOrNil(self.ScriptRootGoTable) then
+        return
+    end
+    --- ScriptRoot go_table
+    ---@type DialogueNewView._obj_ScriptRoot_GoTable
+    self.ScriptRootGoTable = {}
+
+    ---@type DialogueNewView._obj_ScriptRoot_letter_GoTable
+    self.ScriptRootGoTable_letter = {}
+
+    --- 左右两个位置显示的模型对应的 Dialogue3DShow 组件
+    ---@type CS.Game.Dialogue.Dialogue3DShow[]
+    self.Role3DShows = {}
+
+    --- 左右两个位置显示的模型对应的 Dialogue3DShow 组件
+    ---@type Dialogue3DShow[]
+    self.Role3DShowsLua = {
+        [_G.DialogueEnum.PosIndex.left] = nil,
+        [_G.DialogueEnum.PosIndex.mid] = nil,
+        [_G.DialogueEnum.PosIndex.right] = nil
+    }
+    local Dialogue3DShow = reimport("Game.Dialogue.Dialogue3DShow")
+
+    if _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.left]) then
+        self.Role3DShowsLua[_G.DialogueEnum.PosIndex.left] =
+            self:AddComponent(
+            self.go_table.obj_Dialogue3DShow_1,
+            Dialogue3DShow.New(_G.GetAutoGoTable(self.go_table.obj_Dialogue3DShow_1), 1)
+        )
+    end
+    if _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.mid]) then
+        self.Role3DShowsLua[_G.DialogueEnum.PosIndex.mid] =
+            self:AddComponent(
+            self.go_table.obj_Dialogue3DShow_2,
+            Dialogue3DShow.New(_G.GetAutoGoTable(self.go_table.obj_Dialogue3DShow_2), 2)
+        )
+    end
+    if _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.right]) then
+        self.Role3DShowsLua[_G.DialogueEnum.PosIndex.right] =
+            self:AddComponent(
+            self.go_table.obj_Dialogue3DShow_3,
+            Dialogue3DShow.New(_G.GetAutoGoTable(self.go_table.obj_Dialogue3DShow_3), 3)
+        )
+    end
+
+    ---@type DialogueFightBgDic
+    self.FightDic = nil
+    ---@type DialogueBgDic
+    self.BgDic = nil
+
+    self.ScriptRootGoTable = _G.GetAutoGoTable(self.go_table.obj_ScriptRoot)
+    --self.ScriptRootGoTable_letter = _G.GetAutoGoTable(self.go_table.obj_ScriptRoot_letter)
+    if self.ScriptRootGoTable == nil then
+        self.ScriptRootGoTable = -1
+
+        if _G.AppSetting.DEBUG then
+            _G.LogError("ScriptRootGoTable nil. ")
+        end
+    end
+end
+
+--- 显示角色 3D 模型
+function DialogueNewView:ShowRoles()
+    if self:IsDes() then
+        return
+    end
+
+    local data = {}
+    data.Res = self.curCfg.Res
+    data.ShowType = 1
+    local nowLua
+    if self.Role3DShowsLua then
+        nowLua = self.Role3DShowsLua[2]
+    end
+    self.Role3DShowsLua[2]:Init(
+        data.Res,
+        data,
+        function()
+            if not _G.IsNil(self.curCfg.role_states[1]) then
+                self.Role3DShowsLua[2]:PlayAnim(self.curCfg.role_states[1])
+            end
+            self:SetCurrentWorldVisible(false)
+        end)
+end
+
+function DialogueNewView:ShowDialogue()
+
+end
+--- 显示名字
+---@param currentScript gift_dialogue_cfg_item
+function DialogueNewView:ShowIconAndName(curCfg)
+    if self:IsDes() then
+        return
+    end
+    local tSpriteName = "ui_chat_img_liaotiandi_01"
+    self.ScriptRootGoTable.aortext_Content.text = ""
+    ---RootGoTable 位置
+    local objPos = _G.Vector3.New(0, 0, 0)
+    ---背景框 坐标
+    local anchor_pos = _G.Vector3.New(383.2, -41.7, 0)
+    ---内容背景框 是否显示
+    local isShow_ContentBg = true
+    ---背景框 坐标
+    local ContentBg_pos = _G.Vector3.New(6, -42, 0)
+    ---内容背景框  大小
+    local ContentBg_SizeDelta = _G.Vector2.New(1040, 192)
+    ---名字背景框 是否显示
+    local isShow_namebg = true
+    ---名字背景框 是否显示
+    local ContentColor = Color.New(81 / 255, 82 / 255, 104 / 255, 1)
+    local fontSize = 24
+    ---聊天内容文本框坐标
+    ---@type UnityEngine.Vector3
+    local ContentPos = _G.Vector3.New(-115, -115, 0)
+    ---聊天内容文本框大小
+    ---@type UnityEngine.Vector2
+    local tSizeDelta = _G.Vector2.New(645, 95)
+    --- 是否显示Anchor
+    self.ScriptRootGoTable.isAnchorShow = true
+    -- 对齐方式
+    local alignment = _G.CS.UnityEngine.TextAnchor.UpperLeft
+    self.ScriptRootGoTable.gameObject:SetActiveE(1)
+    if not _G.IsNil(self.ScriptRootGoTable) and not _G.IsNil(self.ScriptRootGoTable.aortext_Content) then
+        self.ScriptRootGoTable.gameObject:SetAnchorPosition(objPos.x, objPos.y, objPos.z)
+
+        self.ScriptRootGoTable.aortext_Content.alignment = alignment
+        self.ScriptRootGoTable.aortext_Content.fontSize = fontSize
+        self.ScriptRootGoTable.aortext_Content.rectTransform:SetRectTransformSize(tSizeDelta.x, tSizeDelta.y)
+        self.ScriptRootGoTable.aortext_Content:SetAnchorPosition(ContentPos.x, ContentPos.y, ContentPos.z)
+        self.ScriptRootGoTable.aortext_Content.color = ContentColor
+
+        self.ScriptRootGoTable.aorimage_bg.SpriteName = tSpriteName
+        self.ScriptRootGoTable.aorimage_bg:SetAnchorPosition(ContentBg_pos.x, ContentBg_pos.y, ContentBg_pos.z)
+        self.ScriptRootGoTable.aorimage_bg.rectTransform:SetRectTransformSize(
+            ContentBg_SizeDelta.x,
+            ContentBg_SizeDelta.y
+        )
+        _G.GameUtil.SetActiveByCondition(self.ScriptRootGoTable.aorimage_bg, isShow_ContentBg)
+
+        self.ScriptRootGoTable.aortext_Name.text = _G.LangUtil.GetLangPackValue(curCfg.name)
+
+        if isShow_ContentBg == true then
+            _G.GameUtil.SetActiveByCondition(self.ScriptRootGoTable.aorimage_name_bg, isShow_namebg)
+        else
+            self.ScriptRootGoTable.isAnchorShow = false
+        end
+
+        self.ScriptRootGoTable.obj_anchor:SetAnchorPosition(anchor_pos.x, anchor_pos.y, anchor_pos.z)
+        -- 隐藏箭头符号  句子显示完后显示
+        _G.GameUtil.SetActiveByCondition(self.ScriptRootGoTable.obj_anchor, false)
+    end
+end
+
+--- 关闭界面
+function DialogueNewView:CloseView()
+    _G.GameUtil.SetActiveByCondition(_G.StoryManager:GetInstance().DialogueRootTranDic.SceneBlurTran, false)
+    _G.StoryManager:GetInstance():HideDialoguseCamera()
+    if not self.textEnd then
+        self.ScriptRootGoTable.aortext_Content:DOKill()
+    end
+    if self.FinishCallback then
+        self.FinishCallback()
+    end
+    _G.Events:GetInstance():Broadcast(_G.eMainQuick.QuickBtnChanged, "MainViewGift", false)
+    self:Close()
+end
+
+---隐藏显示当前场景
+---@param visible boolean
+---@param hidePlayer boolean 是否隐藏主角(默认nil 不隐藏)
+function DialogueNewView:SetCurrentWorldVisible(visible)
+    if not self.isEnterWorld then
+        return
+    end
+
+    local CurrentWorld = _G.WorldManager:GetInstance():GetCurWorld()
+    if _G.BattleManager:GetInstance():CheckInBattle() then
+        _G.BattleManager:GetInstance():HideFighterRootItem(visible)
+        _G.BattleManager:GetInstance():SetSceneObjActive(visible)
+        self.IsShowWorld = visible
+    elseif not _G.IsNil(CurrentWorld) then
+        if CurrentWorld.isEnterWorld == visible then
+            return
+        end
+
+        if _G.AppSetting.DEBUG then
+            _G.Log("DialogueNewView:SetCurrentWorldVisible", visible)
+        end
+        self.IsShowWorld = visible
+        CurrentWorld:Visible(visible, true)
+    end
+end
+
+function DialogueNewView:OnDisable()
+    local StoryManager = _G.StoryManager:GetInstance()
+    ---如果对话结束完需要加载布阵前剧情则
+    if not require("AfkBattleManager"):GetInstance():GetFrontEmbattleStoryIsWaitLoad() then
+        if self.IsShowWorld == false then
+            self:SetCurrentWorldVisible(true)
+        end
+        StoryManager:HideDialogueRootFullScreen()
+    end
+    if self.Role3DShowsLua ~= nil then
+        if not _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.left]) then
+            self.Role3DShowsLua[_G.DialogueEnum.PosIndex.left]:delRole(_G.DialogueEnum.RoleShowType.direct)
+        end
+        if not _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.mid]) then
+            self.Role3DShowsLua[_G.DialogueEnum.PosIndex.mid]:delRole(_G.DialogueEnum.RoleShowType.direct)
+        end
+        if not _G.IsNil(self.Role3DShowsLua[_G.DialogueEnum.PosIndex.right]) then
+            self.Role3DShowsLua[_G.DialogueEnum.PosIndex.right]:delRole(_G.DialogueEnum.RoleShowType.direct)
+        end
+    end
+    if _G.IsNil(_G.GraphicsManager.Instance) == false then
+        local cam_3d = _G.GraphicsManager.Instance:GetSubCamera("3DUICam")
+        if not _G.IsNil(cam_3d) then
+            --- 对话中不显示血条  免得层级错误
+            cam_3d:SetActiveE(1)
+        end
+    end
+
+    -- 位置变化
+    self.go_table.aorrawimage_PlayBg:SetLocalPosition(0, 0, 0)
+    -- 角度变化
+    self.go_table.aorrawimage_PlayBg:SetEulerAngles(0, 0, 0)
+    -- 比例变化
+    self.go_table.aorrawimage_PlayBg:SetLocalScale(1, 1, 1)
+
+    self.SkippingAll = true
+    if self.isStartShowMain then
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        self.isStartShowMain = nil
+    end
+
+    local PoolsManager = _G.PoolsManager:GetInstance()
+    if PoolsManager:isCSPoolsManagerNil() == false then
+        PoolsManager:DespawnAll(_G.ePoolType.Temporary)
+    end
+
+    self:SetNil()
+end
+
+---当前脚本是否还存在  true不存在
+function DialogueNewView:IsDes()
+    return _G.IsNil(self.ScriptRootGoTable)
+end
+
+function DialogueNewView:SetIsEnterWorld()
+    if self.isEnterWorld == nil then
+        ---是否在世界场景里面  afk放置对战场景是临时场景(不能通过World操控显示隐藏)
+        self.isEnterWorld = _G.StoryManager:GetInstance():IsDialogueEnterWorld()
+    end
+end
+
+function DialogueNewView:SetNil()
+    self.effAutoAni = nil
+    self.CloseType = nil
+    self.obj_itemShowAnimator = nil
+    self.ScriptSids = nil
+    self.StopAction = nil
+    self.FinishCallback = nil
+    self.taskTempCall = nil
+    self.Role3DShows = nil
+    self.Role3DShowsLua = nil
+    self.FightDic = nil
+    self.BgDic = nil
+    self.ScriptRootGoTable = nil
+    self.ScriptRootGoTable_letter = nil
+    self.currentScript = nil
+    self.RoleRes = nil
+    self.isPlayFinalOptions = nil
+
+    if not _G.IsNil(self.itemShow_Item) then
+        _G.DestroyObject(self.itemShow_Item)
+        self.itemShow_Item = nil
+    end
+
+end
+
+return DialogueNewView

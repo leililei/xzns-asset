@@ -1,0 +1,976 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DailyDelivery.Model.PopUpGiftBagModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/8/1
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+---@class PopUpGiftBagModel : GameDataModelBase
+---@field GetInstance fun():PopUpGiftBagModel
+local PopUpGiftBagModel = _G.BaseClass("PopUpGiftBagModel", _G.GameDataModelBase)
+---@return PopUpGiftBagModel PopUpGiftBagModel
+
+local PopUpGiftBagNet = require "PopUpGiftBagNet"
+function PopUpGiftBagModel:__init()
+    self.IsOkTime = false
+    self.IsOpen = false
+    self.CurPop = {}
+    self.NeedDo = {}
+    self.PopList = {}
+    self.msg = {}
+    self.MinEndTimes = 0
+    self.TimeFormat = 0
+    self.IsGetData = false
+    self.LastOpenTime = nil
+    _G.Events:GetInstance():AddListener(_G.MianViewState.MainViewEnable, self.MainViewEnable, self)
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnCashListener, self)
+    self.Looked = {}
+end
+
+---是否符合重新打开的条件
+function PopUpGiftBagModel:IsAccordWithOpenAginCD()
+    if self.LastOpenTime == nil then
+        return false
+    end
+    local cd = _G.ConfigManager.discrete_cfg[104510][1][1]
+    if _G.TimeUtil.GetServerUnixTime() - self.LastOpenTime > cd then
+        return true
+    end
+    return false
+end
+
+---设置一个上次打开的时间
+function PopUpGiftBagModel:SignLastTime()
+    self.LastOpenTime = _G.TimeUtil.GetServerUnixTime()
+end
+
+function PopUpGiftBagModel:SetIsLook(id)
+    if false == _G.table.indexof(self.Looked, id) then
+        table.insert(self.Looked, id)
+    end
+end
+
+function PopUpGiftBagModel:IsLook(id)
+    if false == _G.table.indexof(self.Looked, id) then
+        return false
+    end
+    return true
+end
+
+function PopUpGiftBagModel:MainViewEnable()
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        self:CheckShowNeedDo()
+    end
+end
+
+function PopUpGiftBagModel:GetIsBuyBySid(sid)
+    local isBuy
+    if self.msg and self.msg.bag_list then
+        for i = 1, #self.msg.bag_list do
+            local info = self.msg.bag_list[i]
+            if sid == info.sid then
+                isBuy = info.buy_list[1].is_buy
+                break
+            end
+        end
+    end
+    return isBuy
+end
+
+function PopUpGiftBagModel:OnCashListener(data)
+    local sid = 0
+    if self.msg and self.msg.bag_list then
+        for i = 1, #self.msg.bag_list do
+            local info = self.msg.bag_list[i]
+            local infotemp = _G.ConfigManager.store_pop_cfg[info.sid]
+            local has = false
+            for k = 1, #infotemp.store_extra do
+                if infotemp.store_extra[k][1] == data.sid then
+                    has = true
+                    break
+                end
+            end
+            if has then
+                sid = info.sid
+                break
+            end
+        end
+    end
+    if sid > 0 then
+        self:ChangeData(sid)
+        self:UpdateData()
+    end
+end
+
+---检测可以执行的礼包
+function PopUpGiftBagModel:CheckShowNeedDo()
+    if _G.AppSetting.IsArraigned then
+        ---提审状态下不弹礼包
+        return
+    end
+    if #self.NeedDo > 0 then
+        local isPop = true
+
+        for i = 1, #self.NeedDo do
+            if nil == self.PopList[self.NeedDo[i]] then
+                isPop = false
+                break
+            end
+        end
+
+        if false == isPop then
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = _G.handler(self, self.OpenBagView)
+            _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.PopUpGiftBag)
+        end
+
+        for i = 1, #self.NeedDo do
+            self.PopList[self.NeedDo[i]] = true
+        end
+    else
+        if self:IsAccordWithOpenAginCD() then
+            if #self.CurPop <= 0 then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("弹出礼包重弹检测没有礼包了")
+                end
+                return
+            end
+            if not (_G.MainManager:GetInstance().isInMainView and _G.MainManager:GetInstance():IsMain()) then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("弹出礼包重弹检测不在主界面")
+                end
+                return
+            end
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = _G.handler(self, self.OpenBagView)
+            _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.PopUpGiftBag)
+        end
+    end
+end
+
+function PopUpGiftBagModel:OpenBagView()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.PopUpGiftBagView.Name)
+end
+
+---检测是否有需要触发的id
+function PopUpGiftBagModel:IsHaveNeedDo()
+    return #self.NeedDo > 0
+end
+
+---开始Pop（界面打开开始，目的是界面打开才开始计时）
+function PopUpGiftBagModel:StartPopup()
+    if #self.NeedDo > 0 then
+        self.NeedDoIndex = 0
+        for i = 1, #self.NeedDo do
+            self:GetReward(self.NeedDo[i], _G.handler(self, self.NeedDoCallBack))
+        end
+    else
+        _G.Events:GetInstance():Broadcast(_G.ePopGiftEvent.PopUpByView, false)
+    end
+end
+
+---回调协议
+function PopUpGiftBagModel:NeedDoCallBack(msgSign)
+    if msgSign.ack == 1 then
+        if nil == self.msg.bag_list then
+            self.msg.bag_list = {}
+        end
+
+        if nil == self.msg.open_sids then
+            self.msg.open_sids = {}
+        end
+
+        table.insert(self.msg.bag_list, msgSign.bag)
+
+        local info = {}
+        info.start_time = _G.TimeUtil.GetServerUnixTime()
+        info.sid = msgSign.bag.sid
+
+        table.insert(self.msg.open_sids, info)
+
+        table.removebyvalue(self.UnlockList, msgSign.bag.sid)
+
+        self.NeedDoIndex = self.NeedDoIndex + 1
+        if self.NeedDoIndex >= #self.NeedDo then
+            ---所有弹出礼包触发完成
+            self:UpdateData()
+
+            _G.Events:GetInstance():Broadcast(_G.ePopGiftEvent.PopUpByView, true)
+            self.NeedDo = {}
+        end
+    else
+        _G.Events:GetInstance():Broadcast(_G.ePopGiftEvent.PopUpByView, false)
+    end
+end
+
+---@return PopUpGiftBagModel PopUpGiftBagModel
+function PopUpGiftBagModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+function PopUpGiftBagModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.MianViewState.MainViewEnable, self.MainViewEnable, self)
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnCashListener, self)
+    if self.Timers then
+        self.Timers:Stop()
+        self.Timers = nil
+    end
+end
+
+function PopUpGiftBagModel:GetDataFormServer()
+    PopUpGiftBagNet:GetInstance():GetPopAwardInfos(_G.handler(self, self.ParseData))
+end
+
+function PopUpGiftBagModel:ParseData(msg)
+    self.msg = msg
+    self.IsGetData = true
+    self.UnlockList = self.msg.unlock_sids or {}
+    for i = 1, #self.UnlockList do
+        local ncfg = _G.ConfigManager.store_pop_cfg[self.UnlockList[i]]
+        if ncfg then
+            table.insert(self.NeedDo, self.UnlockList[i])
+        end
+    end
+    self.msg.unlock_sids = {}
+    self.UnlockList = {}
+    self.super.ParseData(self)
+    self:UpdateData(true)
+    self:CheckCfgCondition()
+    self:CheckShowNeedDo()
+end
+
+function PopUpGiftBagModel:InitFunction()
+    _G.FunctionManager:GetInstance():OpenFunById(_G.MainFunctionItems.PopGift)
+end
+
+---查询是否有对应星级卡片
+---@param star number 卡片星级
+function PopUpGiftBagModel:IsHaveLevelCard(star)
+    local list = _G.StorageManager:GetInstance():GetCardDataSortByStar()
+    for i = 1, #list do
+        if list[i].star >= star then
+            return true
+        end
+    end
+    return false
+end
+
+---判断是否已经触发过了
+function PopUpGiftBagModel:IsInOpen(sid)
+    if nil == self.msg.open_sids then
+        --没有东西
+        return false
+    else
+        if false == self:CheckOpenSids(sid) then
+            return false
+        else
+            return true
+        end
+    end
+end
+
+---检测条件
+function PopUpGiftBagModel:CheckCfgCondition()
+    local afkId = require "AfkModel":GetInstance().LastSid
+    local towerId = require "DeadsoulTowerModel":GetInstance().LandFloor
+    local stoneLevel = 0 ---命令大厅
+    local playerLevel = _G.PlayerModel:GetInstance():GetLevel()
+    local loginDay = _G.PlayerModel:GetInstance():DayCount()
+    local meanCash = (require("MallManager"):GetInstance():GetCashRmb() or 0) / loginDay
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(afkId, "当前放置id")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(towerId, "当前死魂塔层数ID")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(stoneLevel, "当前共鸣等级")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(playerLevel, "当前玩家等级")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local sid = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        local canCheck = false
+        local isOpen = self:IsInOpen(id)
+
+        if not isOpen then
+            if type == _G.PopUpConditionType.Afk and afkId >= sid then
+                canCheck = true
+            elseif type == _G.PopUpConditionType.Tower and towerId >= sid then
+                canCheck = true
+            elseif type == _G.PopUpConditionType.StoneLevel and stoneLevel >= sid then
+                canCheck = true
+            elseif type == _G.PopUpConditionType.PlayerLevel and playerLevel >= sid then
+                canCheck = true
+            elseif type == _G.PopUpConditionType.ActiveCash  then
+                -- 策划要求alpha屏蔽
+                -- if sid == 1 and meanCash >= _G.ConfigManager.discrete_cfg[104507][1][1] then
+                --     canCheck = true
+                -- elseif sid == 0 and meanCash <= _G.ConfigManager.discrete_cfg[104507][1][1] then
+                --     canCheck = true
+                -- end
+            end
+        end
+        if canCheck then
+            local chapterOK = true
+            for i = 1, #v.afk_chapter do
+                local info = v.afk_chapter[i]
+                if not _G.GlobalConditionManager.CheckCondition(info[1], info[2]) then
+                    chapterOK = false
+                    break
+                end
+            end
+            if chapterOK then
+                if v.cycle_time > 0 then
+                    self:CheckCycleTime(v)
+                    self:AddTodoID(id)
+                else
+                    self:AddTodoID(id)
+                end
+            end
+        end
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(self.NeedDo, "检测数据")
+    end
+end
+
+---购买了某一个档后改变购买状态
+---@param id number 当前购买的礼包
+function PopUpGiftBagModel:ChangeData(id)
+    for i = 1, #self.msg.bag_list do
+        local info = self.msg.bag_list[i]
+        if info.sid == id then
+            info.buy_list[1].is_buy = true
+        --break
+        end
+    end
+end
+
+---请除一条过期内容
+function PopUpGiftBagModel:ClearData(id)
+    for i = 1, #self.msg.bag_list do
+        local info = self.msg.bag_list[i]
+        if info.sid == id then
+            table.remove(self.msg.bag_list, i)
+            break
+        end
+    end
+end
+
+---更新当前可弹数据
+function PopUpGiftBagModel:UpdateData(isInit)
+    self.CurPop = {}
+    if nil == self.msg.bag_list then
+        return
+    end
+    local time = 0
+    local id = 0
+    for i = 1, #self.msg.bag_list do
+        local info = self.msg.bag_list[i]
+        local times = info.end_time
+        local is_buy = info.buy_list[1].is_buy
+        if (times - _G.TimeUtil.GetServerUnixTime()) > 0 then
+            if not is_buy then
+                if time <= 0 or time > times then
+                    time = times
+                    id = info.sid
+                end
+                table.insert(self.CurPop, info)
+            end
+        end
+    end
+    self.MinEndTimes = time
+    self.CurId = id
+    self.IsOkTime = (time - _G.TimeUtil.GetServerUnixTime()) > 0
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(self.CurPop, "弹出礼包当前数据")
+    end
+    self:TimeCutDown()
+    if not isInit then
+        _G.FunctionManager:GetInstance():OpenFunById(_G.MainFunctionItems.PopGift)
+    end
+end
+
+---弹出礼包主界面倒计时初始化
+---@param text 主界面时间文本
+function PopUpGiftBagModel:TimeCutDown()
+    local cfg = _G.ConfigManager.function_open_cfg[76]
+    local Open = _G.GlobalConditionManager.CheckConditionByArray(cfg.condition_type)
+    if Open and PopUpGiftBagModel:GetInstance():CheckIsShow() then
+        if self.PopUpGiftTimers == nil then
+            self.PopUpGiftTimers =
+                _G.TimerManager:GetInstance():GetTimer(1, self.ShowPopUpTime, self, false, false, true)
+            self.PopUpGiftTimers:Start()
+        end
+    else
+        _G.DelayFrameDo(
+            function()
+                _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.PopGift)
+            end
+        )
+    end
+end
+
+---刷新倒计时
+function PopUpGiftBagModel:ShowPopUpTime()
+    if self.IsOkTime then
+        local times = self.MinEndTimes - _G.TimeUtil.GetServerUnixTime()
+        self.TimeFormat = times
+        if times <= 0 then
+            --更新礼包时间为0后刷新列表
+            self:UpdateData()
+            --如果是最后一个到期的礼包就结束计时
+            if #self.CurPop <= 0 then
+                if self.PopUpGiftTimers then
+                    self.PopUpGiftTimers:Stop()
+                    self.PopUpGiftTimers = nil
+                end
+                _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.PopGift)
+            end
+        --else
+        --    _G.Events:GetInstance():Broadcast(_G.ePopGiftEvent.ShowMainPopTime)
+        end
+    end
+end
+
+---检测即将弹出的礼包中是否存在同组唯一
+function PopUpGiftBagModel:CheckNeedDoHasIsOnly(id)
+    ---@type store_pop_cfg
+    local cfg = _G.ConfigManager.store_pop_cfg[id]
+    if cfg.isonly then
+        for i = 1, #self.NeedDo do
+            ---@type store_pop_cfg
+            local ncfg = _G.ConfigManager.store_pop_cfg[self.NeedDo[i]]
+            if ncfg and ncfg.type_conditions == cfg.type_conditions then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---添加一个id
+function PopUpGiftBagModel:AddTodoID(id)
+    local isAdd = false
+    if not self.IsGetData then
+        return false
+    end
+    if self.msg.open_sids then
+        if
+            false == _G.table.indexof(self.NeedDo, id) and false == self:CheckOpenSids(id) and
+                false == self:CheckNeedDoHasIsOnly(id)
+         then
+            table.insert(self.NeedDo, id)
+            isAdd = true
+        end
+    else
+        if false == _G.table.indexof(self.NeedDo, id) and false == self:CheckNeedDoHasIsOnly(id) then
+            table.insert(self.NeedDo, id)
+            isAdd = true
+        end
+    end
+    return isAdd
+end
+
+---获得当前已开礼包的时间
+function PopUpGiftBagModel:GetOpenSids(id)
+    ---@type store_pop_cfg
+    local cfg = _G.ConfigManager.store_pop_cfg[id]
+    if cfg.isonly then
+        if self.msg.open_sids then
+            for i = 1, #self.msg.open_sids do
+                local info = self.msg.open_sids[i]
+                ---@type store_pop_cfg
+                local ocfg = _G.ConfigManager.store_pop_cfg[info.sid]
+                if ocfg and (ocfg.id == id or ocfg.type_conditions == cfg.type_conditions) then
+                    return info.start_time
+                end
+            end
+        end
+    else
+        if self.msg.open_sids then
+            for i = 1, #self.msg.open_sids do
+                local info = self.msg.open_sids[i]
+                if info.sid == id then
+                    return info.start_time
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---检测礼包id是否循环
+function PopUpGiftBagModel:CheckDeleteOpenSids(id)
+    if self.msg.open_sids then
+        for i = 1, #self.msg.open_sids do
+            local info = self.msg.open_sids[i]
+            if info.sid == id then
+                table.remove(self.msg.open_sids, i)
+                break
+            end
+        end
+    end
+end
+
+---检测礼包id是否触发过
+function PopUpGiftBagModel:CheckOpenSids(id)
+    ---@type store_pop_cfg
+    local cfg = _G.ConfigManager.store_pop_cfg[id]
+    if cfg.isonly then
+        if self.msg.open_sids then
+            for i = 1, #self.msg.open_sids do
+                local info = self.msg.open_sids[i]
+                ---@type store_pop_cfg
+                local ocfg = _G.ConfigManager.store_pop_cfg[info.sid]
+                if ocfg and (ocfg.id == id or ocfg.type_conditions == cfg.type_conditions) then
+                    return true
+                end
+            end
+        end
+    else
+        if self.msg.open_sids then
+            for i = 1, #self.msg.open_sids do
+                local info = self.msg.open_sids[i]
+                if info.sid == id then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+---检测当前放置层数是否符合弹出礼包条件
+---@param sid number 放置关卡ID
+function PopUpGiftBagModel:IsArrivePlace(sid)
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local csid = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if sid == csid and type == _G.PopUpConditionType.Afk then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---检测当前死魂塔层数是否符合弹出礼包条件
+---@param Did number 当前死魂塔层数ID
+---@param layer number 当前快速挑战跳过层数
+function PopUpGiftBagModel:IsArriveDeadTower(did, layer)
+    local ids = {}
+    if nil ~= layer then
+        local len = did + layer - 1
+        for i = did + 1, len do
+            table.insert(ids, i)
+        end
+    else
+        table.insert(ids, did)
+    end
+
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local sid = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if type == _G.PopUpConditionType.Tower then
+            if false ~= _G.table.indexof(ids, sid) then
+                self:CheckChapterAndAddId(v, id)
+            end
+        end
+    end
+end
+
+---检测当前卡片星级是否符合弹出礼包条件
+---@param sid number 放置关卡ID
+function PopUpGiftBagModel:IsCardStarSure(star)
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local cstar = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if star == cstar and type == _G.PopUpConditionType.StarCard then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---检测当前共鸣神石是否符合弹出礼包条件
+---@param sid number 放置关卡ID
+function PopUpGiftBagModel:IsRecUpLevel(level)
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local clevel = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if level >= clevel and type == _G.PopUpConditionType.StoneLevel then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---检测当前玩家等级是否符合弹出礼包条件
+---@param levelbefor number 玩家等级
+---@param level number 玩家等级
+function PopUpGiftBagModel:IsPlayerLevel(levelbefor, level)
+    local isNew = false
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local clevel = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if levelbefor < clevel and clevel <= level and type == _G.PopUpConditionType.PlayerLevel then
+            isNew = self:CheckChapterAndAddId(v, id)
+        end
+    end
+
+    if isNew then
+        self:MainViewEnable()
+    end
+end
+
+---检测每日卡片招募达到星级
+---@param levelbefor number 玩家等级
+---@param level number 玩家等级
+function PopUpGiftBagModel:IsRecruitCard(item)
+    local conditions = _G.ConfigManager.discrete_cfg[104508]
+    for i = 1, #conditions do
+        local ttype = conditions[i][1]
+        local id = conditions[i][2]
+
+        if not _G.GlobalConditionManager.CheckCondition(ttype, id) then
+            if _G.AppSetting.DEBUG then
+                _G.Log(id, "检测每日卡片招募达到星级时条件不满足，类型是>>>>" .. ttype .. "条件参数是>>>>")
+            end
+            return
+        end
+    end
+
+    local isNew = false
+    for i = 1, #item do
+        local info = item[i].type
+        ---@type card_cfg
+        local cfg = _G.ConfigManager.card_cfg[info[1]]
+        for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+            local order = v.conditions[1][2]
+            local type = v.conditions[1][1]
+            if order == cfg.Order and type == _G.PopUpConditionType.RecruitCard then
+                isNew = self:CheckChapterAndAddId(v, id)
+            end
+        end
+    end
+
+    if isNew then
+        self:MainViewEnable()
+    end
+end
+
+---是否突破石不足
+---@param deficiency boolean 不足
+function PopUpGiftBagModel:IsBtStoneDeficiency(deficiency)
+    if deficiency then
+        for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+            if v.conditions[1][1] == _G.PopUpConditionType.BtStoneDeficiency then
+                self:CheckChapterAndAddId(v, id)
+            end
+        end
+    end
+end
+
+---绝品质神兵达到X级
+---@param level number 神器等级
+function PopUpGiftBagModel:CheckArtifactsLevel(oldlevel, level)
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local clevel = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if clevel > oldlevel and clevel <= level and type == _G.PopUpConditionType.ArtifactsLevel then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---成就目标
+---@param level number 目录等级
+function PopUpGiftBagModel:IsAchievementTarget(level)
+    if _G.AppSetting.DEBUG then
+        _G.Log(level, "成就目标触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if level == value and type == _G.PopUpConditionType.AchievementGoal then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---元素塔层数
+---@param layer number 层数(配置的是元素塔的关卡ID,传入也要是)
+function PopUpGiftBagModel:IsElementTower(layer)
+    if _G.AppSetting.DEBUG then
+        _G.Log(layer, "元素塔层数触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if layer == value and type == _G.PopUpConditionType.ElementTower then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---贪字营等级
+---@param level number 等级
+function PopUpGiftBagModel:IsCampLevel(level)
+    if _G.AppSetting.DEBUG then
+        _G.Log(level, "贪字营等级触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if level == value and type == _G.PopUpConditionType.CampLevel then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---法阵等级
+---@param level number 等级
+function PopUpGiftBagModel:IsRankofMatrix(level, curLevel)
+    if _G.AppSetting.DEBUG then
+        _G.Log(level, "法阵等级触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if type == _G.PopUpConditionType.RankofMatrix then
+            if value > level and value <= curLevel then
+                self:CheckChapterAndAddId(v, id)
+            end
+        end
+    end
+end
+
+---星河罗盘
+---@param tid number 配置的是星河罗盘的等级id，比如109100，为prof_tree_level中的id
+function PopUpGiftBagModel:IsStarCompass(tid)
+    if _G.AppSetting.DEBUG then
+        _G.Log(tid, "星河罗盘触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if tid == value and type == _G.PopUpConditionType.StarCompass then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---放置推图失败
+function PopUpGiftBagModel:IsPlaceFailed()
+    if _G.AppSetting.DEBUG then
+        _G.Log("放置推图失败触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        --local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if type == _G.PopUpConditionType.PlaceFailed then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---竞技场挑战失败
+function PopUpGiftBagModel:IsArenaFailure()
+    if _G.AppSetting.DEBUG then
+        _G.Log("竞技场挑战失败触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        --local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if type == _G.PopUpConditionType.ArenaFailure then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---通关千机黑刹
+function PopUpGiftBagModel:IsPassDungones()
+    if _G.AppSetting.DEBUG then
+        _G.Log("通关千机黑刹触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        --local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if type == _G.PopUpConditionType.PassDungones then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---完成全部日常
+function PopUpGiftBagModel:IsFinishAllDaily()
+    if _G.AppSetting.DEBUG then
+        _G.Log("完成全部日常触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        --local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if type == _G.PopUpConditionType.FinishAllDaily then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---是否活跃充值
+function PopUpGiftBagModel:IsActiveCash()
+    -- 策划要求alpha屏蔽
+    -- local loginDay = _G.PlayerModel:GetInstance():DayCount()
+    -- local meanCash = require("MallManager"):GetInstance():GetCashRmb() / loginDay
+    -- for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+    --     local param = v.conditions[1][2]
+    --     local type = v.conditions[1][1]
+    --     if type == _G.PopUpConditionType.ActiveCash then
+    --         if param == 1 and _G.ConfigManager.discrete_cfg[104507][1][1] <= meanCash then
+    --             self:CheckChapterAndAddId(v, id)
+    --         elseif param == 0 and _G.ConfigManager.discrete_cfg[104507][1][1] >= meanCash then
+    --             self:CheckChapterAndAddId(v, id)
+    --         end
+    --     end
+    -- end
+end
+
+---蓬莱包括完成一轮探索
+function PopUpGiftBagModel:IsSecretFullOnce()
+    if _G.AppSetting.DEBUG then
+        _G.Log("蓬莱包括完成一轮探索触发")
+    end
+    for id, v in pairs(_G.ConfigManager.store_pop_cfg) do
+        --local value = v.conditions[1][2]
+        local type = v.conditions[1][1]
+        if type == _G.PopUpConditionType.SecretFullOnce then
+            self:CheckChapterAndAddId(v, id)
+        end
+    end
+end
+
+---检查条件并添加id
+function PopUpGiftBagModel:CheckChapterAndAddId(v, id)
+    local chapterOK = true
+    for i = 1, #v.afk_chapter do
+        local info = v.afk_chapter[i]
+        if not _G.GlobalConditionManager.CheckCondition(info[1], info[2]) then
+            chapterOK = false
+            break
+        end
+    end
+    if chapterOK then
+        local isAdd
+        if v.cycle_time > 0 then
+            self:CheckCycleTime(v)
+            isAdd = self:AddTodoID(id)
+        else
+            isAdd = self:AddTodoID(id)
+        end
+        if isAdd then
+            local msg = {}
+            msg.sid = id
+            PopUpGiftBagNet:GetInstance():SetUnlockAward(msg)
+            return true
+        end
+    end
+    return false
+end
+
+---检测循环
+function PopUpGiftBagModel:CheckCycleTime(cfg)
+    if cfg.cycle_time > 0 then
+        ---类型唯一
+        if cfg.isonly then
+            ---判断时间是否满足循环
+            if (_G.TimeUtil.GetServerUnixTime() - self:GetOpenSids(cfg.id)) > cfg.cycle_time then
+                for did, dv in pairs(_G.ConfigManager.store_pop_cfg) do
+                    if dv.type_conditions == cfg.type_conditions then
+                        self:CheckDeleteOpenSids(did)
+                    end
+                end
+            end
+        else
+            ---判断时间是否满足循环
+            if (_G.TimeUtil.GetServerUnixTime() - self:GetOpenSids(cfg.id)) > cfg.cycle_time then
+                self:CheckDeleteOpenSids(cfg.id)
+            end
+        end
+    end
+end
+
+function PopUpGiftBagModel:ReConnect(endcall)
+    self:GetDataFormServerRe(endcall)
+end
+
+function PopUpGiftBagModel:GetDataFormServerRe(endcall)
+    PopUpGiftBagNet:GetInstance():GetPopAwardInfos(_G.handlerbind(self, self.ParseDataRe, endcall))
+end
+
+function PopUpGiftBagModel:ParseDataRe(msg, endcall)
+    if endcall then
+        endcall()
+    end
+    self.msg = msg
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.PopUpGiftBagView.Name)
+    if window then
+        window.View:UpdateView()
+    end
+end
+
+---region 对外接口 （main_function,检测函数）
+---是否显示.false是关闭,true是显示
+function PopUpGiftBagModel.IsShowMainFunction()
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(76) and PopUpGiftBagModel:GetInstance():CheckIsShow() then
+        --("_____________________________________界面打开")
+        return true
+    else
+        --("_____________________________________界面关闭")
+        return false
+    end
+end
+
+---检测礼包状态
+function PopUpGiftBagModel:CheckIsShow()
+    local show = false
+    for _, v in pairs(self.CurPop) do
+        local times = v.end_time - _G.TimeUtil.GetServerUnixTime()
+        if times > 0 then
+            if v.buy_list[1].is_buy == false then
+                show = true
+            end
+        end
+    end
+    return show
+end
+
+---触发礼包
+---@param id number 弹出礼包id
+function PopUpGiftBagModel:GetReward(id, callback)
+    ---@type store_pop.c2s_store_pop
+    local msg = {}
+    msg.sid = id
+    PopUpGiftBagNet:GetInstance():GetAward(
+        msg,
+        function(msg)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---检测红点
+function PopUpGiftBagModel:CheckRedPoint()
+    if self:CheckIsShow() then
+        return not self.IsOpen
+    end
+
+    return false
+end
+
+return PopUpGiftBagModel

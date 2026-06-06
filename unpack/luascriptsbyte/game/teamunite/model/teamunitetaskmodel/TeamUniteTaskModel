@@ -1,0 +1,297 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.TeamUnite.Model.TeamUniteTaskModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/08/15
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local TeamUniteSubBaseModel = require "TeamUniteSubBaseModel"
+---@class TeamUniteTaskModel:TeamUniteSubBaseModel	中文描述
+local TeamUniteTaskModel = _G.BaseClass("TeamUniteTaskModel", TeamUniteSubBaseModel)
+local table = _G.table
+---@return TeamUniteTaskModel TeamUniteTaskModel
+function TeamUniteTaskModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function TeamUniteTaskModel:__init()
+    self.curFunctionOpenID = 0
+    ---任务完成 刷新界面
+    self.taskCompletedFun = _G.handler(self, self.RefreshRedPoint)
+    if not _G.ePlayAactionEvent then
+        require("ActiveTaskManager"):GetInstance()
+    end
+    _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.PlayAaction, self.OnTaskAaction, self)
+end
+
+--region 子类重写
+---从服务器拉取数据
+function TeamUniteTaskModel:GetDataFormServer()
+end
+---获取信息回调
+---@param msg season.s2c_season_info
+function TeamUniteTaskModel:GetInfoCall(msg)
+    if msg.ack == 1 then
+        self:ParseData(msg.task_info)
+    else
+        self.super.ParseData(self)
+    end
+end
+---初始化功能逻辑
+function TeamUniteTaskModel:InitFunction()
+end
+function TeamUniteTaskModel:Dispose()
+    self.Data = nil
+    self.MissionCfg = nil
+    self.TaskDatas = nil
+    self.finishTasks = nil
+    _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.PlayAaction, self.OnTaskAaction, self)
+end
+function TeamUniteTaskModel:ParseData(info)
+    if not _G.table.isEmptyOrNil(self.TaskDatas) then
+        for k, v in pairs(self.TaskDatas) do
+            v:Dispose()
+        end
+    end
+    self.redPointId = require "TeamUniteModel":GetInstance():GetRedpointIDByIndex(6)
+    self.Data = info
+    self.MissionCfg = require "TeamUniteModel":GetInstance():GetCfg().mission[1]
+    self.TaskDatas = {}
+    self:InitTaskData()
+    self:InitFinshTask()
+    self.super.ParseData(self)
+end
+
+---初始化已完成任务
+function TeamUniteTaskModel:InitFinshTask()
+    self.finishTasks = {}
+    if self.Data.finish_task then
+        for _, v in pairs(self.Data.finish_task) do
+            self.finishTasks[v] = true
+            self.TaskDatas[v].i_task.target[1] = self.TaskDatas[v].i_task.count
+            self.TaskDatas[v].i_task.state = _G.TaskEnum.ETaskState.Submited
+        end
+    end
+end
+function TeamUniteTaskModel:InitTaskData()
+    local IceGiftTaskData = require "IceGiftTaskData"
+    local count = #self.MissionCfg
+    for i = 1, count do
+        local task = self:GetTaskInfo(self.MissionCfg[i])
+        if not task then
+            task = {
+                sid = self.MissionCfg[i],
+                target = {
+                    [1] = 0
+                },
+            }
+        end
+        self.TaskDatas[self.MissionCfg[i]] = IceGiftTaskData.New(task, self.taskCompletedFun)
+    end
+end
+---检测是否完成
+function TeamUniteTaskModel:CheckIsFinish(sid)
+    return self.finishTasks[sid]
+end
+---检测是否可以领奖
+function TeamUniteTaskModel:CheckIsCanTake(sid)
+    if self:CheckIsGet(sid) then
+        return false
+    end
+    if not self.TaskDatas[sid] then
+        return false
+    else
+        return self.TaskDatas[sid].i_task.state == _G.TaskEnum.ETaskState.Submited
+    end
+end
+function TeamUniteTaskModel:Reset()
+    self.finishTasks = {}
+    for k, v in pairs(self.TaskDatas) do
+        v:Reset()
+    end
+end
+---检测是否有可领奖
+function TeamUniteTaskModel:IsCanTake()
+    if table.isEmptyOrNil(self.TaskDatas) then
+        return false
+    end
+    for _, v in pairs(self.TaskDatas) do
+        if self:CheckIsCanTake(v.sid) then
+            return true
+        end
+    end
+    return false
+end
+---检测是否未领完
+---@return boolean true 未领完
+function TeamUniteTaskModel:IsNotAllFinish()
+    if table.isEmptyOrNil(self.TaskDatas) then
+        return false
+    end
+    for _, v in pairs(self.TaskDatas) do
+        if not self:CheckIsFinish(v.sid) then
+            return true
+        end
+    end
+    return false
+end
+---检测是否已经领过奖
+function TeamUniteTaskModel:CheckIsGet(sid)
+    return self:CheckIsFinish(sid)
+end
+
+---完成任务
+---@param data HellGuardTaskData
+function TeamUniteTaskModel:FinishTask(ids, callback)
+    require "TeamUniteNet":GetInstance():FinishTask(
+        {
+            activity_id = require("TeamUniteModel"):GetInstance():GetActivityID(),
+            task_sids=ids
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                if callback then
+                    callback()
+                end
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.PopWindowManager:GetInstance():AddAwardPopQuene(msg)
+            for k, v in pairs(msg.award.item) do
+                if v.type[1] == 71 then
+                    require("FlyingChessModel"):GetInstance():AddCoin(v.type[2])
+                end
+            end
+            for i = 1, #ids do
+                self.finishTasks[ids[i].sid] = true
+                self.TaskDatas[ids[i].sid].i_task.state = _G.TaskEnum.ETaskState.Submited
+                self.TaskDatas[ids[i].sid]:CheckTaskState()
+            end
+            self:RefreshRedPoint()
+            if callback then
+                callback(msg)
+            end
+            --todo refreshRedPoint
+        end
+    )
+end
+---获取任务信息
+function TeamUniteTaskModel:GetTaskInfo(sid)
+    if not self.Data.task_info then
+        return nil
+    end
+    for _, v in pairs(self.Data.task_info) do
+        if v.sid == sid then
+            return v
+        end
+    end
+    return nil
+end
+---获取模块功能是否开放
+---@return boolean 是否开放
+function TeamUniteTaskModel:GetFunctionOpen()
+    local createPlayer = _G.PlayerModel:GetInstance():CheckCreateRole()
+    if self.curFunctionOpenID > 0 then
+        if createPlayer then
+            return _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) and self:CheckIsOpen()
+        end
+    end
+    return createPlayer
+end
+---获取任务数据 外部
+function TeamUniteTaskModel:GetTaskDatas()
+    local taskArray = {}
+    for _, v in pairs(self.TaskDatas) do
+        _G.table.insert(taskArray, v)
+    end
+    _G.SortList(
+        taskArray,
+        function(data)
+            local a = self.finishTasks[data.sid] and 0 or 1
+            return a, data.i_task.state, -data.sid
+        end
+    )
+    return taskArray
+end
+
+---更新任务数据
+function TeamUniteTaskModel:UpdataTask(task)
+    if not self.Data then
+        return
+    end
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask:UpdataData(task)
+    self:RefreshRedPoint()
+    return true
+end
+---@return HellRoadTaskData
+function TeamUniteTaskModel:GetTaskByTaskid(taskid)
+    for _, v in pairs(self.TaskDatas) do
+        if v.sid == taskid then
+            return v
+        end
+    end
+    return nil
+end
+function TeamUniteTaskModel:RedPointCheck()
+    -- local time = _G.PlayerPrefsManager.GetInt("SeasonIceGift")
+    -- local curTime = _G.TimeUtil.GetServerUnixTime()
+    -- if self:IsCanTake() then
+    --     return true
+    -- elseif curTime - time >= 86400 then
+    --     if self:IsNotAllFinish() then
+    --         return true
+    --     else
+    --         return false
+    --     end
+    -- else
+    --     return false
+    -- end
+    if require("TeamUniteModel"):GetInstance():CheckSeasonIsOpen() then
+        return false
+    end
+    -- local startTime = _G.PlayerPrefsManager.GetInt("SeasonIceGift")
+    -- if startTime == nil or startTime ~= require("SeasonModel"):GetInstance():GetTime().startTime then
+    --     return true
+    -- end
+    return self:IsCanTake()
+end
+---赛季开始
+function TeamUniteTaskModel:OnSeasonStart()
+end
+
+---进入结算期（关闭界面）
+function TeamUniteTaskModel:OnSettlement()
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.TeamUniteTaskView.Name)
+end
+
+---赛季结束
+function TeamUniteTaskModel:OnSeasonEnd()
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.TeamUniteTaskView.Name)
+end
+
+function TeamUniteTaskModel:OnTaskAaction(id, parmas)
+    if not self.MissionCfg then
+        return
+    end
+    local cfg = _G.ConfigManager.mission_extra_cfg
+    for k, v in pairs(self.MissionCfg) do
+        if cfg[v].condition[1][1] == id[1] then
+            self:RefreshRedPoint()
+        end
+    end
+end
+
+---打开界面
+function TeamUniteTaskModel:OpenView(hideFun, openFun, ...)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.TeamUniteTaskView.Name, hideFun, openFun)
+end
+
+return TeamUniteTaskModel

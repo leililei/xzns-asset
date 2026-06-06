@@ -1,0 +1,938 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Mall.View.MallView_monthly.MonthlyModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/01/17
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local MonthlyNet = require("MonthlyNet")
+local base = _G.GameDataModelBase
+---@class MonthlyModel : GameDataModelBase	中文描述
+local MonthlyModel = _G.BaseClass("MonthlyModel", base)
+-- _G.MonthlyModel = MonthlyModel
+-- local WeekKey = "MonthlyModelWeekKey"
+-- local PrivilegeKey = "MonthlyModelPrivilegeKey"
+-- local CS = _G.CS
+-- local typeof = _G.typeof
+local FOREVERDAY = 999
+local TimeUtil = _G.TimeUtil
+---@class type
+---@field public MonthCard number 月卡
+---@field public Gift number 不知道
+---@field public WeekCard number 周卡
+---@field public PriCard number 祝福卡
+local type = {
+    MonthCard = 1,
+    --月卡
+    Gift = 2,
+    --不知道
+    WeekCard = 3,
+    --周卡
+    PriCard = 5
+    --祝福卡
+}
+---@return MonthlyModel MonthlyModel
+function MonthlyModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function MonthlyModel:__init()
+    --- 是否初始化过特权 PrivilegeManager:InitPrivilege  (防止6点刷新多次调用)
+    self.InitPrivil = false
+    local store_month_cfg = _G.ConfigManager.store_month_cfg
+    self.monthCfgSidsArr = {}
+    ---所有月卡id
+    self.monthCfgSids = {}
+    self.BlessCfg = {}
+    self.WeekCfg = {}
+    for key, store_month_cfgItem in pairs(store_month_cfg) do
+        if store_month_cfgItem.type_1 == type.MonthCard and store_month_cfgItem.type_2 == 0 then
+            self.monthCfgSidsArr[store_month_cfgItem.id] = store_month_cfgItem.id
+            self.monthCfgSids[store_month_cfgItem.id] = store_month_cfgItem.id
+        elseif store_month_cfgItem.type_1 == type.WeekCard then --初始化周卡数据
+            self.WeekCfg[store_month_cfgItem.id] = {
+                id = store_month_cfgItem.id,
+                cfg = store_month_cfgItem,
+                state = 0,
+                time = 0
+            }
+        elseif store_month_cfgItem.type_1 == type.MonthCard and store_month_cfgItem.type_2 == 1 then
+            self.monthCfgSids[store_month_cfgItem.id] = store_month_cfgItem.id
+        elseif store_month_cfgItem.type_1 == type.PriCard then --初始化祝福特权
+            self.BlessCfg[store_month_cfgItem.id] = {
+                id = store_month_cfgItem.id,
+                display = store_month_cfgItem.display
+            }
+        end
+    end
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.FunOpen, self)
+end
+
+---@class MonthlyModel_monthCard
+---@field sid number 卡id
+---@field time number 剩余天数
+---@field gate_flag boolean  false可领取
+
+--- 网络请求初始化
+function MonthlyModel:GetDataFormServer()
+    --- 月卡数组
+    ---@type MonthlyModel_monthCard[]
+    self.Cards = {}
+    self.monthCards = {}
+    --- 特权数组
+    ---@type number[]
+    self.privis = {}
+    self.monthCardCashs = {}
+    self.time_out = {}
+    ---初始周卡状态
+    for k, v in pairs(self.WeekCfg) do
+        v.state = 0
+        v.time = 0
+    end
+    MonthlyNet:GetInstance():GetInfo_month(_G.handlerbind(self, self.ParseMonthData))
+end
+
+---6点刷新
+function MonthlyModel:OnSixClockUpdate(endcall)
+    base.OnSixClockUpdate(self, endcall)
+    self:RefreshRedPoint()
+end
+
+---刷新红点
+function MonthlyModel:RefreshRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.PrivilegeCardOfDiamond.id
+    )
+end
+
+---新功能解锁
+function MonthlyModel:FunOpen(mainFunid)
+    if self.BlessCfg then
+        for _, v in pairs(self.BlessCfg) do
+            if mainFunid == v.display then
+                self:RefreshRedPoint()
+                break
+            end
+        end
+    end
+end
+
+---@param msg month_card.s2c_month_card_info_month
+function MonthlyModel:ParseMonthData(msg)
+    self.Cards = msg.cards or {}
+    local len = #self.Cards
+    for i = len, 1, -1 do
+        local data = self.Cards[i]
+        --- 删除0天月卡
+        if data.time <= 0 then
+            table.remove(self.Cards, i)
+        elseif self.monthCfgSids[data.sid] then
+            if data.sid == 401003 then
+                local store_month_cfg = _G.ConfigManager.store_month_cfg[401003]
+                require "PrivilegeManager":GetInstance():AddPrivilege(store_month_cfg.extra_first[1], true, true)
+            end
+            if data.sid == 401002 then
+                local store_month_cfg = _G.ConfigManager.store_month_cfg[401002]
+                for k, v in ipairs(store_month_cfg.extra_first) do 
+                    require "PrivilegeManager":GetInstance():AddPrivilege(v, true, true)
+                end
+            end
+            _G.table.insert(self.monthCards, data)
+        elseif self.WeekCfg[data.sid] then
+            self.WeekCfg[data.sid].time = data.time
+            self.WeekCfg[data.sid].state = data.gate_flag and 1 or 2
+        end
+    end
+    if msg.card_cash ~= nil then
+        local len = #msg.card_cash
+        for i = 1, len do
+            self.monthCardCashs[msg.card_cash[i].k] = msg.card_cash[i].v
+        end
+    end
+    self.privis = {}
+    if msg.g_sids ~= nil then
+        for _, v in pairs(msg.g_sids) do
+            self.privis[v.id] = v.day
+        end
+    end
+    if msg.time_out then
+        for k, v in pairs(msg.time_out) do
+            self.time_out[k] = v
+        end
+    end
+    self:InitBlessPrivilege()
+    self:GetDataFormServer_End()
+    self:RefreshWeekRedPoint()
+    self:RefreshMonthRedPoint()
+    self:RefreshPrivilegeRedPoint()
+end
+
+function MonthlyModel:GetDataFormServer_End()
+    self:ParseData()
+    require("MallManager"):GetInstance():UpdataView(_G.MallViewPage.monthly)
+    local mainview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainview then
+        mainview.View:ShowQuickBtn()
+    end
+
+    if self.MonthReConnectCallback then
+        self.MonthReConnectCallback()
+        self.MonthReConnectCallback = nil
+    end
+end
+
+function MonthlyModel:InitFunction()
+    ---防止购买永久卡时断线，没有完成永久卡任务
+    if self:IsUnlockMonthCard(401003, 1) then
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            { _G.ActiveTaskEnum.ConditionEnum.Mall.PermanentMonthCard, 401003 },
+            1
+        )
+    end
+end
+
+function MonthlyModel:ReConnect(endcall)
+    self.MonthReConnectCallback = endcall
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("月卡重连了")
+    end
+    self:InitData(_G.handler(self, self.InitFunction))
+end
+
+---初始化功能逻辑
+function MonthlyModel:InitBlessPrivilege()
+    local cfg = _G.ConfigManager.store_month_cfg
+    local removeLis = {}
+    for k, v in pairs(self.BlessCfg) do
+        removeLis[v.id] = true
+    end
+    local extra_firsts = {}
+    local cfgItem
+    --- 遍厉特权卡id  读取特权id
+    for k, v in pairs(self.privis) do
+        cfgItem = _G.ConfigManager.store_month_cfg[k]
+        if cfgItem ~= nil and self:IsHavePrivi(k) then
+            table.insertto(extra_firsts, cfgItem.extra_first)
+            removeLis[k] = false
+        end
+    end
+    local idLis = {}
+    for k, v in pairs(removeLis) do
+        if v then
+            for _, id in pairs(cfg[k].extra_first) do
+                _G.table.insert(idLis, id)
+            end
+        end
+    end
+    require("PrivilegeManager"):GetInstance():MultiRemovePrivilege(idLis)
+    require("PrivilegeManager"):GetInstance():InitPrivilege(extra_firsts)
+end
+
+---@return boolean 是否购买月卡
+function MonthlyModel:IsUnlockMonthCard(id, _time)
+    if _G.table.isEmptyOrNil(self.monthCards) then
+        return false
+    end
+    for i = 1, #self.monthCards do
+        if self.monthCards[i].sid == id and self.monthCards[i].time >= _time then
+            return true
+        end
+        if id == 0 and self.monthCards[i].time >= _time then
+            return true
+        end
+    end
+    return false
+end
+
+---@return boolean 是否购买周卡
+function MonthlyModel:IsUnlockWeekCard(id, _time)
+    if self.WeekCfg[id] then
+        if self.WeekCfg[id].state ~= 0 then
+            return true
+        end
+    end
+    return false
+end
+
+---@return MonthlyModel_monthCard nil未买该卡
+function MonthlyModel:GetMonthlyCard(id)
+    if self.monthCards == nil then
+        return nil
+    end
+    for i = 1, #self.monthCards do
+        if self.monthCards[i].sid == id then
+            return self.monthCards[i]
+        end
+    end
+end
+
+---周卡是否可领取
+function MonthlyModel:GetWeekIsCanTake(id)
+    local week = self.WeekCfg[id]
+    if week then
+        if week.state == 2 then
+            return true
+        end
+    end
+    return false
+end
+
+---@return boolean,number true有该卡, 剩余时间戳
+function MonthlyModel:IsHavePrivi(id)
+    if self.privis == nil then
+        return false, 0
+    end
+    if self.privis[id] == nil then
+        return false, 0
+    end
+    local time = _G.TimeUtil.CalCountDownByEndTotalDay(self.privis[id])
+    if time > 0 or self.privis[id] == 0 then
+        -- 永久特权结束时间为0
+        return true, time
+    end
+    return false, 0
+end
+
+---@return boolean true有月卡每日可领取,新加可激活月卡
+function MonthlyModel:IsHaveMonthCardGate()
+    ---是否可激活月卡,flag1 401001为30月卡,flag2 401002为68月卡,配置表store_month_cfg
+    ---30月卡改为了直购
+    -- local flag1 = self:IsCanUnLock(401001)
+    local flag2 = self:IsCanUnLock(401002)
+    if flag2 then
+        return true
+    end
+    if not _G.table.isEmptyOrNil(self.monthCards) then
+        for i = 1, #self.monthCards do
+            if self.monthCards[i].gate_flag == false then
+                return true
+            end
+        end
+    end
+    if not self:GetMonthlyCard(401003) then
+        local createTime = _G.PlayerModel:GetInstance().create_time
+        local curTime = TimeUtil.GetServerUnixTime()
+        local day = TimeUtil.GetInterValDayByGame(createTime, curTime)
+        local value = _G.PlayerPrefsManager.GetInt("isShowMonthlyRepoint", 0)
+        if day >= 14 and value ~= 1 then
+            _G.PlayerPrefsManager.SetInt("isShowMonthlyRepoint", 1)
+            return true
+        end
+    end
+    return false
+end
+
+---@return boolean true有周卡每日可领取
+function MonthlyModel:IsHaveWeekCardGate()
+    if not _G.table.isEmptyOrNil(self.WeekCfg) then
+        for k, v in pairs(self.WeekCfg) do
+            if v.state == 2 then
+                return true
+            end
+        end
+    end
+end
+
+---获取周卡数据
+function MonthlyModel:GetWeekCardCfg(id)
+    return self.WeekCfg[id]
+end
+
+---检测周卡红点
+function MonthlyModel:CheckWeekCardRedPoint()
+    -- local isHasWeek = false
+    -- if not _G.table.isEmptyOrNil(self.WeekCfg) then
+    --     for k, v in pairs(self.WeekCfg) do
+    --         if v.time > 0 then
+    --             isHasWeek = true
+    --             break
+    --         end
+    --     end
+    -- end
+    -- if not isHasWeek then
+    --     local lastime = _G.PlayerPrefsManager.GetInt(WeekKey, 0)
+    --     local time = _G.TimeUtil.GetServerUnixTime()
+    --     return time - lastime >= 604800
+    -- end
+
+    return self:IsHaveWeekCardGate()
+end
+
+---设置周卡(红点)
+function MonthlyModel:SetWeekCardKey()
+    -- local isHasWeek = false
+    -- if not _G.table.isEmptyOrNil(self.WeekCfg) then
+    --     for k, v in pairs(self.WeekCfg) do
+    --         if v.time > 0 then
+    --             isHasWeek = true
+    --             break
+    --         end
+    --     end
+    -- end
+    -- if not isHasWeek then
+    --     local lastime = _G.PlayerPrefsManager.GetInt(WeekKey, 0)
+    --     local time = _G.TimeUtil.GetServerUnixTime()
+    --     if time - lastime >= 604800 then
+    --         local data = _G.TimeUtil.GetDateTime(time)
+    --         if data.week == 0 then
+    --             data.week = 7
+    --         end
+    --         time = time - (data.week - 1) * 86400 - data.hour * 3600 - data.month * 60 - data.second
+    --         _G.PlayerPrefsManager.SetInt(WeekKey, time)
+    --         self:RefreshWeekRedPoint()
+    --     end
+    -- end
+end
+
+---检测祝福红点
+function MonthlyModel:CheckPrivilegePoint()
+    -- if  _G.table.isEmptyOrNil(self.privis) then
+    --     return _G.TimeUtil.GetServerUnixTime()-_G.PlayerPrefsManager.GetInt(PrivilegeKey, 0) >= 604800
+    -- end
+    local noHaveLis = {}
+    for _, v in pairs(self.BlessCfg) do
+        if not self:IsHavePrivi(v.id) then
+            _G.table.insert(noHaveLis, v.id)
+        end
+    end
+    if #noHaveLis == 0 then
+        return false
+    end
+
+    local bm = _G.PlayerPrefsManager.GetInt("BlessMonday")
+    local time = _G.TimeUtil.GetMondaySixTime()
+    if bm ~= time then
+        return true
+    end
+
+    local expire
+    for _, id in pairs(noHaveLis) do
+        expire = _G.PlayerPrefsManager.GetInt("BlessExpire" .. id)
+        if self.privis and self.privis[id] then
+            if expire ~= self.privis[id] then
+                return true
+            end
+        elseif expire > 0 then
+            return true
+        end
+    end
+
+    return false
+end
+
+------设置特权(红点)
+function MonthlyModel:SetPrivilegeKey()
+    -- local isHasPrivilege = not _G.table.isEmptyOrNil(self.privis)
+    -- if not isHasPrivilege then
+    --     local lastime = _G.PlayerPrefsManager.GetInt(PrivilegeKey, 0)
+    --     local time = _G.TimeUtil.GetServerUnixTime()
+    --     if time - lastime >= 604800 then
+    --         local data = _G.TimeUtil.GetDateTime(time)
+    --         if data.week == 0 then
+    --             data.week = 7
+    --         end
+    --         time = time - (data.week - 1) * 86400 - data.hour * 3600 - data.month * 60 - data.second
+    --         _G.PlayerPrefsManager.SetInt(PrivilegeKey, time)
+    --         self:RefreshPrivilegeRedPoint()
+    --     end
+    -- end
+    local time = _G.TimeUtil.GetMondaySixTime()
+    _G.PlayerPrefsManager.SetInt("BlessMonday", time)
+    for _, v in pairs(self.BlessCfg) do
+        if self:IsHavePrivi(v.id) then
+            _G.PlayerPrefsManager.SetInt("BlessExpire" .. v.id, self.privis[v.id])
+        else
+            _G.PlayerPrefsManager.SetInt("BlessExpire" .. v.id, 0)
+        end
+    end
+end
+
+---获取周卡
+function MonthlyModel:GetWeekCard()
+    return self.WeekCfg
+end
+
+---获取周卡数据 根据排序规则
+function MonthlyModel:GetWeekCardSids()
+    local tmpArr = {}
+    for k, v in pairs(self.WeekCfg) do
+        _G.table.insert(tmpArr, v.id)
+    end
+    _G.SortList(
+        tmpArr,
+        function(a)
+            local state = self.WeekCfg[a].state
+            local res
+            if state == 2 then
+                res = 2
+            elseif state == 1 then
+                res = 0
+            else
+                res = 1
+            end
+            return res, -self.WeekCfg[a].cfg.display_priority
+        end
+    )
+    return tmpArr
+end
+
+---购买物品 rmb、
+---@param tips number tips_system id
+function MonthlyModel:BuyRmb(ShopID, price_id, MallType)
+    --- 限制连续点击购买
+    if self.BuyTime ~= nil and os.time() - self.BuyTime < 0.5 then
+        --(os.time() - self.BuyTime)
+        return
+    end
+    self.BuyTime = os.time()
+
+    -- local data = {}
+
+    -- data.id = ShopID
+    -- data.price = num_rmb
+    require("MallManager"):GetInstance():BuyActiveGift(price_id, nil, ShopID)
+    --, _G.handlerbind(self, self.BuyRmbSuc, ShopID))
+end
+
+---使用钻石购买特权
+function MonthlyModel:BuyByDiamond(ShopID, call)
+    --- 限制连续点击购买
+    if self.BuyTime ~= nil and os.time() - self.BuyTime < 0.5 then
+        --(os.time() - self.BuyTime)
+        return
+    end
+    self.BuyTime = os.time()
+
+    require("MallManager"):GetInstance():BuyGiftByDiamond(
+        ShopID,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:BuyRmbSuc(ShopID)
+            local cfg = _G.ConfigManager.store_month_cfg[ShopID]
+            if cfg.price_id > 0 then
+                _G.StorageManager:GetInstance():ConsumeItem(12, 0, cfg.price_id)
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+function MonthlyModel:OnMallCashListener(data)
+    self:BuyRmbSuc(data.sid)
+end
+
+function MonthlyModel:BuyRmbSuc(ShopID)
+    local card = _G.ConfigManager.store_month_cfg[ShopID]
+    if card ~= nil then
+        if card.type_1 == type.MonthCard then
+            ---@type MonthlyModel_monthCard
+            local data = {}
+            data.gate_flag = false
+            data.sid = ShopID
+            if card.day_extra == 0 then
+                --永久卡
+                data.time = FOREVERDAY
+                local createTime = _G.PlayerModel:GetInstance().create_time
+                local curTime = TimeUtil.GetServerUnixTime()
+                local day = TimeUtil.GetInterValDayByGame(createTime, curTime)
+                data.acc_day = day
+            else
+                data.time = card.day_extra
+            end
+            table.insert(self.monthCards, data)
+            require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_Month)
+            if card.day_extra == 0 then
+                require "PrivilegeManager":GetInstance():AddPrivilege(card.extra_first[1], true, true)
+            elseif card.id == 401002 then 
+                for k, v in ipairs(card.extra_first) do 
+                    require "PrivilegeManager":GetInstance():AddPrivilege(v, true)
+                end
+            end
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                { _G.ActiveTaskEnum.ConditionEnum.Mall.PermanentMonthCard, ShopID },
+                1
+            )
+        elseif card.type_1 == type.Gift then
+            if #card.extra_first > 0 then
+                for i = 1, #card.extra_first do
+                    require("PrivilegeManager"):GetInstance():AddPrivilege(card.extra_first[i], true, false)
+                end
+            end
+            local day = _G.TimeUtil.GetTotalDayBy201611() + _G.ConfigManager.store_month_cfg[ShopID].day_extra - 1
+            self.privis[ShopID] = day
+        elseif card.type_1 == type.WeekCard then
+            --_G.PlayerPrefsManager.DeleteKey(WeekKey)
+            local time
+            if card.day_extra == 0 then
+                --永久卡
+                time = FOREVERDAY
+            else
+                time = card.day_extra
+            end
+            self.WeekCfg[ShopID].state = 2
+            self.WeekCfg[ShopID].time = time
+            require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_Week)
+        elseif card.type_1 == type.PriCard then
+            if #card.extra_first > 0 then
+                for i = 1, #card.extra_first do
+                    require("PrivilegeManager"):GetInstance():AddPrivilege(card.extra_first[i], true, false)
+                end
+            end
+            local day = _G.TimeUtil.GetTotalDayBy201611() + _G.ConfigManager.store_month_cfg[ShopID].day_extra - 1
+            -- 永久卡day_extra为0
+            self.privis[ShopID] = _G.ConfigManager.store_month_cfg[ShopID].day_extra == 0 and 0 or day
+            _G.PlayerPrefsManager.SetInt("BlessExpire" .. ShopID, day)
+            if card.id == 405007 then
+                _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.HeroicMinePrivilegeDay, day)
+                require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg
+                    .HeroicIconMinePrivilege.id)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eLimitePrivilege.LimitePrivilegeChange)
+        end
+    end
+    self:RefreshWeekRedPoint()
+    self:RefreshMonthRedPoint()
+    self:RefreshPrivilegeRedPoint()
+    require("MallManager"):GetInstance():UpdataView(_G.MallViewPage.monthly)
+    _G.Events:GetInstance():Broadcast(_G.eMonthCard.MonthCardHasActive)
+    self.BuyTime = nil
+end
+
+---购买物品
+function MonthlyModel:BuyItem(ShopID, num)
+    if _G.StorageManager:GetInstance():CheckItem(_G.ResPropID.Diamond, num) == false then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, _G.ResPropID.Diamond)
+        return
+    end
+    --- 限制连续点击购买
+    if self.BuyTime ~= nil and os.time() - self.BuyTime < 0.5 then
+        --(os.time() - self.BuyTime)
+        return
+    end
+    self.BuyTime = os.time()
+
+    ---@type store.c2s_store_buy
+    local pbdata = {}
+    pbdata.sid = ShopID
+    pbdata.num = num
+    MonthlyNet:GetInstance():BuyItem(pbdata, _G.handlerbind(self, self.BuyItemSuc, ShopID, num))
+end
+
+---购买物品
+function MonthlyModel:BuyItemByCurrencyItem(CurrencyId, GoodsID, num, type_reset)
+    if _G.StorageManager:GetInstance():CheckItem(CurrencyId, num) == false then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, CurrencyId)
+        return
+    end
+    --- 限制连续点击购买
+    if self.BuyTime ~= nil and os.time() - self.BuyTime < 0.5 then
+        --(os.time() - self.BuyTime)
+        return
+    end
+    self.BuyTime = os.time()
+
+    ---@type store.c2s_store_buy
+    local pbdata = {}
+    pbdata.sid = GoodsID
+    pbdata.num = 1
+    MonthlyNet:GetInstance():BuyItem(
+        pbdata,
+        _G.handlerbind(self, self.BuyItemByCurrencyItemSuc, CurrencyId, GoodsID, num, type_reset)
+    )
+end
+
+function MonthlyModel:BuyItemSuc(msg, ShopID, num)
+    if msg.ack == 1 then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        self:BuyRmbSuc(ShopID)
+
+        _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, nil, num)
+    end
+    self.BuyTime = nil
+end
+
+function MonthlyModel:BuyItemByCurrencyItemSuc(msg, CurrencyId, GoodsID, num, type_reset)
+    if msg.ack == 1 then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        _G.StorageManager:GetInstance():ConsumeItem(CurrencyId, nil, num)
+    end
+    local MallManagerIns = require("MallManager"):GetInstance()
+    MallManagerIns:SetItemBuyTimes(GoodsID, type_reset, MallManagerIns:GetItemBuyTimes(GoodsID, type_reset) + 1)
+    MallManagerIns:UpdataView(_G.MallViewPage.monthly)
+    self.BuyTime = nil
+end
+
+---每日领取周卡
+function MonthlyModel:GetWeekCardGate(ShopID, call)
+    ---@type month_card.c2s_month_card_gate
+    local pbdata = {}
+    pbdata.sid = ShopID
+    ------@param msg public.s2c_common_ack
+    MonthlyNet:GetInstance():GetMonthCardGate(
+        pbdata,
+        function(msg)
+            if msg.ack == 1 then
+                self.WeekCfg[ShopID].state = 1
+                self:RefreshWeekRedPoint()
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            end
+            if call ~= nil then
+                call()
+            end
+            require("MallManager"):GetInstance():UpdataView(_G.MallViewPage.monthly)
+            if not self:IsHaveWeekCardGate() then
+                _G.Events:GetInstance():Broadcast(_G.eMainQuick.QuickBtnChanged, _G.QuickBtnType.Week, false)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eMonthCard.MonthCardReceive)
+        end
+    )
+end
+
+---刷新周卡红点
+function MonthlyModel:RefreshWeekRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.WeekCard.id)
+end
+
+---刷新月卡红点
+function MonthlyModel:RefreshMonthRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.MonthCard.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstGather.id)
+end
+
+---刷新特权红点
+function MonthlyModel:RefreshPrivilegeRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.WishButton.id)
+end
+
+---每日领取月卡
+function MonthlyModel:GetMonthCardGate(ShopID, call)
+    ---@type month_card.c2s_month_card_gate
+    local pbdata = {}
+    pbdata.sid = ShopID
+
+    ------@param msg public.s2c_common_ack
+    MonthlyNet:GetInstance():GetMonthCardGate(
+        pbdata,
+        function(msg)
+            if msg.ack == 1 then
+                local card = self:GetMonthlyCard(ShopID)
+                card.gate_flag = true
+                card.acc_day = 0
+                self:RefreshMonthRedPoint()
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            end
+            if call ~= nil then
+                call()
+            end
+            require("MallManager"):GetInstance():UpdataView(_G.MallViewPage.monthly)
+            if not self:IsHaveMonthCardGate() then
+                _G.Events:GetInstance():Broadcast(_G.eMainQuick.QuickBtnChanged, _G.QuickBtnType.Month, false)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eMonthCard.MonthCardReceive)
+        end
+    )
+end
+
+---激活月卡
+---@param sid number 月卡sid
+function MonthlyModel:UnLockMonthCard(sid)
+    ---@type month_card.c2s_month_card_unlock
+    local pbdata = {}
+    pbdata.sid = sid
+    MonthlyNet:GetInstance():UnLockMonthCard(pbdata, _G.handlerbind(self, self.UnLockCallBack, sid))
+end
+
+---激活月卡回调
+---@param sid number 月卡sid
+function MonthlyModel:UnLockCallBack(data, sid)
+    if data.ack == 1 then
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+        self.monthCardCashs[sid] = nil
+        self:BuyRmbSuc(sid)
+    end
+end
+
+---是否能够激活月卡
+---@param sid number 月卡sid
+---@return boolean true 月卡能激活
+function MonthlyModel:IsCanUnLock(sid)
+    if self:GetMonthlyCard(sid) == nil then
+        local pc = _G.ConfigManager.store_month_cfg[sid].price_condition_id
+        local finalPrice = require "MallManager":GetInstance():GetFinalPrice(pc)
+        if self:GetTotalCash(sid) >= finalPrice then
+            return true
+        end
+    end
+    return false
+end
+
+---增加累计充值金额
+---@param count number 金额(分)
+function MonthlyModel:AddTotalCash(count)
+    local isRefresh = false
+    for k, v in pairs(self.monthCfgSidsArr) do
+        if not self:IsUnlockMonthCard(v, 1) then
+            isRefresh = true
+            if self.monthCardCashs[v] == nil then
+                self.monthCardCashs[v] = count
+            else
+                self.monthCardCashs[v] = self.monthCardCashs[v] + count
+            end
+        end
+    end
+    if isRefresh then
+        --如果购买永久卡是否会导致刷两遍
+        require("MallManager"):GetInstance():UpdataView(_G.MallViewPage.monthly)
+    end
+end
+
+---获取累充金额
+---@param sid number 月卡id
+---@return number 月卡累充金额
+function MonthlyModel:GetTotalCash(sid)
+    if self.monthCardCashs[sid] == nil then
+        return 0
+    end
+    return self.monthCardCashs[sid]
+end
+
+---数据解析完成
+function MonthlyModel:UpdataView(data)
+end
+
+---数据解析完成
+function MonthlyModel:ParseData(data)
+    self.super.ParseData(self)
+end
+
+--endregion
+
+function MonthlyModel:GetShowBtnInfo()
+    return "ImagesH5/nFuli/ui_wcfl_czyk_icon_n", _G.GetLangPackValue(90021600012), "ImagesH5/nFuli/ui_wcfl_czyk_icon_c"
+end
+
+function MonthlyModel:GetGameMainViewName()
+    return _G.ConfigManager.ui_cfg.MallView_monthly.Name
+end
+
+function MonthlyModel:GetMineCardFinishTime()
+    for _, v in pairs(self.time_out) do
+        if v.key == 405007 then
+            return v.value
+        end
+    end
+end
+
+function MonthlyModel:IsOutTimePopUp(id)
+    local nowTime = _G.TimeUtil.GetServerUnixTime()
+    for _, v in pairs(self.time_out) do
+        if v.key == id and nowTime > v.value then
+            local cfg = _G.ConfigManager.store_month_cfg[id]
+            local isbuy, time
+            if cfg.type_1 == 1 then
+                local data = self:GetMonthlyCard(id)
+                if data then
+                    isbuy = true
+                    time = _G.TimeUtil.GetDayBegin(nowTime) + data.time * 86400
+                else
+                    isbuy = false
+                end
+            elseif cfg.type_1 == 2 then
+                isbuy, time = self:IsHavePrivi(id)
+            end
+            if isbuy then
+                return false
+            else
+                local lasttime = _G.PlayerPrefsManager.GetInt("store_month_cfg" .. "_" .. id, 0, false)
+                if not self.outTime_Cfg then
+                    self.outTime_Cfg = _G.ConfigManager.discrete_cfg[126501]
+                end
+                if (lasttime == 0 or v.value > lasttime) then
+                    local Interval_time = _G.TimeUtil.GetIntervalDay(v.value, nowTime)
+                    if Interval_time < self.outTime_Cfg[1][1] * 86400 then
+                        _G.PlayerPrefsManager.SetInt("store_month_cfg" .. "_" .. id, v.value, false)
+                        return true
+                    else
+                        return false
+                    end
+                else
+                    return false
+                end
+            end
+        end
+    end
+    return false
+end
+
+---检测是不是要直接走广告
+function MonthlyModel:CheckShowADTips(callback)
+    local yuka1 = self:IsUnlockMonthCard(401001, 1)
+    local yuka3 = self:IsUnlockMonthCard(401003, 1)
+    if _G.AppSetting.DEBUG then
+        _G.Log(yuka1, "月卡1解锁")
+        _G.Log(yuka3, "月卡3解锁")
+    end
+    ---解锁月卡
+    if yuka1 or yuka3 then
+        if callback then
+            callback()
+        end
+    else
+        local showADTips = _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.ShowADTips)
+        if showADTips then
+            local nowtime = _G.TimeUtil.GetServerUnixTime()
+            local savetime = _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.ShowPopAdTips)
+            local todayTime = _G.TimeUtil.GetDayBySix(nowtime)
+            local isChoose = savetime == todayTime
+            if not isChoose then
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                    1180001,
+                    nil,
+                    function(isChoose)
+                        if isChoose then
+                            _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.ShowPopAdTips, todayTime)
+                        end
+                        if callback then
+                            callback()
+                        end
+                    end,
+                    function(isChoose)
+                        _G.JumpManager:GetInstance():Jump(148001)
+                    end
+                )
+            else
+                --_G.JumpManager:GetInstance():Jump(148001)
+                if callback then
+                    callback()
+                end
+            end
+        else
+            if callback then
+                callback()
+            end
+        end
+    end
+end
+
+---销毁对象时,析构函数
+function MonthlyModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.FunOpen, self)
+end
+
+return MonthlyModel

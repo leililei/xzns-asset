@@ -1,0 +1,264 @@
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleAllHeroesBattle : AIHelperModuleBaseNumberMock	    @AI助手-群英会武
+---@field index number                  @已执行次数
+---@field count number                  @剩余挑战次数
+local AIHelperModuleAllHeroesBattle = _G.BaseClass("AIHelperModuleAllHeroesBattle", base)
+
+---是否显示此模块(功能是否开启)
+function AIHelperModuleAllHeroesBattle:IsEnabled()
+    if not base.IsEnabled(self) then
+        return false
+    end
+    return true
+end
+
+---是否满足模块使用条件
+function AIHelperModuleAllHeroesBattle:IsActive()
+    return self.index <= self.number and self:GetNextChallengeRoomId() > 0
+end
+
+---重置状态
+function AIHelperModuleAllHeroesBattle:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.count = 1
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleAllHeroesBattle:Check(callback)
+    self.index = 1
+    self.count = require("AllHeroesBattleManager"):GetInstance():GetFightTimes()
+
+    --更新房间信息
+    require("AllHeroesBattleManager"):GetInstance():UpdateInitData(
+        function()
+            if callback then
+                callback(true)
+            end
+        end
+    )
+end
+
+---获取当前执行状态
+function AIHelperModuleAllHeroesBattle:GetExecuteState()
+    return {
+        total = self.number,
+        index = self.index
+    }
+end
+
+---执行逻辑
+function AIHelperModuleAllHeroesBattle:Execute(callback)
+    if self.count <= 0 then
+        if callback then
+            callback(false, self:CreateFailureResults(self.cfg.fail_tip))
+        end
+        return
+    end
+
+    self.index = self.index + 1
+
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+    ---@type AllHeroesBattleManager
+    local heroManager = require("AllHeroesBattleManager"):GetInstance()
+
+    local function response(success, results)
+        if not callback then
+            return
+        end
+        callback(success, results)
+    end
+
+    ---是否在结算期中
+    if require("SeasonModel"):GetInstance():IsSettlementTime() then
+        if callback then
+            callback(false, self:CreateFailureResults(90025800012))
+        end
+        return
+    end
+
+    --检测布阵是否为空
+    if not embattleModel:CheckBattle(_G.EmbattleType.AllHeroesBattle) then
+        response(false, nil)
+        return
+    end
+
+    --获取下一个可挑战房间信息
+    local targetRoomId = self:GetNextChallengeRoomId()
+    if targetRoomId <= 0 then
+        response(false, nil)
+        return
+    end
+
+    ---刷新房间状态
+    ---@param success boolean
+    ---@param resutls any
+    ---@return void
+    local function refresh(success, resutls)
+        heroManager:UpdateInitData(
+            function(...)
+                heroManager:OnChallengeCall(true)
+                response(success, resutls)
+            end
+        )
+    end
+    --发起战斗请求
+    ---@param posId number
+    ---@param uid number
+    local function fight(posId, uid)
+        require("AllHeroesBattleNet"):GetInstance():Challenge(
+            posId,
+            uid,
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+
+                --获取奖励
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                --发送事件
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.AllHeroesBattle_Fight}, 1)
+
+                local win = msg.winner or false
+                if not win then
+                    refresh(false, nil)
+                    return
+                end
+
+                refresh(
+                    true,
+                    {
+                        roomId = posId
+                    }
+                )
+            end
+        )
+    end
+    ---更新布阵阵容
+    ---@param embattleId number 布阵id
+    ---@param posId number
+    ---@param uid number
+    local function updateEmbattle(embattleId, posId, uid)
+        embattleModel:SaveEmbattleDataNew(
+            embattleId,
+            function(respCode)
+                if respCode ~= 0 then
+                    response(false, nil)
+                    return
+                end
+                fight(posId, uid)
+            end,
+            _G.EmbattleSaveType.server,
+            true,
+            nil
+        )
+    end
+
+    --获取房间信息然后开始战斗, 如果已经是最后一个房间则挑战当前房间的其他玩家
+    heroManager:GetRoomPlayerData(
+        targetRoomId,
+        function(ok, rooms)
+            if not ok then
+                response(false, nil)
+                return
+            end
+            if not rooms or #rooms <= 0 then
+                response(false, nil)
+                return
+            end
+
+            --选择一个挑战目标
+            local player, selfUid = rooms[1], _G.PlayerModel:GetInstance():GetPlayerUid()
+            if player.role_uid == selfUid then
+                player = nil
+                for i = 2, #rooms do
+                    if rooms[i].role_uid ~= selfUid then
+                        player = rooms[i]
+                        break
+                    end
+                end
+            end
+            if not player then
+                response(false, nil)
+                return
+            end
+            updateEmbattle(_G.EmbattleType.AllHeroesBattle, player.sid, player.role_uid)
+        end
+    )
+end
+
+---显示执行状态
+function AIHelperModuleAllHeroesBattle:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    if not self.mock then
+        item.aortext_tip.text = state and (state.index .. "/" .. state.total) or ""
+    end
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleAllHeroesBattle:ShowExecuteResult(item, success, results)
+    if not success or results and results.award then
+        base.ShowExecuteResult(self, item, success, results)
+    else
+        base.ShowExecuteResult(self, item, success, nil)
+    end
+
+    if not success then
+        item.aortext_tip.text = _G.GetLangPackValue(90000001010)
+        return
+    end
+    self.Util.ShowAwardListOfMsg(item, results)
+    --展示房间信息
+    local roomId = results and results.roomId or nil
+    local cfg = roomId and _G.ConfigManager.activity_pvp_cfg[roomId]
+    local roomCfg = cfg and _G.ConfigManager.activity_pvp_room_cfg[cfg.room]
+    if cfg and roomCfg then
+        local roomName, posName =
+            _G.GetLangPackValue(roomCfg.name),
+            _G.GetLangPackValue(cfg.type_pos == 1 and 90000010081 or 90000010080)
+        item.aortext_tip.text = _G.GetLangPackValue(90000011425, roomName, posName)
+    else
+        item.aortext_tip.text = _G.GetLangPackValue(90000011427)
+    end
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleAllHeroesBattle:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+---获取下一个可挑战房间ID, 自动尝试挑战下一级房间
+---@return number       @需要检查房间开启时间, -1表示无房间可用
+function AIHelperModuleAllHeroesBattle:GetNextChallengeRoomId()
+    ---@type AllHeroesBattleManager
+    local heroManager = require("AllHeroesBattleManager"):GetInstance()
+    if not heroManager.rooms then
+        return -1
+    end
+
+    --当前房间位置
+    local curRoomId = heroManager:GetCurRoomID()
+
+    local openTime = _G.TimeUtil.GetServerUnixTime() - heroManager:GetRoomFirstTime()
+    --下一个房间是否存在且已开启
+    local nextRoomId = curRoomId + 1
+    local nextRoom = heroManager.rooms[nextRoomId]
+    if nextRoom and openTime >= (nextRoom.open_condition - 1) * 86400 then
+        return nextRoomId
+    end
+
+    --当前房间, 第一个房间不可挑战
+    local curRoom = heroManager.rooms[curRoomId]
+    if curRoomId > 1 and curRoom and openTime >= (curRoom.open_condition - 1) * 86400 then
+        return curRoomId
+    end
+
+    return -1
+end
+
+return AIHelperModuleAllHeroesBattle

@@ -1,0 +1,1333 @@
+-------------------------------------------------------
+-- Description:     公会成员模块
+-- Author:          wyx
+-- Create Date:     2021/02/25
+-------------------------------------------------------
+
+---@class SociatyMemberModule 公会成员模块
+---@field Member SociatyMemberBase[] 公会成员数组
+---@field MemberDic table<number,SociatyMemberBase> 公会成员字典
+---@field MaxMemberNum string 公会最大成员数量
+---@field CurMemberCount number 公会成员数量
+---@field Requests role.i_role[]
+local SociatyMemberModule = _G.BaseClass("SociatyMemberModule")
+local MemberEnum = require("MemberEnum")
+local SociatyMemberBase = require("SociatyMemberBase")
+local ELocationEnum = MemberEnum.ELocationEnum
+local ChatManager = require("ChatManager")
+
+---@field RemoveMember fun(obj:SociatyMemberModule,uid:number) 删除成员
+local RemoveMember
+
+function SociatyMemberModule:__init()
+    self.Member = {}
+    self.MemberDic = {}
+    self.MaxMemberNum = 0
+    self.CurMemberCount = 0
+    self.Requests = {}
+    self:RefreshCurMemberCount()
+end
+
+---析构函数
+function SociatyMemberModule:Dispose()
+    self.Member = nil
+    self.MemberDic = nil
+    self.Requests = nil
+end
+
+local HOUR_OF_DAY = 24
+local SECOND_OF_HOUR = 3600
+local SECOND_OF_DAY = HOUR_OF_DAY * SECOND_OF_HOUR
+
+---获取会长
+---@return SociatyMemberBase
+function SociatyMemberModule:GetChairman()
+    for i = 1, #self.Member do
+        if self.Member[i].Location == ELocationEnum.Chairman then
+            return self.Member[i]
+        end
+    end
+end
+
+---公会最大成员数量
+---@return number
+function SociatyMemberModule:GetMaxMemberNum()
+    return self.MaxMemberNum
+end
+
+---取得某个职位的数量
+---@param pos number 职位
+---@return number,SociatyMemberBase[]
+function SociatyMemberModule:GetOfficerCount(pos)
+    local tbl = {}
+    for _, v in ipairs(self.Member) do
+        if v.Location == pos then
+            table.insert(tbl, v)
+        end
+    end
+
+    return #tbl, tbl
+end
+
+---取得所有非普通成员
+---@return OfficerCell[]
+function SociatyMemberModule:GetAllOfficer()
+    ---@class OfficerCell
+    ---@param Max number 上限
+    ---@param Cur number 当前人数
+    ---@param Pos number 职位
+
+    ---@type OfficerCell[]
+    local res = {}
+
+    ---@type guild_position_cfg_Item[]
+    local willSet = {}
+    for _, v in pairs(ConfigManager.guild_position_cfg) do
+        if v.id > ELocationEnum.Chairman and v.id < ELocationEnum.Member then
+            table.insert(willSet, v)
+        end
+    end
+
+    ---@param a guild_position_cfg_Item
+    ---@param b guild_position_cfg_Item
+    table.sort(
+        willSet,
+        function(a, b)
+            return a.display_priority < b.display_priority
+        end
+    )
+
+    for _, v in ipairs(willSet) do
+        ---@type OfficerCell
+        local cell = {}
+        cell.Pos = v.id
+        cell.Max = self:GetLocationMax(v.id)
+        cell.Cur = (self:GetOfficerCount(v.id))
+
+        table.insert(res, cell)
+    end
+
+    return res
+end
+
+---获取某项职位数量上限
+---@param id number
+function SociatyMemberModule:GetLocationMax(id)
+    if require("SociatyModel"):GetInstance().SociatySelf then
+        local cfg = require("SociatyModel"):GetInstance().SociatySelf.LevelCfg.num_position
+        for _, v in ipairs(cfg) do
+            local _id = v[1]
+            if _id == id then
+                return v[2]
+            end
+        end
+    end
+
+    return 0
+end
+
+---设置当前成员数
+---@param v number 推荐公会时只会设置这个数字
+function SociatyMemberModule:RefreshCurMemberCount(v)
+    if v and v ~= 0 then
+        self.CurMemberCount = v
+        return
+    end
+
+    if next(self.Member) then
+        self.CurMemberCount = #self.Member
+    end
+end
+
+---取得当前成员数
+---@return number
+function SociatyMemberModule:GetCurMemberCount()
+    return self.CurMemberCount
+end
+
+---取得当前成员数显示字段
+---@return string
+function SociatyMemberModule:GetMemberDesc()
+    local str = string.format("%s/%s", self:GetCurMemberCount(), self:GetMaxMemberNum())
+    return str
+end
+
+---是否满人
+---@return boolean
+function SociatyMemberModule:IsMax()
+    if _G.AppSetting.DEBUG then
+        _G.Log(self:GetCurMemberCount(), "成员当前数量")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(self:GetMaxMemberNum(), "成员最大数量")
+    end
+    return self:GetCurMemberCount() >= self:GetMaxMemberNum()
+end
+
+---取得成员索引
+---@param uid number
+---@return number
+function SociatyMemberModule:GetIndex(uid)
+    if not self.MemberDic[uid] then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(uid, "成员不存在,uid = ")
+        end
+        return nil
+    end
+
+    for i, v in ipairs(self.Member) do
+        if v.Uid == uid then
+            return i
+        end
+    end
+
+    return nil
+end
+
+---添加成员
+---@param pb guild.i_guild_member
+function SociatyMemberModule:AddMember(pb)
+    if _G.AppSetting.DEBUG then
+        _G.Log(pb, "添加成员")
+    end
+    local uid = pb.role.uid
+    assert(uid, "uid is nil")
+
+    if self.MemberDic[uid] then
+        self.MemberDic[uid]:Refresh(pb)
+
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("重复添加,uid = %s,执行刷新流程", uid))
+        end
+        return
+    end
+
+    if self:IsMax() then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("超过数量限制")
+        end
+        return
+    end
+
+    ---@see SociatyMemberBase#__init
+    local data = SociatyMemberBase.New(pb)
+    self.MemberDic[uid] = data
+    table.insert(self.Member, data)
+    self:RefreshCurMemberCount()
+end
+
+---成员排序
+function SociatyMemberModule:SortMember()
+    if not next(self.Member) then
+        return
+    end
+
+    ---@param a SociatyMemberBase
+    ---@param b SociatyMemberBase
+    table.sort(
+        self.Member,
+        function(a, b)
+            if a.CfgItem.rank ~= b.CfgItem.rank then
+                return a.CfgItem.rank < b.CfgItem.rank
+            end
+
+            if a.Power ~= b.Power then
+                return a.Power > b.Power
+            end
+
+            if a.WeekVp ~= b.WeekVp then
+                return a.WeekVp > b.WeekVp
+            end
+
+            return a.JoinTime < b.JoinTime
+        end
+    )
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.MemberRefresh)
+end
+
+---以离线时间为主的成员排序 在线>离线时间（时间从小至大）>活跃>职位>战力
+function SociatyMemberModule:SortMemberByOffline()
+    if not next(self.Member) then
+        return
+    end
+
+    ---@param a SociatyMemberBase
+    ---@param b SociatyMemberBase
+    table.sort(
+        self.Member,
+        function(a, b)
+            local levelA = self:TimeToDescLevel(a.OfflineTime)
+            local levelB = self:TimeToDescLevel(b.OfflineTime)
+            if levelA ~= levelB then
+                return levelA < levelB
+            end
+            if a.WeekVp ~= b.WeekVp then
+                return a.WeekVp > b.WeekVp
+            end
+            if a.CfgItem.rank ~= b.CfgItem.rank then
+                return a.CfgItem.rank < b.CfgItem.rank
+            end
+            return a.Power > b.Power
+        end
+    )
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.MemberRefresh)
+end
+
+---以活跃度为主的成员排序(职位>在线>离线时间（时间从小至大）>活跃)
+function SociatyMemberModule:SortMemberByWeekVp()
+    if not next(self.Member) then
+        return
+    end
+
+    ---@param a SociatyMemberBase
+    ---@param b SociatyMemberBase
+    table.sort(
+        self.Member,
+        function(a, b)
+            if a.CfgItem.rank ~= b.CfgItem.rank then
+                return a.CfgItem.rank < b.CfgItem.rank
+            end
+            local levelA = self:TimeToDescLevel(a.OfflineTime)
+            local levelB = self:TimeToDescLevel(b.OfflineTime)
+            if levelA ~= levelB then
+                return levelA < levelB
+            end
+            return a.WeekVp > b.WeekVp
+        end
+    )
+end
+
+---管理界面的成员排序 职位>在线>离线时间（时间从小至大）>活跃>战力
+function SociatyMemberModule:SortMemberByManager()
+    if not next(self.Member) then
+        return
+    end
+
+    ---@param a SociatyMemberBase
+    ---@param b SociatyMemberBase
+    table.sort(
+        self.Member,
+        function(a, b)
+            if a.CfgItem.rank ~= b.CfgItem.rank then
+                return a.CfgItem.rank < b.CfgItem.rank
+            end
+            local levelA = self:TimeToDescLevel(a.OfflineTime)
+            local levelB = self:TimeToDescLevel(b.OfflineTime)
+            if levelA ~= levelB then
+                return levelA < levelB
+            end
+            if a.WeekVp ~= b.WeekVp then
+                return a.WeekVp > b.WeekVp
+            end
+            return a.Power > b.Power
+        end
+    )
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.MemberRefresh)
+end
+
+---主界面的模型展示成员排序 在线>职位>战力>离线时间（时间从小至大）>活跃
+function SociatyMemberModule:SortMemberByView()
+    if not next(self.Member) then
+        return
+    end
+
+    ---@param a SociatyMemberBase
+    ---@param b SociatyMemberBase
+    table.sort(
+        self.Member,
+        function(a, b)
+            local levelA = self:TimeToDescLevel(a.OfflineTime)
+            local levelB = self:TimeToDescLevel(b.OfflineTime)
+            if levelA ~= levelB then
+                return levelA < levelB
+            end
+            if a.CfgItem.rank ~= b.CfgItem.rank then
+                return a.CfgItem.rank < b.CfgItem.rank
+            end
+            if a.Power ~= b.Power then
+                return a.Power > b.Power
+            end
+            return a.WeekVp > b.WeekVp
+        end
+    )
+end
+
+---时间转换（用于比较）
+---@param offlineTime number 离线时间戳
+---@return number 描述比较
+function SociatyMemberModule:TimeToDescLevel(offlineTime)
+    local level = 0
+    if offlineTime > 0 then
+        local left = _G.TimeUtil.GetServerUnixTime() - offlineTime
+        if left < SECOND_OF_DAY then
+            level = level + math.max(math.floor(left / SECOND_OF_HOUR), 1)
+        else
+            level = level + math.min(math.floor(left / SECOND_OF_DAY), 7) * 100
+        end
+    end
+    return level
+end
+
+---@param self SociatyMemberModule
+---@param uid number
+function RemoveMember(self, uid)
+    local index = self:GetIndex(uid)
+    if index then
+        table.remove(self.Member, index)
+        self.MemberDic[uid] = nil
+    end
+    self:SortMember()
+    self:RefreshCurMemberCount()
+end
+
+---取得成员
+---@param index number
+---@return SociatyMemberBase
+function SociatyMemberModule:GetMemberByIndex(index)
+    return self.Member[index]
+end
+
+---取得成员
+---@param uid number
+---@return SociatyMemberBase
+function SociatyMemberModule:GetMember(uid)
+    return self.MemberDic[uid]
+end
+
+---取得自身的公会数据
+---@return SociatyMemberBase
+function SociatyMemberModule:GetSelfMember()
+    local mineData = self:GetMember(_G.PlayerModel:GetInstance().role_uid)
+    return mineData
+end
+
+--region -------------退出/踢出-------------
+---踢出
+---@param role SociatyMemberBase
+function SociatyMemberModule:KickOut(role, callBack)
+    local uid = role.Uid
+    local other = self:GetMember(uid)
+    if not other then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("merber is nil   uid is " .. uid)
+        end
+        return
+    end
+
+    if other.Location == ELocationEnum.Chairman then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("你在踢出一个会长" .. uid)
+        end
+        return
+    end
+
+    local mineData = self:GetSelfMember()
+    if not mineData.CfgItem.kick_out then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("自身没有踢出权限")
+        end
+        return
+    end
+
+    ---联赛中不能解散
+    if not require "SociatyBattleLeagueManager":GetInstance():CheckCanQuitState() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(250133)
+        return
+    end
+
+    local num = 250303
+    local id = _G.ConfigManager.tips_system_cfg[num].content
+    local desc = _G.GetLangPackValue(id, role.Name)
+    local function confirmFunc()
+        ---@type guild.c2s_guild_kickout
+        local data = {
+            ["uid"] = uid
+        }
+
+        require("SociatyNet"):GetInstance():KickOut(
+            data,
+            function()
+                _G.PopWindowManager:GetInstance():ShowAllTips(250153)
+                self:OnQuit(data, true)
+                if callBack then
+                    callBack()
+                end
+            end
+        )
+    end
+    _G.PopWindowManager:GetInstance():ShowAllTips(num, desc, confirmFunc)
+end
+
+---主动退出
+function SociatyMemberModule:DoQuit()
+    local mineData = self:GetSelfMember()
+    if mineData then
+        if self:GetCurMemberCount() == 1 then
+            ---公会战期间无法解散
+            ---@type StateType
+            local state = require("SociatyBattleModel"):GetInstance():GetState()
+            if state == _G.SociatyBattleState.Battle or state == _G.SociatyBattleState.Rest then
+                _G.PopWindowManager:GetInstance():ShowAllTips(250133)
+                return
+            end
+
+            ---冥界纷争匹配到对手无法解散
+            if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.SociatyMoba) then
+                if require("SociatyMobaModel"):GetInstance():IsMatchGuild() then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(950102)
+                    return
+                end
+            end
+
+            ---联赛中不能解散
+            if not require "SociatyBattleLeagueManager":GetInstance():CheckCanBreakUpState() then
+                _G.PopWindowManager:GetInstance():ShowAllTips(250133)
+                return
+            end
+        end
+
+        ---联赛中不能退出
+        if not require "SociatyBattleLeagueManager":GetInstance():CheckCanQuitState() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(250133)
+            return
+        end
+
+        local num = 250304
+
+        ---是否需要转让会长
+        local needSwitch = false
+        if mineData.Location == ELocationEnum.Chairman then
+            if self:GetCurMemberCount() > 1 then
+                needSwitch = true
+                num = 250102
+            end
+        end
+
+        if self:GetCurMemberCount() == 1 then
+            num = 250309
+        end
+
+        local function confirmFunc(isCheck)
+            if needSwitch then
+                _G.PopWindowManager:GetInstance():ShowAllTips(250102)
+                return
+            end
+
+            if isCheck ~= nil and isCheck == false then
+                _G.PopWindowManager:GetInstance():ShowAllTips(250143)
+                return
+            end
+
+            require("SociatyNet"):GetInstance():Quit(
+                function()
+                    ---@type guild.p2c_guild_quit
+                    local guild_p2c_guild_quit = {
+                        ["uid"] = mineData.Uid
+                    }
+                    self:OnQuit(guild_p2c_guild_quit, false)
+                end
+            )
+        end
+        --ZHJH-8039 首次退出和解散不弹tips直接确认
+        local isFirst = require("SociatyModel"):GetInstance().SociatyRoleSelf.exit_num == 0
+        if not isFirst then
+            _G.PopWindowManager:GetInstance():ShowAllTips(num, nil, confirmFunc)
+        else
+            confirmFunc(true)
+        end
+        -- _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.BeKicked,mineData.Uid)
+    end
+end
+
+--endregion
+
+--region -------------好友/聊天-------------
+
+---添加好友
+---@param uid number
+function SociatyMemberModule:AddFriend(uid)
+    local other = self:GetMember(uid)
+    if not other then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("merber is nil   uid is " .. uid)
+        end
+        return
+    end
+
+    local isFriend = other:RefreshFriendState(other)
+    if isFriend then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("merber is isFriend   uid is " .. uid)
+        end
+        return
+    end
+
+    ---@type friend.c2s_friend_apply
+    local pb = {}
+    pb.f_uid = { uid }
+
+    ---@param ack string 中文描述
+    require("FriendManager"):GetInstance():AddFriendApply(
+        pb,
+        function(ack)
+            if ack == 1 then
+                _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.AddFriendSuccess)
+            end
+        end
+    )
+end
+
+---聊天
+---@param uid number
+function SociatyMemberModule:DoChat(uid)
+    local other = self:GetMember(uid)
+    if not other then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("merber is nil   uid is " .. uid)
+        end
+        return
+    end
+    require("FriendManager"):GetInstance():GoChatOfFriendView(uid)
+end
+
+--endregion
+
+--region -------------职位变动-------------
+---转让会长
+---@param uid number
+---@param callBack fun()
+function SociatyMemberModule:SwitchChairman(uid, callBack)
+    local mineData = self:GetSelfMember()
+    if not mineData.CfgItem.position_transfer then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("不是会长无法执行此操作")
+        end
+        return
+    end
+
+    local other = self:GetMember(uid)
+    if not other then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("merber is nil   uid is " .. uid)
+        end
+        return
+    end
+
+    if other.Location == ELocationEnum.Chairman then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("other is Chairman   uid is " .. uid)
+        end
+        return
+    end
+
+    local num = 250302
+    local id = _G.ConfigManager.tips_system_cfg[num].content
+    local desc = _G.GetLangPackValue(id, other.Name)
+
+    local function confirmFunc()
+        ---@type guild.c2s_guild_set_position
+        local pb = {
+            ["type"] = 0,
+            ["uid"] = uid
+        }
+
+        require("SociatyNet"):GetInstance():SetPosition(
+            pb,
+            function()
+                ---@type guild.p2c_guild_position
+                local guild_p2c_guild_position = {
+                    ["pos"] = {
+                        {
+                            ["uid"] = mineData.Uid,
+                            --['pos'] = other.Location,
+                            ---转让会长，策划需求原会长变为会员！！！！
+                            ["pos"] = ELocationEnum.Member
+                        },
+                        {
+                            ["uid"] = uid,
+                            ["pos"] = ELocationEnum.Chairman
+                        }
+                    }
+                }
+
+                if callBack then
+                    callBack()
+                end
+                self:OnSetPosition(guild_p2c_guild_position)
+            end
+        )
+    end
+    _G.PopWindowManager:GetInstance():ShowAllTips(num, desc, confirmFunc)
+end
+
+---任命职位
+---@param uid number
+---@param pos_id number
+function SociatyMemberModule:DoAppoint(uid, pos_id, callback)
+    local mineData = self:GetSelfMember()
+    if not mineData.CfgItem.position_set then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("会员无法执行此操作")
+        end
+        return
+    end
+
+    local other = self:GetMember(uid)
+    if not other then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("merber is nil   uid is " .. uid)
+        end
+        return
+    end
+    ---@type guild.c2s_guild_set_position
+    local pb = {
+        ["type"] = 1,
+        ["uid"] = uid,
+        ["pos"] = pos_id
+    }
+
+    require("SociatyNet"):GetInstance():SetPosition(
+        pb,
+        function()
+            ---@type guild.p2c_guild_position
+            local guild_p2c_guild_position = {
+                ["pos"] = {
+                    {
+                        ["uid"] = uid,
+                        ["pos"] = pos_id
+                    }
+                }
+            }
+            self:OnSetPosition(guild_p2c_guild_position)
+            if callback then
+                callback()
+            end
+            _G.PopWindowManager:GetInstance():ShowAllTips(250153)
+        end
+    )
+end
+
+--endregion
+
+--region -------------日志-------------
+---显示公会日志窗口
+function SociatyMemberModule:DoShowLogWindow()
+    ---@param data guild.s2c_guild_get_logs
+    local function ShowLogWindow(data)
+        local uiName = _G.ConfigManager.ui_cfg.SociatyShowLogView.Name
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(uiName)
+        if not view then
+            _G.UIManager:GetInstance():OpenWindow(uiName, data)
+        end
+    end
+
+    require("SociatyNet"):GetInstance():ShowLog(ShowLogWindow)
+end
+
+--endregion
+
+--region -----------处理申请---------------
+
+---显示查看申请列表窗口
+function SociatyMemberModule:ShowCheckView(callback)
+    local mineData = self:GetSelfMember()
+    if not mineData.CfgItem.check then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("没有验证公会申请消息权限")
+        end
+        return
+    end
+
+    ---@param data guild.s2c_guild_get_requests
+    local function showWindow(data)
+        if data.ack ~= 1 then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(data, "GetRequests error ")
+            end
+            return
+        end
+
+        if not data.requests then
+            data.requests = {}
+        end
+        self.Requests = data.requests
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.JoinGuildButton.id, 0)
+        if callback then
+            callback(data)
+        end
+    end
+
+    require("SociatyNet"):GetInstance():GetRequests(showWindow)
+end
+
+---同意申请
+---@param uid number
+function SociatyMemberModule:DoAgreeRequest(uid, requests, isAll, call)
+    if self:IsMax() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(803)
+        return
+    end
+    ---@type guild.c2s_guild_check_request
+    local pb = {
+        ["type"] = 1,
+        ["uid"] = uid
+    }
+
+    ---@param msg guild.s2c_guild_check_request
+    require("SociatyNet"):GetInstance():DealRequest(
+        pb,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local tb = {}
+            local tb2 = {}
+            for _, v in pairs(msg.reply) do
+                for _, v2 in pairs(requests) do
+                    if v2.role.uid == v.uid then
+                        if v.ack == 1 then
+                            ---@type guild.p2c_enter_guild_old
+                            local msg2 = {
+                                ["role"] = {
+                                    role = v2.role,
+                                    pos = 9,
+                                    is_online = 0,
+                                    week_liveness = 0,
+                                    week_donate = 0,
+                                    enter_time = _G.TimeUtil.GetServerUnixTime()
+                                }
+                            }
+
+                            if _G.AppSetting.DEBUG then
+                                _G.Log(v2.role.uid, "加入成员UID>>>>")
+                            end
+                            _G.table.insert(tb, msg2)
+                        else
+                            _G.table.insert(tb2, v.uid)
+                        end
+                        break
+                    end
+                end
+            end
+            if call then
+                call(msg.reply)
+            end
+            self:OnDealRequest(uid)
+            self:OnEnterMultiNewMember(tb)
+            _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.Enter, tb, isAll)
+            ---用于移除对象
+            _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefuseRequest, uid, isAll)
+            if isAll and not _G.table.isEmptyOrNil(tb2) then
+                self:DoRefuseRequest(uid, isAll)
+            end
+        end
+    )
+end
+
+---拒绝申请
+---@param uid number
+function SociatyMemberModule:DoRefuseRequest(uid, isAll)
+    ---@type guild.c2s_guild_check_request
+    local pb = {
+        ["type"] = 0,
+        ["uid"] = uid
+    }
+
+    require("SociatyNet"):GetInstance():DealRequest(
+        pb,
+        function()
+            self:OnDealRequest(uid)
+            _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefuseRequest, uid, isAll)
+        end
+    )
+end
+
+--endregion
+
+--region -----------设置申请限制---------------
+
+---设置申请等级限制
+---@param level number
+-- function SociatyMemberModule:SetLimitLevel(level)
+--     local mineData = self:GetSelfMember()
+--     if not mineData.CfgItem.set_join then
+--         if _G.AppSetting.DEBUG then
+--             _G.LogError("没有设置申请条件限制权限")
+--         end
+--         return
+--     end
+
+--     if require("SociatyModel"):GetInstance().SociatySelf then
+--         if require("SociatyModel"):GetInstance().SociatySelf.LimitLevel == level then
+--             if _G.AppSetting.DEBUG then
+--                 _G.Log("<color=red><size=10>" .. "data.LimitLevel == level" .. "</size></color>")
+--             end
+--             return
+--         end
+
+--         ---@type guild.c2s_guild_set_condition
+--         local pb = {
+--             ["type"] = require("SociatyModel"):GetInstance().SociatySelf.NeedApproval,
+--             ["lv"] = level,
+--             ["afk_chapter"] = require("SociatyModel"):GetInstance().SociatySelf.LimitChapter
+--         }
+--         require("SociatyNet"):GetInstance():SetJoinCondition(
+--             pb,
+--             function()
+--                 require("SociatyModel"):GetInstance().SociatySelf.LimitLevel = level
+--             end
+--         )
+--     end
+-- end
+
+---设置审核类型
+---@param level number
+---@param type number
+function SociatyMemberModule:SaveCondition(level, afk_chapter, type, call)
+    local mineData = self:GetSelfMember()
+    if not mineData.CfgItem.set_join then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("没有设置申请条件限制权限")
+        end
+        return
+    end
+
+    if require("SociatyModel"):GetInstance().SociatySelf then
+        ---@type guild.c2s_guild_set_condition
+        local pb = {
+            ["type"] = type,
+            ["lv"] = level,
+            ["afk_chapter"] = afk_chapter
+        }
+        require("SociatyNet"):GetInstance():SetJoinCondition(
+            pb,
+            function()
+                require("SociatyModel"):GetInstance().SociatySelf.NeedApproval = type
+                require("SociatyModel"):GetInstance().SociatySelf.LimitLevel = level
+                require("SociatyModel"):GetInstance().SociatySelf.LimitChapter = afk_chapter
+                _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefreshCondition)
+                if call then
+                    call()
+                end
+            end
+        )
+    end
+end
+
+---设置审核类型
+---@param type number @0：自动审批  1：手动审批
+-- function SociatyMemberModule:SetApprovalType(type)
+--     local mineData = self:GetSelfMember()
+--     if not mineData.CfgItem.set_join then
+--         if _G.AppSetting.DEBUG then
+--             _G.LogError("没有设置申请条件限制权限")
+--         end
+--         return
+--     end
+
+--     if require("SociatyModel"):GetInstance().SociatySelf then
+--         if require("SociatyModel"):GetInstance().SociatySelf.NeedApproval == type then
+--             if _G.AppSetting.DEBUG then
+--                 _G.LogError("data.NeedApproval == type")
+--             end
+--             return
+--         end
+
+--         ---@type guild.c2s_guild_set_condition
+--         local pb = {
+--             ["type"] = type,
+--             ["lv"] = require("SociatyModel"):GetInstance().SociatySelf.LimitLevel,
+--             ["afk_chapter"] = require("SociatyModel"):GetInstance().SociatySelf.LimitChapter
+--         }
+--         require("SociatyNet"):GetInstance():SetJoinCondition(
+--             pb,
+--             function()
+--                 require("SociatyModel"):GetInstance().SociatySelf.NeedApproval = type
+--             end
+--         )
+--     end
+-- end
+
+---修改公会名称
+---@param name string
+---@return boolean
+function SociatyMemberModule:SetName(name)
+    ---@type SociatyMemberBase
+    local mineData = self:GetSelfMember()
+    local SociatyModel = require("SociatyModel")
+    if SociatyModel:GetInstance().SociatySelf then
+        if not mineData.CfgItem.modify_name then
+            if _G.AppSetting.DEBUG then
+                _G.Log("<color=red><size=10>" .. "没有 修改公会名称 权限" .. "</size></color>")
+            end
+        end
+
+        local need = _G.ConfigManager.discrete_cfg[101603][1][1]
+        local isEnough = _G.StorageManager:GetInstance():CheckItem(_G.ResPropID.Diamond, need)
+        if not isEnough then
+            if _G.AppSetting.DEBUG then
+                _G.Log("<color=red><size=10>" .. "Diamond 不够" .. "</size></color>")
+            end
+            return
+        end
+
+        if SociatyModel:GetInstance().SociatySelf.Name == name then
+            if _G.AppSetting.DEBUG then
+                _G.Log("<color=red><size=10>" .. "公会名未被修改" .. "</size></color>")
+            end
+            return
+        end
+
+        _G.GameUtil.SecCheck(name, "1",function()
+            local pb = {
+                ["name"] = name
+            }
+
+            require("SociatyNet"):GetInstance():SetName(
+                    pb,
+                    function()
+                        _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, 0, need)
+                        SociatyModel:GetInstance().SociatySelf.Name = name
+                        _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.ExchangeName)
+                    end
+            )
+        end)
+
+        -- local isIllegal = _G.CS.DenyWordModel.Instance:IsIllegal(name)
+        -- if isIllegal then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(200118)
+        -- else
+        ---@type guild.c2s_guild_set_name
+        
+        --end
+    end
+end
+
+---设置公告/入会说明
+---@param notice string
+---@param type number @类型 0:公会内部公告，1：入户说明
+function SociatyMemberModule:SetNotice(notice, type, call)
+    ---@type SociatyMemberBase
+    local mineData = self:GetSelfMember()
+    if require("SociatyModel"):GetInstance().SociatySelf then
+        if type == 0 then
+            if not mineData.CfgItem.modify_notice then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("没有 设置公告 权限")
+                end
+                return
+            end
+            local condition = _G.ConfigManager.discrete_cfg[101650]
+            local pass, tipSid, content = _G.GlobalConditionManager.CheckConditionArrays(condition)
+            if not pass then
+                local tipscfg = _G.ConfigManager.tips_system_cfg[817]
+
+                _G.PopWindowManager:GetInstance():ShowAllTips(817, _G.GetLangPackValue(tipscfg.content, content))
+                if call then
+                    ---这里界面上的公告已经被改了，调用call把公告还原
+                    call()
+                end
+                return
+            end
+            if require("SociatyModel"):GetInstance().SociatySelf.Declaration == notice then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("<color=red><size=10>" .. "设置 公会内部公告 没有变化" .. "</size></color>")
+                end
+                return
+            end
+        elseif type == 1 then
+            if not mineData.CfgItem.set_join then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("没有设置 入会说明 权限")
+                end
+                return
+            end
+            local condition = _G.ConfigManager.discrete_cfg[101650]
+            local pass, tipSid, content = _G.GlobalConditionManager.CheckConditionArrays(condition)
+            -- if not pass then
+            --     local tipscfg = _G.ConfigManager.tips_system_cfg[817]
+            --     _G.PopWindowManager:GetInstance():ShowAllTips(817, _G.GetLangPackValue(tipscfg.content, content))
+            --     return
+            -- end
+            if require("SociatyModel"):GetInstance().SociatySelf.JoinDeclaration == notice then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("<color=red><size=10>" .. "设置 入会说明 没有变化" .. "</size></color>")
+                end
+                return
+            end
+        end
+        local limit = _G.ConfigManager.discrete_cfg[101401][1][1]
+        local res, len = string.filterStringWithCharacterLimit(notice, limit)
+        if len < 1 then
+            if _G.AppSetting.DEBUG then
+                _G.Log("<color=red><size=10>" .. "输入为空" .. "</size></color>")
+            end
+            notice = ""
+        elseif len > _G.ConfigManager.discrete_cfg[101401][1][1] then
+            if _G.AppSetting.DEBUG then
+                _G.Log("<color=red><size=10>" .. "超过限制长度" .. "</size></color>")
+            end
+            _G.PopWindowManager:GetInstance():ShowAllTips(250107)
+            return
+        end
+
+        _G.GameUtil.SecCheck(notice, "1",function()
+            ---@type guild.c2s_guild_set_notice
+            local pb = {
+                ["type"] = type,
+                ["notice"] = notice
+            }
+            require("SociatyNet"):GetInstance():SetNotice(
+                    pb,
+                    function()
+                        if type == 0 then
+                            require("SociatyModel"):GetInstance().SociatySelf.Declaration = #notice > 0 and notice or _G.LangUtil.GetLangPackValue(90021800022)
+                        elseif type == 1 then
+                            require("SociatyModel"):GetInstance().SociatySelf.JoinDeclaration = #notice > 0 and notice or _G.LangUtil.GetLangPackValue(90021800022)
+                        end
+
+                        ---@type guild.p2c_guild_notice
+                        local msg = {
+                            ["type"] = type,
+                            ["time"] = _G.TimeUtil.GetServerUnixTime(),
+                            ["notice"] = notice
+                        }
+                        _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.ExchangeNotice, msg)
+                        if call then
+                            call()
+                        end
+                    end
+            )
+        end)
+        -- local isIllegal = _G.CS.DenyWordModel.Instance:IsIllegal(notice)
+        -- if isIllegal then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(250106)
+        -- else
+        
+        --end
+    end
+end
+
+--endregion
+
+--region -------------推送-------------
+
+---自身职位变动
+---@param pos number 新职位
+function SociatyMemberModule:OnSelfRefreshLocation(pos)
+    local mine = self:GetSelfMember()
+    if pos == mine.Location then
+        return
+    end
+
+    local newCfg = _G.ConfigManager.guild_position_cfg[pos]
+    local oldCfg = self:GetSelfMember().CfgItem
+
+    ---@class syncStateCell
+    ---@field From boolean 中文描述
+    ---@field To boolean 中文描述
+
+    ---@type syncStateCell[]
+    local syncState = {}
+    for k, v in pairs(oldCfg) do
+        if type(v) == "boolean" then
+            if newCfg[k] ~= v then
+                syncState[k] = {
+                    From = v,
+                    To = newCfg[k]
+                }
+            end
+        end
+    end
+
+    require("SociatyModel"):GetInstance().SociatyRoleSelf.position = pos
+
+    -- local uiCfg = ConfigManager.ui_cfg
+    -- local uiKey = {
+    --     ["dissolution"] = nil,
+    --     ["modify_name"] = nil,
+    --     ["modify_portrait"] = nil
+    --     --  ["modify_notice"] = uiCfg.SociatyCheckView.Name,
+    --     --  ["position_set"] = uiCfg.SociatyMemberInfoView.Name,
+    --     --  ["position_transfer"] = uiCfg.SociatyMemberInfoView.Name
+    -- }
+
+    -- for attrName, v in pairs(syncState) do
+    --     local uiName = uiKey[attrName]
+    --     local ui = _G.UIManager:GetInstance():GetWindow(uiName)
+    --     if ui and ui.Active then
+    --         if v.From == true and v.To == false then
+    --             --_G.UIManager:GetInstance():CloseWindow(uiName)
+    --             ("<color=red><size=10>" .. "自身职位变动,关闭界面 " .. uiName .. "</size></color>")
+    --         end
+    --     end
+    -- end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.JoinGuildButton.id, 0)
+end
+
+---职位变动推送
+---@param data guild.p2c_guild_position
+function SociatyMemberModule:OnSetPosition(data)
+    ---@param v guild.i_position
+    for _, v in ipairs(data.pos) do
+        local member = self:GetMember(v.uid)
+        if member then
+            if member == self:GetSelfMember() then
+                self:OnSelfRefreshLocation(v.pos)
+            end
+            member:RefreshLocation(v.pos)
+        end
+    end
+
+    self:SortMember()
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.MemberLocationRefresh, data)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.JoinGuildButton.id, 0)
+end
+
+---成员踢出推送
+function SociatyMemberModule:OnKickOut()
+    ---@type guild.p2c_guild_quit
+    local data = {
+        uid = _G.PlayerModel:GetInstance().role_uid
+    }
+    self:OnQuit(data, true)
+end
+
+---成员退出
+---@param data guild.p2c_guild_quit
+---@param isKick boolean 是否踢出
+function SociatyMemberModule:OnQuit(data, isKick)
+    local uid = data.uid
+    if isKick then
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red><size=10>" .. uid .. " 踢出出了公会,销毁公会数据" .. "</size></color>")
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red><size=10>" .. uid .. " 退出了公会,销毁公会数据" .. "</size></color>")
+        end
+    end
+
+    if uid == _G.PlayerModel:GetInstance().role_uid then
+        _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.BeKicked, uid)
+        self:Dispose()
+        require("SociatyModel"):GetInstance():ClearSociatySelf(isKick)
+        ChatManager:GetInstance():ClearSociatyChat()
+        local cursId = _G.PlayerModel:GetInstance():GetCurCitySid()
+
+        if _G.AppSetting.DEBUG then
+            _G.Log(cursId, "场景id")
+        end
+        ---临时的
+        require("SociatyManager"):GetInstance():ExitScence(uid)
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MainGuild.id)
+        return
+    end
+
+    local member = self:GetMember(uid)
+    if member then
+        RemoveMember(self, uid)
+    end
+    local world = _G.WorldManager:GetInstance():GetCurWorld()
+    if world and world.Cfg.Sid == require("SociatyManager"):GetInstance().ScenceId then
+        world:RemoveWorldItems(uid)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.BeKicked, uid, isKick)
+end
+
+---新成员加入推送
+---@param data guild.p2c_enter_guild_old
+function SociatyMemberModule:OnEnterNewMember(data)
+    self:AddMember(data.role)
+    self:SortMember()
+    -- local mineData = self:GetSelfMember()
+    -- if mineData.CfgItem.check == true then
+    --     self:OnDealRequest({data.role.role.uid})
+    --     _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefuseRequest, {data.role.role.uid}, false)
+    -- end
+end
+
+---加入多个玩家
+------新成员加入推送
+---@param data guild.p2c_enter_guild_old[]
+function SociatyMemberModule:OnEnterMultiNewMember(data)
+    if _G.table.isEmptyOrNil(data) then
+        return
+    end
+    for _, v in pairs(data) do
+        self:AddMember(v.role)
+    end
+    self:SortMember()
+end
+
+---玩家请求推送
+---@param data guild.p2c_guild_request
+function SociatyMemberModule:OnRoleRequest(data)
+    _G.table.insert(self.Requests, data)
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RoleRequest, data)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.JoinGuildButton.id, 0)
+end
+
+---玩家取消请求推送
+---@param data guild.p2c_guild_role_request_cancel
+function SociatyMemberModule:OnRoleCancelRequest(data)
+    local msg = nil
+    for i, v in pairs(self.Requests) do
+        if v.role.uid == data.role_uid then
+            _G.table.remove(self.Requests, i)
+            msg = v
+            break
+        end
+    end
+    if not msg then
+        LogError("self.Requests not" .. data.role_uid)
+        return
+    end
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RoleRequest, msg, true)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.JoinGuildButton.id, 0)
+end
+
+---处理请求
+---@param msg
+function SociatyMemberModule:OnDealRequest(uids)
+    for _, v in pairs(uids) do
+        for i, v2 in ipairs(self.Requests) do
+            if v2.role.uid == v then
+                _G.table.remove(self.Requests, i)
+                break
+            end
+        end
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.JoinGuildButton.id, 0)
+end
+
+---获取在线的公会成员
+---@return SociatyMemberBase
+function SociatyMemberModule:GetOnlineMember()
+    local tb = {}
+    for _, v in pairs(self.MemberDic) do
+        if v.OfflineTime == 0 then
+            _G.table.insert(tb, v)
+        end
+    end
+    return tb
+end
+
+---获取活跃成员
+---@param time number 活跃时间检测
+function SociatyMemberModule:GetActivityMember(time)
+    local tb = {}
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    for _, v in pairs(self.MemberDic) do
+        if curTime - v.OfflineTime < time or v.OfflineTime == 0 then
+            _G.table.insert(tb, v)
+        end
+    end
+    return tb
+end
+
+--endregion
+
+---@return SociatyMemberModule
+return SociatyMemberModule

@@ -1,0 +1,1102 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.branches.Alpha.Client.Assets.Resources.LuaScripts.Game.Chapter.Model.ChapterModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/06/23
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ChapterNet = require("ChapterNet")
+local base = require "GameDataModelBase"
+---@class ChapterModel : GameDataModelBase	中文描述
+---@field private sections table 关卡数据 {{id=state},{id=state}}
+---@field private curChooseChapterID number 当前所选择的章节ID
+---@field private curChooseSectionID number 当前所选择关卡ID
+---@field private curSectionSID number 当前应当挑战的关卡
+---@field private curSectionDoingSid number 当前正在挑战的关卡
+---@field private chapterAward table 已领取的章节奖励ID组
+---@field private sectionPass table 所有未通关的关卡列表
+---@field private battlemonsterGroupSids table 当前已经战斗过的怪物组
+---@field private taskAwardSids table 当前已经领取过奖励的任务组
+local ChapterModel = _G.BaseClass("ChapterModel", base)
+
+local defaultFirstSectionDiscreteSid = 100207
+
+---@return ChapterModel ChapterModel
+function ChapterModel:GetInstance()
+    return base.GetInstance(self)
+end
+---创建对象时,入口构造函数
+function ChapterModel:__init()
+    ---ZHJ-20054【主线副本】进入传送门的瞬间控制角色触碰巡逻NPC，控制角色位置错误
+    --剧本中传送交互和巡逻机器人交互添加开关 先触发的先执行 后触发的无视
+    self.BehavioralPriority = false
+    self.curFunctionOpenID = 11
+    self.sections = {}
+    self.curChooseChapterID = 0
+    self.curChooseSectionID = 0
+    self.curSectionDoingSid = 0
+    self.curSectionSID = 0
+    self.firstShowChapterIconInMainView = false
+    self.isShowChapterIconInMainView = false
+    self.chapterAward = {}
+    self.sectionPass = {}
+    self.ExploreChapterInfo = {}
+    self.battlemonsterGroupSids = {}
+    -- self.taskAwardSids = {}
+    self:InitBaseData()
+    self.curExploreSection = 0
+    _G.Events:GetInstance():AddListener(_G.eAFKAactionEnum.AfkSectionPass, self.RefreshRedPoint, self)
+    _G.Events:GetInstance():AddListener(_G.ePlayerStatus.PlayerUpLevel, self.RefreshRedPoint, self)
+end
+---销毁对象时,析构函数
+function ChapterModel:Dispose()
+    self.sections = nil
+    self.BehavioralPriority = nil
+    self.firstShowChapterIconInMainView = nil
+    self.isShowChapterIconInMainView = nil
+    self.curChooseChapterID = nil
+    self.curChooseSectionID = nil
+    self.curSectionDoingSid = nil
+    self.sectionPass = nil
+    self.ExploreChapterInfo = nil
+    self.curSectionSID = nil
+    self.battlemonsterGroupSids = nil
+    self.chapterAward = nil
+    self.curExploreSection = nil
+    _G.Events:GetInstance():RemoveListener(_G.eAFKAactionEnum.AfkSectionPass, self.RefreshRedPoint, self)
+    _G.Events:GetInstance():RemoveListener(_G.ePlayerStatus.PlayerUpLevel, self.RefreshRedPoint, self)
+    -- self.taskAwardSids = nil
+end
+--region 重写父类方法
+------获取关卡信息
+function ChapterModel:GetDataFormServer(call)
+    ChapterNet:GetInstance():AccessGetSections(_G.handler(self, self.ParseData, call))
+end
+---剧本玩家->传送门 玩家->npc交互开关
+function ChapterModel:SetBehavioralPriority(isOn)
+    self.BehavioralPriority = isOn
+end
+---检测当前碰撞触发检测时，是否已经存在正在执行的事件
+function ChapterModel:CheckDoingEvent()
+    return self:GetBehavioralPriority() == true
+end
+function ChapterModel:GetBehavioralPriority()
+    return self.BehavioralPriority
+end
+---在线跨天刷新
+function ChapterModel:OnSixClockUpdate(endcall)
+    self.firstShowChapterIconInMainView = false
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        if endcall then
+            endcall()
+        end
+        return
+    end
+    ChapterNet:GetInstance():AccessGetSections(
+        _G.handlerbind(
+            self,
+            self.ParseData,
+            function()
+                local view =
+                    _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SelectSectionMapNewView.Name)
+                if view then
+                    view:InitView()
+                end
+                local mainview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+                if mainview then
+                    mainview.View:ShowQuickBtn()
+                end
+            end
+        )
+    )
+    if endcall then
+        endcall()
+    end
+end
+---进入剧本选择界面 设置为true
+function ChapterModel:SetFirstShowView()
+    self.firstShowChapterIconInMainView = true
+end
+---登录主界面是否显示故事icon
+function ChapterModel:CheckMainViewShowIcon()
+    if self.firstShowChapterIconInMainView then
+        return false
+    end
+    return self.isShowChapterIconInMainView
+end
+function ChapterModel:ParseData(data, call)
+    self:ResolvChapterData(data)
+    base.ParseData(self)
+    if call then
+        call()
+    end
+end
+function ChapterModel:InitFunction()
+    if self.curExploreSection ~= 0 then
+        return
+    end
+    self:CalculateCurSection()
+    self:SetChooseChapter(self.curChooseChapterID)
+    self:SetChooseSection(self.curChooseSectionID)
+    self:SetTotalExplore()
+end
+--endregion
+
+--region 内部方法
+---初始化基础数据
+function ChapterModel:InitBaseData()
+    --默认关卡
+    local defaultSectionID = _G.ConfigManager.discrete_cfg[defaultFirstSectionDiscreteSid][1][1]
+    self.sections[defaultSectionID] = _G.SectionPassType.curSection
+    self.curSectionSID = defaultSectionID
+    --处理关卡列表
+    local cfg = _G.ConfigManager.main_section_cfg
+    local chapter
+    for key, value in pairs(cfg) do
+        if value.Chapter > 0 then
+            chapter = _G.ConfigManager.main_chapter_cfg[value.Chapter]
+            if chapter and chapter.is_formal then
+                _G.table.insert(self.sectionPass, {sid = key, order = value.Section_order})
+            end
+        end
+    end
+    _G.table.sort(
+        self.sectionPass,
+        function(a, b)
+            return a.order < b.order
+        end
+    )
+    self.finalSectionSid = self.sectionPass[#self.sectionPass].sid
+end
+------解析服务器关卡数据
+---@param data table 数据
+function ChapterModel:ResolvChapterData(data)
+    local sectionData = data.section_sid or {}
+    local count
+    for i = 1, #sectionData do
+        self.sections[sectionData[i]] = 3
+    end
+    self:InitPassSectionAward(data.first_pass or {})
+    self:InitExploreData(data)
+    self:RefreshRedPoint()
+end
+---初始化首通奖励
+function ChapterModel:InitPassSectionAward(data)
+    self.passSectionAward = {}
+    for _, info in pairs(data) do
+        self.passSectionAward[info.k] = {}
+        for i = 1, info.v do
+            self.passSectionAward[info.k][i] = true
+        end
+    end
+end
+---计算当前挑战的关卡
+function ChapterModel:CalculateCurSection()
+    local index = 0
+    for i = 1, #self.sectionPass do
+        if
+            self.sections[self.sectionPass[i].sid] and
+                self.sections[self.sectionPass[i].sid] > _G.SectionPassType.curSection
+         then
+            index = index + 1
+        else
+            break
+        end
+    end
+    for i = 1, index do
+        _G.table.remove(self.sectionPass, 1)
+    end
+    if #self.sectionPass > 0 then
+        self.curSectionSID = self.sectionPass[1].sid
+    else
+        self.curSectionSID = self.finalSectionSid
+    end
+    self.curChooseSectionID = self.curSectionSID
+    self.curChooseChapterID = _G.ConfigManager.main_section_cfg[self.curSectionSID].Chapter
+end
+---解析探索相关数据
+---@param data instance.s2c_instance_info 数据
+function ChapterModel:InitExploreData(data)
+    self.curExploreSection = data.sid
+    self.battlemonsterGroupSids = {}
+    if data.fight then
+        for i = 1, #data.fight do
+            self.battlemonsterGroupSids[data.fight[i]] = true
+        end
+    end
+    -- self.taskAwardSids = {}
+    -- if data.task then
+    --     for i = 1, #data.task do
+    --         self.taskAwardSids[data.task[i]] = true
+    --     end
+    -- end
+    self.chapterAward = {}
+    if data.chapter then --已领取章节奖励
+        for i, value in pairs(data.chapter) do
+            _G.table.insert(self.chapterAward, value.sid)
+        end
+    end
+end
+---获取任务奖励是否领取
+---@param id number 任务ID
+---@return boolean 是否领取
+function ChapterModel:GetTaskAwardGot(id)
+    return _G.TaskModule:GetInstance():IsCompletedRoomTask(id) or false
+end
+---房间状态监测方法
+local CheckRoomStateFunc = {
+    ---普通宝箱
+    [_G.MiniMapInfoType.box] = function(cfg)
+        local count = #cfg.BoxID
+        local num = 0
+        local objectCfg
+        for i = 1, count do
+            objectCfg = _G.ConfigManager.object_world_cfg[cfg.BoxID[i]]
+            if _G.tonumber(objectCfg.ClickParams[1]) == 1 then --普通宝箱
+                if _G.WorldItemManager:GetInstance():GetInteractionBySid(cfg.BoxID[i]) then
+                    num = num + 1
+                end
+            else --战斗宝箱
+                if ChapterModel:GetInstance():CheckMonsterGroupFight(objectCfg.Params[1]) then
+                    num = num + 1
+                end
+            end
+        end
+        return num, count
+    end
+    -- ---任务
+    -- [_G.MiniMapInfoType.npc] = function(cfg)
+    --     local count = #cfg.task_id
+    --     local num = 0
+    --     if count > 0 then
+    --         for i = 1, count do
+    --             if ChapterModel:GetInstance():GetTaskAwardGot(cfg.task_id[i]) then
+    --                 num = num + 1
+    --             end
+    --         end
+    --     end
+    --     return num, count
+    -- end,
+    -- ---敌人
+    -- [_G.MiniMapInfoType.monster] = function(cfg)
+    --     local count = cfg.battle_serial and #cfg.battle_serial or 0
+    --     local num = 0
+    --     if count > 0 then
+    --         for i = 1, count do
+    --             if ChapterModel:GetInstance():CheckMonsterGroupFight(cfg.battle_serial[i]) then
+    --                 num = num + 1
+    --             end
+    --         end
+    --     end
+    --     return num, count
+    -- end
+}
+---房间宝箱监测方法
+local CheckRoomBoxFunc = function(cfg)
+    local count = #cfg.BoxID
+    local NormalCount = 0
+    local BattleCount = 0
+    local NormalNum = 0
+    local BattleNum = 0
+    local objectCfg
+    for i = 1, count do
+        objectCfg = _G.ConfigManager.object_world_cfg[cfg.BoxID[i]]
+        if _G.tonumber(objectCfg.ClickParams[1]) == 1 then --普通宝箱
+            NormalCount = NormalCount + 1
+            if _G.WorldItemManager:GetInstance():GetInteractionBySid(cfg.BoxID[i]) then
+                NormalNum = NormalNum + 1
+            end
+        else --战斗宝箱
+            BattleCount = BattleCount + 1
+            if ChapterModel:GetInstance():CheckMonsterGroupFight(objectCfg.Params[1]) then
+                BattleNum = BattleNum + 1
+            end
+        end
+    end
+    return NormalNum, NormalCount, BattleNum, BattleCount
+end
+---获取房间宝箱数据
+---@param id number 房间ID
+---@return number,number,number,number 已探索普通数量，普通总数量 已战斗普通数量，战斗总数量
+function ChapterModel:GetRoomBoxDetail(id)
+    local cfg = _G.ConfigManager.main_room_cfg[id]
+    if not cfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("find main_room_cfg error id = " .. id, "ChapterModel:GetRoomBoxDetail")
+        end
+        return 0, 0
+    end
+    return CheckRoomBoxFunc(cfg)
+end
+---获取房间详细探索数据
+---@param id number 房间ID
+---@param _type number 类型(main_room_cfg中Type2字段值)
+---@return number,number 已探索数量/总数量
+function ChapterModel:GetRoomExploreDetail(id, _type)
+    local cfg = _G.ConfigManager.main_room_cfg[id]
+    if not cfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("find main_room_cfg error id = " .. id, "ChapterModel:GetRoomExploreDetail")
+        end
+        return 0, 0
+    end
+    _type = _type or 0
+    local num, count = 0, 0
+    if _type == 0 then
+        for key, value in pairs(CheckRoomStateFunc) do
+            local n, c = value(cfg)
+            num = num + n
+            count = count + c
+        end
+    else
+        _type = _type <= _G.MiniMapInfoType.battle and _G.MiniMapInfoType.boss or _type
+        num, count = CheckRoomStateFunc[_type](cfg)
+    end
+    return num, count
+end
+
+---获取章节奖励返回
+function ChapterModel:GetChapterAwardSuc(data, sid, call)
+    if data.ack == 1 then
+        table.insert(self.chapterAward, sid)
+        if not _G.IsNil(data.award) then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        end
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GeatherArrayLogin.id)
+    end
+
+    if call then
+        call(data)
+    end
+end
+
+---获取探索度奖励返回
+function ChapterModel:GetSectionExploreAwardSuc(data, sid, call)
+    if data.ack ~= 1 then
+        return
+    end
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    if call then
+        call()
+    end
+end
+--endregion
+
+--region 对外接口
+--region 获取数据
+------检测关卡是否解锁
+---@param id number 关卡ID
+---@return boolean 是否解锁
+function ChapterModel:CheckSection(id)
+    if id == 0 then
+        return true
+    end
+    local config = _G.ConfigManager.main_section_cfg[id]
+    if not config then
+        return false
+    end
+    local CheckCondition = _G.GlobalConditionManager.CheckCondition
+    local ConditionType = _G.GlobalConditionManager.ConditionType
+    if config.Date_Lock and config.Date_Lock > 0 then --建号天数
+        if not CheckCondition(ConditionType.createRoleDay, config.Date_Lock) then --建号天数
+            return false, ConditionType.createRoleDay
+        end
+    end
+    --放置解锁
+    if config.Afk_Lock > 0 and CheckCondition(ConditionType.afk, config.Afk_Lock) == false then
+        return false, ConditionType.afk
+    end
+    -- if config.LimitLevel > 0 then
+    --     if not CheckCondition(ConditionType.playerLV, config.LimitLevel) then --玩家等级判定
+    --         return false, ConditionType.playerLV
+    --     end
+    -- end
+    -- if config.TaskCondition > 0 then
+    --     return CheckCondition(ConditionType.acceptTask, config.TaskCondition), ConditionType.acceptTask --任务
+    -- end
+    if config.PreSection > 0 then
+        if not CheckCondition(ConditionType.section, config.PreSection) then --前置关卡
+            return false, ConditionType.section
+        end
+    end
+    return true
+end
+---获取当前应当挑战的关卡
+function ChapterModel:GetCurSectionSID()
+    return self.curSectionSID
+end
+---获取当前正在探索的关卡 剧本内用
+function ChapterModel:GetCurExploreSection()
+    return self.curSectionDoingSid
+end
+---获取当前正在进行探索的关卡
+function ChapterModel:GetCurExploringSection()
+    return self.curExploreSection
+end
+---获取章节配置
+---@param id number 章节id(nil则为当前应当挑战的关卡所属章节)
+---@return main_chapter_cfg_Item 章节配置
+function ChapterModel:GetCurChapterCfg(id)
+    id = id or self.curSectionSID
+    local cfg = self:GetCurChooseSectionCfg(id)
+    if not cfg then
+        return nil
+    end
+    cfg = _G.ConfigManager.main_chapter_cfg[cfg.Chapter]
+    return cfg
+end
+------设置当前显示的章节序列号(id)
+---@param index number 章节序列号(id)
+---@return table 章节数据
+function ChapterModel:SetChooseChapter(index)
+    self.curChooseChapterID = index
+end
+------设置当前选择的关卡
+---@param id number 关卡ID
+---@return table 关卡数据
+function ChapterModel:SetChooseSection(id)
+    self.curChooseSectionID = id
+end
+------获取选择的关卡ID
+function ChapterModel:GetChooseSectionID()
+    return self.curChooseSectionID
+end
+------获取当前选择的章节数据
+---@return table 章节数据
+function ChapterModel:GetCurChapterData()
+    return _G.ConfigManager.main_chapter_cfg[self.curChooseChapterID]
+end
+------获取关卡配置
+---@param id number 关卡ID(nil则返回当前选择的关卡配置)
+---@return main_section_cfg_Item 关卡配置
+function ChapterModel:GetCurChooseSectionCfg(id)
+    id = id or self.curChooseSectionID
+    return _G.ConfigManager.main_section_cfg[id]
+end
+---设置房间战斗信息
+---@param sid number 房间sid
+function ChapterModel:SetRoomBattleDone(sid)
+    self.battlemonsterGroupSids[sid] = true
+end
+---检测怪物组是否打过
+---@param sid number MonsterGroupID
+---@return boolean 是否打过
+function ChapterModel:CheckMonsterGroupFight(sid)
+    return self.battlemonsterGroupSids[sid] or false
+end
+--endregion
+
+--region功能接口
+---进入关卡
+function ChapterModel:EnterSection(call)
+    local join, _type = self:CheckSection(self.curChooseSectionID)
+    if not join then
+        if call then
+            call(join, _type)
+        end
+        return
+    end
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        local function enter()
+            ChapterNet:GetInstance():AccessEnterSection(
+                self.curChooseSectionID,
+                function(data)
+                    if data.ack == 1 then
+                        self.curSectionDoingSid = self.curChooseSectionID
+                        self.curExploreSection = self.curChooseSectionID
+                        _G.ChapterRoomManager:GetInstance():SetSectionData(data)
+                        if call then
+                            call(true)
+                        end
+                    else
+                        _type = _G.GlobalConditionManager.ConditionType.acceptTask
+                        if call then
+                            call(false, _type)
+                        end
+                    end
+                end
+            )
+        end
+        if self.curExploreSection ~= 0 and self.curChooseSectionID ~= self.curExploreSection then
+            self:ResetSection(self.curExploreSection, enter)
+        else
+            enter()
+        end
+    elseif call then
+        _G.ChapterRoomManager:GetInstance():SetSectionData(
+            {last_Room = 0, fight = {}, cards = {}, empty_room = {}, event = {}}
+        )
+        call(true)
+    end
+end
+---进入剧情关卡
+function ChapterModel:EnterStorySection(data, call)
+    if not self:CheckSectionPass(data.id) then
+        local msg = {}
+        msg.sid = data.id
+        ChapterNet:GetInstance():AccessStorySection(
+            msg,
+            function(data)
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            end
+        )
+    end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SelectSectionMapView.Name)
+
+    _G.AutomaticPlayStory.PlayStoryByID(
+        data.dialogue_before,
+        function()
+            self:SetSectionStar(data.id)
+            if call then
+                call()
+            end
+        end
+    )
+end
+---获取章节奖励
+---@param parmas instance.c2s_instance_get_reward_chapter
+function ChapterModel:GetChapterAward(parmas, call)
+    local msg = parmas
+    ChapterNet:GetInstance():AccessChapterAward(msg, _G.handlerbind(self, self.GetChapterAwardSuc, parmas.sid, call))
+end
+---检查是否领取章节奖励
+function ChapterModel:CheckChapterAwardIsGot(sid)
+    return table.find(
+        self.chapterAward,
+        function(v)
+            return v == sid
+        end
+    )
+end
+---获取探索度奖励
+function ChapterModel:GetSectionExploreAward(sid, call)
+    local msg = {}
+    msg.sid = sid
+    ChapterNet:GetInstance():AccessExploreAward(msg, _G.handlerbind(self, self.GetSectionExploreAwardSuc, sid, call))
+end
+---检测关卡是否通关
+---@param id number 关卡id
+---@return boolean 是否通关(true通关false未通关)
+function ChapterModel:CheckSectionPass(id)
+    if id == 0 then
+        return true
+    end
+    return self.sections and self.sections[id] and self.sections[id] >= 0 or false
+end
+---检测关卡是否挑战过(已通关或者应当挑战的关卡)
+---@param id number 关卡id
+---@return boolean 是否挑战过(true通关false未通关)
+function ChapterModel:CheckSectionChanllenge(id)
+    local challenge = self:CheckSectionPass(id)
+    if not challenge then
+        challenge = id == self.curSectionSID
+    end
+    return challenge
+end
+------通关后设定的星级
+---@param id number 关卡ID
+function ChapterModel:SetSectionStar(id)
+    self.sections[id] = 3
+    self.curExploreSection = 0
+    self:CalculateCurSection()
+
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        ChapterNet:GetInstance():AccessResetSection(
+            function()
+                _G.TaskModule:GetInstance():ResetSectionRoomTask(id)
+                _G.Events:GetInstance():Broadcast(
+                    _G.ePlayAactionEvent.PlayAaction,
+                    {
+                        _G.ActiveTaskEnum.ConditionEnum.Section.SectionPass,
+                        id
+                    },
+                    --副本通关
+                    --#次数#关卡id
+                    1
+                )
+                _G.Events:GetInstance():Broadcast(
+                    _G.eIllustrationsToUnlockEvent.Unlock,
+                    {
+                        id
+                    }
+                )
+                _G.FunctionManager:GetInstance():DoFunctionAction(_G.FunctionTouchType.Section)
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StoryPage.id, id)
+            end
+        )
+    else
+        _G.TaskModule:GetInstance():ResetSectionRoomTask(id)
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {
+                _G.ActiveTaskEnum.ConditionEnum.Section.SectionPass,
+                id
+            },
+            --副本通关
+            --#次数#关卡id
+            1
+        )
+        _G.Events:GetInstance():Broadcast(
+            _G.eIllustrationsToUnlockEvent.Unlock,
+            {
+                id
+            }
+        )
+        _G.FunctionManager:GetInstance():DoFunctionAction(_G.FunctionTouchType.Section)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StoryPage.id, id)
+    end
+end
+---获取关卡详细探索数据
+---@param id number 关卡ID
+---@param _type number 类型(main_room_cfg中Type2字段值)
+---@return number,number 已探索数量/总数量
+function ChapterModel:GetSectionBoxDetail(id)
+    local cfg = _G.ConfigManager.main_section_cfg[id]
+    if not cfg then
+        return 0, 0
+    end
+    local NormalNum, NormalCount, BattleNum, BattleCount = 0, 0, 0, 0
+    for i = 1, #cfg.rooms do
+        local n, nc, b, bc = self:GetRoomBoxDetail(cfg.rooms[i])
+        NormalNum = NormalNum + n
+        NormalCount = NormalCount + nc
+        BattleNum = BattleNum + b
+        BattleCount = BattleCount + bc
+    end
+    return NormalNum, NormalCount, BattleNum, BattleCount
+end
+---获取关卡宝箱探索数据
+---@param id number 关卡ID
+---@param _type number 类型(main_room_cfg中Type2字段值)
+---@return number,number 已探索数量/总数量
+function ChapterModel:GetSectionExploreDetail(id, _type)
+    local cfg = _G.ConfigManager.main_section_cfg[id]
+    if not cfg then
+        return 0, 0
+    end
+    local rcfg = nil
+    local num, count = 0, 0
+    for i = 1, #cfg.rooms do
+        local n, c = self:GetRoomExploreDetail(cfg.rooms[i], _type)
+        num = num + n
+        count = count + c
+    end
+    return num, count
+end
+---检测是否需要重置关卡
+---@param sid number 挑战的关卡SID
+---@return boolean 是否需要重置
+function ChapterModel:CheckResetSection(sid)
+    return self.curExploreSection == sid
+end
+---重置关卡
+---@param sid number 关卡id
+function ChapterModel:ResetSection(sid, callback)
+    ChapterNet:GetInstance():AccessResetSection(
+        function()
+            self.curExploreSection = 0
+            _G.TaskModule:GetInstance():ResetSectionRoomTask(sid)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+--endregion
+
+--region------------目标奖励 相关函数------------
+---获取关卡所有奖励（宝箱，战斗，任务）
+function ChapterModel:GetAllAward(sid)
+    local cfg = _G.ConfigManager.main_section_cfg[sid]
+    if not cfg then
+        return nil
+    end
+    local award = {award = {}, got = {}}
+    local function addDrop(list, dropID)
+        if dropID <= 0 then
+            return
+        end
+        local cfg = _G.ConfigManager.drop_cfg[dropID]
+        if not cfg then
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("未找到奖励配置 id = " .. dropID)
+            end
+            return
+        end
+        for i = 1, #cfg.fixed_drop do
+            _G.table.insert(list, {cfg.fixed_drop[i][1], cfg.fixed_drop[i][2]})
+        end
+    end
+    local rCfg
+    for i = 1, #cfg.rooms do
+        rCfg = _G.ConfigManager.main_room_cfg[cfg.rooms[i]]
+        self:HandleRoomBoxAward(rCfg, award, addDrop)
+        self:HandleRoomEnemyAward(rCfg, award, addDrop)
+        self:HandleRoomTaskAward(rCfg, award, addDrop)
+    end
+    return award
+end
+---获取探索、战斗奖励
+function ChapterModel:GetExploreAndBattleAward(sid)
+    local cfg = _G.ConfigManager.main_section_cfg[sid]
+    if not cfg then
+        return nil
+    end
+    local awardExplore = {award = {}, got = {}}
+    local awardBattle = {award = {}, got = {}}
+    local function addDrop(list, dropID)
+        if dropID <= 0 then
+            return
+        end
+        local cfg = _G.ConfigManager.drop_cfg[dropID]
+        if not cfg then
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("未找到奖励配置 id = " .. dropID)
+            end
+            return
+        end
+        for i = 1, #cfg.fixed_drop do
+            if cfg.fixed_drop[i][1] then
+                _G.table.insert(list, {cfg.fixed_drop[i][1], cfg.fixed_drop[i][2], cfg.fixed_drop[i][3]})
+            end
+        end
+    end
+    local rCfg
+    for i = 1, #cfg.rooms do
+        rCfg = _G.ConfigManager.main_room_cfg[cfg.rooms[i]]
+        self:HandleRoomBoxAward(rCfg, awardExplore, addDrop)
+        self:HandleRoomEnemyAward(rCfg, awardBattle, addDrop)
+    end
+    return awardExplore, awardBattle
+end
+---处理房间宝箱奖励
+---@param cfg main_room_cfg_Item 房间配置
+---@param awardTable table 奖励Table
+---@param addDrop function 添加奖励的方法
+function ChapterModel:HandleRoomBoxAward(cfg, awardTable, addDrop)
+    if not cfg.BoxID then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("房间配置无宝箱字段 房间sid = " .. cfg.id)
+        end
+        return
+    end
+    local boxType = 0
+    local objectcfg
+    local mgpID
+    local mgpcfg
+    for i = 1, #cfg.BoxID do
+        objectcfg = _G.ConfigManager.object_world_cfg[cfg.BoxID[i]]
+        if #objectcfg.ClickParams > 0 then
+            boxType = _G.tonumber(objectcfg.ClickParams[1])
+            if boxType == 0 then
+                if _G.AppSetting.DEBUG then
+                    _G.LogWarning("宝箱类型配置错误 sid = " .. cfg.BoxID[i], "ChapterModel:HandleRoomBoxAward")
+                end
+                break
+            elseif boxType == 1 then --普通宝箱
+                if _G.WorldItemManager:GetInstance():GetInteractionBySid(cfg.BoxID[i]) then
+                    for j = 1, #objectcfg.Params do
+                        addDrop(awardTable.got, objectcfg.Params[j])
+                    end
+                else
+                    for j = 1, #objectcfg.Params do
+                        addDrop(awardTable.award, objectcfg.Params[j])
+                    end
+                end
+            end
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("宝箱未配置类型 sid = " .. cfg.BoxID[i], "ChapterModel:HandleRoomBoxAward")
+            end
+        end
+    end
+end
+---处理房间敌人奖励
+---@param cfg main_room_cfg_Item 房间配置
+---@param awardTable table 奖励Table
+---@param addDrop function 添加奖励的方法
+function ChapterModel:HandleRoomEnemyAward(cfg, awardTable, addDrop)
+    if not cfg.battle_serial then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("房间配置无battle_serial字段 房间sid = " .. cfg.id)
+        end
+        return
+    end
+    local mgpCfg
+    for j = 1, #cfg.battle_serial do
+        mgpCfg = _G.ConfigManager.monster_group_cfg[cfg.battle_serial[j]]
+        if mgpCfg then
+            if self:CheckMonsterGroupFight(cfg.battle_serial[j]) then
+                for i = 1, #mgpCfg.Drop do
+                    addDrop(awardTable.got, mgpCfg.Drop[i])
+                end
+            else
+                for i = 1, #mgpCfg.Drop do
+                    addDrop(awardTable.award, mgpCfg.Drop[i])
+                end
+            end
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("未找到怪物组配置 id = " .. cfg.battle_serial[j] .. "  房间id = " .. cfg.id)
+            end
+        end
+    end
+end
+---处理房间任务奖励
+---@param cfg main_room_cfg_Item 房间配置
+---@param awardTable table 奖励Table
+function ChapterModel:HandleRoomTaskAward(cfg, awardTable)
+    if not cfg.task_id then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("task_id 房间sid = " .. cfg.id)
+        end
+        return
+    end
+    local taskcfg
+    for j = 1, #cfg.task_id do
+        taskcfg = _G.ConfigManager.task_cfg[cfg.task_id[j]]
+        if taskcfg then
+            if
+                _G.GlobalConditionManager.CheckCondition(
+                    _G.GlobalConditionManager.ConditionType.doneTask,
+                    cfg.task_id[j]
+                )
+             then
+                for k = 1, #taskcfg.award do
+                    table.insert(awardTable.got, taskcfg.award[k][1])
+                end
+            else
+                for k = 1, #taskcfg.award do
+                    table.insert(awardTable.award, taskcfg.award[k][1])
+                end
+            end
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("未找到任务配置 任务id = " .. cfg.task_id[j] .. "     房间id = " .. cfg.id)
+            end
+        end
+    end
+end
+---获取未领取奖励的章节id
+---@return number _0全部已领取
+function ChapterModel:GetNoGetAwardChapterId()
+    local cfg = _G.ConfigManager.main_chapter_cfg
+    if self.chapterPairsTalbe == nil then
+        self.chapterPairsTalbe = _G.pairsByKeysGetSortTable(cfg)
+    end
+
+    for id, value in _G.pairsByKeys_ByTable(cfg, self.chapterPairsTalbe) do
+        if self:CheckChapterAwardIsGot(id) then
+        else
+            return id
+        end
+    end
+    return 0
+end
+---获取章节奖励类型
+---@return number _G.EChapterRewardsType
+function ChapterModel:GetChapterRawardType(chapterid)
+    local cfg = _G.ConfigManager.main_chapter_cfg[chapterid]
+    if cfg == nil then
+        return _G.EChapterRewardsType.Prop
+    end
+    if IsNumber(cfg.ChapterReward[1]) then
+        return _G.EChapterRewardsType.Prop
+    else
+        return _G.EChapterRewardsType.CardN1
+    end
+end
+---获取章节奖励参数
+---@return  number[] nil无数据
+function ChapterModel:GetChapterRawardParmas(chapterid)
+    local cfg = _G.ConfigManager.main_chapter_cfg[chapterid]
+    local type = self:GetChapterRawardType(chapterid)
+    if type == _G.EChapterRewardsType.Prop then
+        return cfg.ChapterReward
+    else
+        return cfg.chapter_reward1
+    end
+end
+
+---获取当前章节中所有的关卡
+function ChapterModel:GetChpterAllSections(id)
+    local sectionsCfg = _G.ConfigManager.main_section_cfg
+    local tb = {}
+    for _, v in pairs(sectionsCfg) do
+        if v.Chapter == id then
+            _G.table.insert(tb, v)
+        end
+    end
+    _G.table.sort(
+        tb,
+        function(a, b)
+            return a.id < b.id
+        end
+    )
+    return tb
+end
+---检测是否挑战(红点)
+function ChapterModel:CheckIsChallenge()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return true
+    end
+    if not self.sections then
+        return false
+    end
+    return _G.table.count(self.sections) > 1
+end
+
+---检测首通奖励是否领取
+---@param id number section的id
+---@return boolean
+function ChapterModel:CheckIsGet(id)
+    return false
+end
+
+---获取首通奖励（新版本根据房间通关进度领取满足进度条件的被划分为4等份的奖励）
+function ChapterModel:GetSectionAward(sid, index, callback)
+    local msg = {
+        sid = sid,
+        a_index = index
+    }
+    ChapterNet:GetInstance():AccessSectionAward(
+        msg,
+        _G.handlerbind(self, self.GetSectionAwardCall, sid, index, callback)
+    )
+end
+---获取首通奖励回调
+function ChapterModel:GetSectionAwardCall(data, sid, index, callback)
+    if data.ack ~= 1 then
+        --LogError("获取首通奖励异常")
+        return
+    end
+    if data.ack == 1 then
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+    end
+    self.passSectionAward[sid] = {}
+    for i = 1, index do
+        self.passSectionAward[sid][i] = true
+    end
+    if (callback ~= nil) then
+        callback()
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.StoryPage.id, sid)
+end
+
+function ChapterModel:CheckRedPoint()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(11) then
+        return false
+    end
+    return self:CheckChapterRedPoint()
+end
+function ChapterModel:GetTotalExplore()
+    return self.ExploreChapterInfo
+end
+function ChapterModel:GetCurSectionExplore(sid)
+    return self.ExploreChapterInfo[sid]
+end
+----true该关卡满探索
+function ChapterModel:IsSectionExplore100(sid)
+    local data = self.ExploreChapterInfo[sid]
+    if data then
+        if data.num == data.count then
+            return true
+        end
+    end
+    return false
+end
+
+function ChapterModel:SetTotalExplore()
+    local cfgs = _G.ConfigManager.main_chapter_cfg
+    for _, v in pairs(cfgs) do
+        if v.ID ~= 300000000 and v.ID ~= 999999999 then
+            local count = #v.Section
+            for i = 1, count do
+                if self:CheckSection(v.Section[i]) then
+                    if not self:CheckSectionPass(v.Section[i]) then
+                        self.isShowChapterIconInMainView = true
+                    end
+                    local num, allNum = self:GetSectionExploreDetail(v.Section[i])
+                    self.ExploreChapterInfo[v.Section[i]] = {}
+                    self.ExploreChapterInfo[v.Section[i]].num = num
+                    self.ExploreChapterInfo[v.Section[i]].count = allNum
+                end
+            end
+        end
+    end
+end
+function ChapterModel:SetSectionExplore(sid)
+    if not self.ExploreChapterInfo[sid] then
+        return
+    end
+    local num, allNum = self:GetSectionExploreDetail(sid)
+    self.ExploreChapterInfo[sid].num = num
+    self.ExploreChapterInfo[sid].count = allNum
+
+    --region --------------------------------------任务广播 关卡探索度达到100%--------
+    if num ~= 0 and num == allNum then
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {
+                _G.ActiveTaskEnum.ConditionEnum.Section.SectionExplore100,
+                sid
+            },
+            1,
+            false,
+            true
+        )
+    end
+
+    --endregion------------------------------------任务广播 关卡探索度达到100%--------
+end
+function ChapterModel:CheckChapterRedPoint()
+    local checkfunc = function(param)
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(11) then
+            return 0
+        end
+        if require "ChapterModel":GetInstance():CheckSection(param) then
+            local num, count = require "ChapterModel":GetInstance():GetSectionExploreDetail(param)
+            if num == count and require "ChapterModel":GetInstance():CheckIsGetSectionAward(param, 4) then
+                return 0
+            else
+                return 1
+            end
+        else
+            return 0
+        end
+    end
+    local cfgs = _G.ConfigManager.main_chapter_cfg
+    local num = 0
+    for _, v in pairs(cfgs) do
+        if v.ID ~= 300000000 and v.ID ~= 999999999 then
+            local count = #v.Section
+            for i = 1, count do
+                num = num + checkfunc(v.Section[i])
+            end
+        end
+    end
+    if num > 0 then
+        return true
+    end
+    return false
+end
+function ChapterModel:RefreshRedPoint()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.StoryPage.id)
+end
+
+---检测有无获取首通奖励
+function ChapterModel:CheckIsGetSectionAward(sid, index)
+    if not self.passSectionAward then
+        return false
+    end
+    if nil == self.passSectionAward[sid] then
+        return false
+    end
+    return self.passSectionAward[sid][index]
+end
+
+--endregion
+
+return ChapterModel

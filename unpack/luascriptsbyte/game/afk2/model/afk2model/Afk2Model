@@ -1,0 +1,1030 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.Afk2.Model.Afk2Model	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/10/09
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local Afk2Net = require("Afk2Net")
+local PrivilegeManager = require("PrivilegeManager")
+---@class Afk2Model : GameDataModelBase	中文描述
+---@field sid number 当前通过的最高挂机副本，没有通过时填0
+---@field time number 开始挂机的时间，时间戳
+---@field num number 快速挂机次数
+---@field exp number 巡查经验值
+---@field level number 巡查等级
+---@field free_times number 免费次数
+---@field times number 付费次数
+---@field sectionUnlocks table<number, {buildId:number, level:number}>   @关卡对应开启的建筑
+---@field rewardTimer Timer   @奖励状态刷新定时器
+---@field autoFight boolean   @是否自动开始战斗
+---@field afkRewards table<number,boolean>  关卡一次性奖励领取状态
+local Afk2Model = _G.BaseClass("Afk2Model", _G.GameDataModelBase)
+
+---@return Afk2Model Afk2Model
+function Afk2Model:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function Afk2Model:__init()
+    self.curFunctionOpenID = _G.FunctionID.Afk2
+    ---订单状态
+    self.OrderStatus = {
+        NotStart = 1,
+        Running = 2,
+        Finished = 3
+    }
+    self.buildData = {}
+    self.orderDataList = {}
+
+    self.rewardTimer = _G.TimerManager:GetInstance():GetTimer(60, self.RefreshRewardView, self, false, false, true)
+    self.rewardTimer:Start()
+    _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.FunOpen, self)
+end
+
+---新功能解锁，刷新红点
+function Afk2Model:FunOpen(mainFunid)
+    if mainFunid == self.curFunctionOpenID then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Privilege.id)
+    end
+end
+
+function Afk2Model:GetDataFormServer()
+    Afk2Net:GetInstance():GetAfkInfo(_G.handler(self, self.ParseData))
+end
+
+---解析数据
+---@param msg afk2.s2c_afk2_info
+function Afk2Model:ParseData(msg)
+    self.sid = msg.sid or 0
+    self.time = msg.time
+    self.num = msg.num or 0
+    self.freeTimes = msg.free_times or 0
+    self.times = msg.times or 0
+    self:ParseExp(msg.exp)
+    --关卡奖励
+    self.afkRewards = {}
+    if msg.g_sids then
+        for _, sid in pairs(msg.g_sids) do
+            self.afkRewards[sid] = true
+        end
+    end
+    if msg.builds then
+        local buildConfig = _G.ConfigManager.afk2_building_cfg
+        for _, v in pairs(msg.builds) do
+            ---最大等级
+            local material = buildConfig[v.sid].material
+            v.maxLevel = #material + 1
+            v.config = buildConfig[v.sid]
+            self.buildData[v.sid] = v
+            if self:GetOrderStatus(v.sid) == self.OrderStatus.Running then
+                self.orderDataList[v.sid] = 1
+            end
+        end
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Order.id)
+    end
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.Afk2RewardView.Name)
+    if view then
+        view:RefreshQuickReward()
+    end
+    self:SetOrderTimer()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2BuildLevelUp.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Build.id)
+    self:RefreshSectionAwardRedPoint()
+    self.super.ParseData(self)
+end
+
+---订单计时器
+function Afk2Model:SetOrderTimer()
+    if self.orderTimer then
+        return
+    end
+    self.orderTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateOrderTimer, self, false, false, true)
+    self.orderTimer:Start()
+end
+
+function Afk2Model:UpdateOrderTimer()
+    local isDataChange = false
+    for sid, _ in pairs(self.orderDataList) do
+        if self:GetOrderStatus(sid) == self.OrderStatus.Finished then
+            isDataChange = true
+            self.orderDataList[sid] = nil
+        end
+    end
+    if isDataChange then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Order.id)
+    end
+end
+
+---解析经验值
+---@param exp number
+---@return void
+function Afk2Model:ParseExp(exp)
+    exp = exp or 0
+
+    self.exp = exp
+    self.level = 1
+    --二分查找等级(数据源必需是有序排列)
+    local afk2_level_cfg = _G.ConfigManager.afk2_level_cfg
+    local low, high = 1, #afk2_level_cfg
+    while low <= high do
+        local mid = math.floor((low + high) / 2) --取中间位置
+
+        local needExp = afk2_level_cfg[mid].afk2_exp[2]
+        if exp >= needExp then
+            low = mid + 1
+        elseif exp < needExp then
+            high = mid - 1
+        end
+    end
+
+    local level = math.max(math.min(low, high), 1)
+    local needExp = afk2_level_cfg[level].afk2_exp[2]
+    if exp >= needExp and afk2_level_cfg[level + 1] then
+        level = level + 1
+    end
+    self.level = level
+end
+
+---获取经验值奖励
+---@param msg public.s2c_common_ack|any
+---@return void
+function Afk2Model:ReceiveExpData(msg)
+    if not msg or not msg.award or not msg.award.item then
+        return
+    end
+    --计算经验值更改
+    local expId, expNum = _G.ConfigManager.afk2_level_cfg[1].afk2_exp[1], 0
+    for _, item in pairs(msg.award.item) do
+        if item.type[1] == expId then
+            expNum = expNum + item.type[2]
+        end
+    end
+    if expNum > 0 then
+        self:ParseExp(self.exp + expNum)
+    end
+end
+
+---刷新奖励视图(MainView主页面)
+---@return void
+function Afk2Model:RefreshRewardView()
+    --新号还未创建角色
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return
+    end
+    if not self:CheckFunctionUnlock() then
+        return
+    end
+
+    ---@type MainView
+    -- local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    -- if view then
+    --     view:RefreshAfk2RewardButton()
+    -- end
+    ---@type ZhenRongView
+    local zhenRongView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ZhenRongView.Name)
+    if zhenRongView then
+        zhenRongView:RefreshAfk2RewardButton()
+    end
+end
+
+--region ===========================战斗逻辑===================================
+
+---检查目标关卡是否已达最后一关
+---@return boolean
+function Afk2Model:CheckSectionIsEnd(sid)
+    local cfg = _G.ConfigManager.afk2_cfg[sid]
+    if not cfg or not _G.ConfigManager.afk2_cfg[cfg.next_section] then
+        return true
+    end
+    return false
+end
+
+---初始化挑战信息
+function Afk2Model:InitFight(autoFight)
+    self.autoFight = autoFight or false
+end
+
+---挑战当前关卡
+---@return void
+function Afk2Model:Fight(autoFight)
+    self:InitFight(autoFight)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.Afk2EmbattleView.Name,
+        _G.handler(self, self.ExitEmbattle),
+        function(_, _, skipBattle)
+            if skipBattle then
+                self:SkipFight()
+            else
+                self:EnterFight()
+            end
+        end,
+        self.autoFight
+    )
+end
+
+---重新进行挑战
+---@return void
+function Afk2Model:ReFight()
+    self.autoFight = false
+    self:Fight()
+end
+
+---进入战斗
+---@return void
+function Afk2Model:EnterFight()
+    local sid = self:GetAfkNextSid()
+    local cfg = _G.ConfigManager.afk2_cfg[sid]
+
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.afk2, sid, cfg.monster_group)
+end
+
+---跳过战斗
+---@return void
+function Afk2Model:SkipFight()
+    local sid = self:GetAfkNextSid()
+    local cfg = _G.ConfigManager.afk2_cfg[sid]
+
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    --发起战斗结算
+    require("Afk2Net"):GetInstance():SatrtFight(
+        { sid = sid, monster_sid = cfg.monster_group },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+            --计算战斗结果
+            _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+            local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+            if not record or not record.result then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+
+            ---@type BattleControllerAfk2
+            local controller = _G.require(_G.BattleControllerType.afk2).New()
+            controller.sid = sid
+            controller.monsterId = cfg.monster_group
+            controller.curFightState = 4 --设置战斗结束
+
+            _G.BattleManager:GetInstance():SetArgData(msg.fight_arg)
+            _G.BattleManager:GetInstance():SetStatisticsCached(record)
+            _G.BattleManager:GetInstance():SetBattleController(controller)
+            --显示结算界面
+            controller:FightResultFunc(record.result)
+        end
+    )
+end
+
+---离开战斗
+---@return void
+function Afk2Model:ExitEmbattle()
+    self:ShowWindows()
+end
+
+---返回主页面(刷新)
+---@return void
+function Afk2Model:ReturnPanel(isWin, id)
+    if id == require("SettlementModel").FunctionEnum.Next then
+        return
+    end
+    self:ShowWindows()
+end
+
+function Afk2Model:ShowWindows()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ZhenRongView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.Afk2MainView.Name)
+
+    ---@type Afk2MainView
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.Afk2MainView.Name)
+    if view then
+        view:RefreshView()
+        view:MoveCurrentSction()
+    end
+end
+
+---监听界面打开
+---@param name string 界面名称
+function Afk2Model:OnEmbattleViewOpened(name)
+    if name ~= _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        return
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ZhenRongView.Name)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.Afk2MainView.Name)
+end
+
+--endregion
+
+--region ===========================数据接口===================================
+
+---检测对应功能是否已开启
+---@return void
+function Afk2Model:CheckFunctionUnlock()
+    return _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Afk2)
+end
+
+---获取挂机通过关卡id
+---@return number
+function Afk2Model:GetAfkSid()
+    return self.sid or 0
+end
+
+---设置挂机通过关卡id
+function Afk2Model:SetAfkSid(sid)
+    self.sid = sid
+end
+
+---获取第一个关卡
+---@return number
+function Afk2Model:GetAfkFirstSid()
+    if not self.firstSectionSid then
+        self.firstSectionSid = 0
+        for _, section in pairs(_G.ConfigManager.afk2_cfg) do
+            if section.number == 1 then
+                self.firstSectionSid = section.id
+                break
+            end
+        end
+    end
+    return self.firstSectionSid
+end
+
+---获取下一个需要挑战的关卡
+---@return void
+function Afk2Model:GetAfkNextSid()
+    local sid = self:GetAfkSid()
+    if sid == 0 or not _G.ConfigManager.afk2_cfg[sid] then
+        return self:GetAfkFirstSid()
+    end
+
+    local nextSid = _G.ConfigManager.afk2_cfg[sid].next_section
+    if nextSid and _G.ConfigManager.afk2_cfg[nextSid] then
+        return nextSid
+    end
+    return 0
+end
+
+---获取当前挂机关卡数
+---@return number
+function Afk2Model:GetAfkLevel()
+    return self.level or 1
+end
+
+---获取当前累计经验值
+---@return number
+function Afk2Model:GetAfkExp()
+    return self.exp or 0
+end
+
+---检查Afk关卡奖励是否已领取
+---@param sid number    关卡id
+---@return boolean
+function Afk2Model:CheckAfkSectionAward(sid)
+    if not self.afkRewards then
+        return false
+    end
+    return self.afkRewards[sid] or false
+end
+
+---获取挂机奖励上一次领取时间戳(秒)
+---@return number
+function Afk2Model:GetAfkTime()
+    return self.time or 0
+end
+
+---获取挂机奖励最大时间(秒), 根据配置丶关卡和特权
+---@return number
+function Afk2Model:GetAfkMaxTime()
+    ---@type number 基础挂机最大时长(秒)
+    local seconds = _G.ConfigManager.discrete_cfg[115701][1][1]
+    return seconds
+end
+
+---获取挂机奖励领取时间间隔(秒)
+---@return number
+function Afk2Model:GetAfkInterval()
+    return _G.ConfigManager.discrete_cfg[115702][1][1]
+end
+
+---获取关卡对应开启的建筑
+---@return number,number    @(对应建筑ID, 建筑等级)
+function Afk2Model:GetSectionUnlock(id)
+    if not self.sectionUnlocks then
+        self.sectionUnlocks = {}
+        for _, cfg in pairs(_G.ConfigManager.afk2_building_cfg) do
+            local buildId = cfg.id
+            for lv, id in pairs(cfg.condition) do
+                self.sectionUnlocks[id] = { buildId = buildId, level = lv }
+            end
+        end
+    end
+
+    local state = self.sectionUnlocks[id]
+    if not state then
+        return 0, 0
+    end
+    return state.buildId, state.level
+end
+
+---获取建筑数据
+---@param id number 建筑id
+function Afk2Model:GetBuildData(id)
+    return self.buildData[id]
+end
+
+---获取所有的建筑数据
+function Afk2Model:GetAllBuildData()
+    return self.buildData
+end
+
+---是否有订单解锁
+function Afk2Model:CheckUnlockOrder()
+    if _G.table.isEmptyOrNil(self.buildData) then
+        return false
+    end
+
+    local config = _G.ConfigManager.afk2_building_cfg
+    for _, v in pairs(self.buildData) do
+        if v.level >= config[v.sid].open_level then
+            return true
+        end
+    end
+
+    return false
+end
+
+---获取建筑最大挂机时间
+---@param id number 建筑id
+---@param level number 建筑等级
+function Afk2Model:GetBuildMaxTime(id, level)
+    level = level or self.buildData and self.buildData[id].level or 1
+    local maxTimeList = _G.ConfigManager.afk2_building_cfg[id].max_time
+    if maxTimeList[level] then
+        return maxTimeList[level] * 60
+    end
+
+    ---没有配置最大挂机时间就取最后一个
+    return maxTimeList[#maxTimeList] * 60
+end
+
+---获取状态枚举
+function Afk2Model:GetOrderStatusEnum()
+    return self.OrderStatus
+end
+
+---订单是否解锁
+---@param id number 建筑id
+---@param config afk2_building_cfg
+function Afk2Model:CheckOrderIsUnlock(id, config)
+    if not config then
+        config = _G.ConfigManager.afk2_building_cfg[id]
+    end
+
+    if self.buildData[id] and self.buildData[id].level >= config.open_level then
+        return true
+    end
+
+    return false
+end
+
+---获取订单状态
+---@param id number 建筑id
+function Afk2Model:GetOrderStatus(id)
+    local buildData = self.buildData[id]
+    if not buildData then
+        return self.OrderStatus.NotStart
+    end
+
+    if buildData.order_time > 0 then
+        local serverTime = _G.TimeUtil.GetServerUnixTime()
+        if buildData.order_time <= serverTime then
+            return self.OrderStatus.Finished
+        end
+
+        return self.OrderStatus.Running
+    end
+
+    return self.OrderStatus.NotStart
+end
+
+---有奖励可领取的建筑列表
+---@return ids table
+function Afk2Model:GetBuildAwardList()
+    local ids = {}
+    if _G.table.isEmptyOrNil(self.buildData) then
+        return ids
+    end
+
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    for _, v in pairs(self.buildData) do
+        if serverTime - v.award_time >= v.config.time[v.level] then
+            _G.table.insert(ids, v.sid)
+        end
+    end
+    return ids
+end
+
+---快速挂机最大免费次数
+function Afk2Model:GetMaxFreeAwardTimes()
+    local initTimes = _G.ConfigManager.discrete_cfg[115703][1][1]
+    if require("MonthlyModel"):GetInstance():IsHavePrivi(405005) then
+        local data = PrivilegeManager:GetInstance():GetPrivilegeDataNew(
+            { _G.PrivilegeType.LimitedTimePrivilege.Afk2AwardTimes }
+        )
+        for _, v in pairs(data) do
+            initTimes = initTimes + v[2]
+        end
+    end
+    return initTimes
+end
+
+---获取付费奖励次数
+function Afk2Model:GetFreeTimes()
+    return self.freeTimes
+end
+
+---是否有免费次数
+function Afk2Model:CheckHaveFreeTimes()
+    local maxTimes = self:GetMaxFreeAwardTimes()
+    return self.freeTimes < maxTimes, maxTimes - self.freeTimes
+end
+
+---快速挂机最大免费次数
+function Afk2Model:GetMaxAwardTimes()
+    local initTimes = _G.ConfigManager.discrete_cfg[115704][1][1]
+    if require("MonthlyModel"):GetInstance():IsHavePrivi(405005) then
+        local data = PrivilegeManager:GetInstance():GetPrivilegeDataNew(
+            { _G.PrivilegeType.LimitedTimePrivilege.Afk2BuildGetAward }
+        )
+        for _, v in pairs(data) do
+            initTimes = initTimes + v[2]
+        end
+    end
+
+    return initTimes
+end
+
+---是否有付费次数
+function Afk2Model:CheckHaveBuyTimes()
+    local maxTimes = self:GetMaxAwardTimes()
+    return self.times < maxTimes, maxTimes - self.times
+end
+
+---获取付费奖励次数
+function Afk2Model:GetBuyTimes()
+    return self.times
+end
+
+---建筑解锁红点
+function Afk2Model:CheckBuildUnlock(sid)
+    local buildId = self:GetSectionUnlock(sid)
+    if buildId and buildId > 0 and not self.buildData[buildId] then
+        ---建筑解锁红点
+        _G.PlayerPrefsManager.SetInt("Afk2BuildUnlockId_" .. buildId, 1)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2BuildUnlock.id)
+        self:GetBuildInfo({ buildId }, function()
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2BuildLevelUp.id)
+            _G.Events:GetInstance():Broadcast(_G.eAfk2Events.BuildLevelChange, buildId)
+        end)
+        return
+    end
+
+    if self:CheckCanLevelUp() == 1 then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2BuildLevelUp.id)
+    end
+end
+
+---获取未弹解锁弹窗的建筑id列表
+function Afk2Model:GetUnlockBuildList()
+    local unlockList = _G.PlayerPrefsManager.GetTable("Afk2BuildUnlockIdList") or {}
+    local list = {}
+    if _G.table.isEmptyOrNil(self.buildData) then
+        return list
+    end
+    for _, v in pairs(self.buildData) do
+        if v.level == 1 and not unlockList[v.sid] then
+            _G.table.insert(list, v)
+            unlockList[v.sid] = 1
+        end
+    end
+    if not _G.table.isEmptyOrNil(list) then
+        _G.PlayerPrefsManager.SetTable("Afk2BuildUnlockIdList", unlockList)
+    end
+    return list
+end
+
+--endregion
+
+--region ===========================通讯协议===================================
+---获取建筑基础数据
+function Afk2Model:GetBuildInfo(sids, callBack)
+    Afk2Net:GetInstance():GetBuildInfo(
+        { sids = sids },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if msg.builds then
+                local buildConfig = _G.ConfigManager.afk2_building_cfg
+                for _, v in pairs(msg.builds) do
+                    if not self.buildData[v.sid] then
+                        ---最大等级
+                        local material = buildConfig[v.sid].material
+                        v.maxLevel = #material + 1
+                        v.config = buildConfig[v.sid]
+                    end
+                    self.buildData[v.sid] = v
+                end
+            end
+            if callBack then
+                callBack()
+            end
+        end
+    )
+end
+
+---获取建筑奖励
+---@param sids table 领取奖励的建筑id列表
+function Afk2Model:GetBuildAward(sids, callBack)
+    local pbData = { sids = sids, time = _G.TimeUtil.GetServerUnixTime() }
+    Afk2Net:GetInstance():GetBuildAward(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIUtils.ShowCommonAward(msg)
+            ---更新数据
+            if msg.builds then
+                for _, v in pairs(msg.builds) do
+                    v.config = self.buildData[v.sid].config
+                    v.maxLevel = self.buildData[v.sid].maxLevel
+                    self.buildData[v.sid] = v
+                end
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Build.id)
+            if callBack then
+                callBack()
+            end
+            _G.Events:GetInstance():Broadcast(_G.eAfk2Events.RefreshBuildAward, sids)
+        end
+    )
+end
+
+---升级建筑
+---@param sid number 建筑id
+---@param level number 建筑当前的等级
+function Afk2Model:BuildLevelUp(sid, level, material, callBack)
+    Afk2Net:GetInstance():BuildLevelUp(
+        { sid = sid },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.buildData[sid].level = level + 1
+            _G.StorageManager:GetInstance():ConsumeItem(material[1], material[1], material[2])
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2BuildLevelUp.id)
+            _G.Events:GetInstance():Broadcast(_G.eAfk2Events.BuildLevelChange, sid)
+            if callBack then
+                callBack()
+            end
+        end
+    )
+end
+
+---开始下单
+---@param sid number 建筑id
+function Afk2Model:StartOrder(sid, callBack)
+    Afk2Net:GetInstance():StartOrder(
+        { sid = sid },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if self.buildData[sid] then
+                local exchange_time = _G.ConfigManager.afk2_building_cfg[sid].exchange_time
+                self.buildData[sid].order_time = _G.TimeUtil.GetServerUnixTime() + exchange_time * 60
+            end
+            self.orderDataList[sid] = 1
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Order.id)
+            if callBack then
+                callBack()
+            end
+        end
+    )
+end
+
+---领取订单奖励
+---@param sid number 建筑id
+---@param type number 领奖类型 1:加急 2:普通领奖
+---@param callBack function 回调
+function Afk2Model:GetOrderAward(sid, type, callBack)
+    Afk2Net:GetInstance():GetOrderAward(
+        { sid = sid, type = type },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if self.buildData[sid] then
+                self.buildData[sid].order_time = 0
+            end
+            if self.orderDataList[sid] then
+                self.orderDataList[sid] = nil
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIUtils.ShowCommonAward(msg)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Order.id)
+            if callBack then
+                callBack()
+            end
+        end
+    )
+end
+
+---领取挂机奖励
+---@param type number 领奖类型 1:领奖 2:预览
+---@param callbcak fun(msg:public.s2c_common_ack):void
+function Afk2Model:GetAfkAward(type, callbcak)
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    ---@param msg public.s2c_common_ack
+    Afk2Net:GetInstance():GetAfkAward(
+        { time = serverTime, type = type },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                return
+            end
+            local lv = self.level
+            if type == 1 then
+                --获取奖励
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                --更新缓存信息
+                self.time = msg.next_time or serverTime
+                self:ReceiveExpData(msg)
+
+                self:RefreshRewardView()
+            end
+
+            if callbcak then
+                callbcak(msg, lv, self.level)
+            end
+        end
+    )
+end
+
+---领取快速挂机奖励
+---@param type number 类型，暂时默认都是1
+---@param isFree boolean 是否是领取免费奖励
+function Afk2Model:GetQucikAfkAward(type, num, callbcak)
+    Afk2Net:GetInstance():GetAfkQucikAward(
+        { type = type },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                return
+            end
+            local lv = self.level
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self:ReceiveExpData(msg)
+
+            if num and num > 0 then
+                self.times = self.times + 1
+                _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, _G.ResPropID.Diamond, num)
+            else
+                self.freeTimes = self.freeTimes + 1
+            end
+            if callbcak then
+                callbcak(msg, lv, self.level)
+            end
+        end
+    )
+end
+
+---领取关卡一次性奖励
+---@param sids number[]     需要领取的关卡id列表
+---@param callback fun(msg:public.s2c_common_ack):void
+function Afk2Model:GetAfkSectionAward(sids, callbcak)
+    Afk2Net:GetInstance():GetAfkSectionAward(
+        { sids = sids },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                return
+            end
+            local lv = self.level
+            --接收奖励
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            --缓存数据
+            if not self.afkRewards then
+                self.afkRewards = {}
+            end
+            for _, sid in pairs(sids) do
+                self.afkRewards[sid] = true
+            end
+            self:ReceiveExpData(msg)
+
+            --刷新红点
+            self:RefreshSectionAwardRedPoint()
+
+            if callbcak then
+                callbcak(msg, lv, self.level)
+            end
+        end
+    )
+end
+
+--endregion
+
+--region 红点
+---第一次解锁建筑的红点
+function Afk2Model:CheckFirstUnlock()
+    if _G.table.isEmptyOrNil(self.buildData) then
+        return 0
+    end
+
+    for _, v in pairs(self.buildData) do
+        if _G.PlayerPrefsManager.GetInt("Afk2BuildUnlockId_" .. v.sid, 0) == 1 then
+            return 1
+        end
+    end
+
+    return 0
+end
+
+function Afk2Model:BuildAwardTimer()
+    ---每分钟检测一次
+    if not self.buildAwardTimer then
+        self.buildAwardTimer = _G.TimerManager:GetInstance():GetTimer(60, self.RefreshBuildRedPoint, self, false, false,
+            true)
+        self.buildAwardTimer:Start()
+    end
+end
+
+function Afk2Model:RefreshBuildRedPoint()
+    if self:CheckBuildRedPoint() == 1 then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Build.id)
+        _G.Events:GetInstance():Broadcast(_G.eAfk2Events.RefreshBuildRedPoint)
+    end
+end
+
+---建筑资源红点-资源大于80%显示红点
+function Afk2Model:CheckAllBuildRedPoint()
+    if _G.table.isEmptyOrNil(self.buildData) then
+        return 0
+    end
+
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    for _, v in pairs(self.buildData) do
+        if self:CheckBuildRedPoint(v, serverTime) == 1 then
+            return 1
+        end
+    end
+
+    return 0
+end
+
+---某个建筑的资源是否达到80%以上
+function Afk2Model:CheckBuildRedPoint(buildData, serverTime)
+    if _G.table.isEmptyOrNil(buildData) then
+        return 0
+    end
+
+    if not serverTime then
+        serverTime = _G.TimeUtil.GetServerUnixTime()
+    end
+    local maxTime = self:GetBuildMaxTime(buildData.sid)
+    if serverTime - buildData.award_time >= _G.Mathf.Floor(maxTime * 0.8) then
+        return 1
+    end
+
+    return 0
+end
+
+---订单红点
+function Afk2Model:CheckOrderRedPoint()
+    if _G.table.isEmptyOrNil(self.buildData) then
+        return 0
+    end
+
+    for _, v in pairs(self.buildData) do
+        if self:GetOrderStatus(v.sid) == self.OrderStatus.Finished then
+            return 1
+        end
+    end
+
+    return 0
+end
+
+---可升级提示红点
+function Afk2Model:CheckCanLevelUp()
+    if _G.table.isEmptyOrNil(self.buildData) then
+        return 0
+    end
+
+    for _, v in pairs(self.buildData) do
+        if self:CheckBuildCanLevelUp(v.sid, v) == 1 then
+            return 1
+        end
+    end
+
+    return 0
+end
+
+---某一个建筑是否可升级或第一次解锁
+---@param data table 建筑数据
+function Afk2Model:CheckBuildCanLevelUp(buildId, data)
+    data = data or self.buildData[buildId]
+    if _G.table.isEmptyOrNil(data) then
+        return 0
+    end
+
+    local material = data.config.material[data.level]
+    if _G.PlayerPrefsManager.GetInt("AfkBuildingYcTip_" .. data.sid, 0) == 1 and
+        data.level + 1 <= data.maxLevel and
+        self.sid >= data.config.condition[data.level + 1] and
+        _G.StorageManager:GetInstance():CheckItem(material[1], material[2])
+    then
+        return 1
+    end
+
+    return 0
+end
+
+---特权红点
+function Afk2Model:CheckPrivilegeRedPoint()
+    if require("MonthlyModel"):GetInstance():IsHavePrivi(405005) then
+        return 0
+    end
+    local privilege = _G.PlayerPrefsManager.GetInt("Afk2Privilege_RrfreshTime", 0)
+    return privilege ~= _G.TimeUtil.GetMondaySixTime() and 1 or 0
+end
+
+function Afk2Model:RefreshPrivilegeRedPoint()
+    local privilege = _G.PlayerPrefsManager.GetInt("Afk2Privilege_RrfreshTime", 0)
+    if privilege ~= _G.TimeUtil.GetMondaySixTime() then
+        _G.PlayerPrefsManager.SetInt("Afk2Privilege_RrfreshTime", _G.TimeUtil.GetMondaySixTime())
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Afk2Privilege.id)
+    end
+end
+
+---检测关卡奖励红点数量
+---@return number
+function Afk2Model:CheckSectionAwardRedPoint()
+    if not self:CheckFunctionUnlock() then
+        return 0
+    end
+    --未通关任何关卡
+    if self:GetAfkSid() <= 0 then
+        return 0
+    end
+
+    --检查未领取奖励的关卡
+    local move = _G.ConfigManager.afk2_cfg[self:GetAfkSid()]
+    while move do
+        if move and move.reward and #move.reward > 0 and not self:CheckAfkSectionAward(move.id) then
+            return 1
+        end
+        move = _G.ConfigManager.afk2_cfg[move.pre_section]
+    end
+    return 0
+end
+
+---刷新关卡奖励红点
+---@return void
+function Afk2Model:RefreshSectionAwardRedPoint()
+    --刷新红点
+    require("RedPointManager"):GetInstance():RefreshNode(
+        _G.ConfigManager.redpoint_cfg.Afk2SectionAward.id
+    )
+end
+
+--endregion
+
+---奖励界面跳转
+function Afk2Model:JumpAwawdView()
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.Afk2MainView.Name)
+    if not mainView then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.Afk2MainView.Name)
+    end
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.Afk2RewardView.Name)
+end
+
+---销毁对象时,析构函数
+function Afk2Model:Dispose()
+    if self.buildAwardTimer then
+        self.buildAwardTimer:Stop()
+        self.buildAwardTimer = nil
+    end
+    if self.rewardTimer then
+        self.rewardTimer:Stop()
+        self.rewardTimer = nil
+    end
+    if self.orderTimer then
+        self.orderTimer:Stop()
+        self.orderTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.FunOpen, self)
+end
+
+return Afk2Model

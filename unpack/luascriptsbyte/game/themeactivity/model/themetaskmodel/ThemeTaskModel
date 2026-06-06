@@ -1,0 +1,334 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DrawActivity.Model.ThemeTaskModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2023/02/06
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "ThemeActivityBaseModel"
+local ThemeTaskData = require "ThemeTaskData"
+---@class ThemeTaskModel:ThemeActivityBaseModel 灵域任务
+---@field cfgs activity_theme.i_task_info[]
+---@field TaskCfg activity_theme.i_task_cfg[] 奖励排序后的表
+---@field taskList ThemeTaskData[]      任务实例
+local ThemeTaskModel = _G.BaseClass("ThemeTaskModel", base)
+
+---@return ThemeTaskModel ThemeTaskModel
+function ThemeTaskModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function ThemeTaskModel:__init()
+    --上层管理器会进行数据刷新???
+    --_G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+end
+
+---销毁对象时,析构函数
+function ThemeTaskModel:Dispose()
+    --_G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+    self:ClearTaskData();
+end
+
+---初始化数据
+---@param msg activity_theme.i_draw
+function ThemeTaskModel:InitData(msg)
+    self:ClearTaskData();
+    self.activityId = require "ThemeActivityManager":GetInstance():GetActivityID()
+    self.finishTaskList = {}
+    self.taskList = {}
+    self.TaskCfg = {}
+    ---@type number[] 每日刷新的任务sid
+    self.cyclicTaskSids = {}
+    self:InitTaskCfg(msg.cfg_list_term or {}, msg.cfg_list)
+    self:InitFinishTask(msg.finish_task)
+    self:InitCurTask(msg.task_curr)
+    self:UpdateView()
+end
+function ThemeTaskModel:InitTaskCfg(taskCfgs, resetTaskCfg)
+    if not taskCfgs then
+        return
+    end
+    if resetTaskCfg and #resetTaskCfg > 0 then
+        for _, v in pairs(resetTaskCfg) do
+            table.insert(self.cyclicTaskSids, v.sid)
+            table.insert(taskCfgs, v)
+        end
+    end
+    local _task
+    for _, v in pairs(taskCfgs) do
+        _task = {}
+        _task.id = v.sid
+        _task.name = v.name
+        _task.desc = v.desc
+        _task.type_calculate = v.type_calculate
+        _task.condition = {v.complete}
+        _task.count = v.count
+        _task.function_open = 0
+        _task.reward = v.award
+        _task.link = v.link
+        self.TaskCfg[v.sid] = _task
+    end
+end
+
+function ThemeTaskModel:UpdateTask(taskinfo)
+    if self.taskList[taskinfo.sid] then
+        self.taskList[taskinfo.sid]:UpdataData(taskinfo)
+        self:RefreshRedPoint()
+    end
+end
+function ThemeTaskModel:InitCurTask(task)
+    if not task then
+        return
+    end
+    for _, v in pairs(task) do
+        if self.TaskCfg[v.sid] then
+            self:RemvoeTaskData(v.sid)
+            self.taskList[v.sid] =
+                ThemeTaskData.New(
+                {
+                    sid = v.sid,
+                    target = v.target,
+                    state = v.state,
+                    cfg = self.TaskCfg[v.sid],
+                    acid = self.activityId
+                }
+            )
+        end
+    end
+end
+function ThemeTaskModel:InitFinishTask(finish)
+    if not finish then
+        return
+    end
+    for _, v in pairs(finish) do
+        if not self.finishTaskList[v] then
+            self.finishTaskList[v] = true
+            if self.TaskCfg[v] then
+                self:RemvoeTaskData(v)
+                self.taskList[v] =
+                    ThemeTaskData.New(
+                    {
+                        sid = v,
+                        target = {999},
+                        state = _G.TaskEnum.ETaskState.Completed,
+                        cfg = self.TaskCfg[v],
+                        acid = self.activityId
+                    }
+                )
+            end
+        end
+    end
+end
+
+---移除TaskData实例对象
+---@param sid number 任务sid
+---@return void
+function ThemeTaskModel:RemvoeTaskData(sid)
+    if not self.taskList then
+        return
+    end
+    local data = self.taskList[sid]
+    if not data then
+        return
+    end
+    self.taskList[sid] = nil
+    data:Clear()
+end
+---清除所有TaskData实例对象
+function ThemeTaskModel:ClearTaskData()
+    if not self.taskList then
+        return
+    end
+    for _, data in pairs(self.taskList) do
+        data:Clear()
+    end
+    self.taskList = nil
+end
+
+---六点刷新每日任务
+---@return void
+function ThemeTaskModel:OnSixClockUpdateCallback()
+    --重置每日任务
+    if self.TaskCfg and self.cyclicTaskSids and self.finishTaskList then
+        local updateTasks = {}
+        for _, sid in pairs(self.cyclicTaskSids) do
+            if self.TaskCfg[sid] then
+                self.finishTaskList[sid] = fals
+                table.insert(
+                    updateTasks,
+                    {
+                        sid = sid,
+                        target = {0},
+                        state = _G.TaskEnum.ETaskState.Claimed
+                    }
+                )
+            end
+        end
+        self:InitCurTask(updateTasks)
+    end
+
+    --更新视图和红点
+    self:UpdateView()
+    self:RefreshRedPoint()
+end
+
+function ThemeTaskModel:UpdateView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ThemeTaskView.Name)
+    if view and view.gameObject:GetActiveSelf() == 1 then
+        view:UpdateView(self)
+    end
+end
+---获取任务数据
+function ThemeTaskModel:GetTaskDatas()
+    local taskArray = {}
+    for _, v in pairs(self.taskList) do
+        _G.table.insert(taskArray, v)
+    end
+    _G.SortList(
+        taskArray,
+        function(data)
+            local type = -99
+            local iscantake = self:CheckIsCanTake(data.i_task.sid)
+            if iscantake then
+                type = 100
+            elseif data.i_task.state == _G.TaskEnum.ETaskState.Submited then
+                type = 0
+            elseif data.i_task.state == _G.TaskEnum.ETaskState.Claimed then
+                type = 99
+            end
+            return type, -data.i_task.sid
+        end
+    )
+    return taskArray
+end
+function ThemeTaskModel:InitRedTree()
+    self.redTree = {{1, "RedPointThemeTask", {}}}
+end
+---检测是否完成
+function ThemeTaskModel:CheckIsFinish(sid)
+    return self.finishTaskList[sid]
+end
+---检测红点
+function ThemeTaskModel:CheckRedPoint()
+    if not _G.table.isEmptyOrNil(self.taskList) then
+        for _, v in pairs(self.taskList) do
+            if self:CheckIsCanTake(v.id) then
+                return true
+            end
+        end
+    end
+    return false
+end
+---刷新红点
+function ThemeTaskModel:RefreshRedPoint()
+    require "RedPointManager":GetInstance():RefreshNode(self:GetRedPointId())
+end
+---更新任务状态
+function ThemeTaskModel:ChangeSingleTaskState(sid, state)
+    self.finishTaskList[sid] = true
+    self.taskList[sid].i_task.state = state
+    self.taskList[sid]:CheckTaskState()
+end
+---检测是否可以领奖
+function ThemeTaskModel:CheckIsCanTake(sid)
+    if self:CheckIsGet(sid) then
+        return false
+    end
+    if not self.taskList[sid] then
+        return false
+    else
+        return self.taskList[sid].i_task.state == _G.TaskEnum.ETaskState.Submited
+    end
+end
+---进入活动
+function ThemeTaskModel:EnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ThemeTaskView.Name)
+end
+---完成任务
+function ThemeTaskModel:FinishTask(sid, call)
+    require "ThemeTaskNet":GetInstance():FinishTask(
+        {activity_id = self.activityId, task_sid = {sid}, finish_type = 2},
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call()
+                end
+                return
+            end
+            self:RefreshRedPoint()
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self:ChangeSingleTaskState(sid, _G.TaskEnum.ETaskState.Submited)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---完成任务
+function ThemeTaskModel:FinishAllTask(call)
+    local sids = self:GetCanFinishTaskList()
+    require "ThemeTaskNet":GetInstance():FinishTask(
+        {activity_id = self.activityId, task_sid = sids, finish_type = 2},
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call()
+                end
+                return
+            end
+            self:RefreshRedPoint()
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            local datas = {}
+            datas.award = {}
+            datas.award.item = {}
+            for _, v in pairs(sids) do
+                self:ChangeSingleTaskState(v, _G.TaskEnum.ETaskState.Submited)
+                local taskDatas = self.taskList[v]
+                if taskDatas.Cfg.reward then
+                    for key, value in pairs(taskDatas.Cfg.reward) do
+                        local item1 = {
+                            type = {
+                                value.sid,
+                                value.num
+                            }
+                        }
+                        _G.table.insert(datas.award.item, item1)
+                    end
+                end
+            end
+            require "CommonTipManager".OpenCommonAwardView(datas)
+            if call then
+                call()
+            end
+        end
+    )
+end
+---检测是否可以领奖
+function ThemeTaskModel:CheckIsCanTake(sid)
+    if self:CheckIsGet(sid) then
+        return false
+    end
+    if not self.taskList[sid] then
+        return false
+    else
+        return self.taskList[sid].i_task.state == _G.TaskEnum.ETaskState.Submited
+    end
+end
+---检测是否已经领过奖
+function ThemeTaskModel:CheckIsGet(sid)
+    return self:CheckIsFinish(sid)
+end
+---获取可以领取的任务列表
+function ThemeTaskModel:GetCanFinishTaskList()
+    local tb = {}
+    local insert = _G.table.insert
+    for _, v in pairs(self.taskList) do
+        if v.i_task.state == _G.TaskEnum.ETaskState.Submited and not self:CheckIsFinish(v.i_task.sid) then
+            insert(tb, v.i_task.sid)
+        end
+    end
+    return tb
+end
+
+return ThemeTaskModel

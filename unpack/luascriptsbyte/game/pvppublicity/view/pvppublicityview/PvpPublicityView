@@ -1,0 +1,286 @@
+local PvpPublicityModel = require("PvpPublicityModel")
+local PvpPublicityViewItem = require("PvpPublicityViewItem")
+
+---角色立绘信息
+---@type {role:string,title:string}[]
+local images = {
+    [1] = { role = "ui_mbts_nvxiangong_juese", title = "ui_mbts_jjzx_font" },
+    [2] = { role = "ui_mbts_guanyu_juese", title = "ui_mbts_wdly_font" },
+    [3] = { role = "ui_mbts_kaili_juese", title = "ui_mbts_zbtx_font" },
+    [4] = { role = "ui_mbts_qinwangzheng_juese", title = "ui_mbts_dfyw_font" }
+}
+---活动结束提示(如果为0, 则在倒计时结束时立即关闭页面)
+local finishTipId = 0
+
+---@class PvpPublicityView : UIBaseView Pvp目标推送(登录时弹出)
+---@field private go_table PvpPublicityView_GoTable
+---@field private data PvpPublicityData
+---@field private timer any                         倒计时定时器
+---@field private rankList RankListData.Player[]    排名数据
+---@field private selfItem PvpPublicityViewItem     自身Item
+---@field private rankItemDict table<string|number, PvpPublicityViewItem> 列表Item映射
+local PvpPublicityView = _G.BaseClass("PvpPublicityView", _G.UIBaseView)
+
+---@private
+function PvpPublicityView:__init(d)
+    self.data = d
+end
+---@private
+function PvpPublicityView:OnCreate()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+
+    self:Reset()
+    self:LoadInfos()
+
+    self:LoadTime()
+    self:StartTimer()
+
+    local uiModel = _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.ui_model_1)
+    self.go_table.obj_tip1:SetActiveE(uiModel and 0 or 1)
+    self.go_table.obj_tip2:SetActiveE(uiModel and 1 or 0)
+
+    ---请求数据
+    local function isDestroyed()
+        return not self.gameObject or self.gameObject:IsNull()
+    end
+    PvpPublicityModel:GetInstance():GetSelfRank(
+            self.data.id,
+            function(data)
+                if isDestroyed() then
+                    return
+                end
+                ---@type RankListData.Player
+                local player = _G.PlayerModel:GetInstance():GetIRroleTable() or {}
+                player.uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+                local rank = -1
+                if data and data.ack == 1 then
+                    player.score = data.score
+                    rank = data.rank
+                else
+                    player.score = 0
+                    if data then
+                        _G.PopWindowManager:GetInstance():ShowAllTips(data.ack)
+                    end
+                end
+
+                ---公会战信息
+                if self.data.id == PvpPublicityModel:GetInstance().ePvpPublicityType.SociatyBattle then
+                    if player.guild_name and #player.guild_name > 0 then
+                        player.name = player.guild_name
+                    else
+                        player = nil
+                        rank = -1
+                    end
+                end
+                self:ShowSelf(rank, player)
+            end
+    )
+    PvpPublicityModel:GetInstance():GetRankList(
+            self.data.id,
+            function(data)
+                if isDestroyed() then
+                    return
+                end
+                if not data then
+                    return
+                end
+                self.rankList = data.list
+                self:ShowRankList()
+
+                --所在公会信息
+                if not data.list or self.data.id ~= PvpPublicityModel:GetInstance().ePvpPublicityType.SociatyBattle then
+                    return
+                end
+                local player = (_G.PlayerModel:GetInstance():GetIRroleTable() or {})
+                for index, v in ipairs(data.list) do
+                    if v.name == player.guild_name then
+                        self:ShowSelf(index, v)
+                    end
+                end
+            end
+    )
+end
+function PvpPublicityView:OnDestroy()
+    self:StopTimer()
+end
+
+---重置页面状态
+---@private
+function PvpPublicityView:Reset()
+    self.go_table.obj_item:SetActiveE(0)
+    self.go_table.toggle_reject.isOn = false
+    self:ShowSelf(nil, nil)
+
+    self.rankList = nil
+    self:ShowRankList()
+end
+---加载页面信息(图片丶文本等)
+---@private
+function PvpPublicityView:LoadInfos()
+    local cfg = _G.ConfigManager.card_cfg[112010000]
+    _G.PoolsManager:GetInstance():Spawn(
+            cfg.ModelPathHi,
+            _G.ePoolType.UIItem,
+            self.go_table.obj_role,
+            function(obj)
+                if self:IsNil() then
+                    _G.PoolsManager:GetInstance():Despawn(obj, _G.ePoolType.UIItem)
+                    return
+                end
+                GameUtil.SetCardUiSpineAnimation(obj, "idle", true)
+                obj:SetLocalPosition(_G.table.unpack(cfg.pos_portrait))
+                obj:SetLocalScaleXYZ(cfg.size2)
+            end)
+end
+---加载倒计时
+---@private
+function PvpPublicityView:LoadTime()
+    local GetLangPackValue = _G.GetLangPackValue
+    local remain = PvpPublicityModel:GetInstance():GetRemainTime(self.data)
+    if remain <= 0 then
+        if finishTipId > 0 then
+            self.go_table.aortext_time.text = GetLangPackValue(finishTipId)
+        else
+            self:Close()
+            if _G.AppSetting.DEBUG then
+                _G.Log("PvpPublicityView closed: " .. self.data.id)
+            end
+        end
+        self:StopTimer()
+        return
+    end
+
+    --获取赛季结算时间
+    local seasonRemain = PvpPublicityModel:GetInstance():GetSeasonRemainTime(self.data.id)
+    if seasonRemain < 0 then
+        seasonRemain = 0
+    end
+
+    if seasonRemain <= 0 then
+        self.go_table.aortext_time.text = GetLangPackValue(90026100046) --结算中
+    elseif seasonRemain < 86400 then
+        self.go_table.aortext_time.text = GetLangPackValue(90028900002, _G.TimeUtil.TimeToStringHMS(seasonRemain))
+    else
+        local day, hour, min = math.floor(seasonRemain / 86400),
+        math.floor((seasonRemain % 86400) / 3600),
+        math.floor(((seasonRemain % 86400) % 3600) / 60)
+        self.go_table.aortext_time.text = GetLangPackValue(90028900002, GetLangPackValue(90028010120, day, hour, min))
+    end
+end
+
+---开始活动倒计时
+---@private
+function PvpPublicityView:StartTimer()
+    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.LoadTime, self, false)
+    self.timer:Start()
+end
+---停止倒计时
+---@private
+function PvpPublicityView:StopTimer()
+    if not self.timer then
+        return
+    end
+    self.timer:Stop()
+    self.timer = nil
+end
+
+---加载自身排名信息
+---@private
+---@param index number 排名
+---@param data any 个人信息
+function PvpPublicityView:ShowSelf(index, data)
+    if not self.selfItem then
+        self.selfItem = PvpPublicityViewItem.New(self.go_table.obj_player, self.data)
+    end
+    self.selfItem:Show(index, data)
+end
+---加载排行榜列表
+---@private
+function PvpPublicityView:ShowRankList()
+    local count = self.rankList and #self.rankList or 0
+    if count < 3 then
+        count = 3
+    end
+
+    if not self.initRankList then
+        self.initRankList = true
+        self.go_table.scrollloopvectical_rankList:InitItemData(count, _G.handler(self, self.RefreshRankList))
+    else
+        self.go_table.scrollloopvectical_rankList:UpdateCount(count)
+    end
+end
+
+---刷新列表成员UI显示
+---@private
+function PvpPublicityView:RefreshRankList(index, obj)
+    if index < 0 then
+        return
+    end
+
+    if not self.rankItemDict then
+        self.rankItemDict = {}
+    end
+    local instanceId = obj:GetInstanceIDE()
+    if not self.rankItemDict[instanceId] then
+        self.rankItemDict[instanceId] = PvpPublicityViewItem.New(obj, self.data)
+    end
+
+    index = index + 1 --C#数组下标从0开始, lua从1开始
+    local player = self.rankList and self.rankList[index] or nil
+    self.rankItemDict[instanceId]:Show(index, player)
+end
+
+---UI回调事件监听
+---@private
+function PvpPublicityView:OnClickBtn(go)
+    local function close()
+        if self.go_table.toggle_reject.isOn then
+            _G.PlayerPrefsManager.SetInt(
+                    "PvpPublicity_" .. tostring(_G.PlayerModel:GetInstance().role_uid) .. "_" .. self.data.id,
+                    _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime())
+            )
+        end
+        self:Close()
+    end
+    if go == self.go_table.aorbtn_close then
+        close()
+    elseif go == self.go_table.aorbtn_goto then
+        --弹窗时期已结束
+        if finishTipId > 0 then
+            local remain = PvpPublicityModel:GetInstance():GetRemainTime(self.data)
+            if remain <= 0 then
+                _G.PopWindowManager:GetInstance():ShowAllTips(finishTipId)
+                return
+            end
+        end
+        --赛季结算期
+        local seasonRemain = PvpPublicityModel:GetInstance():GetSeasonRemainTime(self.data.id)
+        if seasonRemain <= 0 then
+            _G.PopWindowManager:GetInstance():ShowAllTips(650106)
+            return
+        end
+
+        local type, ePvpPublicitytype = self.data.id, PvpPublicityModel:GetInstance().ePvpPublicityType
+        if type == ePvpPublicitytype.Arena then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArenaMainPanelView.Name)
+            close()
+        elseif type == ePvpPublicitytype.SpiritualRealm then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SpiritualRealmView.Name)
+            close()
+        elseif type == ePvpPublicitytype.SociatyBattle then
+            --使用ArenaPanelView:EnterArena() 里面的方法???
+            if not require("SociatyManager"):GetInstance():HasSociaty() then
+                _G.PopWindowManager:GetInstance():ShowAllTips(250308)
+                require("SociatyManager"):GetInstance():CreateSociaty()
+            else
+                require("SociatyBattleManager"):GetInstance():Enter()
+            end
+            close()
+        elseif type == ePvpPublicitytype.ArenaPeak then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArenaPeakView.Name)
+            close()
+        end
+    end
+end
+
+return PvpPublicityView

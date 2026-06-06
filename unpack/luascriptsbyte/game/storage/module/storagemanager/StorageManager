@@ -1,0 +1,3924 @@
+-----------------------------------------------------------------------
+-- UI.Storage.Module.StorageManager.lua
+-- Created by csw
+-- Description 仓库管理器
+-----------------------------------------------------------------------
+require "StorageDef"
+require "BaseItemData"
+
+require "PropData"
+require "CardData"
+require "DecorationData"
+require "ArtifactData"
+require "SpiritualData"
+require "DebrisData"
+require "CarvingData"
+
+require "EquipmentItem"
+require "CardViewBase"
+require "EquipViewBase"
+require "DecorationViewBase"
+require "ArtifactViewBase"
+require "SpiritualViewBase"
+require "DebrisViewBase"
+require "CarvingViewBase"
+
+require "JumpManager"
+local StorageNet = require "StorageNet"
+local base = _G.GameDataModelBase
+---@class StorageManager : GameDataModelBase    仓库管理器
+---@field GetInstance fun() : StorageManager
+---@field public Storages table<StorageID, BaseStorage> 仓库容器集
+---@field public ParseFunc table<ItemType, function> 解析奖励方法集合
+---@field public CurItemTable ShowAwardData[] 单次获取的所有奖励，用于弹窗显示
+local StorageManager = _G.BaseClass("StorageManager", base)
+local currencySids = {}
+local ignoreItem = {}
+_G.StorageManager = StorageManager
+-- 发过来的奖励如果第一个参数是0，根据参数拿到的活动类型在这个表里，就调用活动内部加代币的方法
+local haveCoinParseFuncActivity = {10065, 10043, 10064, 10067, 10052, 10044, 10069, 10068, 10085, 10028, 10031, 10095}
+--活动代码特有的table 用于haveCoinParseFuncActivity检测不到时，这个地方再检测一次
+local activityResTable = { _G.ResPropID.ServerMergeActivePoint}
+
+
+---需要展示红点的使用类型
+local useTypes = {
+    [_G.ItemUseType.GetResprop] = true,
+    [_G.ItemUseType.ItemDrop] = true,
+    [_G.ItemUseType.CompoundCard] = true,
+    [_G.ItemUseType.GetProp] = true,
+    [_G.ItemUseType.SelectProp] = true,
+    [_G.ItemUseType.DrawCard] = true,
+    [_G.ItemUseType.ProgressChest] = true,
+    [_G.ItemUseType.TreasureMap] = true,
+    [_G.ItemUseType.InterfaceJump] = true,
+    [_G.ItemUseType.Collection] = true,
+    [_G.ItemUseType.GetXHourAfkAward] = true
+}
+
+---创建对象时,入口构造函数
+function StorageManager:__init()
+    currencySids = {}
+    local currencyCfg = _G.ConfigManager.currency_type_client_cfg
+    for k, v in pairs(currencyCfg) do
+        local data = v.id
+        currencySids[data] = k
+    end
+    ignoreItem = _G.ConfigManager.discrete_cfg[109701]
+    self.noShowRed = {}
+    for k, v in pairs(ignoreItem[1]) do
+        self.noShowRed[v] = -1
+    end
+    self.Time_Power = 3600
+    local discrete_cfg_Power = _G.ConfigManager.discrete_cfg[100503]
+    if discrete_cfg_Power ~= nil then
+        self.Time_Power = discrete_cfg_Power[1][1] or self.Time_Power
+    end
+    self.Storages = {}
+    self:InitStorages()
+    self.ParseFunc = {
+        [_G.StorageID.Card] = _G.handler(self, self.ParseCardAward),
+        [_G.StorageID.ResProp] = _G.handler(self, self.ParseResAward),
+        [_G.StorageID.Equipment] = _G.handler(self, self.ParseEquipmentAward),
+        [_G.StorageID.Material] = _G.handler(self, self.ParseMaterialAward),
+        [_G.StorageID.Prop] = _G.handler(self, self.ParsePropAward),
+        [_G.StorageID.Decoration] = _G.handler(self, self.ParseDecorationAward),
+        [_G.StorageID.Artifact] = _G.handler(self, self.ParseArtifactAward),
+        [_G.StorageID.Spiritual] = _G.handler(self, self.ParseSpiritualAward),
+        [_G.StorageID.Debris] = _G.handler(self, self.ParseDebrisAward),
+        [_G.StorageID.RelicTeamBuff] = _G.handler(self, self.ParseRelicTeamBuffAward),
+        [_G.StorageID.RingGod] = _G.handler(self, self.ParseRelicTeamBuffAward),
+        [_G.StorageID.Remains] = _G.handler(self, self.ParseRemainsAward),
+        [_G.StorageID.Carving] = _G.handler(self, self.ParseCavringAward),
+        [_G.StorageID.Gemstone] = _G.handler(self, self.ParseGemstoneAward),
+    }
+    self.StorageTypeToStorageID = {
+        [_G.StorageType.Prop] = _G.StorageID.Prop,
+        [_G.StorageType.Card] = _G.StorageID.Card,
+        [_G.StorageType.Material] = _G.StorageID.Material,
+        [_G.StorageType.ResProp] = _G.StorageID.ResProp,
+        [_G.StorageType.Equipment] = _G.StorageID.Equipment,
+        [_G.StorageType.Decoration] = _G.StorageID.Decoration,
+        [_G.StorageType.ProgressChest] = _G.StorageID.Prop,
+        [_G.StorageType.Artifact] = _G.StorageID.Artifact,
+        [_G.StorageType.Spiritual] = _G.StorageID.Spiritual,
+        [_G.StorageType.Debris] = _G.StorageID.Debris,
+        [_G.StorageType.RechargeAccumulate] = _G.StorageID.Prop,
+        [_G.StorageType.VoucherDiscount] = _G.StorageID.Prop,
+        [_G.StorageType.Remains] = _G.StorageID.Remains,
+        [_G.StorageType.Carving] = _G.StorageID.Carving,
+        [_G.StorageType.Gemstone] = _G.StorageID.Gemstone,
+    }
+    self.CurItemTable = {}
+
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+end
+
+---销毁对象时,析构函数
+function StorageManager:Dispose()
+    self:StopTimer_CardPower()
+    self:DisposeUnloclItem()
+
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.OnSixClockUpdateCallback, self)
+end
+
+-- region 重写父类方法
+function StorageManager:GetDataFormServer()
+    self:GetGoodsStorageData()
+    self:GetExChangeData()
+    self:GetCardEquipBoundData()
+end
+
+---region 重写父类方法
+function StorageManager:ReConnect(endCallback)
+    self.StorageReconnectCallback = endCallback
+    self:GetGoodsStorageData()
+    self:GetExChangeData()
+end
+
+---初始化功能逻辑
+function StorageManager:InitFunction()
+    for _, storage in pairs(self.Storages) do
+        storage:InitMutuallyData()
+    end
+    self:SendServerCardPower()
+    self:InitUnloclItem()
+end
+
+-- endregion
+
+-- region 初始化
+-- region 初始化仓库对象
+---初始化新建所有仓库
+function StorageManager:InitStorages()
+    for _, value in pairs(_G.ConfigManager.storage_cfg) do
+        self.Storages[value.Id] = self:CreateStorage(value)
+    end
+end
+
+---新建指定类型的仓库
+---@param value StorageConfig_Itemf
+function StorageManager:CreateStorage(value)
+    local type = value.Id
+    if type == _G.StorageID.Prop then
+        return require("PropStorage").New(_G.StorageID.Prop)
+    elseif type == _G.StorageID.Material then
+        return require("MaterialStorage").New(_G.StorageID.Material)
+    elseif type == _G.StorageID.Equipment then
+        return require("EquipmentStorage").New(_G.StorageID.Equipment)
+    elseif type == _G.StorageID.Card then
+        return require("CardStorage").New(_G.StorageID.Card)
+    elseif type == _G.StorageID.ResProp then
+        return require("ResourcesStorage").New(_G.StorageID.ResProp)
+    elseif type == _G.StorageID.Decoration then
+        return require("DecorationStorage").New(_G.StorageID.Decoration)
+    elseif type == _G.StorageID.Artifact then
+        return require("ArtifactStorage").New(_G.StorageID.Artifact)
+    elseif type == _G.StorageID.Spiritual then
+        return require("SpiritualStorage").New(_G.StorageID.Spiritual)
+    elseif type == _G.StorageID.Remains then
+        return require("RemainsStorage").New(_G.StorageID.Remains)
+    elseif type == _G.StorageID.Debris then
+        return require("DebrisStorage").New(_G.StorageID.Debris)
+    elseif type == _G.StorageID.Carving then
+        return require("CarvingStorage").New(_G.StorageID.Carving)
+    elseif type == _G.StorageID.Gemstone then
+        return require("GemstoneStorage").New(_G.StorageID.Gemstone)
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.LogError(" Storage is nil", value.Key)
+    end
+    return require("BaseStorage").New()
+end
+
+-- endregion
+-- region 初始化仓库数据
+function StorageManager:GetGoodsStorageData()
+    local asyncCombiner = _G.CS.YoukiaCore.AsyncCombiner()
+    local ignoreType = {_G.StorageType.RelicTeamBuff, _G.StorageType.RingGod} -- 不用初始化的仓库类型
+    for _, value in pairs(_G.StorageType) do
+        if not _G.table.ContainsValue(ignoreType, value) then
+            local asyncHandle = asyncCombiner:CreateAsyncHandle()
+            local msg = {
+                types = _G.tostring(value)
+            }
+            StorageNet:GetInstance():GetData(msg, function(curMsg)
+                self.Storages[self.StorageTypeToStorageID[value]]:Parse(curMsg, nil ~= self.StorageReconnectCallback)
+                asyncHandle:Finish()
+            end)
+        end
+    end
+    asyncCombiner:AddCompletionCall(_G.handler(self, self.GetGoodsStorageSucceed))
+    asyncCombiner:RefreshAsyncHandles()
+end
+
+function StorageManager:GetGoodsStorageSucceed()
+    base.ParseData(self)
+    if self.StorageReconnectCallback then
+        self.StorageReconnectCallback()
+        self.StorageReconnectCallback = nil
+    end
+end
+
+-- region 兑换
+---六点刷新去重新拉取购买限制数据,
+---OnSixClockUpdate需要注册LoginManager.updateSixClockModels
+---不能调用基类GameDataModelBase.OnSixClockUpdate方法, 此方法将导致整个背包重新拉取
+function StorageManager:OnSixClockUpdateCallback()
+    self:GetExChangeData()
+end
+
+---获取兑换数据
+function StorageManager:GetExChangeData()
+    StorageNet:GetInstance():PropBuyInfo(_G.handler(self, self.GetExChangeDataCall))
+end
+
+---获取卡牌装备绑定数据
+function StorageManager:GetCardEquipBoundData()
+    StorageNet:GetInstance():CardBoundEquipInfo(_G.handler(self, self.GetCardEquipBoundCall))
+end
+
+---获取兑换数据回调
+function StorageManager:GetExChangeDataCall(msg)
+    self.bought_times = {}
+    if msg.bought_times then
+        for _, v in pairs(msg.bought_times) do
+            self.bought_times[v.sid] = v.times
+        end
+    end
+    -- 发送购买限制次数刷新
+    _G.Events:GetInstance():Broadcast(_G.eStorageRefreshType.ExchangeLimit)
+end
+
+---获取卡牌该部位是否有绑定装备
+---@param sid number CardSid
+---@param buwei number 部位
+---@return boolean
+function StorageManager:GetCardIsBound(sid, buwei)
+    if not _G.table.isEmptyOrNil(self.boundCards) then
+        if self.boundCards[sid] then
+            for i = 1, #self.boundCards[sid] do
+                if self.boundCards[sid][buwei] and self.boundCards[sid][buwei] > 0 then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+---设置卡牌绑定的装备
+function StorageManager:SetCardEquipBound(csid, esid, buwei)
+    if not csid then
+        return
+    end
+    if self.boundCards then
+        if self.boundCards[csid] then
+            if self.boundCards[csid][buwei] == 0 then
+                self.boundCards[csid][buwei] = esid
+            end
+        else
+            self.boundCards[csid] = {}
+            self.boundCards[csid][buwei] = esid
+        end
+    end
+end
+
+---获取卡牌装备绑定数据回调
+function StorageManager:GetCardEquipBoundCall(msg)
+    self.boundCards = {}
+    if msg.bound then
+        for _, v in pairs(msg.bound) do
+            --- e_sids  {sid,sid,sid,sid,sid 没有为0}
+            self.boundCards[v.c_sid] = v.e_sids
+        end
+    end
+end
+
+---获取已兑换次数
+function StorageManager:GetExChangeCount(id)
+    return self.bought_times[id] or 0
+end
+
+-- endregion
+
+-- endregion
+-- endregion
+
+-- region 获取数据
+
+-- region仓库通用
+---获取仓库容量
+---@param id StorageID 仓库类型
+---@return number 仓库容量
+function StorageManager:GetStorageCapacity(id)
+    return self.Storages[id]:GetSumCapacity()
+end
+
+---获取仓库扩容次数
+---@param id StorageID 仓库类型
+---@return number 仓库扩容次数
+function StorageManager:GetStorageCapacityTimes(id)
+    return self.Storages[id]:GetSumCapacityTimer()
+end
+
+---检测仓库容量
+function StorageManager:CheckSize(id, num)
+    return self.Storages[id]:CheckSize(num)
+end
+
+---仓库扩容次数增加
+---@param id StorageID 仓库类型
+---@param num number 扩容次数
+function StorageManager:AddCapacityTimes(id, num)
+    num = num or 1
+    self.Storages[id]:AddCapacityTimes(num)
+end
+
+---获取指定类型的仓库
+---@param type StorageID 仓库类型
+---@return table<number, BaseItemData> 仓库数据
+function StorageManager:GetDataStorageByID(id)
+    local datas = {}
+    if not _G.IsNil(self.Storages) and self.Storages[id] ~= nil then
+        datas = self.Storages[id]
+    end
+    return datas
+end
+
+---获取指定类型的仓库数据
+---@param type StorageID 仓库类型
+---@return table<number, BaseItemData> 仓库数据
+function StorageManager:GetDataByID(id, ...)
+    local datas = {}
+    if not _G.IsNil(self.Storages) and self.Storages[id] ~= nil then
+        datas = self.Storages[id]:GetAllItems(...)
+    end
+    return datas
+end
+
+---根据仓库ID 获取仓库所有道具id列表
+---@param type StorageID 仓库类型
+---@return table 道具ID列表
+function StorageManager:GetIdsByStorageID(id)
+    return self.Storages[id] and self.Storages[id]:GetAllIds() or nil
+end
+
+---@param sid number 道具sid
+---@return BaseItemData 物品数据(可能为nil)
+function StorageManager:GetItemDataByIDEx(sid)
+    local _, propType = StorageManager:CheckSidType(sid)
+    if propType == nil then
+        return nil
+    end
+    return self:GetItemDataByID(propType, sid)
+end
+
+---获取指定物品数据
+---@param type StorageID 仓库类型
+---@param sidOrUid number|string 模板Sid 或 唯一Uid
+---@param ignoreWarning? boolean 是否忽略打印信息
+---@return BaseItemData 物品数据(可能为nil)
+function StorageManager:GetItemDataByID(id, sidOrUid, ignoreWarning)
+    if not id or not sidOrUid or sidOrUid <= 0 then
+        return nil
+    end
+    local storage = self.Storages[id]
+    if not storage then
+        if _G.AppSetting.DEBUG and not ignoreWarning then
+            -- _G.LogError("未找到仓库 类型id=" .. id, "StorageManager:GetItemDataByID")
+        end
+        return nil
+    end
+    local data = storage:GetItemByKey(sidOrUid)
+    if not data then
+        if _G.AppSetting.DEBUG and not ignoreWarning then
+            -- _G.LogWarning("仓库 类型id=" .. id .. ",未找到物品 sidOrUid=" .. sidOrUid, "StorageManager:GetItemDataByID")
+        end
+    end
+    return data
+end
+
+---获取指定物品数量
+---@param id StorageID 仓库类型
+---@param sidOrUid number|string 模板Sid 或 唯一Uid
+---@return number 物品数量
+function StorageManager:GetItemCountByID(id, sidOrUid)
+    local item = self:GetDataByID(id)[sidOrUid]
+    if item == nil then
+        return 0
+    end
+    return item.count
+end
+
+---获取指定活动代币数量
+---@param activityID number 活动类型
+---@param subType number 活动子类型
+---@param sidOrUid number|string 模板Sid 或 唯一Uid
+---@return number 物品数量
+function StorageManager:GetActivityItemCountByID(activityID, subType, sidOrUid)
+    if _G.table.ContainsValue(haveCoinParseFuncActivity, activityID) then
+        -- 活动内代币
+        local act = require("ActivitySynManager"):GetInstance():GetChildAcitivity(activityID, subType)
+        if act and act:GetActivityTypeCls().GetCoin then
+            return act:GetActivityTypeCls():GetCoin(sidOrUid)
+        end
+    end
+    return 0
+end
+
+---获取卡牌、装备sid
+---@param StorageID number 仓库ID
+---@param sidOrUid number 物品sid或uid
+---@return BaseItemData[] 数据对象组
+function StorageManager:GetDatasBySid(StorageID, sid)
+    local datas = {}
+    if not _G.IsNil(self.Storages) and self.Storages[StorageID] ~= nil then
+        local allItems = self.Storages[StorageID]:GetAllItems()
+        for _, v in pairs(allItems) do
+            if v.sid == sid then
+                datas[v.uid] = v
+            end
+        end
+    end
+    return datas
+end
+
+---获取卡牌、装备uid
+---@param StorageID number 仓库ID
+---@param sidOrUid number 物品uid
+---@return table 数据对象组
+function StorageManager:GetDatasByUid(StorageID, uid)
+    local datas = {}
+    if not _G.IsNil(self.Storages) and self.Storages[StorageID] ~= nil then
+        local allItems = self.Storages[StorageID]:GetAllItems()
+        for _, v in pairs(allItems) do
+            if v.uid == uid then
+                datas = v
+                break
+            end
+        end
+    end
+    return datas
+end
+
+---添加临时 卡牌
+---@param StorageID number 仓库ID
+---@param sidOrUid number 物品sid或uid
+---@return table 数据对象组
+function StorageManager:AddDatasByData(StorageID, data)
+    if not _G.IsNil(self.Storages) and self.Storages[StorageID] ~= nil then
+        data.isTemp = true
+        local _, card = self.Storages[StorageID]:AddTempItemByData(data)
+        card.isTemp = true
+        card:OnInitMutuallyData()
+    end
+end
+
+---移除临时 卡牌
+---@param StorageID number 仓库ID
+---@param sidOrUid number 物品sid或uid
+---@return table 数据对象组
+function StorageManager:RemoveDatasBySid(StorageID, id)
+    if not _G.IsNil(self.Storages) and self.Storages[StorageID] ~= nil then
+        self.Storages[StorageID]:RemoveItem(id)
+    end
+end
+
+---获取是否拥有装备
+---@param StorageID StorageID
+function StorageManager:IsHasEquipment(StorageID, sid)
+    local proplist = self:GetDatasBySid(StorageID, sid)
+    local isHas = false
+    for i, v in pairs(proplist) do
+        isHas = true
+        break
+    end
+    return isHas
+end
+
+-- endregion
+
+-- region 卡牌仓库
+---刷新所有卡牌的战斗力
+---@param func function
+function StorageManager:UpdateCardProp(func)
+    local cards = self:GetDataByID(_G.StorageID.Card)
+    for _, card in pairs(cards) do
+        if func then
+            if func(card) then
+                card:CalcNowSumProp()
+            end
+        else
+            card:CalcNowSumProp()
+        end
+    end
+end
+
+-- region 卡牌仓库
+---超过一定数量后分帧刷新所有卡牌的战斗力（已优化过，如果属性和战斗力计算开销依然过大，可以把分帧数量调小触发分帧）
+---@param force boolean 强制分帧
+function StorageManager:DelayUpdateAllCardProp(attrFunType, force)
+    local cards = self:GetDataByID(_G.StorageID.Card)
+    if force or _G.table.count(cards) >= 4000 then
+        if self.Duacp then
+            _G.coroutine.stopwaiting(self.Duacp)
+            self.Duacp = nil
+        end
+        local index = 0
+        self.Duacp = _G.coroutine.start(function()
+            for _, card in pairs(cards) do
+                card:CalcNowSumProp(attrFunType)
+                index = index + 1
+                if index > 20 then
+                    index = 0
+                    _G.coroutine.yield()
+                end
+            end
+            _G.coroutine.yield()
+            _G.Events:GetInstance():Broadcast(_G.GlobalEvents.DelayUpdateAllCardProp)
+            _G.coroutine.stopwaiting(self.Duacp)
+            self.Duacp = nil
+        end)
+    else
+        for _, card in pairs(cards) do
+            card:CalcNowSumProp(attrFunType)
+        end
+        _G.Events:GetInstance():Broadcast(_G.GlobalEvents.DelayUpdateAllCardProp)
+    end
+end
+
+-- region 卡牌仓库
+---刷新所有卡牌的战斗力根据职业
+---@param func function
+function StorageManager:UpdateCardPropByProfessional(prof, attrFunType)
+    local cards = self:GetDataByID(_G.StorageID.Card)
+    for _, card in pairs(cards) do
+        if card.cfg.Professional == prof then
+            card:CalcNowSumProp(attrFunType)
+        end
+    end
+end
+
+---@field sid number
+---@field lv number
+---@class params_CheckCardLvCount 检测背包 拥有指定等级卡牌的数量
+---检测背包 拥有指定等级卡牌的数量
+------@param data params_CheckCardLvCount
+function StorageManager:CheckCardLvCount(data, num)
+    local lv = data.lv
+    local sid = data.sid
+    local count = 0
+    if lv or sid then
+        ---@param card CardData
+        local func = function(k, card)
+            if sid and sid ~= card.sid then
+                return false
+            end
+            return card.lv >= lv
+        end
+        local tb = self.Storages[_G.StorageID.Card].list
+        for k, v in pairs(tb) do
+            if func(k, v) then
+                count = count + 1
+                if num ~= nil and count >= num then
+                    break
+                end
+            end
+        end
+    end
+    if num ~= nil then
+        return count >= num
+    else
+        return count
+    end
+end
+
+---@field sid number
+---@field lv number
+---@class params_CheckCardLvCount 检测背包 拥有指定等级卡牌的数量
+---检测背包 拥有指定等级卡牌的数量
+------@param data params_CheckCardLvCount
+function StorageManager:CheckCardSidStar(sid)
+    local data = self:GetMaxStarCardBySid(sid)
+    if data then
+        return data.star
+    else
+        return 0
+    end
+end
+
+---获取能上阵的卡片数量(相同sid算一个)
+function StorageManager:CheckCanEmbattleCardCount()
+    local sids = {}
+    local tb = self.Storages[_G.StorageID.Card].list
+    for _, v in pairs(tb) do
+        if sids[v.sid] == nil then
+            sids[v.sid] = true
+        end
+    end
+    return table.count(sids)
+end
+
+---@field star number
+---@field num number 卡牌指定数量
+---检测背包 拥有指定等级卡牌的数量
+function StorageManager:CheckCardStarCount(star, num)
+    ---@type CardStorage
+    local tb = self.Storages[_G.StorageID.Card]
+    local count = 0
+    for k, v in pairs(tb.starTable) do
+        if k >= star then
+            count = count + tb:GetCardStarCount(k)
+            if num and count >= num then
+                count = num
+                break
+            end
+        end
+    end
+
+    return count
+end
+
+---更新卡牌星级数量
+---@param s_star number 卡牌起始星级
+---@param e_star number 卡牌更改后的等级
+function StorageManager:UpdateCardStarCount(s_star, e_star)
+    local cardStorage = self.Storages[_G.StorageID.Card]
+    cardStorage:UpdateStarCount(s_star, e_star)
+end
+
+---获取排序后CarDataList<角色 卡牌背包>  lv-star-grade-sid-uid
+---@param includeDemo boolean 是否包含试玩卡
+function StorageManager:GetCardDataSortList(includeDemo)
+    local items = self:GetDataByID(_G.StorageID.Card)
+    items = table.toArray(items)
+    if includeDemo then
+        local demoData = require("DemoModel"):GetInstance():GetAllCards()
+        for _, v in pairs(demoData) do
+            _G.table.insert(items, v)
+        end
+    end
+    ---@param item CardData
+    SortList(items, function(item)
+        ---self.sortEnum  取排序字段
+        local sort1 = item.lv or 0
+        local sort2 = item.star or 0
+        local sort3 = item.Grade or 0
+        local sort4 = item.sid
+        local sort5 = item.uid
+        return sort1, sort2, sort3, sort4, sort5
+    end)
+    return items
+end
+
+---获取排序后CarDataList<角色 卡牌背包>
+function StorageManager:GetCardDataSortByStar()
+    local items = self:GetDataByID(_G.StorageID.Card)
+    items = table.toArray(items)
+    ---@param item CardData
+    SortList(items, function(item)
+        ---self.sortEnum  取排序字段
+        local sort1 = item.star or 0
+        return sort1
+    end)
+    return items
+end
+
+---获取根据符文槽位等级排序后CarDataList<角色 卡牌背包>(同样卡筛选战力最高一张)
+function StorageManager:GetCardDataSortByTotalDecorationLv(order)
+    local T = self:GetMaxPowerCards()
+    T = table.toArray(T)
+    local items = {}
+    if order then
+        for k, v in ipairs(T) do
+            if v.cfg.Order >= order then
+                table.insert(items, v)
+            end
+        end
+    else
+        items = T
+    end
+    ---@param item CardData
+    for k, v in ipairs(items) do
+        v.totalDecorationLv = v:GetTotalDecorationLv()
+    end
+    table.sort(items, function(a, b)
+        local totalDecorationLvA = a.totalDecorationLv
+        local totalDecorationLvB = b.totalDecorationLv
+        local decorationLvMaxA = totalDecorationLvA >= 400 and 1 or 0
+        local decorationLvMaxB = totalDecorationLvB >= 400 and 1 or 0
+        if decorationLvMaxA ~= decorationLvMaxB then
+            return decorationLvMaxA < decorationLvMaxB
+        elseif totalDecorationLvA ~= totalDecorationLvB then
+            return totalDecorationLvA > totalDecorationLvB
+        elseif a.power ~= b.power then
+            return a.power > b.power
+        elseif a.star ~= b.star then
+            return a.star > b.star
+        else
+            return a.sid < b.sid
+        end
+    end)
+    return items
+end
+
+function StorageManager:GetCardDataSortByTotalCarvingLv(order)
+    local T = self:GetMaxPowerCards()
+    T = table.toArray(T)
+    local items = {}
+    if order then
+        for k, v in ipairs(T) do
+            if v.cfg.Order >= order then
+                table.insert(items, v)
+            end
+        end
+    else
+        items = T
+    end
+    ---@param item CardData
+    for k, v in ipairs(items) do
+        v.totalCarvingLv = v:GetTotalCarvingLv()
+    end
+    table.sort(items, function(a, b)
+        local totalCarvingLvA = a.totalCarvingLv
+        local totalCarvingLvB = b.totalCarvingLv
+        local decorationLvMaxA = totalCarvingLvA >= 400 and 1 or 0
+        local decorationLvMaxB = totalCarvingLvB >= 400 and 1 or 0
+        if decorationLvMaxA ~= decorationLvMaxB then
+            return decorationLvMaxA < decorationLvMaxB
+        elseif totalCarvingLvA ~= totalCarvingLvB then
+            return totalCarvingLvA > totalCarvingLvB
+        elseif a.power ~= b.power then
+            return a.power > b.power
+        elseif a.star ~= b.star then
+            return a.star > b.star
+        else
+            return a.sid < b.sid
+        end
+    end)
+    return items
+end
+
+---获取所有卡中的养成最高的卡(同样卡筛选一张)
+function StorageManager:GetStrongestCards()
+    local CardList = self.Storages[_G.StorageID.Card]:GetAllCardSids()
+    local CardDatas = {}
+    for _, v in pairs(CardList) do
+        table.insert(CardDatas, self:GetStrongestCardBySid(v))
+    end
+    return CardDatas
+end
+
+---获取所有战力最高的卡
+---@return table 卡牌数组
+function StorageManager:GetMaxPowerCards()
+    local CardList = self.Storages[_G.StorageID.Card]:GetAllCardSids()
+    local CardDatas = {}
+    local cardData
+    for _, v in pairs(CardList) do
+        cardData = self:GetMaxPowerCardBySid(v)
+        CardDatas[v] = cardData
+    end
+    return CardDatas
+end
+
+---根据职业获取所有战力最高的卡
+---@param prof enum 职业类型
+---@return table 卡牌数组
+function StorageManager:GetMaxPowerCardByProf(prof)
+    local CardList = self.Storages[_G.StorageID.Card]:GetAllCardSids()
+    local CardDatas = {}
+    local cardData
+    for _, v in pairs(CardList) do
+        if _G.ConfigManager.card_cfg[v].Professional == prof then
+            cardData = self:GetMaxPowerCardBySid(v)
+            CardDatas[v] = cardData
+        end
+    end
+    return CardDatas
+end
+
+---根据{五行,职业,卡牌类型}获取所有战力最高的卡
+---@param target table {五行,职业,卡牌类型}
+---@return table 卡牌数组
+function StorageManager:GetMaxPowerCardByTarget(target)
+    local CardList = self.Storages[_G.StorageID.Card]:GetAllCardSids()
+    local CardDatas = {}
+    local cardData
+    for _, v in pairs(CardList) do
+        if (_G.ConfigManager.card_cfg[v].Elements == target[1] or target[1] == 0) and
+            (_G.ConfigManager.card_cfg[v].Professional == target[2] or target[2] == 0) and
+            (_G.ConfigManager.card_cfg[v].UnitType == target[3] or target[3] == 0) then
+            cardData = self:GetMaxPowerCardBySid(v)
+            CardDatas[v] = cardData
+        end
+    end
+    return CardDatas
+end
+
+---根据sid获取该卡牌战力最高的那张
+function StorageManager:GetMaxPowerCardBySid(sid)
+    local Card
+    local CardList = self.Storages[_G.StorageID.Card]:GetCardsBySid(sid)
+    for _, v in pairs(CardList) do
+        if Card == nil or Card.power < v.power then
+            Card = v
+        end
+    end
+    return Card
+end
+
+---根据职业获取所有星级最高的卡
+---@param prof enum 职业类型
+---@return table 卡牌数组
+function StorageManager:GetMaxStarCardByProf(prof)
+    local CardList = self.Storages[_G.StorageID.Card]:GetAllCardSids()
+    local CardDatas = {}
+    local cardData
+    for _, v in pairs(CardList) do
+        if _G.ConfigManager.card_cfg[v].Professional == prof then
+            cardData = self:GetMaxStarCardBySid(v)
+            CardDatas[v] = cardData
+        end
+    end
+    return CardDatas
+end
+
+---根据sid获取该卡牌星级最高的那张
+function StorageManager:GetMaxStarCardBySid(sid)
+    local Card
+    local CardList = self.Storages[_G.StorageID.Card]:GetCardsBySid(sid)
+    for _, v in pairs(CardList) do
+        if Card == nil or Card.star < v.star then
+            Card = v
+        end
+    end
+    return Card
+end
+
+---根据sid获取该卡牌魂链等级最高的那张
+function StorageManager:GetMaxHunLianCardBySid(sid)
+    local Card
+    local CardList = self.Storages[_G.StorageID.Card]:GetCardsBySid(sid)
+    for _, v in pairs(CardList) do
+        if Card == nil or Card.soulLink_lv < v.soulLink_lv then
+            Card = v
+        end
+    end
+    return Card
+end
+
+---根据sid获取该卡牌 天赋等级最高的那张
+function StorageManager:GetMaxTianFuCardBySid(sid)
+    local Card
+    local CardList = self.Storages[_G.StorageID.Card]:GetCardsBySid(sid)
+    for _, v in pairs(CardList) do
+        if Card == nil or _G.table.count(Card.open_inborn) < _G.table.count(v.open_inborn) then
+            Card = v
+        end
+    end
+    return Card
+end
+
+---根据sid获取该卡牌(星级》觉醒》是否拥有神器》装备穿戴数量)
+function StorageManager:GetStrongestCardBySid(sid)
+    local Card
+    local CardList = self.Storages[_G.StorageID.Card]:GetCardsBySid(sid)
+    for _, v in pairs(CardList) do
+        if Card == nil then
+            Card = v
+        elseif Card.star < v.star then
+            Card = v
+        elseif Card.star == v.star and Card.awaken < v.awaken then
+            Card = v
+        elseif Card.star == v.star and Card.awaken == v.awaken then
+            Card = v
+        elseif Card.star == v.star and Card.awaken == v.awaken and Card:GetEquipBarNumber() < v:GetEquipBarNumber() then
+            Card = v
+        elseif Card.star == v.star and Card.awaken == v.awaken and Card:GetEquipBarNumber() == v:GetEquipBarNumber() and
+            Card.uid > v.uid then
+            Card = v
+        end
+    end
+    return Card
+end
+
+---根据sid,星级获取该卡牌某星级 等级最低的多张
+function StorageManager:GetWeakestCardsBySidStar(sid, star, num, uidT)
+    local tempCards = {}
+    local cards = {}
+    local cardList = self.Storages[_G.StorageID.Card]:GetCardsBySid(sid)
+    for _, v in pairs(cardList) do
+        local bol = true
+        if uidT then
+            for i = 1, #uidT do
+                if v.uid == uidT[i] then
+                    bol = false
+                end
+            end
+        end
+        if bol then
+            if v.star == star then
+                _G.table.insert(tempCards, v)
+            end
+        end
+    end
+    _G.SortList(tempCards, function(a)
+        return -a.lv
+    end)
+    local CardResonanceModel = require("CardResonanceModel"):GetInstance()
+    for i = 1, #tempCards do
+        if #cards < num then
+            local ca = tempCards[i]
+            if ca and not CardResonanceModel:CheckCardIsInPos(ca.uid) then
+                _G.table.insert(cards, ca)
+            end
+        else
+            break
+        end
+    end
+    return cards
+end
+
+---删除卡牌
+---@param uid uid uid
+function StorageManager:DelCard(uid)
+    local Storages = self.Storages[_G.StorageID.Card]
+    Storages:ChangeCount(uid, 0, true)
+    _G.Events:GetInstance():Broadcast(_G.eCard.CardDelCard, uid)
+end
+
+-- endregion
+
+-- region 装备仓库
+
+---消耗装备
+---@param uid uid uid
+function StorageManager:ConsumeEquipment(uid, num)
+    local Storages = self.Storages[_G.StorageID.Equipment]
+    Storages:ChangeCount(uid, -num)
+end
+
+---获取满足条件的装备列表
+---@param part number _G.EquipmentPart
+---@param prof number 配置表Professional
+---@param lv number 需求lv
+---@return table
+function StorageManager:GetEquipListByParam(part, prof, lv)
+    local list = {}
+    local tempList = self.Storages[_G.StorageID.Equipment].list
+    for i, v in pairs(tempList) do
+        if not part or part == v.cfg.parts then
+            if not prof or prof == v.cfg.professional then
+                table.insert(list, v)
+            end
+        end
+    end
+    return list
+end
+
+-- endregion
+
+---获取卡牌、装备sid(引导专用)
+---@param StorageID number 仓库ID
+------@param sidOrUid number 物品sid或uid
+function StorageManager:GetDatasBySidGuide(StorageID, sid)
+    local datas = {}
+    if StorageID == _G.StorageID.Card then
+        datas = self.Storages[StorageID]:GetCardsBySid(sid)
+    elseif StorageID == _G.StorageID.Equipment then
+        datas = self.Storages[StorageID]:GetEquipmentsBySid(sid)
+    end
+    return datas
+end
+
+--- 检测脱下装备是否仓库满了 (判断脱下的装备是否是仓库里的装备)
+---@param num number 要脱装备数量
+---@return boolean true 满了 不能托
+function StorageManager:CheckUnfixEquipmentIsFull(num)
+    local nowCount = 0
+    ---@type CardData
+    local EquipList = self:GetDataByID(_G.StorageID.Equipment)
+    ---@param v  EquipmentItem
+    for _, v in pairs(EquipList) do
+        if v:GetEquipCardUid() == 0 then
+            nowCount = nowCount + 1
+        end
+    end
+    --- 容量    -   未装备数量  <   num
+    return self.Storages[_G.StorageID.Equipment]:GetSumCapacity() - nowCount < num
+end
+
+---修改物品数据后调用
+---@param storageID StorageID 仓库ID
+---@param uid number 物品uid
+function StorageManager:OnChangeItemData(storageID, uid, type)
+    local storage = self.Storages[storageID]
+    if storage then
+        storage:ItemDataChanged(uid, type)
+    end
+end
+
+-- endregion
+
+-- region 奖励相关
+
+-- region 解析各类型奖励
+---解析卡片奖励
+---@param data award.AItem
+function StorageManager:ParseCardAward(data)
+    ---@type CardStorage
+    local Storages = self.Storages[_G.StorageID.Card]
+    ---@type prop.CardProp
+    local card = Storages:ParseSimpleAward(data)
+    self:SaveAwardData(card, 1, _G.StorageID.Card)
+    ---第一次解锁的角色 获取一次成长星辉数量
+    local firstUnlock = require "IllustrationModel":GetInstance():HunjiangJieSuo(card.sid)
+    if not firstUnlock then
+        require "PlayerTreeModel":GetInstance():GetGrow()
+    end
+    ---图鉴解锁
+    if _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.ChapterRewardsView.Name) then
+        require "IllustrationModel":GetInstance():JieSuoHunJiang(card.sid)
+    elseif _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.DrawView.Name) then
+        require "IllustrationModel":GetInstance():JieSuoHunJiang(card.sid)
+    else
+        require "IllustrationModel":GetInstance():JieSuoHunJiangNew(card.sid)
+    end
+    -- region 刷新头像，形象 红点 在 （图鉴解锁后）
+    ---头像
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "portrait" .. card.sid
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+    else
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, 1)
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Portrait.id)
+    end
+    ---形象
+    local key1 = tostring(_G.PlayerModel:GetInstance().role_uid) .. "playerRole" .. card.sid
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key1) then
+    else
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key1, 1)
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PlayerRole.id, card.sid)
+end
+
+---解析饰品奖励
+---@param data award.AItem
+function StorageManager:ParseDecorationAward(data)
+    ---@type CardStorage
+    local Storages = self.Storages[_G.StorageID.Decoration]
+    ---@type prop.CardProp
+    local Decoration = Storages:ParseSimpleAward(data)
+    self:SaveAwardData(Decoration, 1, _G.StorageID.Decoration)
+    require("RuneIllustrationModel"):GetInstance():AddIllustrate(Decoration.sid)
+    require("RuneModel"):GetInstance():GetNewRune(Decoration)
+end
+
+---解析圣辉奖励
+---@param data award.AItem
+function StorageManager:ParseCavringAward(data)
+    ---@type CardStorage
+    local Storages = self.Storages[_G.StorageID.Carving]
+    ---@type prop.CardProp
+    local Carving = Storages:ParseSimpleAward(data)
+    self:SaveAwardData(Carving, 1, _G.StorageID.Carving)
+    require("CarvingIllustrationModel"):GetInstance():AddIllustrate(Carving.sid)
+    require("CarvingModel"):GetInstance():GetNewCarving(Carving)
+end
+
+---@field sid number sid
+---@field fixNum number 修改数量
+---@field factNum number 剩余数量/进度宝箱这个值用来作为道具获得时间
+---@field args BasePropDataArgs 额外参数
+---@class PropAwardSimple 单条道具奖励
+---解析道具奖励
+---@param data award.AItem
+function StorageManager:ParseRemainsAward(data)
+    ---@type PropStorage Storages
+    local Storages = self.Storages[_G.StorageID.Remains]
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+    ---@type PropAwardSimple
+    local args = {}
+    args.sid = data[1]
+    args.fixNum = data[2]
+    args.factNum = data[3]
+    Storages:ParseSimpleAward(args)
+    self:SaveAwardData(data[1], data[2], _G.StorageID.Remains)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryRelicStarUp.id)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.LegendaryRelicLevelUp.id)
+end
+
+---解析虚拟货币资源奖励
+---@param data award.AItem
+function StorageManager:ParseResAward(data)
+    ---@type CardStorage
+    local Storages = self.Storages[_G.StorageID.ResProp]
+    ---@type prop.CardProp
+    local args = {}
+    args.sid = data[1]
+    args.fixNum = data[2]
+    args.factNum = data[3] or data[2]
+    Storages:ParseSimpleAward(args)
+    self:SaveAwardData(args.sid, args.fixNum, _G.StorageID.ResProp)
+
+    ---刷新下共鸣神石的 红点 2 是默认解
+
+    ---刷新菩提馈赠红点活跃度
+    local bodIsOpen = require"BodhiPresentModel":GetInstance().IsOpenTime()
+    if bodIsOpen then
+        require "BodhiPresentModel":GetInstance():BodhiAwardsInfo(
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.WeekendTurntableButton.id))
+    end
+    ---刷新幸运转盘红点
+    require("SeasonTurntableModel"):GetInstance():RefreshRedPoint()
+end
+
+---@field sid number sid
+---@field fixNum number 修改数量
+---@field factNum number 剩余数量/进度宝箱这个值用来作为道具获得时间
+---@field args BasePropDataArgs 额外参数
+---@class PropAwardSimple 单条道具奖励
+---解析道具奖励
+---@param data award.AItem
+function StorageManager:ParsePropAward(data)
+    ---@type PropStorage Storages
+    local Storages = self.Storages[_G.StorageID.Prop]
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+    ---@type PropAwardSimple
+    local args = {}
+    args.sid = data[1]
+    args.fixNum = data[2]
+    ---@type item_cfg
+    local item_cfg = _G.ConfigManager.item_cfg[args.sid]
+    if item_cfg.UseType == _G.ItemUseType.ProgressChest then
+        ---如果是进度宝箱  设置数量为0 (进度宝箱 数量就代表领取进度索引1->)
+        args.factNum = 0
+        ---@type ProgressChestArgs
+        local progressChestArgs = {}
+        progressChestArgs.time = data[3]
+        args.args = progressChestArgs
+    elseif item_cfg.UseType == _G.ItemUseType.VoucherDiscount then
+        args.factNum = 1
+        args.args = {
+            time = data[3]
+        }
+    else
+        args.factNum = data[3]
+    end
+    Storages:ParseSimpleAward(args)
+    self:SaveAwardData(args.sid, args.fixNum, _G.StorageID.Prop)
+    -- 对卡牌回退道具特殊处理
+    local resumeCfg = _G.ConfigManager.discrete_cfg[103712][1]
+    if resumeCfg[1] == data[1] then
+        require("RedPointManager"):GetInstance()
+            :RefreshNode(_G.ConfigManager.redpoint_cfg.BackpackItem.id, resumeCfg[1])
+    end
+end
+
+---解析材料奖励
+---@param data award.AItem
+function StorageManager:ParseMaterialAward(data)
+    ---@type MaterialStorage Storages
+    local Storages = self.Storages[_G.StorageID.Material]
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+    ---@type PropAwardSimple
+    local args = {}
+    args.sid = data[1]
+    args.fixNum = data[2]
+    args.factNum = data[3]
+    Storages:ParseSimpleAward(args)
+    self:SaveAwardData(args.sid, args.fixNum, _G.StorageID.Material)
+    ---刷新下共鸣神石的 红点 2 是默认解锁
+end
+
+---解析装备奖励
+---@param data award.AItem
+function StorageManager:ParseEquipmentAward(data)
+    ---@type EquipmentStorage Storages
+    local Storages = self.Storages[_G.StorageID.Equipment]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    ---@type PropAwardSimple
+    local Equip = Storages:ParseSimpleAward(data)
+
+    self:SaveAwardData(Equip, 1, _G.StorageID.Equipment)
+end
+
+---解析宝石奖励
+---@param data award.AItem
+function StorageManager:ParseGemstoneAward(data)
+    ---@type GemstoneStorage Storages
+    local Storages = self.Storages[_G.StorageID.Gemstone]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    ---@type PropAwardSimple
+    local gem = Storages:ParseSimpleAward(data)
+
+    self:SaveAwardData(gem, 1, _G.StorageID.Gemstone)
+end
+
+---解析神器奖励
+---@param data award.i_award_item
+function StorageManager:ParseArtifactAward(data)
+    ---@type ArtifactStorage Storages
+    local Storages = self.Storages[_G.StorageID.Artifact]
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Artifact Storages is nil")
+        end
+        return
+    end
+    ---@type ArtifactData
+    local artifact = Storages:ParseSimpleAward(data)
+    self:SaveAwardData(artifact, artifact:GetCount(), _G.StorageID.Artifact)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifact.id)
+    require("RedPointManager"):GetInstance()
+        :RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.ArtifactUpgrade.id)
+    require "ArtifactIllustrationModel":GetInstance():GainArtifact(artifact.sid)
+    require "PowerToTheTopModel":GetInstance():GetArtifact(artifact.sid)
+    ---自动分解检测
+    local ArtifactAutoDecompose = _G.PlayerPrefsManager.GetTable(_G.PlayerPrefsKey.ArtifactAutoDecompose)
+    local keepBol = _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.ArtifactAutoDecomposeKeepBol, 1)
+    if not ArtifactAutoDecompose or _G.TableIsEmpty(ArtifactAutoDecompose) then
+        ArtifactAutoDecompose = {}
+    end
+    local grade = _G.StorageManager:GetInstance():GetItemGrade(data[1], data[2])
+    if ArtifactAutoDecompose[grade] then
+        if keepBol == 0 or require "ArtifactIllustrationModel":GetInstance():CheckArtifactUnlock(data[1]) then
+            self.artifactDecomposeList = self.artifactDecomposeList or {}
+            local haveBol
+            for k, v in pairs(self.artifactDecomposeList) do
+                if v.uid == data[2] then
+                    v.num = v.num + data[3]
+                    haveBol = true
+                end
+            end
+            if not haveBol then
+                self.artifactDecomposeList[#self.artifactDecomposeList + 1] = {
+                    uid = data[2],
+                    num = data[3]
+                }
+            end
+            if not self.artifactDecomposeTimer then
+                -- 延迟两秒统一分解
+                self.artifactDecomposeTimer = _G.TimerManager:GetInstance():GetTimer(2, self.AutoDecomposeArtifact,
+                    self, true)
+                self.artifactDecomposeTimer:Start()
+            end
+            return
+        end
+    end
+end
+
+---神器自动分解
+function StorageManager:AutoDecomposeArtifact()
+    if self.artifactDecomposeTimer ~= nil then
+        self.artifactDecomposeTimer:Stop()
+        self.artifactDecomposeTimer = nil
+    end
+    local decList = self:GetDataByID(_G.StorageID.Artifact)
+    local selectList = {}
+    for k, v in pairs(self.artifactDecomposeList) do
+        if decList[v.uid] then
+            _G.table.insert(selectList, v)
+        end
+    end
+    if #selectList == 0 then
+        self.artifactDecomposeList = {}
+        return
+    end
+    local pbData = {
+        artifact_list = selectList
+    }
+    require "ArtifactNet":GetInstance():Decompose(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        for k, v in pairs(pbData.artifact_list) do
+            self.Storages[_G.StorageID.Artifact]:ChangeCount(v.uid, -v.num)
+        end
+        self.artifactDecomposeList = {}
+        self:ReceiveAwardData(msg)
+        local awardData = self:MergeAwardList(msg.award.item)
+        if msg.award then
+            _G.DelayDo(1, function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecomposeTipsView.Name,
+                    {{awardData[1][1], awardData[1][2]}})
+            end)
+        end
+    end)
+end
+
+---解析灵契奖励
+---@param data award.i_award_item
+function StorageManager:ParseSpiritualAward(data)
+    local Storages = self.Storages[_G.StorageID.Spiritual]
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Spiritual Storages is nil")
+        end
+        return
+    end
+    ---@type SpiritualData
+    local Spiritual = Storages:ParseSimpleAward(data)
+    self:SaveAwardData(Spiritual, Spiritual:GetCount(), _G.StorageID.Spiritual)
+    require "SpiritualIllustrationModel":GetInstance():GainSpiritual(Spiritual.sid)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SpiritualPage.id)
+    ---自动分解检测
+    local SpiritualAutoDecompose = _G.PlayerPrefsManager.GetTable(_G.PlayerPrefsKey.SpiritualAutoDecompose)
+    local keepBol = _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.SpiritualAutoDecomposeKeepBol, 1)
+    if not SpiritualAutoDecompose or _G.TableIsEmpty(SpiritualAutoDecompose) then
+        SpiritualAutoDecompose = {}
+    end
+    local grade = _G.StorageManager:GetInstance():GetItemGrade(data[1], data[2])
+    if SpiritualAutoDecompose[grade] then
+        if keepBol == 0 or require "SpiritualIllustrationModel":GetInstance():CheckSpiritualUnlock(data[1]) then
+            self.spiritualDecomposeList = self.spiritualDecomposeList or {}
+            local haveBol
+            for k, v in pairs(self.spiritualDecomposeList) do
+                if v.uid == data[2] then
+                    v.num = v.num + data[3]
+                    haveBol = true
+                end
+            end
+            if not haveBol then
+                self.spiritualDecomposeList[#self.spiritualDecomposeList + 1] = {
+                    uid = data[2],
+                    num = data[3]
+                }
+            end
+            if not self.spiritualDecomposeTimer then
+                -- 延迟两秒统一分解
+                self.spiritualDecomposeTimer = _G.TimerManager:GetInstance():GetTimer(2, self.AutoDecomposeSpiritual,
+                    self, true)
+                self.spiritualDecomposeTimer:Start()
+            end
+            return
+        end
+    end
+end
+
+---灵契自动分解
+function StorageManager:AutoDecomposeSpiritual()
+    if self.spiritualDecomposeTimer ~= nil then
+        self.spiritualDecomposeTimer:Stop()
+        self.spiritualDecomposeTimer = nil
+    end
+    local decList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual)
+    local selectList = {}
+    for k, v in pairs(self.spiritualDecomposeList) do
+        if decList[v.uid] then
+            _G.table.insert(selectList, v)
+        end
+    end
+    if #selectList == 0 then
+        self.spiritualDecomposeList = {}
+        return
+    end
+    local pbData = {
+        uids = selectList
+    }
+    require "SpiritualNet":GetInstance():Decompose(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        for _, v in pairs(pbData.uids) do
+            self:ConsumeSpiritual(v.uid, v.num)
+        end
+        self.spiritualDecomposeList = {}
+        self:ReceiveAwardData(msg)
+        local awardData = self:MergeAwardList(msg.award.item)
+        if msg.award then
+            _G.DelayDo(1, function()
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DecomposeTipsView.Name,
+                    {{awardData[1][1], awardData[1][2]}})
+            end)
+        end
+    end)
+end
+
+---解析碎片奖励
+---@param data award.i_award_item
+function StorageManager:ParseDebrisAward(data)
+    local Storages = self.Storages[_G.StorageID.Debris]
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Debris Storages is nil")
+        end
+        return
+    end
+    ---@type DebrisData
+    local args = {}
+    args.sid = data[1]
+    args.fixNum = data[2]
+    args.factNum = data[3]
+    Storages:ParseSimpleAward(args)
+    self:SaveAwardData(args.sid, args.fixNum, _G.StorageID.Debris)
+end
+
+---解析不进入背包的物品
+---@param data award.i_award_item
+function StorageManager:ParseRelicTeamBuffAward(data)
+    local Sid = data[1]
+    local args = {}
+    while (Sid > 1000) do
+        Sid = Sid / 10
+    end
+    Sid = _G.math.floor(Sid)
+    if Sid == _G.ItemSidJudgeSection.RelicTeamBuff then
+        ---解析古神遗迹buff奖励
+        ---@type DebrisData
+        args.sid = data[1]
+        args.fixNum = data[2]
+        args.factNum = data[3]
+        require "RelicTeamModel":GetInstance():AddBuff(args)
+    elseif Sid == _G.ItemSidJudgeSection.HeroicIcon then
+        ---解析英雄圣像奖励
+        ---@type DebrisData
+        args.sid = data[1]
+        args.fixNum = data[2]
+        args.factNum = data[3]
+        require "HeroicIconModel":GetInstance():AddHeroicIcon(data[1])
+    elseif Sid == _G.ItemSidJudgeSection.RingGod then
+        _G.PlayerModel:GetInstance():AddUnlockGodHalo(data[1])
+    end
+    self:SaveAwardData(args.sid, args.fixNum, _G.StorageID.RelicTeamBuff)
+end
+
+-- endregion
+
+---解析奖励
+---@param data award.Award 奖励数据
+function StorageManager:ReceiveAwardData(data)
+    if data ~= nil and data.award ~= nil then
+        self:ParseAward(data.award.item)
+    end
+    if data ~= nil and data.other_award ~= nil then
+        self:ParseAward(data.other_award.item)
+    end
+end
+
+---卸下装备 重新入库
+---@param data EquipmentItem
+function StorageManager:AddItemByEquipment(data)
+    ---@type EquipmentStorage Storages
+    local Storages = self.Storages[_G.StorageID.Equipment]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    Storages:AddItemByEntity(data)
+end
+
+---神器初始化卡牌入库
+---@param data ArtifactData
+function StorageManager:AddItemByArtifactData(data)
+    ---@type ArtifactStorage Storages
+    local Storages = self.Storages[_G.StorageID.Artifact]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    Storages:AddItemByArtifactData(data)
+end
+
+---神器堆叠拆分入库
+---@param data ArtifactData
+---@param newUid number 新的uid
+---@param cardUid number 穿戴卡牌uid
+function StorageManager:AddEntityItemByArtifactData(data, newUid, cardUid)
+    ---@type ArtifactStorage Storages
+    local Storages = self.Storages[_G.StorageID.Artifact]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    return Storages:AddItemByEntity(data, newUid, cardUid)
+end
+
+---穿上独立神器，仓库变动
+---@param data ArtifactData
+function StorageManager:PutOnArtifact(data)
+    ---@type ArtifactStorage Storages
+    local Storages = self.Storages[_G.StorageID.Artifact]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    Storages:OnPutOnArtifact(data)
+end
+
+---脱下神器，仓库变动
+---@param data ArtifactData
+function StorageManager:TakeOffArtifact(data)
+    ---@type ArtifactStorage Storages
+    local Storages = self.Storages[_G.StorageID.Artifact]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    Storages:OnTakeOffArtifact(data)
+end
+
+---穿上灵契
+---@param data SpiritualData
+function StorageManager:PutOnSpiritual(data)
+    ---@type ArtifactStorage Storages
+    local Storages = self.Storages[_G.StorageID.Spiritual]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    Storages:OnPutOnSpiritual(data)
+end
+
+---灵契初始化卡牌入库
+---@param spiritual SpiritualData
+function StorageManager:AddItemBySpiritualData(spiritual)
+    ---@type SpiritualStorage Storages
+    local Storages = self.Storages[_G.StorageID.Spiritual]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    Storages:AddItemBySpiritualData(spiritual)
+end
+
+---一键脱下灵契
+---@param spiritualDatas SpiritualData[]
+function StorageManager:TakeOffMultiSpiritual(spiritualDatas)
+    if _G.table.isEmptyOrNil(spiritualDatas) then
+        return
+    end
+
+    for _, value in pairs(spiritualDatas) do
+        self:TakeOffSpiritual(value)
+    end
+end
+
+---脱下单个灵契
+---@param spiritualData SpiritualData
+function StorageManager:TakeOffSpiritual(spiritualData)
+    ---@type SpiritualStorage Storages
+    local Storages = self.Storages[_G.StorageID.Spiritual]
+
+    if not Storages then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("Prop Storages is nil")
+        end
+        return
+    end
+
+    Storages:OnTakeOffSpiritual(spiritualData)
+end
+
+---消耗灵契
+function StorageManager:ConsumeSpiritual(uid, num, spiritualData, fact)
+    local Storages = self.Storages[_G.StorageID.Spiritual]
+    Storages:ChangeCount(uid, -num, fact, spiritualData)
+end
+
+---整合奖励
+---@param data table 服务器下发的public.i_award
+---@return table 数组{{sid,count},{sid,count}
+function StorageManager:MergeAward(data)
+    local list = {}
+    local storageType, storageID
+    if data.award then
+        if data.award.item then
+            for _, v in pairs(data.award.item) do
+                storageType, storageID = self:CheckSidType(v.type[1])
+                if storageType == _G.StorageType.Card then
+                    table.insert(list, {v.type[1], 1, v.type[3]})
+                elseif storageType == _G.StorageType.Equipment then
+                    table.insert(list, {v.type[1], 1, v.type[4]})
+                else
+                    table.insert(list, {v.type[1], v.type[2]})
+                end
+            end
+        end
+        if data.award.overflow then
+            for _, v in pairs(data.award.overflow) do
+                storageType, storageID = self:CheckSidType(v.type[1])
+                if storageType == _G.StorageType.Card or storageType == _G.StorageType.Equipment then
+                    table.insert(list, {v.type[1], v.type[2], v.type[3]})
+                else
+                    table.insert(list, {v.type[1], v.type[2]})
+                end
+            end
+        end
+    end
+    return list
+end
+
+---整合奖励带额外奖励
+---@param data table 服务器下发的public.i_award
+---@param double boolean 是否在双倍期间
+---@return table 数组{{sid,count},{sid,count}
+function StorageManager:MergeExtraAward(data, double)
+    if not double then
+        return self:MergeAward(data), {}
+    end
+    local list = {}
+    local awards = {}
+    local extraAward = {}
+    local tmp
+    local storageType, storageID
+    if data.award then
+        if data.award.item then
+            for _, v in pairs(data.award.item) do
+                storageType, storageID = self:CheckSidType(v.type[1])
+                if storageType == _G.StorageType.Card then
+                    if _G.table.isEmptyOrNil(awards[v.type[1]]) then
+                        awards[v.type[1]] = {v.type[1], 1, v.type[3]}
+                    else
+                        extraAward[v.type[1]] = {v.type[1], 1, v.type[3]}
+                    end
+                elseif storageType == _G.StorageType.Equipment then
+                    if _G.table.isEmptyOrNil(awards[v.type[1]]) then
+                        awards[v.type[1]] = {v.type[1], 1, v.type[4]}
+                    else
+                        extraAward[v.type[1]] = {v.type[1], 1, v.type[4]}
+                    end
+                elseif storageType == _G.StorageType.Decoration then
+                    if _G.table.isEmptyOrNil(awards[v.type[1]]) then
+                        awards[v.type[1]] = {v.type[1], 1}
+                    else
+                        extraAward[v.type[1]] = {v.type[1], 1}
+                    end
+                elseif storageType == _G.StorageType.Carving then
+                    if _G.table.isEmptyOrNil(awards[v.type[1]]) then
+                        awards[v.type[1]] = {v.type[1], 1}
+                    else
+                        extraAward[v.type[1]] = {v.type[1], 1}
+                    end
+                else
+                    if _G.table.isEmptyOrNil(awards[v.type[1]]) then
+                        awards[v.type[1]] = {v.type[1], v.type[2]}
+                    else
+                        if awards[v.type[1]][2] >= v.type[2] then
+                            extraAward[v.type[1]] = {v.type[1], v.type[2]}
+                        else
+                            tmp = extraAward[v.type[1]]
+                            extraAward[v.type[1]] = awards[v.type[1]]
+                            awards[v.type[1]] = tmp
+                        end
+                    end
+                end
+            end
+        end
+        if data.award.overflow then
+            for _, v in pairs(data.award.overflow) do
+                storageType, storageID = self:CheckSidType(v.type[1])
+                if storageType == _G.StorageType.Card or storageType == _G.StorageType.Equipment then
+                    if _G.table.isEmptyOrNil(awards[v.type[1]]) then
+                        awards[v.type[1]] = {v.type[1], v.type[2], v.type[3]}
+                    else
+                        extraAward[v.type[1]] = {v.type[1], v.type[2], v.type[3]}
+                    end
+                else
+                    if _G.table.isEmptyOrNil(awards[v.type[1]]) then
+                        if (_G.ConfigManager.item_cfg[v.type[1]] or _G.ConfigManager.currency_type_cfg[v.type[1]]) and
+                            double then
+                            local count = math.ceil(v.type[2] / 2)
+                            awards[v.type[1]] = {v.type[1], count}
+                            if v.type[2] - count > 0 then
+                                extraAward[v.type[1]] = {v.type[1], v.type[2] - count}
+                            end
+                        else
+                            awards[v.type[1]] = {v.type[1], v.type[2]}
+                        end
+                    else
+                        if awards[v.type[1]][2] >= v.type[2] then
+                            extraAward[v.type[1]] = {v.type[1], v.type[2]}
+                        else
+                            tmp = extraAward[v.type[1]]
+                            extraAward[v.type[1]] = awards[v.type[1]]
+                            awards[v.type[1]] = tmp
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local Awards = {}
+    local ExtraAward = {}
+    for i, v in pairs(awards) do
+        table.insert(Awards, v)
+    end
+    if not _G.table.isEmptyOrNil(extraAward) then
+        for i, v in pairs(extraAward) do
+            table.insert(ExtraAward, v)
+        end
+    end
+    return Awards, ExtraAward
+end
+
+---合并重复的奖励
+---@param awardList table 传入奖励的内容
+function StorageManager:MergeAwardList(awardList)
+    local t = {}
+    local checkAward = {}
+    for i = 1, #awardList do
+        local itemType = awardList[i].type or awardList[i]
+        if itemType[1] ~= nil then
+            local type = _G.StorageManager:GetInstance():CheckSidType(itemType[1])
+            if type == _G.StorageType.Card or type == _G.StorageType.Equipment or type == _G.StorageType.Decoration or
+                type == _G.StorageType.Carving or type == _G.StorageType.Artifact or type == _G.StorageType.Spiritual then
+                table.insert(t, itemType)
+            else
+                if checkAward[itemType[1]] == nil then
+                    table.insert(t, itemType)
+                    checkAward[itemType[1]] = t[#t]
+                else
+                    if checkAward[itemType[1]][2] then
+                        checkAward[itemType[1]][2] = checkAward[itemType[1]][2] + itemType[2]
+                    elseif checkAward[itemType[1]][3] then
+                        checkAward[itemType[1]][3] = checkAward[itemType[1]][3] + itemType[3]
+                    end
+                end
+            end
+        end
+    end
+    return t
+end
+
+---记录单次解析奖励
+---@param item number|table
+---@param count number
+function StorageManager:SaveAwardData(item, count, type)
+    ---@type AwardSimple
+    local data = {}
+    data.Item = item
+    data.type = type
+    data.Count = count
+    table.insert(self.CurItemTable, data)
+end
+
+---获取最近一次奖励
+function StorageManager:GetAwardData()
+    return self.CurItemTable[#self.CurItemTable]
+end
+
+---查看是否有足够的物品
+function StorageManager:CheckItem(sid, num)
+    num = tonumber(num) or 1
+    if sid == nil or sid == 0 or num == nil then
+        return false
+    end
+    local _, storageId = self:CheckSidType(sid)
+    if self.Storages[storageId] == nil then
+        return false
+    end
+    return self.Storages[storageId]:GetItemCount(sid) >= num
+end
+
+---获取 资源数量
+function StorageManager:GetItemCountBySid(sid)
+    if sid == nil or sid == 0 then
+        return 0
+    end
+    local _, storageId = self:CheckSidType(sid)
+    if self.Storages[storageId] == nil then
+        return 0
+    end
+    return self.Storages[storageId]:GetItemCount(sid)
+end
+
+---获取不进背包的限时代币的数量
+function StorageManager:GetOtherItemCountBySid(sid)
+    local itemValue
+    -- 根据子ID或用户ID更新特定资源数量
+    if sid == 65 then
+        -- 公会建筑比币
+        itemValue = require("SociatyModel"):GetInstance():GetBuildCoinNumber()
+    elseif sid == 101 then
+        itemValue = require "MonsterSiegeManager":GetInstance():GetCoinActivity()
+    elseif sid == 103 then
+        itemValue = require "ArenaFairManager":GetInstance():GetCoin()
+    elseif sid == 104 then
+        itemValue = require "GuessGameModel":GetInstance():GetCoin()
+    elseif sid == 105 then
+        itemValue = require "DrawActivityModel":GetInstance():GetCoinNum()
+    elseif sid == 109 then
+        itemValue = require "SixVsSixCoinModel":GetInstance():GetCoin()
+    elseif require("DrawUpCoinModel"):GetInstance():GetCoinIdList(sid) then
+        -- 限时招募货币刷新
+        itemValue = require "DrawUpCoinModel":GetInstance():GetCoinIdList(sid)
+    elseif require("ArtifactDrawUpMainModel"):GetInstance():GetCoinIdList(sid) then
+        -- 神器招募货币刷新
+        itemValue = require "ArtifactDrawUpMainModel":GetInstance():GetCoinIdList(sid)
+    elseif sid == 111 then
+        -- 神器招募货币刷新
+        itemValue = require("TreasureHuntingManager"):GetInstance():GetCoin()
+    elseif sid == 115 then
+        ---灵兽起源召唤
+        itemValue = require("PetDrawUpMainModel"):GetInstance():GetCoinIdList(sid)
+    elseif sid == 117 then
+        ---塔罗牌
+        itemValue = require("TarotManager"):GetInstance():GetCoinNum()
+    elseif sid == 118 then
+        itemValue = require("SwornModel"):GetInstance():GetCoinNum()
+    elseif sid == 120 then
+        ---国庆拼图道具1
+        itemValue = require("FestivalModel"):GetInstance():GetCoinNum1()
+    elseif sid == 121 then
+        ---国庆拼图道具2
+        itemValue = require("FestivalModel"):GetInstance():GetCoinNum2()
+    elseif sid == 124 or sid == 128 or sid == 136 or sid == 137 or sid == 141 or sid == 195 then
+        ---联动召唤
+        itemValue = require("JointActivityDrawUpModel"):GetInstance():GetCoinIdList(sid)
+    elseif sid == 130 then
+        ---国庆拼图道具2
+        itemValue = require("IceFestivalPuzzleManager"):GetInstance():GetCoinNum1()
+    elseif sid == 125 or sid == 146 or sid == 147 or sid == 148 or sid == 149 then
+        ---限时掉落
+        itemValue = require "LimitTimeDropCoinModel":GetInstance():GetCoinIdList(sid)
+    elseif sid == 74 then
+        ---战歌争锋
+        itemValue = require("ActivityDispatchModel"):GetInstance():GetCoinNum(sid)
+    elseif sid == 76 then
+        -- 团队副本水晶
+        itemValue = require("RelicTeamModel"):GetInstance():GetJewel()
+    elseif sid == 71 then
+        itemValue = require("FlyingChessModel"):GetInstance():GetCoinNum()
+    elseif require("ActivityCumulativeModel"):GetInstance():CheckCoinType(sid) then
+        itemValue = require("ActivityCumulativeModel"):GetInstance():GetCoinNum(sid)
+    elseif sid == 132 or sid == 142 or sid == 167 then
+        -- 荣耀集结
+        local activityList = require("ActivitySynManager"):GetInstance():GetActivityByType(_G.ActivityMainType
+                                                                                               .GloryAssembly)
+        if activityList and #activityList > 0 then
+            ---@type GloryAssemblyModel
+            for k, v in pairs(activityList) do
+                local model = activityList[1]:GetActivityTypeCls()
+                if model:GetCoinSid() == sid then
+                    itemValue = model:GetCoinNumber()
+                    break
+                end
+            end
+        end
+    elseif sid == 19 then
+        itemValue = require("GMArenaPeakModel"):GetInstance():GetCoinNum(sid)
+    elseif sid == 138 or sid == 181 or sid == 182 or sid == 194 or sid == 195 then
+        itemValue = require("JointActivityDrawUpModel"):GetInstance():GetCoinIdList(sid)
+    elseif sid == 150 or sid == 151 or sid == 152 or sid == 153 or sid == 154 then
+        itemValue = require("SpBoxManager"):GetInstance():GetCoin(sid)
+    elseif sid == 135 or sid == 140 or sid == 198 then
+        -- 小游戏_赛车(MT联动)
+        local activityList = require("ActivitySynManager"):GetInstance():GetActivityByType(10065)
+        if activityList and #activityList > 0 then
+            ---@type MiniGameSynModel
+            local model = activityList[1]:GetActivityTypeCls()
+            itemValue = model:GetCoinNumber()
+        end
+    elseif sid == 191 then
+        itemValue = require("ActivityTournamentModel"):GetInstance():GetCoinNum(sid)
+    elseif sid == 78 then
+        itemValue = require("ActiveSeverMergeModel"):GetInstance():GetCoinNum(sid)
+    elseif require("FestivalRedBoundModel"):GetInstance():GetCoinIdList(sid) then
+        -- 红包小游戏
+        itemValue = require "FestivalRedBoundModel":GetInstance():GetCoinIdList(sid)
+    elseif require("SnowBallRedBoundModel"):GetInstance():GetCoinIdList(sid) then
+        -- 新版本红包小游戏
+        itemValue = require "SnowBallRedBoundModel":GetInstance():GetCoinIdList(sid)
+    elseif require("FestivalActivityModel"):GetInstance():CheckCoin(sid) then
+        itemValue = require("FestivalActivityModel"):GetInstance():GetCoin(sid)
+    elseif require("JointActivitySuperModel"):GetInstance():CheckCoin(sid) then
+        itemValue = require("JointActivitySuperModel"):GetInstance():GetCoin(sid)
+    elseif require("MTTarotManager"):GetInstance():GetCoinIdList(sid) then
+        itemValue = require "MTTarotManager":GetInstance():GetCoinIdList(sid)
+    elseif require("JointActivityDrawUpModel"):GetInstance():CheckActCoinId(sid) then
+        itemValue = require "JointActivityDrawUpModel":GetInstance():GetCoinIdList(sid)
+    elseif require("LabourDayGameModel"):GetInstance():CheckCoinId(sid) then
+        itemValue = require "LabourDayGameModel":GetInstance():GetCoinNumber()
+    else
+        local coin = require("StrategyGoddessModel"):GetInstance():GetCoin()
+        if sid == coin[1][1] or sid == coin[2][1] then
+            itemValue = require("StrategyGoddessModel"):GetInstance():GetPoint(sid == coin[1][1] and 1 or 2)
+        end
+    end
+    return itemValue
+end
+
+---消耗物品
+function StorageManager:ConsumeItem(sid, uid, num, activityType, ActivitySubType)
+    if sid ~= 0 and uid == 0 and not self:CheckItem(sid, num) then
+        return
+    end
+    local _, storageId = self:CheckSidType(sid)
+    if self.Storages[storageId] == nil then
+        return
+    end
+    if storageId == _G.StorageID.Card or storageId == _G.StorageID.Decoration or storageId == _G.StorageID.Carving then
+        self.Storages[storageId]:ChangeCount(uid, 0, true)
+    elseif storageId == _G.StorageID.Equipment or storageId == _G.StorageID.Artifact then
+        self.Storages[storageId]:ChangeCount(uid, -num)
+    elseif storageId == _G.StorageID.Prop or storageId == _G.StorageID.ResProp or storageId == _G.StorageID.Material or
+        storageId == _G.StorageID.Debris or storageId == _G.StorageID.Remains then
+        self.Storages[storageId]:ChangeCount(sid, -num)
+
+        ---@type award.i_award_item
+        local i_award_item = {}
+        i_award_item.type = {
+            [1] = sid,
+            [2] = -num,
+            [3] = self.Storages[storageId]:GetAllItems()[sid] and self.Storages[storageId]:GetAllItems()[sid].count or 0
+        }
+
+        _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, {i_award_item})
+    end
+end
+
+---消耗物品
+function StorageManager:Consume(data)
+    local T = data.item or data.type or data
+    if T[1] == 0 and _G.table.ContainsValue(haveCoinParseFuncActivity, T[2]) then
+        -- 活动内代币
+        local act = require("ActivitySynManager"):GetInstance():GetChildAcitivity(T[2], T[3])
+        if act:GetActivityTypeCls().AddCoin then
+            act:GetActivityTypeCls():AddCoin(-T[5])
+        elseif act:GetActivityTypeCls().SetCoin then
+            act:GetActivityTypeCls():SetCoin({
+                key = T[4],
+                value = -T[5]
+            })
+        end
+    else
+        self:ConsumeItem(T[1], nil, T[2])
+    end
+end
+
+---解析奖励
+---@param data award.i_award_item[] 奖励数据
+---@return ShowAwardData[] 返回显示的奖励
+function StorageManager:ParseAward(data)
+    self.CurItemTable = {}
+    if data == nil then
+        return
+    end
+    local newData = {}
+    local temp = {}
+    local isActivityCoin
+    for k, value in ipairs(data) do
+        isActivityCoin = false
+        if value.type[1] == 0 then
+            local act = require("ActivitySynManager"):GetInstance():GetActivityClass(value.type[2])
+            if act then
+                local actType = act:GetTypeId()
+                if _G.table.ContainsValue(haveCoinParseFuncActivity, actType) then
+                    -- SGHS-6632【春节活动】第一期祈福罗盘抽奖道具消耗后，道具TIPS界面的数量没有及时刷新
+                    -- 如果活动实例接受了货币数据, 则不要将数量放入Storages, 否则在消耗时默认不会处理Storages
+                    -- GetItemWayView面板中, 当活动实例代币消耗剩余为0时, 展示的是Storages缓存的数据
+                    if act:GetActivityTypeCls().AddCoin then
+                        act:GetActivityTypeCls():AddCoin(value.type[4])
+                        isActivityCoin = true
+                    elseif act:GetActivityTypeCls().SetCoin then
+                        act:GetActivityTypeCls():SetCoin({
+                            key = value.type[3],
+                            value = value.type[4]
+                        })
+                        isActivityCoin = true
+                    end
+                end
+            end
+            if not isActivityCoin then
+                value.type = {value.type[3], value.type[4], value.type[5], value.type[2], value.type[1]}
+            end
+        elseif self:IsActivityRes(value.type[1]) then
+            isActivityCoin = true --表示该资源不进背包，由活动数据中监听奖励事件，通过事件对活动自己的代币数量进行改变
+        end
+        if not isActivityCoin then
+            local itemType = value.type
+            local id = itemType[1]
+            local type, storageId = self:CheckSidType(id)
+            if storageId == _G.StorageID.ResProp or storageId == _G.StorageID.Prop or storageId == _G.StorageID.Material or
+                storageId == _G.StorageID.Debris or storageId == _G.StorageID.Remains then
+                local fix = itemType[2]
+                local fact = itemType[3]
+                if nil == temp[id] then
+                    temp[id] = {fix, fact}
+                else
+                    if id == _G._G.ResPropID.VipExp or not fact then
+                        ---VIP没有第三个参数，所以奖励特殊处理，单独合并奖励
+                        temp[id] = {fix + temp[id][1], fact}
+                    else
+                        if fact > temp[id][2] then
+                            temp[id] = {fix, fact}
+                        end
+                    end
+                end
+            elseif storageId == _G.StorageID.Card then
+                if itemType[2] > 0 then
+                    table.insert(newData, value)
+                else
+                    require "IllustrationModel":GetInstance():JieSuoHunJiang(itemType[1])
+                end
+            else
+                table.insert(newData, value)
+            end
+        end
+    end
+
+    for k, v in pairs(temp) do
+        local data1 = {}
+        data1.type = {k, v[1], v[2]}
+        table.insert(newData, data1)
+    end
+    for key, value in ipairs(newData) do
+        self:ParseSimpleAward(value)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, data)
+    return self.CurItemTable
+end
+
+---是否活动资源
+---@param resId number 资源id
+function StorageManager:IsActivityRes(resId)
+    --XZNS-7381 【Beta_1.1.5】BuglistXZNS-8021
+    --【整合活动】曙光赐福购买消耗钻石的礼包，查看积分详情tip时持有数量刷新不及时
+    --解释：为什么要加这个函数
+    --按理说活动代币相关资源在StorageManager:ParseAward(data) data是五个参数才对，但是某些活动没按要求进行配置，活动上不支持配置5参
+    --所以单独某些资源的代币走这里再检查一次
+    return _G.table.ContainsValue(activityResTable, resId)
+end
+
+---解析单条奖励
+---@param data award.Award 奖励数据
+function StorageManager:ParseSimpleAward(data)
+    ---@field ItemType ItemType 道具类型
+    local itemType = data.type
+    if itemType[1] ~= nil then
+        local type, storageId = self:CheckSidType(itemType[1])
+        if storageId == _G.StorageID.Prop then
+            local Cfg = _G.ConfigManager.item_cfg[itemType[1]]
+            if Cfg.UsePattern == _G.ItemUsePattern.Get and Cfg.UseType == _G.ItemUseType.GetSkin then
+                local cfg = tonumber(Cfg.UseParameter[1][1])
+                local ID = _G.ConfigManager.skin_cfg[cfg]
+                -- 获得的皮肤道具数量
+                local num = itemType[2]
+                -- 当前是否拥有皮肤
+                local isGotSkin = require "CardCommentManager":GetInstance():CradSid(ID.card, cfg)
+                if not isGotSkin then
+                    self.ParseFunc[storageId]({itemType[1], 1, 1})
+                    num = num - 1
+                end
+                if num > 0 then
+                    -- 没有皮肤且兑换皮肤后仍有剩余，则转化多余皮肤道具；拥有皮肤则全部转化
+                    self:PropBuy(itemType[1], num, 2, function()
+                        _G.PopWindowManager:GetInstance():ShowAllTips(1310001)
+                    end)
+                end
+            elseif Cfg.UsePattern == _G.ItemUsePattern.Get and Cfg.UseType == _G.ItemUseType.Events then
+                local cfg = tonumber(Cfg.UseParameter[1][1])
+                if require "ChatManager":GetInstance():IsExpressionUnlocked(cfg) then
+                    self:PropBuy(itemType[1], 1, 2)
+                else
+                    self.ParseFunc[storageId](itemType)
+                end
+            elseif Cfg.UsePattern == _G.ItemUsePattern.Get and Cfg.UseType == _G.ItemUseType.GetTitle then
+                local titleId = tonumber(Cfg.UseParameter[1][1])
+                local titleCfg = _G.ConfigManager.player_title_effect_cfg[titleId] -- 限时称号可叠加时间
+                if _G.PlayerModel:GetInstance():GetTitleData(titleId) and (not titleCfg or titleCfg.time_duration <= 0) then
+                    self:PropBuy(itemType[1], 1, 2)
+                else
+                    self.ParseFunc[storageId](itemType)
+                end
+            elseif Cfg.UsePattern == _G.ItemUsePattern.Get and Cfg.UseType == _G.ItemUseType.GetHalo then
+                local haloId = tonumber(Cfg.UseParameter[1][1])
+                local haolCfg = _G.ConfigManager.player_halo_effect_cfg[haloId] -- 限时光环可叠加时间
+                if _G.PlayerModel:GetInstance():GetHaloData(haloId) and (not haolCfg or haolCfg.time_duration <= 0) then
+                    self:PropBuy(itemType[1], 1, 2)
+                else
+                    self.ParseFunc[storageId](itemType)
+                end
+            elseif Cfg.UsePattern == _G.ItemUsePattern.Get and Cfg.UseType == _G.ItemUseType.GetChatFrame then
+                local chatFrameId = tonumber(Cfg.UseParameter[1][1])
+                local chatFrameCfg = _G.ConfigManager.player_bubble_cfg[chatFrameId] -- 限时聊天框可叠加时间
+                if _G.PlayerModel:GetInstance():GetChatFrameData(chatFrameId) and
+                    (not chatFrameCfg or chatFrameCfg.time_duration <= 0) then
+                    self:PropBuy(itemType[1], 1, 2)
+                else
+                    self.ParseFunc[storageId](itemType)
+                end
+            else
+                self.ParseFunc[storageId](itemType)
+            end
+        else
+            if type == _G.StorageID.RingGod then
+                _G.PlayerModel:GetInstance():AddUnlockGodHalo(itemType[1])
+            else
+                self.ParseFunc[storageId](itemType)
+            end
+        end
+    end
+end
+
+---检查该物品是否为新的
+---@param sid number 物品sid
+---@return boolean 是否为新
+function StorageManager:CheckItemIsNew(sid)
+    local storageType, storageID = self:CheckSidType(sid)
+    local item = self:GetItemDataByID(storageID, sid)
+    return item and item.isNew or false
+end
+
+---设置物品isNew状态
+---@param sid number 物品sid
+---@param bl boolean 是否为新
+function StorageManager:SetItemIsNewState(sid, bl)
+    local storageType, storageID = self:CheckSidType(sid)
+    local item = self:GetItemDataByID(storageID, sid)
+    if item then
+        item.isNew = bl
+    end
+end
+
+local ItemBase = {
+    [_G.StorageType.Card] = _G.CardViewBase,
+    [_G.StorageType.Equipment] = _G.EquipViewBase,
+    [_G.StorageType.Material] = require("ItemViewBase"),
+    [_G.StorageType.Prop] = require("ItemViewBase"),
+    [_G.StorageType.ResProp] = require("ItemViewBase"),
+    [_G.StorageType.Decoration] = _G.DecorationViewBase,
+    [_G.StorageType.Artifact] = _G.ArtifactViewBase,
+    [_G.StorageType.Spiritual] = _G.SpiritualViewBase,
+    [_G.StorageType.Debris] = _G.DebrisViewBase,
+    [_G.StorageType.RelicTeamBuff] = require("ItemViewBase"),
+    [_G.StorageType.RingGod] = require("ItemViewBase"),
+    [_G.StorageType.Remains] = require("ItemViewBase"),
+    [_G.StorageType.Carving] = _G.CarvingViewBase,
+    [_G.StorageType.Gemstone] = require("ItemGemstoneBase"),
+}
+
+local ItemData = {
+    [_G.StorageType.Card] = _G.CardData,
+    [_G.StorageType.Equipment] = _G.EquipmentItem,
+    [_G.StorageType.Material] = _G.PropData,
+    [_G.StorageType.Prop] = _G.PropData,
+    [_G.StorageType.ResProp] = _G.PropData,
+    [_G.StorageType.Decoration] = _G.DecorationData,
+    [_G.StorageType.Artifact] = _G.ArtifactData,
+    [_G.StorageType.Spiritual] = _G.SpiritualData,
+    [_G.StorageType.Debris] = _G.DebrisData,
+    [_G.StorageType.RelicTeamBuff] = require("RelicTeamBuffData"),
+    [_G.StorageType.RingGod] = require("RingGodData"),
+    [_G.StorageType.Remains] = _G.PropData,
+    [_G.StorageType.Carving] = _G.CarvingData,
+    [_G.StorageType.Gemstone] = require("GemstoneData"),
+}
+---获取道具显示（不要在使用此方法）
+function StorageManager:GetItemBaseView(Sid, Count, Parent, call, OnBtnCall, extend, Uid)
+    if self.itemViewArray == nil then
+        self.itemViewArray = {}
+    end
+    _G.table.insert(self.itemViewArray, {
+        Sid = Sid,
+        Count = Count,
+        Parent = Parent,
+        call = call,
+        OnBtnCall = OnBtnCall,
+        Extend = extend,
+        Uid = Uid
+    })
+    self:GetItemView()
+end
+
+---获取道具显示
+function StorageManager:GetItemBaseViewNew(Array, Parent, call, OnBtnCall, Uid)
+    if self.itemViewArray == nil then
+        self.itemViewArray = {}
+    end
+    local count = #Array
+    local array, Sid, Count, extend
+    array = _G.GlobalInterface.GetNewTable(Array)
+    if array[1] == 0 and #array == 5 then
+        -- 活动5参数结构
+        Sid = array[4]
+        Count = array[5] > 0 and array[5] or 0
+    else
+        Sid = _G.table.remove(array, 1)
+        Count = 0
+        if count > 1 then
+            Count = _G.table.remove(array, 1)
+        end
+        extend = array
+    end
+    _G.table.insert(self.itemViewArray, {
+        Sid = Sid,
+        Count = Count,
+        Parent = Parent,
+        call = call,
+        OnBtnCall = OnBtnCall,
+        Extend = extend,
+        Uid = Uid
+    })
+    self:GetItemView()
+end
+
+-- region --------------------------------------道具配置相关获取--------
+
+---@field Cfg table
+---@field Grade number
+---@field Icon string
+---@field name string
+---@class StorageItemData
+
+---获取物品配置数据
+---@param sid number 道具ID
+---@return StorageItemData 道具信息
+function StorageManager:GetStorageItemData(sid)
+    ---@type StorageItemData
+    local data = nil
+    -- data.Grade
+    -- data.Icon
+    -- data.Name
+    -- data.Cfg
+
+    local storageType, storageID, sidType = self:CheckSidType(sid)
+    if storageType == _G.StorageType.ResProp then
+        ---@type currency_type_cfg
+        local cfg
+        if sid > 100 then
+            cfg = _G.ConfigManager.currency_type_client_cfg[sid]
+        else
+            cfg = _G.ConfigManager.currency_type_cfg[sid]
+        end
+        if cfg then
+            data = {}
+            data.Grade = cfg.Quality or cfg.quality
+            data.Icon = cfg.icon
+            data.name = cfg.name
+            data.Describe = cfg.Describe
+            data.Cfg = cfg
+        end
+    elseif storageType == _G.StorageType.RelicTeamBuff then
+        local cfg = _G.ConfigManager[_G.NoInitTypeToCfg[sidType]][sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.grade or cfg.Grade
+            data.Icon = cfg.icon or cfg.Icon
+            data.name = cfg.name or cfg.Name
+            data.Describe = cfg.describe or cfg.Describe
+            data.Cfg = cfg
+            if sidType == _G.ItemSidJudgeSection.HeroicIcon then -- XZNS-7394 策划要求读新字段
+                data.Icon = cfg.present_icon or data.Icon
+            end
+        end
+    elseif storageType == _G.StorageType.Material or _G.StorageType.Prop == storageType or _G.StorageType.Debris ==
+        storageType or _G.StorageType.Remains == storageType then
+        ---@type item_cfg
+        local cfg = _G.ConfigManager.item_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.Quality
+            data.Icon = cfg.Icon
+            data.name = cfg.Name
+            data.Describe = cfg.Describe
+            data.Cfg = cfg
+            if _G.VoucherSid[sid] and _G.GameUtil.CheckVoucherModel() then
+                data.Icon = _G.VoucherIconPath.Voucher
+            end
+        end
+    elseif storageType == _G.StorageType.Card then
+        ---@type card_cfg
+        local cfg = _G.ConfigManager.card_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.Order
+            data.Icon = cfg.Icon
+            data.name = cfg.Name
+            data.Describe = cfg.desc
+            data.Cfg = cfg
+        end
+    elseif storageType == _G.StorageType.Equipment then
+        ---@type equipment_cfg
+        local cfg = _G.ConfigManager.equipment_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.grade
+            data.Icon = cfg.icon
+            data.name = cfg.name
+            data.Describe = cfg.Describe
+            data.Cfg = cfg
+        end
+    elseif storageType == _G.StorageType.Decoration then
+        ---@type decoration_cfg
+        local cfg = _G.ConfigManager.decoration_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.grade
+            data.Icon = cfg.icon
+            data.name = cfg.name
+            data.Describe = cfg.Describe
+            data.Cfg = cfg
+        end
+    elseif storageType == _G.StorageType.Carving then
+        ---@type carving_cfg
+        local cfg = _G.ConfigManager.carving_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.grade
+            data.Icon = cfg.icon
+            data.name = cfg.name
+            data.Describe = cfg.Describe
+            data.Cfg = cfg
+        end
+    elseif storageType == _G.StorageType.Artifact then
+        ---@type artifact_cfg
+        local cfg = _G.ConfigManager.artifact_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.Order
+            data.Icon = cfg.Icon
+            data.name = cfg.Name
+            data.Describe = ""
+            data.Cfg = cfg
+        end
+    elseif storageType == _G.StorageType.Spiritual then
+        ---@type spiritual_cfg
+        local cfg = _G.ConfigManager.spiritual_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.Order
+            data.Icon = cfg.Icon
+            data.name = cfg.Name
+            data.Describe = ""
+            data.Cfg = cfg
+        end
+    elseif storageType == _G.StorageType.RingGod then
+        ---@type god_halo_cfg
+        local cfg = _G.ConfigManager.god_halo_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.grade
+            data.Icon = cfg.icon
+            data.name = cfg.name
+            data.Describe = cfg.Describe
+            data.Cfg = cfg
+        end
+    elseif storageType == _G.StorageType.Gemstone then
+        ---@type gem_cfg
+        local cfg = _G.ConfigManager.gem_cfg[sid]
+        if cfg then
+            data = {}
+            data.Grade = cfg.grade
+            data.Icon = cfg.icon
+            data.name = cfg.name
+            data.Describe = ""
+            data.Cfg = cfg
+        end
+    end
+    if data then
+        if data.name then
+            data.name = _G.LangUtil.GetLangPackValue(data.name)
+        end
+    end
+    return data
+end
+
+---获取道具名称
+---@param sid number 道具ID
+---@return number 品质
+function StorageManager:GetItemName(sid)
+    local data = self:GetStorageItemData(sid)
+    if data then
+        return data.name
+    end
+end
+
+---获取道具品质
+---@param sid number 道具ID
+---@return number 品质
+function StorageManager:GetItemQuality(sid)
+    local data = self:GetStorageItemData(sid)
+    if data then
+        return data.Grade
+    end
+end
+
+---获取道具Icon
+---@param sid number 道具ID
+---@return string 图标路径
+function StorageManager:GetItemIcon(sid)
+    local data = self:GetStorageItemData(sid)
+    if data then
+        return data.Icon
+    end
+end
+
+---获取道具Tag
+---@param sid number 道具ID
+---@return string 图标路径
+function StorageManager:GetItemTag(sid)
+    local data = self:GetStorageItemData(sid)
+    if data then
+        return data.Cfg.tag
+    end
+end
+
+---获取道具title
+---@param sid number 道具ID
+---@return string 图标路径
+function StorageManager:GetItemTitle(sid)
+    local data = self:GetStorageItemData(sid)
+    if data then
+        return data.Describe
+    end
+end
+
+-- endregion------------------------------------道具配置相关获取--------
+
+function StorageManager:GetItemView()
+    if self.itemViewArray == nil or #self.itemViewArray <= 0 or self.isLoadItemView then
+        return
+    end
+    local info = self.itemViewArray[1]
+    local storageType, storageID = self:CheckSidType(info.Sid)
+    if not ItemBase[storageType] or not info.Parent then
+        _G.table.remove(self.itemViewArray, 1)
+        self:GetItemView()
+        return
+    end
+    self.isLoadItemView = true
+    local data
+    if info.Uid and info.Uid > 0 then
+        data = self:GetItemDataByID(storageID, info.Uid)
+    end
+    if not data then
+        data = self:GetItemDataClass(info.Sid, info.Count, info.Extend)
+    end
+    if data and not _G.IsNil(info.Parent) then
+        ItemBase[storageType].Create(data, info.Parent, _G.handler(self, self.OnGetItemViewCall), info.OnBtnCall)
+    else
+        self:OnGetItemViewCall()
+    end
+end
+
+---回收 通过GetItemView 创建的物体
+function StorageManager:RemoveItemView()
+    if self.itemViewArray == nil or #self.itemViewArray <= 0 or self.isLoadItemView then
+        return
+    end
+    local info = self.itemViewArray[1]
+    local storageType, storageID = self:CheckSidType(info.Sid)
+    if not ItemBase[storageType] then
+        if _G.AppSetting.DEBUG then
+            _G.Log("", "<color=red>" .. "[itemBase[storageType]] : 为空" .. "</color>")
+        end
+        return
+    end
+    ItemBase[storageType].Despawn()
+end
+
+function StorageManager:OnGetItemViewCall(item)
+    self.isLoadItemView = false
+    local info = _G.table.remove(self.itemViewArray, 1)
+    if item then
+        item:ShowNumText()
+        if info and info.call ~= nil then
+            info.call(item)
+        end
+    end
+    self:GetItemView()
+end
+
+function StorageManager:GetItemExtend(Params)
+    local extend
+    if #Params > 2 then
+        extend = {}
+        for i = 3, #Params do
+            table.insert(extend, _G.tonumber(Params[i]))
+        end
+    end
+
+    return extend
+end
+
+function StorageManager:GetItemDataClassByCfg(info)
+    --local sid = _G.tonumber(info[1])
+    --local count = _G.tonumber(info[2])
+
+    local sid = info[1] == 0 and _G.tonumber(info[4]) or _G.tonumber(info[1])
+    local count = info[1] == 0 and _G.tonumber(info[5]) or _G.tonumber(info[2])
+
+    local extend = self:GetItemExtend(info)
+
+    return self:GetItemDataClass(sid, count, extend)
+end
+
+---根据类型获取不同的数据类   ---ZHJ-11713添加  设置属性 /卡牌星级装备五行 (前端通过配置的奖励 配置可能大于2维长度的奖励 数组或表作为第三参数)
+function StorageManager:GetItemDataClass(Sid, Count, extend)
+    local storageType, storageID, sidType = self:CheckSidType(Sid)
+    if storageType == nil then
+        return nil
+    end
+    if storageType == _G.StorageType.Artifact then
+        local cfg = _G.ConfigManager.artifact_cfg[Sid]
+        if not cfg then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("artifact_cfg表中没有找到配置，sid: " .. Sid)
+            end
+            return
+        end
+    end
+    if storageType == _G.StorageType.Card then
+        if not _G.ConfigManager.card_cfg[Sid] then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("card_cfg表中没有找到配置，sid: " .. Sid)
+            end
+            return
+        end
+    end
+    if storageType == _G.StorageType.RelicTeamBuff then
+        if not sidType or not _G.ConfigManager[_G.NoInitTypeToCfg[sidType]] or
+            not _G.ConfigManager[_G.NoInitTypeToCfg[sidType]][Sid] then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("没有找到配置，sid: " .. Sid)
+            end
+            return
+        end
+    end
+    local data = ItemData[storageType].New()
+    data:Parse({
+        sid = Sid,
+        uid = Sid,
+        num = Count or 0,
+        count = Count or 0,
+        sidType = sidType
+    })
+    if extend then
+        data:ParseExtend(extend)
+    end
+    return data
+end
+
+---判断sid类型,仓库ID
+function StorageManager:CheckSidType(sid)
+    if nil == sid or sid == 0 then
+        return nil
+    end
+    local cfg = {}
+    if sid <= _G.ItemSidJudgeSection.ResPropMax or currencySids[sid] then
+        return _G.StorageType.ResProp, _G.StorageID.ResProp
+    else
+        ---取sid前三位判断是什么类型
+        local Sid = sid
+        while (Sid > 1000) do
+            Sid = Sid / 10
+        end
+        Sid = _G.math.floor(Sid)
+        if Sid >= _G.ItemSidJudgeSection.CardMin and Sid < _G.ItemSidJudgeSection.CardMax then
+            return _G.StorageType.Card, _G.StorageID.Card
+        elseif Sid == _G.ItemSidJudgeSection.Equipment then
+            -- 装备
+            return _G.StorageType.Equipment, _G.StorageID.Equipment
+        elseif Sid == _G.ItemSidJudgeSection.Remains then
+            return _G.StorageType.Remains, _G.StorageID.Remains
+        elseif (Sid >= _G.ItemSidJudgeSection.PropMin and Sid < _G.ItemSidJudgeSection.PropMax) or Sid ==
+            _G.ItemSidJudgeSection.ProgressChest or Sid == _G.ItemSidJudgeSection.RechargeAccumulate or Sid ==
+            _G.ItemSidJudgeSection.VoucherDiscount then
+            -- 道具
+            cfg = _G.ConfigManager.item_cfg[sid]
+            if cfg then
+                if cfg.Field == _G.StorageID.Prop then
+                    return _G.StorageType.Prop, _G.StorageID.Prop
+                elseif cfg.Field == _G.StorageID.Material then
+                    return _G.StorageType.Material, _G.StorageID.Material
+                elseif cfg.Field == _G.StorageID.Debris then
+                    return _G.StorageType.Debris, _G.StorageID.Debris
+                end
+            end
+        elseif Sid == _G.ItemSidJudgeSection.Decoration then
+            return _G.StorageType.Decoration, _G.StorageID.Decoration
+        elseif Sid == _G.ItemSidJudgeSection.Carving then
+            return _G.StorageType.Carving, _G.StorageID.Carving
+        elseif Sid == _G.ItemSidJudgeSection.Task then
+            return _G.StorageType.Material, _G.StorageID.Material
+        elseif Sid == _G.ItemSidJudgeSection.Artifact then
+            return _G.StorageType.Artifact, _G.StorageID.Artifact
+        elseif Sid == _G.ItemSidJudgeSection.Spiritual then
+            return _G.StorageType.Spiritual, _G.StorageID.Spiritual
+        elseif Sid == _G.ItemSidJudgeSection.RingGod then
+            return _G.StorageType.RingGod, _G.StorageID.RingGod
+        elseif table.ContainsValue(_G.NoInitType, Sid) then
+            return _G.StorageType.RelicTeamBuff, _G.StorageID.RelicTeamBuff, Sid
+        elseif Sid == _G.ItemSidJudgeSection.Gemstone then
+            return _G.StorageType.Gemstone, _G.StorageID.Gemstone
+        end
+    end
+    return nil
+end
+
+-- endregion
+
+---道具使用
+---@param sid number  item_cfg的id
+---@param call function 使用成功回调
+function StorageManager:PropUse(sid, call)
+    local cfg = _G.ConfigManager.item_cfg[sid]
+    if not cfg or _G.PlayerModel:GetInstance():GetLevel() < cfg.LimitLevel then
+        return
+    end
+    --- cfg.Field  _G.StorageID.Prop
+    local itemData = self:GetItemDataByID(cfg.Field, sid)
+    if not itemData then
+        return
+    end
+    local UseType = _G.ItemUseType
+    if cfg.UseType == UseType.GetXHourAfkAward then
+        if require("AfkModel"):GetInstance():GetCurEfficiency(cfg.UseParameter[1]) == 0 then
+            _G.PopWindowManager:GetInstance():ShowAllTips(380105)
+            return
+        end
+    end
+
+    if cfg.UseType == UseType.Not then
+        return
+    elseif cfg.UseType == UseType.GetSkin then
+        local cfg = tonumber(cfg.UseParameter[1][1])
+        local ID = _G.ConfigManager.skin_cfg[cfg]
+
+        if require "CardCommentManager":GetInstance():CradSid(ID.card, cfg) then
+            local num = _G.ConfigManager.item_repeat_cfg[sid].get_item[2]
+            local name = self:GetStorageItemData(_G.ConfigManager.item_repeat_cfg[sid].get_item[1]).name
+            local connect = num .. name
+            _G.PopWindowManager:GetInstance():ShowAllTips(513, _G.LangUtil.GetLangPackValue(90000001079, connect),
+                function()
+                    self:PropBuy(sid, 1, 2, call)
+                end)
+        else
+            self:UsePropToServer(sid, 1, call)
+        end
+    elseif cfg.UseType == _G.ItemUseType.Events then
+        -- local listTheme = { sid = _G.tonumber(cfg.UseParameter[1][1]), type = 4 }
+        -- _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetTitleView.Name, listTheme)
+        require "ChatManager":GetInstance():IsExpressionUnlocked(_G.tonumber(cfg.UseParameter[1][1]))
+        if require "ChatManager":GetInstance():IsExpressionUnlocked(_G.tonumber(cfg.UseParameter[1][1])) then
+            local num = _G.ConfigManager.item_repeat_cfg[sid].get_item[2]
+            local name = self:GetStorageItemData(_G.ConfigManager.item_repeat_cfg[sid].get_item[1]).name
+            local connect = num .. name
+            _G.PopWindowManager:GetInstance():ShowAllTips(513, _G.LangUtil.GetLangPackValue(90000001079, connect),
+                function()
+                    self:PropBuy(sid, 1, 2, call)
+                end)
+        else
+            self:UsePropToServer(sid, 1, call)
+        end
+    elseif cfg.UseType == UseType.GetFrame then
+        if _G.PlayerModel:GetInstance():IsUnlockFrame(tonumber(cfg.UseParameter[1][1])) then
+            local num = _G.ConfigManager.item_repeat_cfg[sid].get_item[2]
+            local name = self:GetStorageItemData(_G.ConfigManager.item_repeat_cfg[sid].get_item[1]).name
+            local connect = num .. name
+            _G.PopWindowManager:GetInstance():ShowAllTips(513, _G.LangUtil.GetLangPackValue(90000001079, connect),
+                function()
+                    self:PropBuy(sid, 1, 2, call)
+                end)
+        else
+            self:UsePropToServer(sid, 1, call)
+        end
+    elseif cfg.UseType == UseType.GetHalo then
+        local haloId = tonumber(cfg.UseParameter[1][1])
+        local haolCfg = _G.ConfigManager.player_halo_effect_cfg[haloId] -- 限时光环可叠加时间
+        if _G.PlayerModel:GetInstance():GetHaloData(haloId) and (not haolCfg or haolCfg.time_duration <= 0) then
+            local num = _G.ConfigManager.item_repeat_cfg[sid].get_item[2]
+            local name = self:GetStorageItemData(_G.ConfigManager.item_repeat_cfg[sid].get_item[1]).name
+            local connect = num .. name
+            _G.PopWindowManager:GetInstance():ShowAllTips(513, _G.LangUtil.GetLangPackValue(90000001079, connect),
+                function()
+                    self:PropBuy(sid, 1, 2, call)
+                end)
+        else
+            self:UsePropToServer(sid, 1, call)
+        end
+    elseif cfg.UseType == UseType.GetTitle then
+        local titleId = tonumber(cfg.UseParameter[1][1])
+        local titleCfg = _G.ConfigManager.player_title_effect_cfg[titleId] -- 限时称号可叠加时间
+        if _G.PlayerModel:GetInstance():GetTitleData(titleId) and (not titleCfg or titleCfg.time_duration <= 0) then
+            local num = _G.ConfigManager.item_repeat_cfg[sid].get_item[2]
+            local name = self:GetStorageItemData(_G.ConfigManager.item_repeat_cfg[sid].get_item[1]).name
+            local connect = num .. name
+            _G.PopWindowManager:GetInstance():ShowAllTips(513, _G.LangUtil.GetLangPackValue(90000001079, connect),
+                function()
+                    self:PropBuy(sid, 1, 2, call)
+                end)
+        else
+            self:UsePropToServer(sid, 1, call)
+        end
+    elseif cfg.UseType == UseType.GetChatFrame then
+        local chatFrameId = tonumber(cfg.UseParameter[1][1])
+        local chatFrameCfg = _G.ConfigManager.player_bubble_cfg[chatFrameId] -- 限时聊天框可叠加时间
+        if _G.PlayerModel:GetInstance():GetChatFrameData(chatFrameId) and
+            (not chatFrameCfg or chatFrameCfg.time_duration <= 0) then
+            local num = _G.ConfigManager.item_repeat_cfg[sid].get_item[2]
+            local name = self:GetStorageItemData(_G.ConfigManager.item_repeat_cfg[sid].get_item[1]).name
+            local connect = num .. name
+            _G.PopWindowManager:GetInstance():ShowAllTips(513, _G.LangUtil.GetLangPackValue(90000001079, connect),
+                function()
+                    self:PropBuy(sid, 1, 2, call)
+                end)
+        else
+            self:UsePropToServer(sid, 1, call)
+        end
+    elseif cfg.UseType == UseType.SettingTheme then
+        self:UsePropToServer(sid, 1, call)
+    elseif cfg.UseType == UseType.Collection then
+        local isLock = require "CollectionModel":GetInstance():CheckIsLock(cfg.UseParameter[1][1])
+        if isLock then
+            local num = _G.ConfigManager.item_repeat_cfg[sid].get_item[2]
+            local name = self:GetStorageItemData(_G.ConfigManager.item_repeat_cfg[sid].get_item[1]).name
+            local connect = num .. name
+            _G.PopWindowManager:GetInstance():ShowAllTips(513, _G.LangUtil.GetLangPackValue(90000001079, connect),
+                function()
+                    self:PropBuy(sid, 1, 2, call)
+                end)
+        else
+            _G.JumpManager:GetInstance():Jump(tonumber(cfg.UseParameter[1][2]), nil, cfg.UseParameter[1][1])
+        end
+    elseif cfg.UseType == UseType.InterfaceJump then
+        -- 界面跳转
+        _G.JumpManager:GetInstance():Jump(tonumber(cfg.UseParameter[1][1]))
+    elseif cfg.UseType == UseType.DecorationLv then
+        local unlockRune = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Rune)
+        if not unlockRune then
+            _G.PopWindowManager:GetInstance():ShowAllTips(1080004, _G.GetLangPackValue(2148006033))
+            return
+        end
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RuneItemUseView.Name, itemData, call)
+    elseif cfg.UsePattern == _G.ItemUsePattern.Num then
+        if itemData.count == 1 then
+            self:UsePropToServer(sid, 1, call)
+        else
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ItemUseView.Name, sid, call)
+        end
+    elseif cfg.UsePattern == _G.ItemUsePattern.Content then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.BagChoosePropTipView.Name, itemData, call)
+    elseif cfg.UsePattern == _G.ItemUsePattern.ProgressChest then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ProgressChestView.Name, sid, call)
+    end
+end
+
+---使用道具，向服务器发消息
+---@param sid number 道具id
+---@param num number 使用数量
+---@param call function 使用完成回调
+---@param param number 额外参数
+---@param hideAwardBol boolean 是否隐藏恭喜获得弹窗判断
+function StorageManager:UsePropToServer(sid, num, call, param, param1, hideAwardBol)
+    local msg = {}
+    msg.sid = sid
+    local cfg = _G.ConfigManager.item_cfg[sid]
+    if num > cfg.limit_num then
+        num = cfg.limit_num
+    end
+    msg.num = _G.math.floor(num)
+    if param then
+        local arg = {}
+        for i, v in pairs(param) do
+            table.insert(arg, {
+                k = i,
+                v = v
+            })
+        end
+        msg.param2 = arg
+    end
+    if param1 then
+        msg.param1 = {param1}
+    end
+
+    ---皮肤宝箱判定，皮肤是非重复道具
+    local isSkinBos, id = self:CheckSkinBox(sid, param)
+    if isSkinBos then
+        local irc = _G.ConfigManager.item_repeat_cfg[id]
+        if irc then
+            _G.PopWindowManager:GetInstance():ShowAllTips(628, nil, function()
+                StorageNet:GetInstance():PropUse(msg, _G.handlerbind(self, self.UsePropToServerSuc, sid, num, call,
+                    hideAwardBol))
+            end, nil, nil, false, irc.get_item[2])
+            return
+        end
+    end
+
+    local isSkinItem = self:CheckSkinItem(sid)
+    if isSkinItem then
+        local irc = _G.ConfigManager.item_repeat_cfg[sid]
+        if irc then
+            _G.PopWindowManager:GetInstance():ShowAllTips(628, nil, function()
+                self:PropBuy(sid, num, 2, call)
+            end, nil, nil, false, irc.get_item[2])
+            return
+        end
+    end
+
+    StorageNet:GetInstance():PropUse(msg, _G.handlerbind(self, self.UsePropToServerSuc, sid, num, call, hideAwardBol))
+end
+
+---判断是不是皮肤宝箱
+---@return boolean 是否存在皮肤或兑换多个皮肤, number 皮肤id
+function StorageManager:CheckSkinBox(sid, param)
+    ---ZHJH5ZHJH-8086 【7月版本】程序主单号ZHJH-9715
+    ---【客户端】时装-玩家重复获得的二次提示
+    if param then
+        for index, num in pairs(param) do
+            local type, storageId = self:CheckSidType(sid)
+            if storageId == _G.StorageID.Prop then
+                local cfgTemp = _G.ConfigManager.item_cfg[sid]
+                ---道具类型匹配到自选箱
+                if (cfgTemp.UseType == 5 or cfgTemp.UseType == 6) and cfgTemp.UsePattern == 2 and
+                    cfgTemp.UseParameter2[index] then
+                    local cfg = _G.ConfigManager.item_cfg[cfgTemp.UseParameter2[index][1]]
+                    ---自选箱为皮肤箱子
+                    if cfg and cfg.UsePattern == _G.ItemUsePattern.Get and cfg.UseType == _G.ItemUseType.GetSkin then
+                        local id = tonumber(cfg.UseParameter[1][1])
+                        local skinCfg = _G.ConfigManager.skin_cfg[id]
+                        local isGotSkin = require "CardCommentManager":GetInstance():CradSid(skinCfg.card, id)
+                        ---存在些皮肤
+                        if isGotSkin or num > 1 then
+                            return true, cfg.ID
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+---判断是不是皮肤皮肤物品
+function StorageManager:CheckSkinItem(sid)
+    local type, storageId = self:CheckSidType(sid)
+    if storageId == _G.StorageID.Prop then
+        local cfg = _G.ConfigManager.item_cfg[sid]
+        ---道具类型匹配到自选箱
+        if cfg.UseType == 10 and cfg.UsePattern == _G.ItemUsePattern.Get then
+            local id = tonumber(cfg.UseParameter[1][1])
+            local skinCfg = _G.ConfigManager.skin_cfg[id]
+            local isGotSkin = require "CardCommentManager":GetInstance():CradSid(skinCfg.card, id)
+            ---存在些皮肤
+            if isGotSkin then
+                return true
+            end
+        end
+
+        if cfg.UseType == 13 and cfg.UsePattern == 1 then
+            local id = tonumber(cfg.UseParameter[1][1])
+            if _G.PlayerModel:GetInstance():IsUnlockTitle(id) then
+                return true
+            end
+        end
+
+        if cfg.UseType == 12 and cfg.UsePattern == 1 then
+
+        end
+    end
+    return false
+end
+
+---道具批量使用
+function StorageManager:PropBatchUse(info, isOn, type, hideAwardBol, call)
+    if isOn then
+        if type == 1 then
+            self.bagOpenTip = 1
+        else
+            self.bagComposeTip = 1
+        end
+    end
+    local pbData = {
+        use_info = info
+    }
+    StorageNet:GetInstance():PropBatchUse(pbData,
+        _G.handlerbind(self, self.BatchUsePropToServerSuc, info, call, hideAwardBol))
+end
+
+---使用道具，向服务器发消息
+---@param data storage.s2c_storage_use 服务器下发消息
+---@param sid number 道具id
+---@param num number 使用数量   (进度宝箱 该值代表领取进度 服务器定的)
+---@param call function 使用完成回调
+---@param hideAwardBol boolean 是否隐藏恭喜获得弹窗判断
+function StorageManager:UsePropToServerSuc(data, sid, num, call, hideAwardBol)
+    if data.ack ~= 1 then
+        return
+    end
+    local UseType = _G.ItemUseType
+    ---@type item_cfg
+    local cfg = _G.ConfigManager.item_cfg[sid]
+    local baseCount = 1
+    if cfg.UseType == UseType.CompoundCard or cfg.UseType == UseType.DrawCard or cfg.UseType == UseType.CompoundProp then
+        baseCount = cfg.UseParameter[1][1]
+    end
+
+    if cfg.UseType == UseType.ProgressChest then
+        ---如果是进度宝箱
+        local item_box_con_cfgID = tonumber(cfg.UseParameter[1][1])
+        ---@type item_box_con_cfg
+        local item_box_con_cfg = _G.ConfigManager.item_box_con_cfg[item_box_con_cfgID]
+        if num >= #item_box_con_cfg.condition_params then
+            ---如果都领取了就删道具
+            self:ConsumeItem(sid, 0, 1)
+        end
+    elseif cfg.UseType ~= UseType.TreasureMap then
+        self:ConsumeItem(sid, 0, num * tonumber(baseCount))
+    end
+
+    self:ReceiveAwardData(data)
+    -- local cfg = _G.ConfigManager.item_cfg[sid]
+
+    if cfg.UseType == UseType.DrawCard and data.award.item then
+        local uidstemp = {}
+        local cardUidList = {}
+        for _, v in pairs(data.award.item) do
+            cardUidList[v.type[2]] = true
+        end
+        local cardList = self:GetDataByID(_G.StorageID.Card)
+        for _, v in pairs(cardList) do
+            if cardUidList[v.uid] ~= nil then
+                uidstemp[v.uid] = v
+            end
+        end
+    end
+
+    if cfg.UseType == UseType.GetFrame then
+        local frameId = tonumber(cfg.UseParameter[1][1])
+        local frameCfg = _G.ConfigManager.player_frame_cfg[frameId]
+        local duration = frameCfg and frameCfg.time_duration or 0
+        -- if duration > 0 then
+        --     duration = duration + _G.PlayerModel:GetInstance():GetFrameRemainDuration(frameId)
+        -- end
+
+        _G.PlayerModel:GetInstance():SetUnlockFrame({
+            sid = frameId,
+            end_time = duration + _G.TimeUtil.GetServerUnixTime()
+        })
+        -- ZHJ-20396【客户端】头像、光环、称号重复兑换,type 1 2 3对应头像框，称号，光环
+        local listFrame = {
+            sid = _G.tonumber(cfg.UseParameter[1][1]),
+            type = 1
+        }
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetTitleView.Name, listFrame)
+    end
+    if cfg.UseType == UseType.GetTitle then
+        local titleId = tonumber(cfg.UseParameter[1][1])
+        local titleCfg = _G.ConfigManager.player_title_effect_cfg[titleId]
+        local duration = titleCfg and titleCfg.time_duration or 0
+        if duration > 0 then
+            duration = duration + _G.PlayerModel:GetInstance():GetTitleRemainDuration(titleId)
+        end
+
+        _G.PlayerModel:GetInstance():SetUnlockTitle({
+            sid = titleId,
+            end_time = duration + _G.TimeUtil.GetServerUnixTime()
+        })
+        _G.SystemSettingManager:GetInstance():RefreshTitleAndHaloAttribute()
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.TitleAndHalo)
+        local listTitle = {
+            sid = titleId,
+            type = 2
+        }
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetTitleView.Name, listTitle)
+    end
+    if cfg.UseType == UseType.GetHalo then
+        local haloId = tonumber(cfg.UseParameter[1][1])
+        local haloCfg = _G.ConfigManager.player_halo_effect_cfg[haloId]
+        local duration = haloCfg and haloCfg.time_duration or 0
+        if duration > 0 then
+            duration = duration + _G.PlayerModel:GetInstance():GetHaloRemainDuration(haloId)
+        end
+
+        _G.PlayerModel:GetInstance():SetUnlockHalo({
+            sid = haloId,
+            end_time = duration + _G.TimeUtil.GetServerUnixTime()
+        })
+        _G.SystemSettingManager:GetInstance():RefreshTitleAndHaloAttribute()
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.TitleAndHalo)
+        local listHalo = {
+            sid = haloId,
+            type = 3
+        }
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetTitleView.Name, listHalo)
+    end
+    if cfg.UseType == UseType.GetChatFrame then
+        local chatFrameId = tonumber(cfg.UseParameter[1][1])
+        local chatFrameCfg = _G.ConfigManager.player_bubble_cfg[chatFrameId]
+        local duration = chatFrameCfg and chatFrameCfg.time_duration or 0
+        local endTime = 0
+        if duration > 0 then
+            duration = duration + _G.PlayerModel:GetInstance():GetChatFrameRemainDuration(chatFrameId)
+            endTime = duration + _G.TimeUtil.GetServerUnixTime()
+        end
+
+        _G.PlayerModel:GetInstance():SetUnlockChatFrame({
+            sid = chatFrameId,
+            end_time = endTime
+        })
+        _G.SystemSettingManager:GetInstance():RefreshTitleAndHaloAttribute()
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.TitleAndHalo)
+        local listHalo = {
+            sid = chatFrameId,
+            type = 5
+        }
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetTitleView.Name, listHalo)
+    end
+
+    if cfg.UseType == UseType.RoleFrame then
+        local roleFrameId = tonumber(cfg.UseParameter[1][1])
+        local roleFrameCfg = _G.ConfigManager.player_rolebox_cfg[roleFrameId]
+        local duration = roleFrameCfg and roleFrameCfg.time_duration or 0
+        local endTime = 0
+        if duration > 0 then
+            duration = duration + _G.PlayerModel:GetInstance():GetRoleFrameRemainDuration(roleFrameId)
+            endTime = duration + _G.TimeUtil.GetServerUnixTime()
+        end
+
+        _G.PlayerModel:GetInstance():SetUnlockRoleFrame({
+            sid = roleFrameId,
+            end_time = endTime
+        })
+        local listHalo = {
+            sid = roleFrameId,
+            type = 7
+        }
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.RoleFrameView.Name, listHalo)
+    end
+
+    if cfg.UseType == UseType.SettingTheme then
+        _G.PlayerModel:GetInstance():UnLockSettingTheme(_G.tonumber(cfg.UseParameter[1][1]))
+        local listTheme = {
+            sid = _G.tonumber(cfg.UseParameter[1][1]),
+            type = 4
+        }
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetTitleView.Name, listTheme)
+    end
+
+    if cfg.UseType == UseType.GetSkin then
+        -- local skinArr = ""
+        if cfg.UseParameter ~= nil then
+            for _, arr in pairs(cfg.UseParameter) do
+                if arr ~= nil then
+                    for _, skinID in pairs(arr) do
+                        local skinIDs = tonumber(skinID)
+                        local ID = _G.ConfigManager.skin_cfg[skinIDs]
+                        if ID and ID.card then
+                            require "CardCommentManager":GetInstance():AddSkin(ID.card, skinIDs)
+                            local key1 = tostring(_G.PlayerModel:GetInstance().role_uid) .. "playerRole" .. skinIDs
+                            if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key1) then
+                            else
+                                _G.CS.WechatGameCore.PlayerPrefs.SetInt(key1, 1)
+                            end
+                            require "RedPointManager":GetInstance():RefreshNode(
+                                _G.ConfigManager.redpoint_cfg.PlayerRole.id, ID.card)
+                        end
+                        -- _G.PlayerModel:GetzInstance():AddHaveSkin(tonumber(skinID))
+                        -- skinArr = skinArr .. skinID
+                    end
+                end
+            end
+        end
+        ---形象
+
+        -- _G.PopWindowManager:GetInstance():ShowAllTips(1001, "测试  获得皮肤:" .. skinArr)
+    end
+    if cfg.UseType == _G.ItemUseType.Events then
+        require "ChatManager":GetInstance():ExpressionUnlocked(_G.tonumber(cfg.UseParameter[1][1]))
+        -- local listTheme = { sid = _G.tonumber(cfg.UseParameter[1][1]), type = 4 }
+        -- _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetTitleView.Name, listTheme)
+    end
+    if cfg.UseType == UseType.TreasureMap then
+        require "TreasureMapModel":GetInstance():UseTreasureMap(data.xy, sid)
+    end
+
+    if cfg.UseType == UseType.SecretRealm then
+        local secretRealmIndex = require "SecretRealmModel":GetInstance():GetCurBattleIndex()
+        require "SecretRealmModel":GetInstance():AddTicket(num, secretRealmIndex)
+    end
+
+    if cfg.UseType == UseType.RelicTeamEnergy then
+        require "RelicTeamModel":GetInstance():AddEnergy(num * _G.tonumber(cfg.UseParameter[1][1]))
+    end
+
+    if cfg.UseType == _G.ItemUseType.RechargeDraw then
+        local activity = require("ActivitySynManager"):GetInstance():GetActivityClass(1013401)
+        if activity then
+            activity.typeClass:AddDrawTime(num)
+        end
+    end
+
+    if cfg.UseType == UseType.UnlockHeadIcon then
+        local headId = _G.tonumber(cfg.UseParameter[1][1])
+        _G.PlayerModel:GetInstance():AddHeadShot(headId)
+        local listHead = {
+            sid = headId,
+            type = 6
+        }
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetTitleView.Name, listHead)
+    end
+
+    if data.award then
+        -- (竞技场宝箱)不要合并奖励数量丶不要排序
+        local isNotMerge = cfg.Type1 == 4 and cfg.UseType == 3
+        local isNotSort = isNotMerge and true or nil
+        if not hideAwardBol then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data, nil, isNotMerge,
+                nil, nil, nil, nil, isNotSort)
+        end
+    end
+    -- 合成碎片的任务后端有推送注释掉
+    -- if cfg.Type1 == 6 then
+    --     ---卡牌碎片合成
+    --     _G.Events:GetInstance():Broadcast(
+    --             _G.ePlayAactionEvent.PlayAaction,
+    --             { _G.ActiveTaskEnum.ConditionEnum.Item.SyntheticCardFragment, sid },
+    --             num
+    --     )
+    -- end
+    if hideAwardBol then
+        if call then
+            call(data)
+        end
+    else
+        if call then
+            call()
+        end
+    end
+end
+
+---批量使用道具
+---@param data storage.s2c_storage_use 服务器下发消息
+function StorageManager:BatchUsePropToServerSuc(data, info, call, hideAwardBol)
+    if data.ack ~= 1 then
+        return
+    end
+    for _, v in pairs(info) do
+        local UseType = _G.ItemUseType
+        ---@type item_cfg
+        local cfg = _G.ConfigManager.item_cfg[v.sid]
+        local baseCount = 1
+        if cfg.UseType == UseType.CompoundCard or cfg.UseType == UseType.DrawCard or cfg.UseType == UseType.CompoundProp then
+            baseCount = cfg.UseParameter[1][1]
+        end
+
+        if cfg.UseType == UseType.ProgressChest then
+            ---如果是进度宝箱
+            local item_box_con_cfgID = tonumber(cfg.UseParameter[1][1])
+            ---@type item_box_con_cfg
+            local item_box_con_cfg = _G.ConfigManager.item_box_con_cfg[item_box_con_cfgID]
+            local itemData = self:GetItemDataByID(_G.StorageID.Prop, v.sid)
+            itemData.progress = v.num
+            if v.num >= #item_box_con_cfg.condition_params then
+                ---如果都领取了就删道具
+                self:ConsumeItem(v.sid, 0, 1)
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.BackpackItem.id, v.sid)
+        elseif cfg.UseType ~= UseType.TreasureMap then
+            self:ConsumeItem(v.sid, 0, v.num * _G.tonumber(baseCount))
+        end
+        -- 合成碎片的任务后端有推送注释掉
+        -- if cfg.Type1 == 6 then
+        --     ---卡牌碎片合成
+        --     _G.Events:GetInstance():Broadcast(
+        --             _G.ePlayAactionEvent.PlayAaction,
+        --             { _G.ActiveTaskEnum.ConditionEnum.Item.SyntheticCardFragment, v.sid },
+        --             v.num
+        --     )
+        -- end
+    end
+    self:ReceiveAwardData(data)
+    if data.award then
+        -- (竞技场宝箱)不要合并奖励数量丶不要排序
+        if not hideAwardBol then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+        end
+    end
+    if call then
+        call()
+    end
+end
+
+---道具购买
+---@param id number exchange_cfg_Item的id
+---@param num number 购买数量
+---@param type number  兑换类型(1:exchange_cfg 兑换;2:item_repeat_cfg)
+function StorageManager:PropBuy(id, num, type, callback)
+    self.onPropBuyCallback = callback
+    ---2023/2/9前调用该接口处理
+    if type == nil then
+        type = 1
+    end
+    StorageNet:GetInstance():PropBuy(id, num, type, _G.handlerbind(self, self.OnPropBuyCall, id, num, type))
+end
+
+function StorageManager:OnPropBuyCall(msg, _, id, num, type)
+    if msg.ack == 1 then
+        self:ReceiveAwardData(msg)
+        msg.consume = msg.consume or {}
+        msg.consume.item = msg.consume.item or {}
+        for i = 1, #msg.consume.item do
+            self:ConsumeItem(msg.consume.item[i].item[1], 0, msg.consume.item[i].item[2])
+        end
+        if not self.bought_times[id] then
+            self.bought_times[id] = 0
+        end
+        ---@type exchange_cfg
+        local cfg_exchange = _G.ConfigManager.exchange_cfg[id]
+        local cfg_item_repeat = _G.ConfigManager.item_repeat_cfg[id]
+        if cfg_exchange and type == 1 then
+            self.bought_times[id] = _G.math.floor(self.bought_times[id] + num / cfg_exchange.get_item[1][2])
+        elseif cfg_item_repeat and type == 2 then
+            self.bought_times[id] = _G.math.floor(self.bought_times[id] + num / cfg_item_repeat.get_item[2])
+        end
+        if type == 2 then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        end
+    end
+    if self.onPropBuyCallback then
+        self.onPropBuyCallback(msg)
+    end
+end
+
+---通过sid检测仓库是否满了
+---@param sid number sid
+---@param num number 添加数量
+---@return boolean 是否满
+function StorageManager:CheckIsFullBySid(sid, num)
+    local storageType, storageID = self:CheckSidType(sid)
+    if not storageType then
+        return true
+    end
+    if not self.Storages[storageID] then
+        return false
+    end
+    return self.Storages[storageID]:CheckSize(num, sid) == false
+end
+
+---通过一组判断是否能入库
+---@param data table 数组[id#num]
+function StorageManager:IsCheckAddGetItem(data)
+    if data then
+        for _, v in pairs(data) do
+            if self:CheckIsFullBySid(v[1], v[2], v) then
+                return false
+            end
+        end
+    else
+        return false
+    end
+    return true
+end
+
+-- region --------------------------------------卡牌战力同步--------
+
+function StorageManager:SendServerCardPower()
+    self:StopTimer_CardPower()
+    self.Timer_CardPower = _G.TimerManager:GetInstance():GetTimer( -- 60 * 60 * 24
+    self.Time_Power, self.SendServerCardPowerCallBack, self, false, false)
+
+    self.Timer_CardPower:Start()
+end
+
+function StorageManager:StopTimer_CardPower()
+    if self.Timer_CardPower ~= nil then
+        self.Timer_CardPower:Stop()
+        self.Timer_CardPower = nil
+    end
+end
+
+function StorageManager:SendServerCardPowerCallBack()
+    self:GetServerCardPower()
+end
+
+----定时 触发战力同步  (卡牌仓库初始化完成后触发第一次)
+function StorageManager:GetServerCardPower(callback, notExecuteCall)
+    local nowTime = os.time()
+    ---加个间隔 防止一时间触发多次
+    if self.PowerIng_Time and nowTime - self.PowerIng_Time <= 2 then
+        if not notExecuteCall and callback then
+            callback()
+        end
+        return
+    end
+    self.PowerIng_Time = nowTime
+
+    local sumPower = 0
+
+    local Cards = self:GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local CardsDic = {}
+
+    ---@type power.i_uids
+    local i_uids
+    for uid, v in pairs(Cards) do
+        if not v.isTemp then
+            i_uids = {}
+            i_uids.uid = uid
+            i_uids.power = v.power
+
+            sumPower = sumPower + (i_uids.power or 0)
+            CardsDic[uid] = i_uids
+        end
+    end
+    local sendPower = function()
+        --- 战斗力与服务器相同的卡 【uid】=true
+        local okUid = {}
+        ---@param i_uids power.i_uids
+        for _, i_uids in pairs(self.sever_power) do
+            ---@type card CardData
+            local card = CardsDic[i_uids.uid]
+            if card ~= nil and card.power == i_uids.power then
+                okUid[i_uids.uid] = true
+            end
+        end
+        ---@type power.c2s_power_update
+        local SendDIc = {}
+        SendDIc.cards = {}
+        ---@type power.i_uids
+        local i_uids
+        for uid, v in pairs(CardsDic) do
+            if okUid[uid] == nil then
+                table.insert(SendDIc.cards, v)
+            end
+        end
+        if #SendDIc.cards > 0 then
+            -- region --------------------------------------再验一次  防止期间有吃卡操作 导致服务器找不到该卡--------
+            local tCards = self:GetDataByID(_G.StorageID.Card)
+            for i = #SendDIc.cards, 1, -1 do
+                if tCards[SendDIc.cards[i].uid] == nil then
+                    table.remove(SendDIc.cards, i)
+                    self.sever_power[SendDIc.cards[i].uid] = nil
+                end
+            end
+
+            -- start ZHJH5ZHJH-11856 9月程序主任务ZHJH-13304
+            -- 【客户端】战力统计规则调整
+            _G.SortList(SendDIc.cards, function(item)
+                return item.power
+            end)
+
+            for i = 51, #SendDIc.cards do
+                SendDIc.cards[i] = nil
+            end
+
+            ---end
+
+            -- endregion------------------------------------再验一次  防止期间有吃卡操作 导致服务器找不到该卡--------
+            StorageNet:GetInstance():UpDateServerCardPower(SendDIc, function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                self.sumFightPower = sumPower
+                for _, v in pairs(SendDIc.cards) do
+                    if self.sever_power[v.uid] then
+                        self.sever_power[v.uid].power = v.power
+                    end
+                end
+                if callback then
+                    callback()
+                end
+                _G.PlayerModel:GetInstance():SetPower(sumPower)
+                ---任务目标战力计算规则: 只看共鸣神石上的卡牌
+                local power = self:GetPlayerPower()
+                _G.Events:GetInstance():Broadcast(_G.ePlayAactionEvent.PlayAaction,
+                    {_G.ActiveTaskEnum.ConditionEnum.Power.TotalPowerW}, power // 10000)
+            end)
+        else
+            if callback then
+                callback()
+            end
+        end
+    end
+    if sumPower ~= self.sumFightPower then
+        if not self.sever_power then
+            StorageNet:GetInstance():GetServerCardPower(function(s2c_get_power)
+                self:InitSeverPower(s2c_get_power)
+                sendPower()
+            end)
+        else
+            sendPower()
+        end
+    else
+        if callback then
+            callback()
+        end
+    end
+    _G.PlayerModel:GetInstance():SetPower(sumPower)
+end
+
+---@param msg power.s2c_get_power
+function StorageManager:InitSeverPower(msg)
+    self.sever_power = {}
+    if not _G.table.isEmptyOrNil(msg.cards) then
+        for _, v in pairs(msg.cards) do
+            self.sever_power[v.uid] = v
+        end
+    end
+end
+
+---获取玩家战力
+function StorageManager:GetPlayerPower()
+    local power = 0
+    local cards
+    -- local cards = self:GetDataByID(_G.StorageID.Card)
+    if require("CardResonanceModel"):GetInstance():CheckSelfOpen() then
+        cards = require("CardResonanceModel"):GetInstance():GetAllPosCards()
+        for _, v in pairs(cards) do
+            power = power + v.power
+        end
+    else
+        cards = self:GetDataByID(_G.StorageID.Card)
+        ---最强战力的五张卡
+        cards = _G.table.toArray(cards)
+        _G.SortList(cards, function(data)
+            return data.power
+        end)
+        for index, v in ipairs(cards) do
+            power = power + v.power
+            if index >= 5 then
+                break
+            end
+        end
+    end
+
+    return power
+end
+
+-- region --------------------------------------通用生成--------
+
+---获取道具显示
+---@param Parent UnityEngine.GameObject  Parent有GoTable组件
+---@param call function<table,number>  Item加载完成返回<itemlua,storageType>
+function StorageManager:GetItem(Parent, sid, num, call, OnBtnCall)
+    local storageType, storageID = self:CheckSidType(sid)
+
+    local ItemGoTable = _G.GetAutoGoTable(Parent)
+    if ItemGoTable.DataDic == nil then
+        ItemGoTable.DataDic = {}
+    end
+    ItemGoTable.DataDic[storageType] = {sid, num}
+
+    if ItemGoTable.ItemLuaDic == nil then
+        ItemGoTable.ItemLuaDic = {}
+    end
+
+    local ItemLua = ItemGoTable.ItemLuaDic[storageType]
+
+    if ItemLua == nil then
+        ItemGoTable.ItemLuaDic[storageType] = true
+        local data = ItemData[storageType].New()
+        data:Parse({
+            sid = sid,
+            uid = sid,
+            count = num
+        })
+        ItemBase[storageType].Create(data, Parent, function(itemLua)
+            ItemGoTable.ItemLuaDic[storageType] = itemLua
+            if call ~= nil then
+                call(itemLua, storageType)
+            end
+        end, OnBtnCall)
+    elseif ItemLua ~= true then
+        if storageType == _G.StorageType.Material or storageType == _G.StorageType.ResProp or storageType ==
+            _G.StorageType.Debris then
+            ---@type ItemViewBase
+            local lua = ItemLua
+            lua:ShowCount(num)
+            lua:SetImage(sid)
+        end
+        if call ~= nil then
+            call(ItemLua, storageType)
+        end
+    end
+end
+
+-- endregion------------------------------------通用生成--------
+
+---获取物体品质
+function StorageManager:GetItemGrade(sid, uid)
+    local type = self:CheckSidType(sid)
+    local grade = 1
+    if type == _G.StorageType.Card then
+        if uid and uid > 0 and uid > sid then
+            local data = self:GetItemDataByID(_G.StorageID.Card, uid)
+            grade = require "CardInfoManager":GetInstance():GetOrderStarCount(data.star)
+        else
+            local cfg = _G.ConfigManager.card_cfg[sid]
+            if cfg then
+                ---ZHJ-19443【8日登录】角色奖励特效显示错误 +1,3改为4
+                grade = require "CardInfoManager":GetInstance():GetOrderStarCount(cfg.Star) + 1
+            end
+        end
+    elseif type == _G.StorageType.Equipment then
+        local cfg = _G.ConfigManager.equipment_cfg[sid]
+        if cfg then
+            ----没有白 按道具来
+            grade = cfg.grade
+        end
+    elseif type == _G.StorageType.Decoration then
+        local cfg = _G.ConfigManager.decoration_cfg[sid]
+        if cfg then
+            grade = cfg.grade
+        end
+    elseif type == _G.StorageType.Carving then
+        local cfg = _G.ConfigManager.carving_cfg[sid]
+        if cfg then
+            grade = cfg.grade
+        end
+    elseif type == _G.StorageType.Artifact then
+        local cfg = _G.ConfigManager.artifact_cfg[sid]
+        if cfg then
+            grade = cfg.Order
+        end
+    elseif type == _G.StorageType.Spiritual then
+        local cfg = _G.ConfigManager.spiritual_cfg[sid]
+        if cfg then
+            grade = cfg.Order
+        end
+    else
+        grade = self:GetItemQuality(sid)
+    end
+    return grade, type
+end
+
+---ZHJH-2885  ZHJH-2048 删除蓝绿
+local itemEffect = {
+    [1] = false,
+    [2] = false,
+    [3] = false,
+    [4] = "ef_BaseItemWithCount_zi",
+    [5] = "ef_BaseItemWithCount_cheng",
+    [6] = "ef_BaseItemWithCount_hong",
+    [7] = "ef_BaseItemWithCount_jin",
+    [8] = "ef_daojukuang_xuancai"
+}
+---获取通用奖励物体特效
+function StorageManager:GetCommonLightEffect(sid, uid)
+    local grade, type = self:GetItemGrade(sid, uid)
+    if type == _G.StorageType.Artifact then
+        if grade < 3 then
+            grade = grade + 4
+        else
+            grade = grade + 5
+        end
+
+    elseif type == _G.StorageType.Spiritual then
+        if grade < 4 then
+            grade = grade + 3
+        else
+            grade = grade + 4
+        end
+
+    end
+    grade = grade > #itemEffect and #itemEffect or grade
+    local key = itemEffect[grade]
+    if key then
+        return _G.ConfigManager.ui_effect_cfg[key], key
+    end
+    return nil, key
+end
+
+-- region --------------------------------------解锁的头像--------
+
+function StorageManager:InitUnloclItem()
+    ---{sid=1}   获得就解锁的item
+    self.UnlockItemSidDic = {}
+    local cfg = _G.ConfigManager.item_cfg
+    ---@param value item_cfg
+    for _, value in pairs(cfg) do
+        if value.UsePattern == _G.ItemUsePattern.Get then
+            self.UnlockItemSidDic[value.ID] = 1
+        end
+    end
+end
+
+---true是解锁类道具 (主要用来获得时自动使用)
+function StorageManager:IsUnloclItem(sid)
+    return self.UnlockItemSidDic and self.UnlockItemSidDic[sid] == 1
+end
+
+---设置nil(自动使用过了 防止获得时 一直请求使用)
+function StorageManager:SetNilUnloclItem(sid)
+    if self.UnlockItemSidDic and self.UnlockItemSidDic[sid] then
+        self.UnlockItemSidDic[sid] = nil
+    end
+end
+
+function StorageManager:DisposeUnloclItem()
+    self.UnlockItemSidDic = nil
+end
+
+-- endregion------------------------------------解锁的头像--------
+
+-- region --------------------------------------快捷使用道具--------
+
+---true打开了道具使用界面
+---@param sid number 要获得的资源 discrete_cfg[100507]
+---@param Call function 使用后回调用于刷新界面
+---@param fromName string 谁打开了道具使用界面
+function StorageManager:FastCheckItem(sid, Call, fromName)
+    local storageType = self:CheckSidType(sid)
+    if storageType then
+        if storageType == _G.StorageType.ResProp or _G.StorageType.Material == storageType then
+            ---资源
+            local params = _G.ConfigManager.discrete_cfg[100507]
+            for _, v in pairs(params) do
+                if v[1] == sid then
+                    for index, itemId in ipairs(v) do
+                        if index > 1 and _G.StorageManager:GetInstance():CheckItem(itemId, 1) then
+                            ---@type params_FastUseItemView
+                            local data = {}
+                            data.Call = Call
+                            data.sid = itemId
+                            data.getSid = sid
+                            data.from = fromName
+                            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.FastUseItemView.Name, data)
+                            return true
+                        end
+                    end
+                end
+            end
+        elseif storageType == _G.StorageType.Artifact then
+            ---神器宝箱
+            local cfg = _G.ConfigManager.artifact_cfg[sid]
+            if not _G.table.isEmptyOrNil(cfg.quick_use) then
+                for _, v in ipairs(cfg.quick_use) do
+                    if _G.StorageManager:GetInstance():CheckItem(v, 1) then
+                        self:PropUse(v, Call)
+                        return true
+                    end
+                end
+            end
+        elseif storageType == _G.StorageType.Spiritual then
+            ---灵契宝箱
+            local cfg = _G.ConfigManager.spiritual_cfg[sid]
+            if not _G.table.isEmptyOrNil(cfg.quick_use) then
+                for _, v in ipairs(cfg.quick_use) do
+                    if _G.StorageManager:GetInstance():CheckItem(v, 1) then
+                        self:PropUse(v, Call)
+                        return true
+                    end
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+---灵兽宝箱快捷使用
+---@param sid number 灵兽sid
+function StorageManager:PetFastCheckItem(sid, call)
+    local cfg = _G.ConfigManager.pet_cfg[sid]
+    if not _G.table.isEmptyOrNil(cfg.quick_use) then
+        for _, v in ipairs(cfg.quick_use) do
+            if _G.StorageManager:GetInstance():CheckItem(v, 1) then
+                self:PropUse(v, call)
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+---建筑宝箱快捷使用
+---@param sid number 建筑sid
+function StorageManager:BuildFastCheckItem(sid, call)
+    local cfg = _G.ConfigManager.manor_build_cfg[sid]
+    if not _G.table.isEmptyOrNil(cfg.quick_use) then
+        for _, v in ipairs(cfg.quick_use) do
+            if _G.StorageManager:GetInstance():CheckItem(v, 1) then
+                self:PropUse(v, call)
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+---战利品宝箱快捷使用
+---@param sid number 战利品sid
+function StorageManager:SpoilsFastCheckItem(sid, callback)
+    local cfg = _G.ConfigManager.spoils_cfg[sid]
+    if cfg and not _G.table.isEmptyOrNil(cfg.quick_use) then
+        for _, v in ipairs(cfg.quick_use) do
+            if _G.StorageManager:GetInstance():CheckItem(v, 1) then
+                self:PropUse(v, callback)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---检测道具数量是否满足
+---@param Sid number 道具sid
+---@param Count number 道具数量
+---@return boolean
+function StorageManager:CheckItemNew(Sid, Count, call)
+    if not self:CheckItem(Sid, Count) then
+        if not self:FastCheckItem(Sid, call) then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, Sid)
+        end
+        return false
+    end
+    return true
+end
+
+---检测是否要显示红点-使用道具
+function StorageManager:CheckIsShowRedPointUseProp(id)
+    return self:CheckIsShowRedPointUse(_G.StorageID.Prop, id)
+end
+
+-- 检查是否要显示碎片红点
+function StorageManager:CheckIsShowRedPointUseDebris(id)
+    return self:CheckIsShowRedPointUse(_G.StorageID.Debris, id)
+end
+
+function StorageManager:CheckIsShowRedPointUse(storageID, id)
+    if not self.noShowRed or not self.noShowRed[id] then
+        return true
+    end
+    ---@type item_cfg
+    local cfg = _G.ConfigManager.item_cfg[id]
+    if cfg and useTypes[cfg.UseType] then
+        if cfg.UseType == _G.ItemUseType.CompoundCard or cfg.UseType == _G.ItemUseType.DrawCard then
+            local num = _G.StorageManager:GetInstance():GetItemCountByID(storageID, id)
+            local size = _G.tonumber(cfg.UseParameter[1][1])
+            if math.floor(num / size) > math.floor(self.noShowRed[id] / size) then
+                return true
+            end
+        elseif cfg.UseType == _G.ItemUseType.InterfaceJump then
+            local resumeCfg = _G.ConfigManager.discrete_cfg[103712][1]
+            if id == resumeCfg[1] then
+                return true
+            end
+            return false
+        else
+            if self.noShowRed[id] == -1 then
+                return false
+            end
+            return _G.StorageManager:GetInstance():GetItemCountByID(storageID, id) > self.noShowRed[id]
+        end
+    else
+        return false
+    end
+end
+
+---保存不需要显示红点的道具表
+function StorageManager:SaveRedUseProp()
+    self.noShowRed = {}
+    local items = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Prop)
+    for key, v in pairs(items) do
+        self.noShowRed[key] = v.count
+    end
+    items = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Debris)
+    for key, v in pairs(items) do
+        self.noShowRed[key] = v.count
+    end
+end
+
+---生成award.prop奖励结构
+---@param sid number 物体sid
+---@param number number 数量
+---@param extend table 其他参数 如卡牌{star}，装备{element}
+function StorageManager:SimulationAward(sid, number, extend)
+    local type = self:CheckSidType(sid)
+    local tb = {}
+    if type == _G.StorageType.Card then
+        local cfg = _G.ConfigManager.card_cfg[sid]
+        tb[1] = sid
+        tb[2] = 0
+        tb[3] = _G.table.isEmptyOrNil(extend) and cfg.Star or extend[1]
+        tb[4] = number
+    else
+        tb[1] = sid
+        tb[2] = number
+    end
+    return tb
+end
+
+-- endregion------------------------------------快捷使用道具--------
+function StorageManager:GetIDMax(sid, uid)
+    local pan = false
+    local type = _G.StorageManager:GetInstance():CheckSidType(sid)
+
+    if type == _G.StorageType.Card then
+        local num = _G.StorageManager:GetInstance():GetMaxStarCardBySid(sid)
+        -- ZHJH5ZHJH-5518 【Beta0.0.1+CBT】BuglistZHJH-6436
+        -- 【心愿招募】卡牌满星之之后，选择心愿提示错误
+        -- 镇魂街最高24，H5改成27
+        if num and num.star >= 27 then
+            pan = true
+        end
+    elseif type == _G.StorageType.Prop then
+        local data = _G.ConfigManager.item_cfg[sid]
+        if data then
+            -- ZHJH5ZHJH-5518 【Beta0.0.1+CBT】BuglistZHJH-6436
+            -- 【心愿招募】卡牌满星之之后，选择心愿提示错误
+            -- 镇魂街最高24，H5改成27
+            if data.Type1 == 6 or data.Type1 == 9 then
+                local num = _G.StorageManager:GetInstance():GetMaxStarCardBySid(uid)
+                if num and num.star >= 27 then
+                    pan = true
+                end
+            end
+        end
+    end
+    return pan
+end
+
+---检测一键合成是否需要弹tip弹窗
+function StorageManager:CheckBagOpenTip()
+    return self.bagOpenTip
+end
+
+function StorageManager:CheckBagComposeTip()
+    return self.bagComposeTip
+end
+
+-- endregion
+
+---添加代币数量
+function StorageManager:AddItemByData(storageID, sid, num)
+    self.Storages[storageID]:AddItemByData(sid, num)
+end
+
+---解析活动代币奖励: 活动代币奖励从0开始
+---@param awardList number[][]
+---@return number[][]
+function StorageManager:ResoveActivityAwardCfg(awardList)
+    local hasActivityAward = false
+    for i, v in ipairs(awardList) do
+        if v[1] == 0 and #v >= 5 then
+            hasActivityAward = true
+            break
+        end
+    end
+    if not hasActivityAward then
+        return awardList
+    end
+    awardList = {table.unpack(awardList)}
+    for i, v in ipairs(awardList) do
+        if v[1] == 0 and #v >= 5 then
+            v = {v[4], v[5], v[1], v[2], v[3]}
+            awardList[i] = v
+        end
+    end
+    return awardList
+end

@@ -1,0 +1,1838 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s0514.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.ChatView.View.ChatManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/07/15
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ChatViewNet = require "ChatViewNet"
+---@class ChatManager : GameDataModelBase    中文描述
+---@field GetInstance fun():ChatManager
+local ChatManager = _G.BaseClass("ChatManager", _G.GameDataModelBase)
+
+-- ---@class ChatManager.Chat_PinDao
+-- ---@field system number 系统
+-- ---@field world number 世界
+-- ---@field self number 本服
+-- ---@field union number 公会
+-- ---@field team number 队伍
+-- local chat_pindao = {
+--     ["system"] = 1,
+--     ["world"] = 2,
+--     ["self"] = 3,
+--     ["union"] = 4,
+--     ["team"] = 5
+-- }
+-- ChatManager.Chat_PinDao = _G.CreatEnumTable(chat_pindao)
+
+local bulletTypeDic = {
+    [_G.ChatType.events] = 1,
+    [_G.ChatType.support] = 2,
+    [_G.ChatType.leagueevents] = 2
+}
+local shareTipsId = 416
+
+---创建对象时,入口构造函数
+function ChatManager:__init()
+    local param = _G.ConfigManager.discrete_cfg[101004][1][1]
+    self.UiDic = {
+        ---最大最近私聊数 频道聊天界面显示
+        zjslMaxCount = tonumber(param)
+    }
+    ---世界聊天 未分配战区时为0 其他情况字段不给值
+    self.zone_id = 1
+    ---@class discreteCfg_Chat
+    self.language_Chat = {
+        --系统
+        xt = 9002060001,
+        --世界
+        sj = 9002060002,
+        --本服
+        bf = 9002060003,
+        --公会
+        gh = 9002060004,
+        --队伍
+        dw = 9002060005,
+        --不可聊天，切换频道(当前频道不可聊天，请切换到其他频道)
+        bkltqhpd = 9002060006,
+        --最多输入(六十字)
+        zdsr = 9002060007,
+        --发送
+        fs = 9002060008,
+        --未加入公会
+        wjrgh = 9002060009,
+        --输入(达到)上限
+        srsx = 9002060010,
+        --不能(发送)空白(消息)
+        bnkb = 9002060011,
+        --(消息)发送频繁，(请)
+        fspb = 9002060012,
+        --内容重复(，请修改后再试)
+        nrcf = 9002060013,
+        --返回错误
+        fjcw = 9002060014,
+        --聊天功能未开启
+        ltgnwkq = 9002060015,
+        --内容不为空
+        nrbwk = 9002060016,
+        --内容长度限制
+        nrcdxv = 9002060017,
+        --聊天通道错误
+        lntdcw = 9002060018,
+        --聊天时间限制
+        ltsjxz = 9002060019
+    }
+    ---消息最大条数
+
+    local chat_cfg = _G.ConfigManager.chat_cfg
+
+    --- 所有消息内容 -频道
+    ---@type chat.i_chat[]
+    self.Chat_InfoAll = {}
+    ---每个频道 保存数量
+    self.ChatSaveCountDic = {}
+    ---每个频道发送间隔  加1秒 误差
+    self.PindaoSendTimeDic = {}
+    ---主界面下面频道通知 包含频道   1显示 0不显示
+    self.mainPindao = {}
+    ---消息发送时间戳
+    self.chatSendTIMEDic = {}
+    ---聊天频道开放 { ChatType=true 开放  or  chatType={4#103020}   }  如果=true 则开放  否则为开启参数
+    self.chat_openDic = {}
+
+    for key, value in pairs(_G.ChatType) do
+        self.Chat_InfoAll[value] = {}
+        self:SetMainHasPindao(value, true)
+        self.chatSendTIMEDic[value] = 0
+        local chat_cfgItem = chat_cfg[value]
+        if chat_cfgItem then
+            -- if value == 3 and not require "SociatyManager":GetInstance():HasSociaty() then
+            --     self.chat_openDic[value] = false
+            -- else
+            -- end
+            self.ChatSaveCountDic[value] = chat_cfgItem.save_msg or 50
+            self.PindaoSendTimeDic[value] = chat_cfgItem.cooling_time or 0
+            ---加0.3的误差 防止网络延迟
+            self.PindaoSendTimeDic[value] = self.PindaoSendTimeDic[value] + 0.3
+
+            --判断渠道条件
+            local newCondition = self:CheckPlatformCondition(value)
+            if newCondition then
+                self.chat_openDic[value] = newCondition
+            else
+                ---判断公会当前功能是否开启
+                self.chat_openDic[value] = chat_cfgItem.chat_open[1] ~= nil and chat_cfgItem.chat_open or true
+            end
+        else
+            self.ChatSaveCountDic[value] = 50
+            self.PindaoSendTimeDic[value] = 0
+            ---判断公会当前功能是否开启
+            self.chat_openDic[value] = true
+        end
+    end
+    -- ---不显示私聊
+    -- self:SetMainHasPindao(_G.ChatType.privateChat, false)
+
+    ---在聊天频道中 自己刚发送的消息记录 (自己发送的立即显示后 忽略广播的自己消息)
+    ---@field time  number
+    ---@field content  string
+    ---@class ChatmanagerOldSendDic_Itme
+
+    ---上次自己 发送的消息(世界频道 自己发送立马显示  不等服务器广播防止延迟)
+    ---@type ChatmanagerOldSendDic_Itme[]
+    self.oldSendDic = {}
+    self:Phiz_Even()
+    self:Phiz_Init()
+    _G.Events:GetInstance():AddListener(_G.ChatViewEvents.ChatViewLevel, self.ChatViewLevel, self)
+    _G.Events:GetInstance():AddListener(_G.ChatViewEvents.ChatViewHunLian, self.ChatViewHunLian, self)
+    _G.Events:GetInstance():AddListener(_G.ChatViewEvents.ChatViewTianFv, self.ChatViewTianFv, self)
+end
+
+---检测有无渠道条件替换
+function ChatManager:CheckPlatformCondition(value)
+    --ZHJH5ZHJH-8086 【7月版本】程序主单号ZHJH-9432
+    --【客户端】支付宝-聊天频道开启条件判断调整(同样也支持其他渠道替换聊天条件,条件目前只支持单条件)
+    local platform = _G.tonumber(_G.SDKManager:GetInstance():GetChannelId())
+    if _G.AppSetting.DEBUG then
+        _G.Log(platform, "聊天频道判断渠道id")
+    end
+
+    ---先判断是否有渠道并取出渠道聊天条件信息
+    local newCondition
+    ---ZHJH-13445新的条件配在function_block_cfg，以前的离散配置先不管，这里取不到再取离散
+    local pCfg = _G.ConfigManager.function_block_cfg[platform]
+    for _, v in pairs(pCfg.chat) do
+        if v[1] == value then
+            newCondition = {v[2], v[3]}
+            if _G.AppSetting.DEBUG then
+                _G.Log(newCondition, "聊天频道替换新条件")
+                _G.Log(value, "聊天频道")
+            end
+            return newCondition
+        end
+    end
+
+    local newDId
+    local info = _G.ConfigManager.discrete_cfg[126105]
+    for i = 1, #info do
+        local pf = info[i]
+        if pf[1] == platform then
+            newDId = pf[2]
+            break
+        end
+    end
+    
+    if newDId then
+        ---匹配聊天频道并替换条件
+        info = _G.ConfigManager.discrete_cfg[newDId]
+        for i = 1, #info do
+            local condition = info[i]
+            if condition[1] == value then
+                ---需要多条件可在此处新增解析
+                newCondition = { condition[2], condition[3] }
+                break
+            end
+        end
+    end
+
+    if _G.AppSetting.DEBUG and newCondition then
+        _G.Log(newCondition, "聊天频道替换新条件")
+        _G.Log(value, "聊天频道")
+    end
+    return newCondition
+end
+
+--region 角色培养炫耀性提示
+function ChatManager:ChatViewLevel(card, zhi)
+    if not require "SociatyManager":GetInstance():HasSociaty() or not self:IsUnLock(_G.ChatType.union) then
+        return
+    end
+    local v, k
+    local SociatyData = _G.ConfigManager.discrete_cfg[101008]
+    local is = false
+    for key, value in pairs(SociatyData) do
+        if value[1] == zhi then
+            if self:ISCrad(1, card, value[2]) then
+                return
+            end
+            v = value
+            k = key
+            is = true
+        end
+    end
+    if is then
+        self:GetNewChatInfoData(1, card, k, v[2])
+    end
+end
+
+function ChatManager:ChatViewHunLian(card, zhi)
+    if not require "SociatyManager":GetInstance():HasSociaty() or not self:IsUnLock(_G.ChatType.union) then
+        return
+    end
+    local v, k
+    local SociatyData = _G.ConfigManager.discrete_cfg[101009]
+    local is = false
+    for key, value in pairs(SociatyData) do
+        if value[1] == zhi then
+            if self:ISCrad(2, card, value[2]) then
+                return
+            end
+            if card:GetStar() >= 19 then
+                k = 2
+            else
+                -- body
+                k = 1
+            end
+            v = value
+            is = true
+        end
+    end
+    if is then
+        self:GetNewChatInfoData(2, card, k, v[2])
+    end
+end
+
+function ChatManager:ChatViewTianFv(card, zhi)
+    if not require "SociatyManager":GetInstance():HasSociaty() or not self:IsUnLock(_G.ChatType.union) then
+        return
+    end
+    local v, k
+    local SociatyData = _G.ConfigManager.discrete_cfg[101010]
+    local is = false
+    for key, value in pairs(SociatyData) do
+        if value[1] == zhi then
+            if self:ISCrad(3, card, value[2]) then
+                return
+            end
+            v = value
+            k = key
+            is = true
+        end
+    end
+    if is then
+        self:GetNewChatInfoData(3, card, k, v[2])
+    end
+end
+
+function ChatManager:GetNewChatInfoData(shareType, card, k, v)
+    local data = {}
+    data.shareType = shareType
+    data.shareType_1 = k
+    data.shareType_2 = v
+    data.dfname = card.cfg.Name
+    if card.skin and card.skin ~= 0 then
+        data.sid = card.skin
+    else
+        data.sid = card.sid
+    end
+    data.uid = card.uid
+    data.star = card.star
+    data.lv = card.lv
+    data.type = card.type
+    data.soul_chain_lv = card.soulLink_lv
+    data.soul_state = card.soulLink_IsActivate
+    data.big_born_num = card.big_born_num
+
+    local dataStr = _G.Table2Json(data)
+
+    ---@type chat.c2s_chat dsd
+    local param = {}
+    param.channel = _G.ChatType.union
+    param.content = dataStr
+    param.f_uid = nil
+    param.type = _G.ChatInfoType.ShowCultivationPride
+    param.voice = 0
+    param.share_id = 0
+
+    ---@type ClintSendChatInfo ---本地自己的消息 先显示 忽略服务器广播 防止延迟
+    local msg = {}
+    msg.channel = _G.ChatType.union
+    msg.n_content = dataStr
+    msg.f_uid = nil
+    msg.type = _G.ChatInfoType.ShowCultivationPride
+    msg.voice = 0
+    msg.share_id = 0
+    msg = require("ChatManager"):GetInstance():GetNewChatInfo(msg)
+    require("ChatViewNet"):GetInstance():SendCHAT(param, _G.handlerbind(self, self.CallSendChat, msg))
+end
+
+function ChatManager:CallSendChat(param, msg)
+    if param.ack == 1 then
+        --  _G.PopWindowManager:GetInstance():ShowAllTips(411)
+        --- 以服务器返回的内容为准  (违禁字 处理后)
+        if not _G.IsNil(param.content) and not string.IsNullOrEmpty(param.content) then
+            msg.chat.n_content = param.content
+        end
+        if not _G.IsNil(param.time) then
+            msg.chat.time = param.time
+        end
+        require("ChatManager"):GetInstance():P2C_NewChat(msg)
+    end
+end
+
+---判断当前英雄是否已发送
+function ChatManager:ISCrad(type, card, zhi)
+    local CradList = _G.PlayerPrefsManager.GetTable("ChatManager" .. type) or {}
+    if CradList[card.sid] then
+        local is = true
+        for key, value in pairs(CradList[card.sid]) do
+            if zhi == value then
+                return true
+            end
+        end
+
+        _G.table.insert(CradList[card.sid], zhi)
+    else
+        -- _G.table.insert(CradList, { card.id, { zhi } })
+        CradList[card.sid] = {}
+        _G.table.insert(CradList[card.sid], zhi)
+    end
+    _G.PlayerPrefsManager.SetTable("ChatManager" .. type, CradList)
+    return false
+end
+
+--endregion
+
+function ChatManager:GetDataFormServer()
+    ---最近私聊数组 [uid,]
+    self.zjsl_uids = self:Zjsl_GetUids()
+    self:InitChatData(
+        function()
+            self:ParseData()
+        end
+    )
+end
+
+function ChatManager:InitFunction()
+    if not self.inited then
+        self.inited = true
+        self.unReadList = {}
+    end
+end
+
+function ChatManager:ReConnect(call)
+    self:InitChatData(
+        function()
+            local FriendsView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.FriendsView.Name)
+            if FriendsView ~= nil then
+                FriendsView:UpdateFriendPanel()
+            end
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatView.Name)
+            if call ~= nil then
+                call()
+            end
+        end
+    )
+end
+
+function ChatManager:InitChatData(call)
+    local ReCallCount = 0
+    local ReCallFun = function()
+        ReCallCount = ReCallCount - 1
+        if ReCallCount <= 0 then
+            if call then
+                call()
+            end
+        end
+    end
+    self:Phiz_GetExpressionInfo()
+    ---@type chat.c2s_get_chat
+    local pbdata = {}
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        ReCallCount = 4
+        pbdata.channel = _G.ChatType.world
+
+        local bool = self:IsUnLock(_G.ChatType.world)
+
+        if bool ~= false and self.zone_id ~= 0 then
+            --获取  频道聊天历史消息
+            ChatViewNet:GetInstance():GetChatByType(pbdata, _G.handlerbind(self, self.CallGetChatByType, ReCallFun))
+        else
+            self:CallGetChatByType({}, ReCallFun)
+        end
+        -- ReCallCount = ReCallCount + 1
+        pbdata.channel = _G.ChatType.selfWorld
+
+        bool = self:IsUnLock(_G.ChatType.selfWorld)
+        if bool ~= false then
+            ChatViewNet:GetInstance():GetChatByType(pbdata, _G.handlerbind(self, self.CallGetChatByType, ReCallFun))
+        else
+            --获取  本地聊天历史消息
+            self:CallGetChatByType({}, ReCallFun)
+        end
+        -- ReCallCount = ReCallCount + 1
+        bool = self:IsUnLock(_G.ChatType.privateChat)
+        if bool ~= false then
+            ChatViewNet:GetInstance():GetRecentChat(_G.handlerbind(self, self.CallGetRecentChat, ReCallFun))
+        else
+            self:CallGetChatByType({}, ReCallFun)
+        end
+        --- 获取公会聊天记录
+        -- ReCallCount = ReCallCount + 1
+        bool = self:IsUnLock(_G.ChatType.union)
+        if bool ~= false then
+            self:GetSociatyChat(ReCallFun)
+        else
+            self:CallGetChatByType({}, ReCallFun)
+        end
+        --region --------------------------------------zjsl--------
+        ---不解析好友聊天记录  否则会导致重复
+        -- self:ParsFriendList()
+
+        -- local uids = self:Zjsl_GetUids()
+        -- for _, uid in pairs(uids) do
+        --     self:ParsSingleFriend(uid)
+        -- end
+        --endregion------------------------------------zjsl--------
+    end
+end
+
+function ChatManager:CallGetRecentChat(Data, call)
+    ---@type chat.private_chat[]
+    local chatArr = Data.chat_list
+    if chatArr ~= nil then
+        ---清空
+        self.Chat_InfoAll[_G.ChatType.privateChat] = {}
+
+        for i = #chatArr, 1, -1 do
+            local chat = chatArr[i]
+            local uid = chat.f_uid
+            ---@type chat.i_chat[]
+            local chatlist = chat.list
+            if chatlist and #chatlist > 0 then
+                for i = #chatlist, 1, -1 do
+                    local data = chatlist[i]
+                    self:P2C_NewChat(data)
+                end
+            end
+        end
+    end
+    if call then
+        call()
+    end
+end
+
+function ChatManager:CheckPrivateChat()
+    local list = self.Chat_InfoAll[_G.ChatType.privateChat]
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local IntervalTime = _G.ConfigManager.discrete_cfg[100305][1][1]
+    for uid, chat in pairs(list) do
+        for i, v in pairs(chat) do
+            if v.time + IntervalTime < time then
+                list[uid][i] = nil
+            end
+        end
+    end
+end
+
+--- 加入公会 (拉取 当前公会聊天记录)
+function ChatManager:OnJoinSociaty()
+    local bool = self:IsUnLock(_G.ChatType.union)
+    if bool ~= false then
+        self:GetSociatyChat()
+    else
+        self:CallGetChatByType({})
+    end
+end
+
+--- 退出公会 (清空 当前公会聊天记录)
+function ChatManager:ClearSociatyChat()
+    if self.Chat_InfoAll ~= nil then
+        self.Chat_InfoAll[_G.ChatType.union] = {}
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatView.Name)
+    end
+end
+
+function ChatManager:GetSociatyChat(call)
+    self:ClearSociatyChat()
+
+    local bool = self:IsUnLock(_G.ChatType.union)
+    if bool ~= false and require "SociatyManager":GetInstance():HasSociaty() then
+        ---@type chat.c2s_get_chat
+        local pbdata = {}
+        pbdata.channel = _G.ChatType.union
+        --获取  频道聊天历史消息
+        ChatViewNet:GetInstance():GetChatByType(pbdata, _G.handlerbind(self, self.CallGetChatByType, call))
+    else
+        self:CallGetChatByType({}, call)
+    end
+end
+
+---@param call fun(msg:chat.s2c_get_chat)
+function ChatManager:GetActivityTournamentChatInfo(call)
+    if self.Chat_InfoAll ~= nil then
+        self.Chat_InfoAll[_G.ChatType.activityTournament] = {}
+    end
+    ---@type chat.c2s_get_chat
+    local pbdata = {}
+    pbdata.channel = _G.ChatType.activityTournament
+    --获取  频道聊天历史消息
+    ChatViewNet:GetInstance():GetChatByType(pbdata, _G.handlerbind(self, self.CallGetChatByType, call))
+end
+
+---@param data chat.i_chat
+function ChatManager:AddChatInfo(pindao, data)
+    ---发送者id
+    local sendUid = data.role_info.uid
+    local isinBlackList = require("FriendManager"):GetInstance():CheckInBlackList(sendUid)
+    ---拉黑后不显示消息
+    if isinBlackList then
+        return
+    end
+    if self.ChatCoroutineIingQueue == nil then
+        self.ChatCoroutineIingQueue = _G.Queue.new()
+    end
+    _G.Queue.pushright(self.ChatCoroutineIingQueue, { pindao, data })
+
+    if self.coroutine_Chat == nil then
+        self.coroutine_Chat = _G.coroutine.start(_G.handler(self, self.ChatCoroutine))
+    end
+end
+
+function ChatManager:_AddChatInfo(pindao, data)
+    local nowInfo = self.Chat_InfoAll[pindao]
+
+    local maxcount = self.ChatSaveCountDic[pindao]
+    ---如果是私聊
+    if pindao == _G.ChatType.privateChat then
+        if _G.IsNil(nowInfo) then
+            self.Chat_InfoAll[pindao] = {}
+        end
+        nowInfo = self.Chat_InfoAll[pindao]
+
+        ---以对方uid为key
+        ---发送者id
+        local sendUid = data.role_info.uid
+        ---如果是我自己发送的  看我发送给谁的消息
+        if data.is_self == 1 then
+            sendUid = data.f_uid
+        else
+            require("FriendManager"):GetInstance():MsgToMe(sendUid, data.time)
+        end
+
+        if _G.IsNil(nowInfo[sendUid]) then
+            nowInfo[sendUid] = {}
+        end
+
+        local old = nowInfo[sendUid][#nowInfo[sendUid]]
+        if old then
+            if old.time == data.time then
+                return
+            end
+        end
+        table.insert(nowInfo[sendUid], data)
+        --最大条数
+        local del = #nowInfo[sendUid] - maxcount
+        if del > 0 then
+            for i = 1, del do
+                table.remove(nowInfo[sendUid], 1)
+            end
+        end
+
+        self:Zjsl_PushUid(sendUid, true)
+
+        self.SaveFriendChatRecord(sendUid, nowInfo[sendUid])
+        self:SetIsRead(pindao, true)
+        _G.Events:GetInstance():Broadcast(_G.eChatStatus.newChat, data)
+    else
+        if data.role_info and data.role_info.uid == _G.PlayerModel:GetInstance().role_uid then
+            ---  防止系统广播出自己刚发送的消息 (自己在聊天频道发送的消息已立即增加)
+            local old = self.oldSendDic[pindao]
+            if old then
+                if old.time == data.time then
+                    return
+                end
+            else
+                self.oldSendDic[pindao] = {}
+            end
+            self.oldSendDic[pindao].content = data.n_content
+            self.oldSendDic[pindao].time = data.time
+        end
+
+        table.insert(nowInfo, data)
+        --最大条数
+        local del = #nowInfo - maxcount
+        if del > 0 then
+            for i = 1, del do
+                table.remove(nowInfo, 1)
+            end
+        end
+        self:SetIsRead(pindao, true)
+        _G.Events:GetInstance():Broadcast(_G.eChatStatus.newChat, data)
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Chat.id, pindao)
+end
+
+--region --------------------------------------协程 队列解析新聊天--------
+function ChatManager:ChatCoroutine()
+    while self.ChatCoroutineIingQueue.first <= self.ChatCoroutineIingQueue.last do
+        for i = 1, 5 do
+            local data = _G.Queue.popleft(self.ChatCoroutineIingQueue)
+            if data ~= nil then
+                self:_AddChatInfo(data[1], data[2])
+            end
+            if self.ChatCoroutineIingQueue.first > self.ChatCoroutineIingQueue.last then
+                break
+            end
+        end
+        _G.coroutine.yield()
+    end
+    self.coroutine_Chat = nil
+end
+
+--endregion------------------------------------协程 队列解析新聊天--------
+
+---获取对应频道 单条消息
+---@param pindao int -频道
+---@param index int  索引 -1为最新信息
+---@return chat.i_chat or nil
+function ChatManager:GetChatInfoIndex(pindao, index)
+    local nowInfo = self:GetChatInfoByPingDao(pindao)
+    if #nowInfo <= 0 then
+        return nil
+    elseif index == -1 then
+        return nowInfo[#nowInfo]
+    end
+    return nowInfo[1]
+end
+
+---获取玩家本地 聊天记录
+---@return chat.i_chat or nil
+function ChatManager:GetChatByUID(uid)
+    return self.Chat_InfoAll[_G.ChatType.privateChat][uid] or {}
+end
+
+---获取玩家 聊天记录
+---@return chat.i_chat or nil
+function ChatManager:GetChatPrivateByUID(uid, callback)
+    local nowInfo = self:GetChatInfoByPingDao(_G.ChatType.privateChat)
+
+    local function returnFun()
+        if callback ~= nil then
+            return callback(
+            --   uid,
+                nowInfo[uid]
+            )
+        end
+    end
+
+    if not _G.IsNil(nowInfo) and not _G.IsNil(nowInfo[uid]) then
+        returnFun()
+        return
+    end
+
+    local infoArr = self.GetFriendChatRecord(uid)
+    if #infoArr > 0 then
+        nowInfo[uid] = infoArr
+    end
+    returnFun()
+end
+
+---有新聊天信息
+---@param data chat.i_chat PB数据
+function ChatManager:P2C_NewChat(data)
+    if data == nil then
+        return
+    end
+
+    data = self:NewChatProcess(data)
+    if data.channel ~= _G.ChatType.events and data.channel ~= _G.ChatType.leagueevents then
+        if data.type == _G.ChatInfoType.StrategyStation then
+            data.channel = _G.ChatType.system
+        end
+        _G.Events:GetInstance():Broadcast(_G.eChatStatus.MainNewChat, data)
+        _G.MainManager:GetInstance():OnAddMinChatItem(data)
+    end
+    self:AddChatInfo(data.channel, data)
+end
+
+---有新屏蔽消息
+---@param data chat.p2c_del_chat
+function ChatManager:P2C_DelChat(data)
+    if data.chat_id then
+        self:DelChatByChatID(data.chat_id, data.channel)
+    end
+    if data.role_uid and data.role_uid ~= _G.PlayerModel:GetInstance():GetPlayerUid() then
+        self:DelChatByUid(data.role_uid, data.channel)
+        self:Zjsl_DelUid(data.role_uid)
+        if data.channel == _G.ChatType.privateChat then
+            require("FriendManager"):GetInstance():RedDotnil(data.role_uid, _G.TimeUtil.GetServerUnixTime())
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.PrivateChat.id)
+        end
+    end
+    if data.channel ~= _G.ChatType.events then
+        _G.Events:GetInstance():Broadcast(_G.eChatStatus.DelChat, data)
+    end
+end
+
+---通过chatID删除聊天记录
+function ChatManager:DelChatByChatID(chatID, channel)
+    local myUid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    if channel == _G.ChatType.privateChat then
+        if self.Chat_InfoAll[channel] == nil then
+            return
+        end
+        for uid, chatList in pairs(self.Chat_InfoAll[channel]) do
+            for i = #chatList, 1, -1 do
+                if chatList[i].chat_id == chatID and chatList[i].role_info.uid ~= myUid then
+                    _G.table.remove(chatList, i)
+                end
+            end
+        end
+    else
+        local chatList = self.Chat_InfoAll[channel]
+        for i = #chatList, 1, -1 do
+            if chatList[i].chat_id == chatID and chatList[i].role_info.uid ~= myUid then
+                _G.table.remove(chatList, i)
+            end
+        end
+    end
+end
+
+---通过uid删除聊天记录
+function ChatManager:DelChatByUid(uid, channel)
+    if channel == _G.ChatType.privateChat then
+        if self.Chat_InfoAll[channel] == nil or self.Chat_InfoAll[channel][uid] == nil then
+            return
+        end
+        self.Chat_InfoAll[channel][uid] = nil
+    else
+        local chatList = self.Chat_InfoAll[channel]
+        for i = #chatList, 1, -1 do
+            if chatList[i].role_info.uid == uid then
+                _G.table.remove(chatList, i)
+            end
+        end
+    end
+end
+
+---设置 主界面是否显示该频道消息
+---@param pindao _G.ChatType
+function ChatManager:SetMainHasPindao(pindao, isShow)
+    if _G.IsNil(pindao) then
+        return
+    end
+    self.mainPindao[pindao] = isShow and 1 or 0
+end
+
+---主界面是否显示该频道消息
+---@param pindao _G.ChatType
+function ChatManager:GetMainHasPindao(pindao)
+    if _G.IsNil(pindao) then
+        return false
+    end
+    if _G.IsNil(self.mainPindao[pindao]) or self.mainPindao[pindao] ~= 1 then
+        return false
+    end
+    return true
+end
+
+---新消息 内容处理
+---@param data chat.i_chat
+---@param isMain boolean true 是主界面(不解析表情)
+function ChatManager:NewChatProcess(data, isMain)
+    -- if data.type == nil then
+    --     data.type = _G.ChatInfoType.none --默认消息类型
+    --     --- 如果不是系统频道
+    --     if data.channel ~= _G.ChatType.system then
+    --         --- 如果是系统消息
+    --         if tonumber(data.n_content[1]) ~= 0 then
+    --             data.type = _G.ChatInfoType.system
+    --         else
+    --             data.type = _G.ChatInfoType.chat
+    --         end
+    --     else
+    --         data.type = _G.ChatInfoType.system
+    --     end
+    -- end
+
+    --- 如果是系统消息  没有roleinfo
+    local chat = data.chat or data
+    chat.chat_id = data.chat_id
+    chat.chat_frame = chat.chat_frame or data.chat_frame
+
+    if chat.n_content[1] == "90033400144" then
+        chat.n_content[3] = _G.GetLangPackValue(_G.ConfigManager.item_cfg[tonumber(chat.n_content[3])].Name)
+       
+    end
+
+    if
+        chat.type == _G.ChatInfoType.system and chat.channel ~= _G.ChatType.events and
+        chat.channel ~= _G.ChatType.support and
+        chat.channel ~= _G.ChatType.leagueevents
+    then
+        ---@type role.i_role
+        local roleinfo = {}
+        roleinfo.uid = 0
+        roleinfo.name = _G.LangUtil.GetLangPackValue(9002060001)
+        chat["role_info"] = roleinfo
+    elseif chat.type == _G.ChatInfoType.Push then
+        ---@type role.i_role
+        local roleinfo = {}
+        roleinfo.uid = 0
+        roleinfo.name = _G.LangUtil.GetLangPackValue(9002060001)
+        chat["role_info"] = roleinfo
+    end
+    if chat.type == _G.ChatInfoType.Push then
+        -- body
+    elseif chat.channel == nil then
+        chat.n_content = self:Parsing_content(chat.n_content) --解析为真实消息内容
+        chat.n_Maincontent = chat.n_content
+    elseif
+        chat.channel ~= _G.ChatType.events and chat.channel ~= _G.ChatType.support and
+        chat.channel ~= _G.ChatType.leagueevents
+    then
+        chat.n_content = self:Parsing_content(chat.n_content) --解析为真实消息内容
+        chat.n_Maincontent = chat.n_content
+        --  chat.n_content = self:chatInfoFormat(chat.n_content, isMain) --解析表情
+    end
+
+    chat.is_self = chat.role_info.uid == _G.PlayerModel:GetInstance().role_uid and 1 or 0 --是否是自己 1 是自己
+
+    if isMain ~= true then
+        -----不再添加时间 不好删除 (保留200条聊天记录  不好剃除时间)
+        -- if data.channel == _G.ChatType.privateChat then
+        --     --  local Olddata = self:GetChatPrivateByUID(data.r_uid, -1)
+        --     -- ---如果两条消息间隔时间 过长         显示时间
+        --     -- if Olddata and Olddata.type == _G.ChatInfoType.chat and data.time - Olddata.time > 300 then
+        --     --     local timedata = _G.DeepCopy(data)
+        --     --     timedata.type = _G.ChatInfoType.time
+        --     --     self:AddChatInfo(data.channel, timedata)
+        --     -- end
+        --     -- data.type = _G.ChatInfoType.chat
+        -- else
+        --     -- local Olddata = self:GetChatInfoIndex(data.channel, -1)
+        --     -- ---如果两条消息间隔时间 过长         显示时间
+        --     -- if (Olddata == nil) or (Olddata.type ~= _G.ChatInfoType.time and data.time - Olddata.time > 300) then
+        --     --     local timedata = _G.DeepCopy(data)
+        --     --     timedata.type = _G.ChatInfoType.time
+        --     --     timedata.role_info.uid = 0
+        --     --     self:AddChatInfo(data.channel, timedata)
+        --     -- end
+        -- end
+    end
+    return chat
+end
+
+--解析 聊天内容信息 消息   content[1] 为类型  0玩家消息
+function ChatManager:Parsing_content(content)
+    if _G.IsTable(content) then
+        local contentType = tonumber(content[1])
+
+        if contentType == 0 then
+            return content[2]
+        else
+            table.remove(content, 1)
+            return _G.LangUtil.GetLangPackValue(contentType, _G.SafeUnpack(content)) or ""
+        end
+    end
+    return content
+end
+
+--获取 新版 聊天结构 (防止服务器改动结构)  用于发给服务器
+---@param ChatInfo ClintSendChatInfo
+---@return chat.i_chat nil,TipsId
+function ChatManager:GetNewChatInfo(ChatInfo)
+    ---@field channel number            频道
+    ---@field n_content string           内容
+    ---@field time  number               发送时间
+    ---@field voice number               是否语音
+    ---@field type  number               类型
+    ---@field f_uid number               对象uid
+    ---@field name string               发送者名字
+    ---@field r_level   number          发送者等级
+    ---@field r_uid number              发送者uid
+    ---@field style number              发送者头像
+    ---@field power number              发送者战力
+    ---@field frame number              发送者头像框
+    ---@field is_self number               是自己1
+    ---@field title role.i_effect              没称号0
+
+    ---@class  ClintSendChatInfo
+
+    ---@type role.i_role
+    local roleinfo = {}
+    roleinfo.uid = ChatInfo.r_uid or _G.PlayerModel:GetInstance().role_uid
+    roleinfo.name = ChatInfo.name or _G.PlayerModel:GetInstance().role_name      ---玩家名字
+    roleinfo.style = ChatInfo.style or _G.PlayerModel:GetInstance().role_style   ---头像
+    roleinfo.level = ChatInfo.r_level or _G.PlayerModel:GetInstance():GetLevel() ---等级
+    roleinfo.power = ChatInfo.power or _G.PlayerModel:GetInstance().power        ---战力
+    roleinfo.frame = ChatInfo.frame or _G.PlayerModel:GetInstance().frame        ---头像框
+    roleinfo.title = ChatInfo.title or _G.PlayerModel:GetInstance():GetTitle()   ---称号
+
+    ---@type chat.i_chat
+    local msg = {}
+    msg.channel = ChatInfo.channel or _G.ChatType.world                            ---聊天频道
+    msg.voice = ChatInfo.voice or 0                                                ---是否语音 0：非语音  1：语音
+    msg.type = ChatInfo.type or _G.ChatInfoType.chat                               ---类型 ： 1:玩家  2:系统 3 :分享
+    msg.time = ChatInfo.time or _G.TimeUtil.GetServerUnixTime()                    ---时间
+    msg.n_content = { "0", ChatInfo.n_content or "" }                              ---聊天内容
+    msg.f_uid = ChatInfo.f_uid                                                     ---对象uid（私聊用）
+    msg.share_id = ChatInfo.share_id
+    msg.role_info = roleinfo                                                       ---角色信息
+    msg.is_self = roleinfo.uid == _G.PlayerModel:GetInstance().role_uid and 1 or 0 --是否是自己 1 是自己
+    msg.share_type = ChatInfo.share_type or 0
+    msg.uid = ChatInfo.uid
+    if msg.is_self then
+        local chatFrame = _G.PlayerModel:GetInstance():GetChatFrame()
+        msg.chat_frame = { chatFrame.sid, chatFrame.end_time }
+    else
+        msg.chat_frame = { 0, 0 }
+    end
+    ---工會uid
+
+    return self:CheckContent(msg)
+end
+
+---检测聊天内容合法
+---@param   msg chat.i_chat
+function ChatManager:CheckContent(msg)
+    local content = msg.n_content[2]
+    content = string.trim(content)
+    if string.IsNullOrEmpty(content) then
+        return nil, 160102
+    else
+        msg.n_content[2] = content
+        return { chat = msg }
+    end
+end
+
+---根据频道 获取消息队列
+function ChatManager:GetChatInfoByPingDao(pindao)
+    return self.Chat_InfoAll[pindao]
+end
+
+---获取指定频道历史记录 网络回调
+---@param param chat.s2c_get_chat PB数据
+function ChatManager:CallGetChatByType(param, call)
+    if param.zone_id then
+        self.zone_id = param.zone_id
+    end
+    if _G.IsNil(param) or _G.IsNil(param.list) then
+    else
+        if param.list and #param.list > 0 then
+            ---清空
+            self.Chat_InfoAll[param.list[1].chat.channel] = {}
+            for _, value in ipairs(param.list) do
+                self:P2C_NewChat(value)
+            end
+        end
+    end
+
+    if call then
+        call()
+    end
+end
+
+---根据获取所有消息
+function ChatManager:GetChatInfoAll()
+    return _G.DeepCopy(self.Chat_InfoAll)
+end
+
+---精灵图片格式
+function ChatManager:SpriteFormat(id)
+    -- return "<sprite=" .. id .. ">"
+    return "<" .. id .. ">"
+end
+
+---超链接格式
+function ChatManager:LinkFormat(id, content)
+    local mStr = ""
+    local mColor = "#0000FF"
+    -- id = tonumber(id)
+    -- if id == 1 then
+    --     mStr = "劫火却灰剑"
+    --     mColor = "#727e87"
+    -- elseif id == 2 then
+    --     mStr = "劫火却蓝剑"
+    --     mColor = "#004fa8"
+    -- elseif id == 3 then
+    --     mStr = "劫火却紫剑"
+    --     mColor = "#6f00a8"
+    -- elseif id == 4 then
+    --     mStr = "劫火却黄剑"
+    --     mColor = "#a86700"
+    -- elseif id == 5 then
+    --     mStr = "劫火却红剑"
+    --     mColor = "#a80018"
+    -- else
+    --     mStr = content
+    --     mColor = "#0000FF"
+    -- end
+    return "<" .. mStr .. "@" .. mStr .. ">"
+end
+
+---信息内容 格式化  [#1] 表情(1:表情序号)    超链接[uid#文字]
+function ChatManager:chatInfoFormat(content, isMain)
+    if string.IsNullOrEmpty(content) then
+        return ""
+    end
+    if isMain ~= true then
+        --表情   [#5]  -->  <sprite=5>
+        content = string.gsub(
+            content,
+            "%[#%d+%]",
+            function(s)
+                return self:SpriteFormat(string.sub(s, 3, #s - 1))
+            end
+        )
+    end
+    --超链接   [151#方天画戟]  -->  <sprite=5>
+    content = string.gsub(
+        content,
+        -- "%[%-?%d+#.+]",
+        "%[[A-Za-z0-9]+#[A-Za-z0-9]+]",
+        function(s)
+            local jinIndex = string.find(s, "#")
+            return self:LinkFormat(string.sub(s, 2, jinIndex - 1), string.sub(s, jinIndex + 1, #s - 1))
+        end
+    )
+    return content
+    -- body
+end
+
+local StrSplitKey = "^*&^**^"
+
+---得到在世界频道的数据存储 key
+---@return string key
+function ChatManager.GetMyChannelRecordKey()
+    local storyidsavekey = string.format("%s_Channel_Record", _G.PlayerModel:GetInstance().role_uid)
+    return storyidsavekey
+end
+
+---存储世界频道发言数据
+---@param strArr string[] @总共发言数组 #strArr为最新
+function ChatManager.SaveMyChannelRecordKey(strArr)
+    local storyidsavekey = require("ChatManager").GetMyChannelRecordKey()
+    if #strArr >= 7 then
+        table.remove(strArr, 1)
+    end
+    local strSave = ""
+    for key, value in pairs(strArr) do
+        strSave = strSave .. value
+
+        if key ~= #strArr then
+            strSave = strSave .. StrSplitKey
+        end
+    end
+    _G.PlayerPrefsManager.SetString(storyidsavekey, strSave)
+end
+
+---获取世界频道发言数据
+---@param storyid number @剧情ID
+---@return string[] @历史发言记录
+function ChatManager.GetMyChannelRecordInfo()
+    local storyidsavekey = require("ChatManager").GetMyChannelRecordKey()
+    local storyidvalue = _G.PlayerPrefsManager.GetString(storyidsavekey)
+    local str = {}
+    if not string.IsNullOrEmpty(storyidvalue) then
+        local strpllist = string.split(storyidvalue, StrSplitKey)
+        return strpllist
+    end
+    return str
+end
+
+---得到好友聊天的数据存储 key
+---@return string key
+function ChatManager.GetMyFriendChannelRecordKey(uid)
+    local storyidsavekey = string.format("%s_Channel_Friend_Record%s", _G.PlayerModel:GetInstance().role_uid, uid)
+    return storyidsavekey
+end
+
+---获取好友聊天记录         服务器存储
+---@param uid number @剧情ID
+---@return chat.i_chat[] @历史发言记录
+function ChatManager.GetFriendChatRecord(uid)
+    local arr = {}
+    -- local storyidsavekey = require("ChatManager").GetMyFriendChannelRecordKey(uid)
+    -- local storyidvalue = _G.PlayerPrefsManager.GetString(storyidsavekey)
+    -- if #storyidvalue > 0 then
+    --     arr = _G.json.decode(storyidvalue)
+    -- end
+    return arr
+end
+
+---存储好友聊天记录         服务器存储
+---@param uid number @剧情ID
+---@param arr chat.i_chat[] @历史发言记录
+function ChatManager.SaveFriendChatRecord(uid, arr)
+    -- if not (#arr > 0) then
+    --     return
+    -- end
+    -- local str = _G.json.encode(arr)
+    -- local storyidsavekey = require("ChatManager").GetMyFriendChannelRecordKey(uid)
+    -- _G.PlayerPrefsManager.SetString(storyidsavekey, str)
+end
+
+---删除好友聊天记录
+function ChatManager.DelFriendChatRecord(uid)
+    local storyidsavekey = require("ChatManager").GetMyFriendChannelRecordKey(uid)
+    _G.PlayerPrefsManager.DeleteKey(storyidsavekey)
+end
+
+--region --------------------------------------获取是否频道解锁--------
+
+function ChatManager:IsUnLock(pindao)
+    local data = self.chat_openDic[pindao]
+
+    if data ~= true then
+        if data == nil then
+            self.chat_openDic[pindao] = true
+        else
+            local isUnlock = _G.GlobalConditionManager.CheckCondition(data[1], data[2])
+            --- 如果解锁了 就保存解锁
+
+            if isUnlock == true then
+                if _G.ChatType.union == pindao and not require "SociatyManager":GetInstance():HasSociaty() then
+                    return false, _G.FunctionManager:GetInstance():GetStrWithType(data[1], data[2], true)
+                end
+                self.chat_openDic[pindao] = true
+            else
+                if data[1] == 9 then
+                    local ct = _G.TimeUtil.GetDayBySix(_G.PlayerModel:GetInstance():GetCreateRoleTime())
+                    ct = _G.TimeUtil.TranslateSecond(ct + (data[2] - 1) * 86400 - _G.TimeUtil.GetServerUnixTime())
+                    local timeStr
+                    if ct.day > 0 then
+                        timeStr = _G.GetLangPackValue(90022100001, ct.day, ct.hour)
+                    elseif ct.hour > 1 then
+                        timeStr = _G.GetLangPackValue(90025500029, ct.hour)
+                    else
+                        timeStr = _G.GetLangPackValue(90025500029, 1)
+                    end
+                    if pindao == _G.ChatType.world then
+                        return false, _G.GetLangPackValue(90000011114, timeStr)
+                    elseif pindao == _G.ChatType.union then
+                        return false, _G.GetLangPackValue(90000011356, timeStr)
+                    elseif pindao == _G.ChatType.privateChat then
+                        return false, _G.GetLangPackValue(90000011357, timeStr)
+                    end
+                end
+                return false, _G.FunctionManager:GetInstance():GetStrWithType(data[1], data[2], true)
+            end
+        end
+    end
+    return self.chat_openDic[pindao]
+end
+
+--endregion------------------------------------获取是否频道解锁--------
+
+--region --------------------------------------频道 发送间隔--------
+--- 获取发送时间间隔
+---@param isSend boolean true 返回发送间隔时间  false 返回距离上次发送间隔
+function ChatManager:GetPinDaoSendTime(pindao, isSend)
+    local time = self.chatSendTIMEDic[pindao]
+    if time == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" ChatManager:GetPinDaoSendTime 参数有误 " .. pindao)
+        end
+        return 0
+    end
+
+    local chatSendTIME = self:GetPinDaoSendCfg(pindao)
+    local sub = _G.TimeUtil.GetServerUnixTime() - time
+    local timeLeft = chatSendTIME - sub
+    if timeLeft < 0 then
+        if isSend then
+            timeLeft = chatSendTIME
+        else
+            timeLeft = 0
+        end
+    end
+    return timeLeft
+end
+
+--- 设置 该频道发送时间
+function ChatManager:SetPinDaoSendTime(pindao)
+    self.chatSendTIMEDic[pindao] = _G.TimeUtil.GetServerUnixTime()
+end
+
+--- 获取改频道 设定的发送间隔
+function ChatManager:GetPinDaoSendCfg(pindao)
+    return self.PindaoSendTimeDic[pindao] or 0
+end
+
+--region --------------------------------------获取好友聊天记录--------
+
+---开始解析好友聊天记录
+function ChatManager:ParsFriendList()
+    require("FriendManager"):GetInstance():GetFriendListInServer(
+        function(FriendDic)
+            if table.isEmptyOrNil(FriendDic) then
+                return
+            end
+            for friendUid, _ in pairs(FriendDic) do
+                self:ParsSingleFriend(friendUid)
+            end
+        end
+    )
+end
+
+function ChatManager:ParsSingleFriend(friendUid)
+    ---@type chat.c2s_get_private_chat
+    local data = {}
+    data.f_uid = friendUid
+    ChatViewNet:GetInstance():GetPrivateChat(
+        data,
+        function(data)
+            if data == nil or data.list == nil then
+                return
+            end
+            ---@type chat.i_chat[]
+            local list = data.list
+            for _, data in pairs(list) do
+                self:P2C_NewChat(data)
+            end
+            -- body
+        end
+    )
+end
+
+--endregion
+
+--region --------------------------------------zjsl  频道聊天 最近私聊--------
+
+----对外界接口  打开私聊
+function ChatManager:Zjsl_OpenView(uid)
+    local uiname = _G.ConfigManager.ui_cfg.ChatView.Name
+    self:Zjsl_PushUid(uid)
+    if _G.UIManager:GetInstance():IsActiveWindow(uiname) then
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(uiname)
+        view:SetPrivateUid(uid)
+        view:Private_Open()
+    else
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.ChatView.Name,
+            _G.ChatType.privateChat,
+            nil,
+            nil,
+            nil,
+            nil,
+            uid
+        )
+    end
+end
+
+----增加最近联系人id
+function ChatManager:Zjsl_PushUid(uid, isNewMsg)
+    local zjsl_uids = self:Zjsl_GetUids()
+    ---删除旧值
+    _G.table.removebyvalue(zjsl_uids, uid)
+    ---添加在顶
+    table.insert(zjsl_uids, 1, uid)
+    if #zjsl_uids > self.UiDic.zjslMaxCount then
+        _G.table.remove(zjsl_uids, self.UiDic.zjslMaxCount + 1)
+    end
+
+    _G.PlayerPrefsManager.SetTable("zjsl_uids", zjsl_uids)
+
+    if not isNewMsg then
+        ---新消息不刷新界面，客户端派发的_G.eChatStatus.newChat已经触发了刷新，不需要重复刷新
+        local uiname = _G.ConfigManager.ui_cfg.ChatView.Name
+        if _G.UIManager:GetInstance():IsActiveWindow(uiname) then
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(uiname)
+            view:Private_Open(isNewMsg)
+        end
+    end
+end
+
+---删除最近联系人id
+function ChatManager:Zjsl_DelUid(uid)
+    local zjsl_uids = self:Zjsl_GetUids()
+    ---删除旧值
+    _G.table.removebyvalue(zjsl_uids, uid)
+    _G.PlayerPrefsManager.SetTable("zjsl_uids", zjsl_uids)
+end
+
+---获取最近联系人uids
+function ChatManager:Zjsl_GetUids()
+    if self.zjsl_uids == nil then
+        self.zjsl_uids = {}
+
+        local zjsl_uids = _G.PlayerPrefsManager.GetTable("zjsl_uids")
+        if zjsl_uids == nil then
+            self.zjsl_uids = {}
+        else
+            self.zjsl_uids = zjsl_uids
+        end
+    end
+    return self.zjsl_uids
+end
+
+---获取最近联系人 指定玩家信息
+function ChatManager:Zjsl_GetUidInfo(uid)
+    local zjsl_PlayInfoDic = self:Zjsl_GetUidInfos()
+    return zjsl_PlayInfoDic[uid]
+end
+
+---获取最近联系人玩家信息
+function ChatManager:Zjsl_GetUidInfos(isInit)
+    if self.zjsl_PlayInfoDic == nil or isInit then
+        self.zjsl_PlayInfoDic = {}
+    end
+    return self.zjsl_PlayInfoDic
+end
+
+---设置最近联系人玩家信息
+---@param data FriendData
+function ChatManager:Zjsl_SetUidInfo(uid, data)
+    local zjsl_PlayInfoDic = self:Zjsl_GetUidInfos()
+    zjsl_PlayInfoDic[uid] = data
+end
+
+---获取最近联系人信息
+function ChatManager:Zjsl_SeekPlayinfo(call)
+    self:Zjsl_GetUidInfos()
+    local uids = self:Zjsl_GetUids()
+
+    ---查询记数
+    self.zjsl_SeekPlayinfoCount = #uids
+
+    local SystemSettingNet = require("SystemSettingNet"):GetInstance()
+    if #uids > 0 then
+        for i = 1, #uids do
+            local uid = uids[i]
+            if uid > 0 then
+                local msg = {}
+                msg.uid = uid
+                SystemSettingNet:GetPlayerInfo(msg, _G.handlerbind(self, self.Zjsl_SeekPlayinfoSuc, uid, call))
+            end
+        end
+    else
+        if call then
+            call()
+        end
+    end
+end
+
+---成功的返回
+function ChatManager:Zjsl_SeekPlayinfoSuc(data, uid, call)
+    if data.ack ~= 1 then
+        return
+    end
+    self.zjsl_SeekPlayinfoCount = self.zjsl_SeekPlayinfoCount - 1
+    -- if data.ack == 1 then
+    --     for _, v in pairs(data.friend) do
+    --         local tFriendData = require("FriendData").New()
+    --         tFriendData:Init(v)
+    --         self:Zjsl_SetUidInfo(v.uid, tFriendData)
+    --     end
+    -- end
+
+    data.info.uid = uid
+
+    local tFriendData = require("FriendData").New()
+    tFriendData:Init(data.info)
+    self:Zjsl_SetUidInfo(uid, tFriendData)
+
+    if self.zjsl_SeekPlayinfoCount == 0 then
+        if call ~= nil then
+            call(self:Zjsl_GetUidInfos())
+        end
+    end
+end
+
+--endregion------------------------------------zjsl  频道聊天 最近私聊--------
+
+--region --------------------------------------聊天大表情--------
+function ChatManager:Phiz_GetExpressionInfo()
+    require("ChatViewNet"):GetInstance():GetExpressionInfo(
+        function(msg)
+            self:Phiz_CallSendChat(msg)
+        end
+    )
+end
+
+function ChatManager:Phiz_CallSendChat(msg)
+    --解锁表情
+    self.ExpressionUnlock = msg.unlock or {}
+    --喜欢的表情
+    self.ExpressionLike = msg.like or {}
+    --战斗设置表情
+    self.ExpressionFight_expression = msg.fight_expression or {}
+end
+
+---返回当前id是否被选中
+function ChatManager:GetPhiz_CallSendChat(id)
+    local data = 0
+    for key, value in pairs(self.ExpressionFight_expression) do
+        if value.sid == id then
+            data = 1
+        end
+    end
+    return data
+end
+
+---返回当前id是否被选中
+function ChatManager:GetPhiz_CallSendChatID(id)
+    local data = 0
+    for key, value in pairs(self.ExpressionFight_expression) do
+        if value.type == id then
+            data = value.sid
+        end
+    end
+    return data
+end
+
+---返回当前战斗表情
+function ChatManager:GetPhiz_DataID()
+    local data = {}
+    for key, value in pairs(self.PhizDic) do
+        if self:GetPhiz_CallSendChatID(value.id) ~= 0 then
+            _G.table.insert(data, value)
+        end
+    end
+    return data
+end
+
+---设置当前战斗表情
+function ChatManager:SaveDataID(index, id, callback)
+    local id1 = 0
+    local index2 = 0
+    for key, value in pairs(self.ExpressionFight_expression) do
+        if value.type == index then
+            if value.sid == id then
+                return
+            elseif value.sid == 0 then
+                id1 = 0
+            else
+                id1 = value.sid
+            end
+        end
+        if value.sid == id then
+            if value.type == index then
+                return
+            else
+                index2 = value.type
+            end
+        end
+    end
+    local msg = { type = index, sid = id }
+    local fight_expression = {}
+    fight_expression.fight_expression = { msg }
+    if index2 ~= 0 then
+        _G.table.insert(fight_expression.fight_expression, { type = index2, sid = id1 })
+    end
+    require("ChatViewNet"):GetInstance():GetExpressionFightExpression(
+        fight_expression,
+        function()
+            if callback then
+                for key, value in pairs(fight_expression.fight_expression) do
+                    local i = true
+                    for k, v in pairs(self.ExpressionFight_expression) do
+                        if value.type == v.type then
+                            v.sid = value.sid
+                            i = false
+                        end
+                    end
+                    if i then
+                        _G.table.insert(self.ExpressionFight_expression, value)
+                    end
+                end
+                callback()
+            end
+        end
+    )
+end
+
+---解锁表情
+---@param expressionKey string 表情关键字
+---@return boolean 是否解锁
+function ChatManager:ExpressionUnlocked(expressionKey)
+    local Is = true
+    for key, value in pairs(self.ExpressionUnlock or {}) do
+        if value == expressionKey then
+            Is = false
+        end
+    end
+    if Is then
+        _G.table.insert(self.ExpressionUnlock, expressionKey)
+        self:GetExpressionUnlockRep()
+        _G.table.insert(self.ExpressionUnlockRep, expressionKey)
+        _G.PlayerPrefsManager.SetTable("ExpressionUnlockRep", self.ExpressionUnlockRep)
+        --刷新红点
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RankList.id)
+    end
+end
+
+function ChatManager:DeleteFriendChat(uid, callback)
+    require("ChatViewNet"):GetInstance():DeleteFriendChat(
+        { f_uid = uid },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:Zjsl_DelUid(uid)
+            if self.zjsl_PlayInfoDic[uid] then
+                self.zjsl_PlayInfoDic[uid] = nil
+            end
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---获取是否有解锁表情的红点
+---@return boolean 是否存在解锁表情
+function ChatManager:GetExpressionUnlockRepNew()
+    self:GetExpressionUnlockRep()
+
+    if #self.ExpressionUnlockRep > 0 then
+        return true
+    end
+
+    return false
+end
+
+---获取解锁表情
+---@return table 解锁表情
+function ChatManager:GetExpressionUnlockRep()
+    self.ExpressionUnlockRep = _G.PlayerPrefsManager.GetTable("ExpressionUnlockRep") or {}
+    return self.ExpressionUnlockRep
+end
+
+---获取解锁表情
+---@return table 解锁表情
+function ChatManager:CloseExpressionUnlockRep()
+    _G.PlayerPrefsManager.SetTable("ExpressionUnlockRep", {})
+end
+
+---删除解锁表情的副本（新）
+---@param id number 表情ID
+function ChatManager:DelExpressionUnlockRepNew(id)
+    self:GetExpressionUnlockRep()
+    local index = _G.table.indexof(self.ExpressionLike, id)
+    if index then
+        _G.table.remove(self.ExpressionLike, index)
+    end
+end
+
+---判断表情是否解锁
+---@param expressionKey string 表情关键字
+---@return boolean 是否解锁
+function ChatManager:IsExpressionUnlocked(expressionKey)
+    local Is = false
+    for key, value in pairs(self.ExpressionUnlock or {}) do
+        if value == expressionKey then
+            Is = true
+        end
+    end
+    return Is
+end
+
+---判断表情是否喜爱
+---@param expressionKey string 表情关键字
+---@return boolean 是否解锁
+function ChatManager:IsExpressionLike(expressionKey)
+    local Is = false
+    for key, value in pairs(self.ExpressionLike or {}) do
+        if value == expressionKey then
+            Is = true
+        end
+    end
+    return Is
+end
+
+---获取已解锁的表情
+function ChatManager:Phiz_GetAll()
+    local PhizList = {}
+    for key, value in pairs(self.PhizDic) do
+        if value.initial == 0 then
+            _G.table.insert(PhizList, value)
+        elseif self:IsExpressionUnlocked(value.id) then
+            _G.table.insert(PhizList, value)
+        end
+    end
+    return PhizList
+end
+
+---获取喜爱的表情
+function ChatManager:Phiz_GetGif()
+    local PhizList = {}
+    for key, value in pairs(self.PhizDic) do
+        if self:IsExpressionLike(value.id) then
+            _G.table.insert(PhizList, value)
+        end
+    end
+    return PhizList
+end
+
+---设置喜爱的表情
+function ChatManager:Phiz_AddGif(id, callback)
+    local msg = {}
+    msg.type = 1
+    msg.sids = { id }
+    if self:IsExpressionLike(id) then
+        msg.type = 2
+    end
+    require("ChatViewNet"):GetInstance():GetExpressionLikeExpression(
+        msg,
+        function()
+            if msg.type == 1 then
+                _G.PopWindowManager:GetInstance():ShowAllTips(420)
+            elseif msg.type == 2 then
+                _G.PopWindowManager:GetInstance():ShowAllTips(421)
+            end
+            self:Phiz_AddsGif(id, msg.type)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---添加或者删除喜爱的表情
+function ChatManager:Phiz_AddsGif(id, is)
+    if is == 1 then
+        _G.table.insert(self.ExpressionLike, id)
+    elseif is == 2 then
+        local index = _G.table.indexof(self.ExpressionLike, id)
+        _G.table.remove(self.ExpressionLike, index)
+    end
+end
+
+function ChatManager:SaveData(id)
+    self:GetData()
+
+    if self.Phiz_ChatManager[id] then
+        self.Phiz_ChatManager[id] = _G.TimeUtil.GetServerUnixTime()
+    else
+        self.Phiz_ChatManager[id] = _G.TimeUtil.GetServerUnixTime()
+    end
+    _G.PlayerPrefsManager.SetTable("Phiz_ChatManager", self.Phiz_ChatManager)
+end
+
+function ChatManager:GetData()
+    self.Phiz_ChatManager = _G.PlayerPrefsManager.GetTable("Phiz_ChatManager") or {}
+    return self.Phiz_ChatManager
+end
+
+function ChatManager:GetPhiz_ChatData(id)
+    self:GetData()
+
+    return self.Phiz_ChatManager[id] or 0
+end
+
+function ChatManager:Phiz_Init()
+    ---{"表情关键字"=表情配置,}
+    self.PhizDic = {}
+
+    local expression_cfg = _G.ConfigManager.expression_cfg
+    ---@param value expression_cfg
+    for key, value in pairs(expression_cfg) do
+        self.PhizDic[value.id] = value
+    end
+end
+
+---弹幕表情
+function ChatManager:Phiz_Even()
+    ---{"表情关键字"=表情配置,}
+    self.EvenDic = {}
+
+    local bullet_chat_cfg = _G.ConfigManager.bullet_chat_cfg
+    ---@param value bullet_chat_cfg
+    for key, value in pairs(bullet_chat_cfg) do
+        if not self.EvenDic[value.type] then
+            self.EvenDic[value.type] = {}
+        end
+        self.EvenDic[value.type][value.id] = value
+    end
+    for k, v in pairs(self.EvenDic) do
+        self.EvenDic[k] = _G.table.toArray(v)
+    end
+end
+
+function ChatManager:Phiz_GetEvenAll(chatType)
+    return self.EvenDic[bulletTypeDic[chatType]]
+end
+
+function ChatManager:Phiz_GetEven(chatType, str)
+    return self.EvenDic[bulletTypeDic[chatType]][str]
+end
+
+function ChatManager:Phiz_Get(str)
+    return self.PhizDic[str]
+end
+
+function ChatManager:Phiz_GetCount()
+    return table.count(self.PhizDic)
+end
+
+--endregion------------------------------------聊天大表情--------
+
+---销毁对象时,析构函数
+function ChatManager:Dispose()
+    if not _G.IsNil(self.ChatTimer) then
+        self.ChatTimer:Stop()
+    end
+    if not _G.IsNil(self.PrivateChatTimer) then
+        self.PrivateChatTimer:Stop()
+    end
+end
+
+---检测红点
+function ChatManager:CheckRedPoint(type)
+    if not self.unReadList then
+        return false
+    end
+    return self.unReadList[type]
+end
+
+---设置是否已读
+function ChatManager:SetIsRead(type, bool)
+    if not type then
+        return
+    end
+    if not self.unReadList then
+        self.unReadList = {}
+    end
+    self.unReadList[type] = bool
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Chat.id, type)
+end
+
+---检测是否可以分享
+---@param uid number 玩家或者公会uid
+function ChatManager:CheckIsCanShare(type, uid, call)
+    if not self.shareList then
+        self.shareList = {}
+    end
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local param = _G.ConfigManager.discrete_cfg[106902][1]
+    local check = function(data)
+        if time < data.time + param[1] * 3600 and data.num >= param[2] then
+            local timeData = _G.TimeUtil.TranslateSecond(data.time + param[1] * 3600 - time)
+            ---@type tips_system_cfg
+            local tips = _G.ConfigManager.tips_system_cfg[shareTipsId]
+            local str = ""
+            if timeData.hour > 0 then
+                str = _G.GetLangPackValue(tips.content, _G.GetLangPackValue(90025500029, timeData.hour))
+            elseif timeData.min > 0 then
+                str = _G.GetLangPackValue(tips.content, _G.GetLangPackValue(90000010394, timeData.min))
+            else
+                str = _G.GetLangPackValue(tips.content, _G.GetLangPackValue(90000010394, 1))
+            end
+            _G.PopWindowManager:GetInstance():ShowAllTips(shareTipsId, str)
+        else
+            if call then
+                call()
+            end
+        end
+    end
+    ---@type share.s2c_share_limit
+    local data = self.shareList[type]
+    if not data then
+        require "ChatViewNet":GetInstance():GetShareLimit(
+            { uid = uid, share_type = type },
+            function(msg)
+                self.shareList[type] = msg
+                check(msg)
+            end
+        )
+    elseif not (time < data.time + param[1] * 3600 and data.num >= param[2]) then
+        require "ChatViewNet":GetInstance():GetShareLimit(
+            { uid = uid, share_type = type },
+            function(msg)
+                self.shareList[type] = msg
+                check(msg)
+            end
+        )
+    else
+        check(data)
+    end
+end
+
+---是否打开了弹幕功能(不检测功能开放, 默认true)
+---@return boolean
+function ChatManager:CheckFloatMessageEnabled()
+    return _G.PlayerPrefsManager.GetInt("FloatMessage", 1) == 1
+end
+
+---设置弹幕功能开关
+---@param active boolean
+---@return void
+function ChatManager:SetFloatMessageEnabled(active)
+    _G.PlayerPrefsManager.SetInt("FloatMessage", active and 1 or 0)
+end
+
+---是否解锁了弹幕功能
+---@return boolean
+function ChatManager:CheckUnlockFloatMessage()
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return false
+    end
+    return _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.FloatMessages)
+end
+
+---检测某个频道是否开启
+function ChatManager:CheckChannelConditionByType(chatType, showTip)
+    local con = self:CheckPlatformCondition(chatType)
+    if not con then
+        con = _G.ConfigManager.chat_cfg[chatType].chat_open
+    end
+    local unlock, tipId, content = _G.GlobalConditionManager.CheckConditionArrays({con})
+    if showTip and tipId then
+        _G.PopWindowManager:GetInstance():ShowAllTips(tipId, content)
+    end
+    return unlock
+end
+
+return ChatManager

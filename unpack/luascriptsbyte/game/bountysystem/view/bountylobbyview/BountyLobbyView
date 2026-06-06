@@ -1,0 +1,1136 @@
+--------------------------------------------------------------------------
+-- F:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.BountySystem.View.BountyLobbyView	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/03/25
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local TrackingPointModel = require("TrackingPointModel")
+local BountyEnum = require "BountyEnum"
+local BountyQuestBase = require "BountyQuestBase"
+local BountySystemManager = require("BountySystemManager")
+---@class BountyLobbyView : UIBaseView    中文描述
+---@field public go_table BountyLobbyView_GoTable GoTable
+---@field bountyData dispatch.s2c_dispatch_info 贪字营数据
+---@field EvilRefreshTimer Timer 恶灵任务刷新倒计时
+---@field QuestPanel BountyLobbyView._obj_QuestPanel_GoTable QuestPanel界面
+---@field EvilTasks BountyQuestBase[] 所有的恶灵任务
+---@field EvilTaskDatas BountyQuestData[] 所有恶灵任务数据
+---@field EvilMaps BountyMosterItem[] 地图上的恶灵
+---@field cfg bounty_level_cfg
+local BountyLobbyView = _G.BaseClass("BountyLobbyView", _G.UIBaseView)
+--_G.BountyLobbyView = BountyLobbyView
+local CS = _G.CS
+local typeof = _G.typeof
+
+function BountyLobbyView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self:AddListener(_G.AnimationEvents.BountyUnDispath, self.OnBountyUnDispathEnd)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OpenDialog, self)
+end
+
+---414/487
+---界面的入口函数
+function BountyLobbyView:OnCreate()
+    if _G.AppSetting.IsXzns then
+        _G.GameUtil.SetUiHeXieMask(self.go_table)
+    end
+    self.go_table.obj_QuestPanel:SetActiveE(1)
+    self.go_table.obj_ChallengePanel:SetActiveE(0)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.BountyLobby.id)
+    self:InitToggle()
+    self.canvas = self.gameObject:GetComponentE(typeof(CS.UnityEngine.Canvas))
+    if require("BountySystemManager"):GetInstance().BountyData then
+        self:Init()
+    else
+        require("BountySystemManager"):GetInstance():GetBountyData(
+            function()
+                _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.BountyLobbyView.Name)
+                self:Init()
+            end
+        )
+        _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.BountyLobbyView.Name)
+    end
+    if not _G.PlayerPrefsManager.HasKey("OpenBountyLobbyView") then
+        _G.PlayerPrefsManager.SetInt("OpenBountyLobbyView", 1)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.MainChallenge.id, 202)
+    end
+
+    self.go_table.toggle_disPatch.isOn = false
+    self.go_table.toggle_disPatch.isOn = true
+    TrackingPointModel:GetInstance():SetWindowStartTime(self.viewName, true)
+    self:AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed)
+end
+
+---界面初始化
+function BountyLobbyView:Init()
+    require("BountySystemManager"):GetInstance():InitAllQuset()
+    self.isDefult = require "BountySystemManager":GetInstance().isDefult
+    require("BountySystemManager"):GetInstance():BindUpdateTime(
+        _G.handler(self, self.UpdateEvilRefreshTime),
+        _G.handler(self, self.EvilRefreshTimerOver)
+    )
+    self.bountyData = require("BountySystemManager"):GetInstance().BountyData
+    self.cfg = _G.ConfigManager.bounty_level_cfg[self.bountyData.level]
+    self.EvilTaskDatas = require("BountySystemManager"):GetInstance().AllQuest
+    self.EvilTasks = {}
+    self.EvilMaps = {}
+    self.unDisposeTask = {}
+    self.refreshTimer = nil
+    self.bossTimer = nil
+    self.boss = nil
+    self.go_table.aortext_Level.text = _G.string.format(_G.LangUtil.GetLangPackValue(90020600039), self.bountyData.level)
+    self.NewDatas = {}
+    self:InitNew()
+    self:AddComponent(
+        self.go_table.obj_resourceRoot,
+        require("ResourceCompont").New(
+            self.go_table.obj_resourceRoot,
+            _G.ConfigManager.ui_cfg.BountyLobbyView.resources
+        )
+    )
+    local isWaiting = require("BountySystemManager"):GetInstance().BountyData.boss.boss_start_time > 0
+    local bool = _G.StorageManager:GetInstance():GetItemCountBySid(52) < self.cfg.points_boss or isWaiting
+    self.go_table.obj_tip:SetActiveE(bool and 0 or 1)
+
+    local cfg = _G.ConfigManager.store_month_cfg[405006]
+    local review = cfg and cfg.review or 0
+    self.go_table.aorbtn_Privilege:SetActiveE((review == 1 and _G.AppSetting.IsArraigned) and 0 or 1)
+end
+
+---初始化toggle
+function BountyLobbyView:InitToggle()
+    self.toggles = {
+        disPatch = _G.GetAutoGoTable(
+            self.go_table.toggle_disPatch,
+            _G.handlerbind(self, self.OnClickToggle, "disPatch", _G.handler(self, self.InitQuestPanel))
+        ),
+        hunt = _G.GetAutoGoTable(
+            self.go_table.toggle_hunt,
+            _G.handlerbind(self, self.OnClickToggle, "hunt", _G.handler(self, self.InitChallengePanel))
+        ),
+    }
+end
+
+function BountyLobbyView:OnClickToggle(go, isOn, key, call)
+    local tb = self.toggles[key]
+    tb.aorimage_isOn:SetActiveE(isOn and 1 or 0)
+    tb.aorimage_isOff:SetActiveE(isOn and 0 or 1)
+    if call then
+        call(isOn)
+    end
+end
+
+---初始化派遣任务界面
+function BountyLobbyView:InitQuestPanel(isOn)
+    if not isOn then
+        return
+    end
+    self.QuestPanel = _G.GetAutoGoTable(self.go_table.obj_QuestPanel)
+    self.isInited = false
+    self:ShowBtn()
+    self:InitEvilTask()
+    self:ShowNoTask()
+    self:InitTimer()
+    self.go_table.obj_QuestPanel:SetActiveE(1)
+    self.go_table.obj_ChallengePanel:SetActiveE(0)
+end
+
+---初始化挑战boss界面
+function BountyLobbyView:InitChallengePanel(isOn)
+    if not isOn then
+        return
+    end
+    self:InitBoss()
+    self.go_table.obj_QuestPanel:SetActiveE(0)
+    self.go_table.obj_ChallengePanel:SetActiveE(1)
+end
+
+function BountyLobbyView:OpenDialog(name)
+    if name == _G.ConfigManager.ui_cfg.OptionDialogByToggleView.Name then
+        local count = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.ResProp, 12)
+        self.go_table.aortext_dialogText.text = _G.GetLangPackValue(90021700048, 50)
+        ---@type OptionDialogView
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.OptionDialogByToggleView.Name)
+        --local view=require("OptionDialogView")
+        view:ShowDown(
+            {{content = _G.GetLangPackValue(90028500030, count),
+            sid = 12}})
+        view:CustomContent(function(go)
+            local content = _G.InstantiateObject(self.go_table.obj_OptionDialogContent, go)
+            content:SetLocalPositionToZero()
+        end)
+    end
+end
+
+function BountyLobbyView:InitNew()
+    self.NewDatas = {}
+end
+
+---显示按钮
+function BountyLobbyView:ShowBtn()
+    local isHave = false
+    for _, v in pairs(self.EvilTaskDatas) do
+        if v.taskState == BountyEnum.BountyQuestStateEnum.DNS or v.taskState == BountyEnum.BountyQuestStateEnum.Award then
+            isHave = true
+            break
+        end
+    end
+    local flag = false
+    local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.Trial.Bounty })
+    local level = require "VIPPrivilegeModel":GetInstance().currentVipLevel
+
+    if data[1] then
+        local needLevel = _G.ConfigManager.discrete_cfg[101504][1][1]
+        flag = level >= needLevel
+    end
+
+    local isShowBtn = not self.isDefult and isHave and flag
+    self.go_table.obj_Btn:SetActiveE(isShowBtn and 1 or 0)
+    self.go_table.obj_UnlockTips:SetActiveE(flag and 0 or 1)
+    if not self.scrollInit then
+        local _, height = self.go_table.scrollloopvectical_QuestList:GetRectTransformWidthHeight()
+        self.height = height
+        self.scrollInit = true
+    end
+    if not _G.table.isEmptyOrNil(self.bountyData.missions) then
+        self.go_table.scrollloopvectical_QuestList:UpdateScrollRectHeight(isShowBtn and self.height or self.height + 60)
+    end
+
+    --self.go_table.scrollloopvectical_QuestList:UpdateScrollRectHeight(flag and 414 or 487)
+    if (not isShowBtn) then
+        self.go_table.aortext_unlockTip.text = _G.GetLangPackValue(90021700037)
+        local _, height = self.go_table.scrollloopvectical_QuestList:GetRectTransformWidthHeight()
+        self.scrollInit = true
+    end
+end
+
+function BountyLobbyView:InitBoss()
+    self.BossRTS = 0
+    if self.bountyData.boss.boss_start_time > 0 then
+        self.BossRTS = _G.TimeUtil.GetServerUnixTime() - self.bountyData.boss.boss_start_time
+        if self.BossRTS > self.cfg.duration then
+            _G.GameUtil.SetActiveByCondition(self.go_table.obj_boss, false)
+            _G.GameUtil.SetActiveByCondition(self.go_table.obj_getBoss, true)
+            self.BossRTS = 0
+        else
+            _G.GameUtil.SetActiveByCondition(self.go_table.obj_getBoss, false)
+            _G.GameUtil.SetActiveByCondition(self.go_table.obj_boss, true)
+            _G.GameUtil.SetActiveByCondition(self.go_table.obj_BossDispath, true)
+            _G.GameUtil.SetActiveByCondition(self.go_table.obj_BossUnDispath, false)
+            self.go_table.obj_tip:SetActiveE(0)
+            self.BossRTS = self.cfg.duration - self.BossRTS
+            self.go_table.aortext_Slider.text = _G.TimeUtil.TimeToString(self.BossRTS, 1)
+            self.go_table.slider_BossTime.maxValue = self.cfg.duration
+            self.go_table.slider_BossTime.value = self.cfg.duration - self.BossRTS
+            if self.bossTimer == nil then
+                self.bossTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateBossTimer, self, false, false, true)
+                self.bossTimer:Start()
+            end
+        end
+    else
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_getBoss, false)
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_boss, true)
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_BossUnDispath, true)
+        local isWaiting = require("BountySystemManager"):GetInstance().BountyData.boss.boss_start_time > 0
+        local bool = _G.StorageManager:GetInstance():GetItemCountBySid(52) < self.cfg.points_boss or isWaiting
+        self.go_table.obj_tip:SetActiveE(bool and 0 or 1)
+    end
+    local nowCount = _G.StorageManager:GetInstance():GetItemCountBySid(52)
+    local maxCount = self.cfg.points_boss
+    self.go_table.slider_BossTime.maxValue = self.cfg.duration
+    --self.go_table.aorrawimage_icon:LoadImage(_G.ConfigManager.currency_type_cfg[52].icon)
+    if nowCount > maxCount then
+        self.go_table.slider_count.value = 1
+    else
+        self.go_table.slider_count.value = nowCount / maxCount
+    end
+    self.go_table.aortext_count.text = nowCount .. "/" .. maxCount
+    local bool = nowCount < maxCount
+    self.go_table.aorbtn_Changllenge:SetGray(bool)
+    self.go_table.aorbtn_Changllenge:GetComponentE(_G.typeof(_G.CS.AorImage)).color =
+        _G.ColorTools.FormatColorByString(bool and "A9A9A9" or "FFFFFF")
+    self.go_table.aortext_name.color =
+        _G.ColorTools.FormatColorByString(bool and "434343" or "8C2D14")
+    _G.GameUtil.SetActiveByCondition(self.go_table.aortext_gray, bool)
+    _G.GameUtil.SetActiveByCondition(self.go_table.aortext_name, not bool)
+
+    if not self.bossEff then
+        _G.UIUtils.LoadEffectByCfg(_G.ConfigManager.ui_effect_cfg.ef_xuanshangemoshoulie, self.go_table.obj_eff,
+            function(obj)
+                if self:IsNil() then
+                    _G.UIUtils.RemoveEffect(obj)
+                    return
+                end
+                self.bossEff = obj
+            end)
+    end
+end
+
+function BountyLobbyView:UpdateBossTimer(elapsed)
+    if self:IsNil() then
+        return
+    end
+    self.BossRTS = self.BossRTS - elapsed
+    self.go_table.aortext_Slider.text = _G.TimeUtil.TimeToString(Mathf.RoundToInt(self.BossRTS), 1)
+    self.go_table.slider_BossTime.value = Mathf.RoundToInt(math.max(self.cfg.duration - self.BossRTS, 0))
+    if self.BossRTS <= 0 then
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_boss, false)
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_BossDispath, false)
+        _G.GameUtil.SetActiveByCondition(self.go_table.obj_getBoss, true)
+        self.bossTimer:Stop()
+        self.bossTimer = nil
+    end
+end
+
+---初始化恶灵任务刷新时间
+function BountyLobbyView:InitTimer()
+    self.RTS = _G.TimeUtil.GetSixClockTimer()
+    self:UpdateEvilRefreshTime(self.RTS)
+    if self.refreshTimer == nil then
+        self.refreshTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnChangeRTS, self, false, false, true)
+        self.refreshTimer:Start()
+    end
+end
+
+function BountyLobbyView:OnChangeRTS(elapsed)
+    self.RTS = self.RTS - elapsed
+    if self.RTS <= 0 then
+        self.RTS = 86400 + self.RTS
+    end
+    self:UpdateEvilRefreshTime(self.RTS)
+end
+
+---更新恶灵任务刷新时间
+function BountyLobbyView:UpdateEvilRefreshTime(RTS)
+    self.QuestPanel.aortext_TimeLeft.text = _G.TimeUtil.TimeToString(Mathf.RoundToInt(RTS), 1)
+end
+
+---恶灵倒计时完成
+function BountyLobbyView:EvilRefreshTimerOver(data, isSetCount)
+    self.bountyData = data
+    require("BountySystemManager"):GetInstance():UpdateAllQuest()
+    self:SortEvilTask2(isSetCount)
+    if isSetCount then
+        --self.QuestPanel.looplist2_QuestList:SetListItemCount(#self.bountyData.missions)
+        self:UpdateList()
+    end
+    self:ShowBtn()
+    self:ShowNoTask()
+end
+
+---初始化恶灵任务
+function BountyLobbyView:InitEvilTask()
+    if not self.bountyData.missions then
+        self.bountyData.missions = {}
+    end
+    self.QuestPanel.scrollloopvectical_QuestList:InitItemData(
+        self.isDefult and 1 or #self.bountyData.missions,
+        _G.handler(self, self.RefreshEvilTask)
+    )
+    self.NewDatas = {}
+    self.isInited = true
+    -- self.QuestPanel.looplist2_QuestList:InitListView(#self.bountyData.missions, _G.handler(self, self.RefreshEvilTask))
+end
+
+---刷新恶灵任务
+function BountyLobbyView:RefreshEvilTask(index, obj)
+    index = index + 1
+    local item = obj
+    --listView2:NewListViewItem("$_obj_QuestItem")
+    obj:SetName(index)
+    local instanceID = item:GetInstanceIDE()
+    if not self.EvilTasks[instanceID] then
+        self.EvilTasks[instanceID] = BountyQuestBase.CreateBountyQuest(
+            item,
+            _G.handler(self, self.AcceptEvilTask),
+            _G.handler(self, self.OnFinishEvilTask),
+            _G.handler(self, self.SortEvilTask2),
+            self
+        )
+        if not self.isInited then
+            self:DelayDo(
+                0.1 * index,
+                function()
+                    _G.GameUtil.SetActiveByCondition(obj, false)
+                    _G.GameUtil.SetActiveByCondition(obj, true)
+                end
+            )
+            self.EvilTasks[instanceID]:InitData(index, true, true)
+            _G.GameUtil.SetActiveByCondition(obj, false)
+        else
+            self.EvilTasks[instanceID]:InitData(index, true)
+        end
+    elseif self.EvilTaskDatas[index] then
+        self.EvilTasks[instanceID]:InitData(
+            index,
+            self:CheckIsNew(self.EvilTaskDatas[index].cfg.id),
+            nil,
+            self:CheckIsUnDisposeTask(self.EvilTaskDatas[index].cfg.id)
+        )
+    end
+    -- return item
+end
+
+---检测是否为新的任务
+function BountyLobbyView:CheckIsNew(id)
+    if not self.NewDatas then
+        return false
+    end
+    local isNew = self.NewDatas[id]
+    self.NewDatas[id] = nil
+    return isNew
+end
+
+function BountyLobbyView:DelayDo(time, call)
+    if not self.DelayTb then
+        self.DelayTb = {}
+    end
+    self.DelayTb[call] = _G.DelayDo(
+        time,
+        function()
+            self.DelayTb[call] = nil
+            call()
+        end
+    )
+end
+
+---检测是否为未派遣任务
+function BountyLobbyView:CheckIsUnDisposeTask(id)
+    local isTrue = self.unDisposeTask[id]
+    self.unDisposeTask[id] = nil
+    return isTrue
+end
+
+---接取恶灵任务
+function BountyLobbyView:AcceptEvilTask(id)
+    self.unDisposeTask = {}
+    for _, v in pairs(self.EvilTaskDatas) do
+        if v.id ~= id and v.taskState == BountyEnum.BountyQuestStateEnum.DNS then
+            self.unDisposeTask[v.id] = true
+        end
+    end
+    self:SortEvilTask2()
+end
+
+---完成恶灵任务
+---@param data  BountyQuestData 任务
+---@param item BountyQuestBase
+function BountyLobbyView:OnFinishEvilTask(data, item, callback)
+    if data.taskState ~= BountyEnum.BountyQuestStateEnum.Award then
+        return
+    end
+    --XZNS-8271所有任务都改成一键领取
+    self:ReceiveAllAward()
+    --data.taskState = BountyEnum.BountyQuestStateEnum.Awarding
+    --require("BountySystemManager"):GetInstance():FinshEvilTask(
+    --    { data.mission.sid },
+    --    _G.handlerbind(self, self.OnFinishEvilTaskSuc, data, item, callback)
+    --)
+end
+
+function BountyLobbyView:ChangeIndex(index, isMove, callback)
+    local count = 0
+    local canMove = false
+    for _, v in pairs(self.EvilTasks) do
+        if v.index and v.index > index then
+            v.index = v.index - 1
+            if isMove and v.gameObject:GetActiveSelf() == 1 then
+                canMove = true
+                local _, y = v.transform:GetLocalPosition()
+                local endY = y + 147
+                count = count + 1
+                v.transform:DOLocalMoveY(endY, 0.2):SetEase(_G.CS.DG.Tweening.Ease.Linear):OnComplete(
+                    function()
+                        count = count - 1
+                        if count == 0 then
+                            if callback then
+                                callback()
+                                callback = nil
+                            end
+                        end
+                    end
+                )
+            end
+        end
+    end
+    if not canMove then
+        if callback then
+            callback()
+            callback = nil
+        end
+    end
+end
+
+---完成恶灵任务回掉
+---@param msg dispatch.s2c_dispatch_finish
+---@param data BountyQuestData
+---@param item BountyQuestBase
+function BountyLobbyView:OnFinishEvilTaskSuc(msg, data, item, callback)
+    if msg.ack ~= 1 then
+        return
+    end
+
+    if msg.missions then
+        _G.table.insertto(self.bountyData.missions, msg.missions)
+        for _, v in pairs(msg.missions) do
+            self.NewDatas[v.sid] = true
+        end
+        require("BountySystemManager"):GetInstance():AddQuest(msg.missions)
+        self:UpdateList()
+    end
+
+    if msg.award then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        local awardData = require("BountySystemManager"):GetInstance():ParaseAward(msg.award)
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+            msg,
+            function()
+                self:ShowBoss()
+            end,
+            true,
+            nil,
+            true
+        )
+    end
+    local isNew = not _G.table.isEmptyOrNil(msg.missions)
+    item:PlayOut(
+        function()
+            self:RemoveEvilTask(data.mission.sid)
+            self:ChangeIndex(
+                item.index,
+                true,
+                function()
+                    --self.QuestPanel.scrollloopvectical_QuestList:RecycleItem(item.index - 1, 1)
+                    if isNew then
+                        self:SortEvilTask2(true)
+                    end
+                    self:ShowBtn()
+                    self:ShowNoTask()
+                    if self.isDefult then
+                        self.isDefult = false
+                        require "BountySystemManager":GetInstance().isDefult = false
+                        self:UpdateList()
+                    end
+                    self.QuestPanel.scrollloopvectical_QuestList:UpdateAllItem()
+                end
+            )
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.BountyLobby.id)
+        end
+    )
+
+    if not msg.award then
+        self:ShowBoss()
+    end
+    local isWaiting = require("BountySystemManager"):GetInstance().BountyData.boss.boss_start_time > 0
+    local bool = _G.StorageManager:GetInstance():GetItemCountBySid(52) < self.cfg.points_boss or isWaiting
+    self.go_table.obj_tip:SetActiveE(bool and 0 or 1)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.MainChallenge.id, 202)
+end
+
+---显示当前没有任务
+function BountyLobbyView:ShowNoTask()
+    _G.GameUtil.SetActiveByCondition(self.QuestPanel.obj_NoTask, _G.table.isEmptyOrNil(self.bountyData.missions))
+end
+
+---移除恶灵任务
+---@param sid number 任务sid
+function BountyLobbyView:RemoveEvilTask(sid, card)
+    if card == nil then
+        card = require("BountySystemManager"):GetInstance():ChangeCards()
+    end
+    require("BountySystemManager"):GetInstance():RemoveQuest(sid, card)
+end
+
+---出现Boss
+function BountyLobbyView:ShowBoss()
+    if self.bountyData.boss.boss_start_time > 0 then
+        return
+    end
+    self.bountyData.boss.boss_start_time = 0
+    local bool = _G.StorageManager:GetInstance():GetItemCountBySid(52) < self.cfg.points_boss
+    self.go_table.aorbtn_Changllenge:SetGray(bool)
+    self.go_table.aorbtn_Changllenge:GetComponentE(_G.typeof(_G.CS.AorImage)).color =
+        _G.ColorTools.FormatColorByString(bool and "A9A9A9" or "FFFFFF")
+    --设置灰色颜色
+    _G.GameUtil.SetActiveByCondition(self.go_table.aortext_gray, bool)
+    _G.GameUtil.SetActiveByCondition(self.go_table.aortext_name, not bool)
+end
+
+---一键派遣
+function BountyLobbyView:DispathAll()
+    if _G.table.isEmptyOrNil(self.bountyData.missions) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(350102)
+        return
+    end
+    local haveTask = false
+    for _, v in pairs(self.EvilTaskDatas) do
+        if not v.mission.card or #v.mission.card == 0 then
+            haveTask = true
+            break
+        end
+    end
+    if not haveTask then
+        _G.PopWindowManager:GetInstance():ShowAllTips(350110)
+        return
+    end
+
+    local cards = require("BountySystemManager"):GetInstance():GetDispathAll()
+    if _G.table.isEmptyOrNil(cards) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(350101)
+    else
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.BountyDispatchView.Name,
+            cards,
+            function(data)
+                local list = {}
+                for k, v in pairs(data) do
+                    local tb = {}
+                    tb.sid = v.mission.sid
+                    tb.card_uid = {}
+                    for i = 1, #v.mission.card do
+                        tb.card_uid[#tb.card_uid + 1] = v.mission.card[i].uid
+                    end
+                    _G.table.insert(list, tb)
+                end
+                require("BountySystemManager"):GetInstance():AcceptEvilTask(
+                    list,
+                    function(msg)
+                        if msg.ack ~= 1 then
+                            _G.PopWindowManager:GetInstance():ShowAllTips(350101)
+                            return
+                        end
+                        self.unDisposeTask = {}
+                        if msg.success_sid then
+                            local isAdd = false
+                            for i = 1, #self.EvilTaskDatas do
+                                for j = 1, #msg.success_sid do
+                                    isAdd = false
+                                    if msg.success_sid[j] == self.EvilTaskDatas[i].mission.sid then
+                                        self.EvilTaskDatas[i]:StartTask(
+                                            msg.start_time,
+                                            data[msg.success_sid[j]].mission.card,
+                                            true
+                                        )
+                                        self.NewDatas[msg.success_sid[j]] = true
+                                        isAdd = true
+                                        break
+                                    end
+                                end
+                                if not isAdd and self.EvilTaskDatas[i].taskState == BountyEnum.BountyQuestStateEnum.DNS then
+                                    self.unDisposeTask[self.EvilTaskDatas[i].mission.sid] = true
+                                end
+                            end
+                            self:SortEvilTask2()
+                            self.unDisposeTask = {}
+                        end
+                    end
+                )
+            end
+        )
+    end
+end
+
+---一键领取
+function BountyLobbyView:ReceiveAllAward()
+    local TaskSids = {}
+    local IndexTb = {}
+    local count = #self.EvilTaskDatas
+    for i = 1, count do
+        local v = self.EvilTaskDatas[i]
+        if v.taskState == BountyEnum.BountyQuestStateEnum.Award and v.mission then
+            TaskSids[v.mission.sid] = v.mission.sid
+            v.taskState = BountyEnum.BountyQuestStateEnum.Awarding
+            _G.table.insert(IndexTb, { index = i, data = v })
+        end
+    end
+    if _G.table.count(TaskSids) > 0 then
+        require("BountySystemManager"):GetInstance():FinshEvilTask(
+            _G.table.toArray(TaskSids),
+            _G.handlerbind(self, self.ReceiveAllAwardCall, IndexTb)
+        )
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(350103)
+    end
+end
+
+---一键领取回调
+---@param msg dispatch.s2c_dispatch_finish
+function BountyLobbyView:ReceiveAllAwardCall(msg, IndexTb)
+    if msg.ack ~= 1 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(350103)
+    end
+    if msg.missions then
+        _G.table.insertto(self.bountyData.missions, msg.missions)
+        for _, v in pairs(msg.missions) do
+            self.NewDatas[v.sid] = true
+        end
+        require("BountySystemManager"):GetInstance():AddQuest(msg.missions)
+    end
+    local isNew = not _G.table.isEmptyOrNil(msg.missions)
+    if msg.success_sid then
+        local count = #IndexTb
+        local count2 = #msg.success_sid
+        local tb = {}
+        for _, v in pairs(msg.success_sid) do
+            tb[v] = true
+        end
+        local index = 0
+        for i = count, 1, -1 do
+            ---@type BountyQuestData
+            local v = IndexTb[i].data
+            if tb[v.mission.sid] then
+                if v.questBase and v.questBase.index == i then
+                    local item = v.questBase
+                    item:PlayOut(
+                        function()
+                            index = index + 1
+                            self:RemoveEvilTask(v.mission.sid)
+                            --self.QuestPanel.scrollloopvectical_QuestList:RecycleItem(IndexTb[i].index - 1)
+                            if index >= count2 then
+                                if isNew then
+                                    self:SortEvilTask2(true)
+                                    self:UpdateList()
+                                    self.NewDatas = {}
+                                else
+                                    self:MoveAllQuest()
+                                end
+                                require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager
+                                .redpoint_cfg.BountyLobby.id)
+                            end
+                            self.QuestPanel.scrollloopvectical_QuestList:UpdateAllItem()
+                        end
+                    )
+                else
+                    self:RemoveEvilTask(v.mission.sid)
+                    --self.QuestPanel.scrollloopvectical_QuestList:RecycleItem(IndexTb[i].index - 1)
+                    index = index + 1
+                end
+            end
+        end
+        if not msg.award then
+            self:ShowBoss()
+        end
+
+        if msg.award then
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                msg,
+                function()
+                    self:ShowBoss()
+                end,
+                true,
+                nil,
+                true
+            )
+        end
+    end
+    local isWaiting = require("BountySystemManager"):GetInstance().BountyData.boss.boss_start_time > 0
+    local bool = _G.StorageManager:GetInstance():GetItemCountBySid(52) < self.cfg.points_boss or isWaiting
+    self.go_table.obj_tip:SetActiveE(bool and 0 or 1)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.MainChallenge.id, 202)
+end
+
+function BountyLobbyView:MoveAllQuest(call)
+    local count = #self.EvilTaskDatas
+    if count == 0 then
+        self:ShowBtn()
+        self:ShowNoTask()
+    else
+        for i = 1, count do
+            if
+                self.EvilTaskDatas[i].questBase and
+                self.EvilTaskDatas[i].questBase.questData.id == self.EvilTaskDatas[i].id
+            then
+                self.EvilTaskDatas[i].questBase.index = i
+                if i == count then
+                    self:ShowBtn()
+                    if call then
+                        call()
+                    end
+                end
+            end
+        end
+    end
+end
+
+---刷新恶灵任务
+---@param msg dispatch.s2c_dispatch_refresh
+function BountyLobbyView:RefreshAllEvilTask(msg)
+    if msg.ack ~= 1 then
+        return
+    end
+    self:UpdateList()
+    require("BountySystemManager"):GetInstance():UpdateAllQuest()
+    for _, v in pairs(self.bountyData.missions) do
+        self.NewDatas[v.sid] = true
+    end
+    self:SortEvilTask2(true)
+    self:RefreshAllTask()
+    _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Diamond, 0, _G.ConfigManager.discrete_cfg[101501][1][1])
+end
+
+---@param missions dispatch.i_evil_spirit_mission
+function BountyLobbyView:ChangeNew(missions)
+    local isNew = true
+    for _, v in pairs(missions) do
+        isNew = true
+        for _, v2 in pairs(self.bountyData.missions) do
+            if v2.sid == v.sid then
+                isNew = false
+                break
+            end
+            if isNew then
+                self.NewDatas[v.sid] = true
+            end
+        end
+    end
+end
+
+function BountyLobbyView:OnStartClose()
+    if self.EvilTaskDatas then
+        for _, v in pairs(self.EvilTaskDatas) do
+            v:Dispose()
+            require("BountySystemManager"):GetInstance():RespawnQuestData(v)
+        end
+    end
+
+    if self.refreshTimer then
+        self.refreshTimer:Stop()
+        self.refreshTimer = nil
+    end
+    if self.bossTimer then
+        self.bossTimer:Stop()
+        self.bossTimer = nil
+    end
+    if self.DelayTb then
+        for _, v in pairs(self.DelayTb) do
+            _G.coroutine.stopwaiting(v)
+        end
+        self.DelayTb = nil
+    end
+
+    require("BountySystemManager"):GetInstance():UnBindUpdateTime()
+end
+
+---关闭贪字营界面
+function BountyLobbyView:CloseView()
+    TrackingPointModel:GetInstance():CloseActTracking(self.viewName)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OpenDialog, self)
+    self:Close()
+end
+
+---完成Boss任务
+---@param msg dispatch.s2c_dispatch_finish_boss
+function BountyLobbyView:FinishBossTask(msg)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.bountyData.boss.boss_start_time = 0
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        { _G.ActiveTaskEnum.ConditionEnum.Section.TzyBossTaskOver },
+        -- 贪字营 boss任务完成x次
+        --- #次数
+        1
+    )
+
+    self.bountyData.boss_kill_num = self.bountyData.boss_kill_num + 1
+    --检测升级
+    if self.bountyData.level < #_G.ConfigManager.bounty_level_cfg then
+        if self.bountyData.boss_kill_num >= _G.ConfigManager.bounty_level_cfg[self.bountyData.level].num_boss then
+            self.bountyData.boss_kill_num = 0
+            self.bountyData.level = self.bountyData.level + 1
+
+            require "PopUpGiftBagModel":GetInstance():IsCampLevel(self.bountyData.level)
+
+            self.cfg = _G.ConfigManager.bounty_level_cfg[self.bountyData.level]
+            self.go_table.slider_BossTime.maxValue = self.cfg.duration
+            self.go_table.aortext_count.text = "x" .. self.cfg.points_boss
+            self.go_table.aortext_Level.text = string.replace(self.go_table.aortext_Level.text, self.bountyData.level - 1,
+                self.bountyData.level)
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                { _G.ActiveTaskEnum.ConditionEnum.Section.TzyLevel },
+                -- 贪字营等级达到X级
+                --- #等级
+                self.bountyData.level
+            )
+        end
+    end
+
+    ---奖励飞入位置
+    if msg.award then
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        local awardData = require("BountySystemManager"):GetInstance():ParaseAward(msg.award)
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+            msg,
+            function()
+                self:ShowBoss()
+            end,
+            true,
+            nil,
+            true
+        )
+    else
+        --TODO 提示背包已满，奖励发送至邮件
+    end
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_boss, true)
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_BossUnDispath, true)
+    local isWaiting = require("BountySystemManager"):GetInstance().BountyData.boss.boss_start_time > 0
+    local bool = _G.StorageManager:GetInstance():GetItemCountBySid(52) < self.cfg.points_boss or isWaiting
+    self.go_table.obj_tip:SetActiveE(bool and 0 or 1)
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_getBoss, false)
+    if not msg.award then
+        self:ShowBoss()
+    end
+    if msg.missions then
+        _G.table.insertto(self.bountyData.missions, msg.missions)
+        require("BountySystemManager"):GetInstance():AddQuest(msg.missions)
+        --self.QuestPanel.looplist2_QuestList:SetListItemCount(#self.bountyData.missions)
+        self:UpdateList()
+        self:SortEvilTask2(true)
+        self:ShowNoTask()
+    end
+end
+
+---排序
+function BountyLobbyView:SortEvilTask(isNotRefresh)
+    if self.isSort then
+        return
+    end
+    self.isSort = true
+    -- require("BountySystemManager"):GetInstance():SortEvilTask(self.EvilTaskDatas)
+    -- if not isNotRefresh then
+    --     self:RefreshAllTask()
+    -- end
+    self.isSort = false
+end
+
+---排序
+function BountyLobbyView:SortEvilTask2(isNotRefresh)
+    if self.isSort then
+        return
+    end
+    self.isSort = true
+    require("BountySystemManager"):GetInstance():SortEvilTask()
+
+    self:ShowBtn()
+    if require("BountySystemManager"):GetInstance().isHaveDispath then
+        require("BountySystemManager"):GetInstance().isHaveDispath = false
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.BountyLobby.id, 1)
+    end
+    if not isNotRefresh then
+        self:RefreshAllTask()
+    end
+    self.isSort = false
+end
+
+---刷新所有的恶灵任务
+function BountyLobbyView:RefreshAllTask()
+    for i = 1, #self.EvilTaskDatas do
+        self.EvilTaskDatas[i].questBase = nil
+    end
+    --self.QuestPanel.looplist2_QuestList:RefreshAllShownItem()
+    self.QuestPanel.scrollloopvectical_QuestList:UpdateAllItem()
+
+    -- self:RefreshAllTask()
+end
+
+function BountyLobbyView:UpdateList()
+    local noData = _G.table.isEmptyOrNil(self.bountyData.missions)
+    if not noData then
+        local count = noData and 0 or #self.bountyData.missions
+        self.QuestPanel.scrollloopvectical_QuestList:UpdateCount(self.isDefult and 1 or count)
+    else
+        self.QuestPanel.scrollloopvectical_QuestList:UpdateCount(0)
+    end
+end
+
+---按钮点击事件在这里派发
+function BountyLobbyView:OnClickBtn(go, isOn)
+    local name = go:GetName()
+    if name == "@_aorbtn_CloseView" then
+        self:CloseView()
+    elseif name == "@_aorbtn_DispathAll" then
+        self:DispathAll()
+    elseif name == "@_aorbtn_Refresh" then
+        local isHaveRefreshTask = false
+        for i = 1, #self.bountyData.missions do
+            if self.bountyData.missions[i].time == 0 then
+                isHaveRefreshTask = true
+                break
+            end
+        end
+        if not isHaveRefreshTask then
+            _G.PopWindowManager:GetInstance():ShowAllTips(350106)
+            return
+        end
+        local rolid = _G.PlayerModel:GetInstance().role_uid
+        local savetime = _G.PlayerPrefsManager.GetInt("BountyLobbyRefresh" .. rolid)
+        local nowtime = _G.TimeUtil.GetServerUnixTime()
+        local todayTime = _G.TimeUtil.GetDayBySix(nowtime)
+        local isChoose = savetime == todayTime
+        if isChoose then
+            if
+                _G.StorageManager:GetInstance():CheckItem(
+                    _G.ResPropID.Diamond,
+                    _G.ConfigManager.discrete_cfg[101501][1][1]
+                )
+            then
+                require("BountySystemManager"):GetInstance():RefreshEvilTask(
+                    _G.handler(self, self.RefreshAllEvilTask)
+                )
+            else
+                _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.GetItemWayView.Name,
+                    _G.ResPropID.Diamond
+                )
+            end
+        else
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                350301,
+                string.format(
+                    _G.LangUtil.GetLangPackValue(_G.ConfigManager.tips_system_cfg[350301].content),
+                    _G.ConfigManager.discrete_cfg[101501][1][1]
+                ),
+                function(isChoose)
+                    if
+                        _G.StorageManager:GetInstance():CheckItem(
+                            _G.ResPropID.Diamond,
+                            _G.ConfigManager.discrete_cfg[101501][1][1]
+                        )
+                    then
+                        require("BountySystemManager"):GetInstance():RefreshEvilTask(
+                            _G.handler(self, self.RefreshAllEvilTask)
+                        )
+                    else
+                        _G.UIManager:GetInstance():OpenWindow(
+                            _G.ConfigManager.ui_cfg.GetItemWayView.Name,
+                            _G.ResPropID.Diamond
+                        )
+                    end
+                    if isChoose then
+                        _G.PlayerPrefsManager.SetInt("BountyLobbyRefresh" .. rolid, todayTime)
+                    end
+                end
+            )
+        end
+    elseif name == "@_aorbtn_onLevel" then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.BountyUpgradeView.Name, self.bountyData)
+    elseif name == "@_aorbtn_GetAllReward" then
+        self:ReceiveAllAward()
+    elseif name == "@_aorbtn_closeBoss" then
+        self.go_table.obj_BossAttack:SetActiveE(0)
+    elseif name == "@_aorbtn_PlayDescribe" or name == "@_aorbtn_PlayDescribe2" then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 5)
+    elseif name == "@_aorbtn_banner" then
+        _G.PopWindowManager:GetInstance():ShowAllTips(350108)
+    elseif name == "@_aorbtn_Changllenge" then
+        if _G.StorageManager:GetInstance():GetItemCountBySid(52) >= self.cfg.points_boss then
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.BountyBossView.Name,
+                self.bountyData.level,
+                self.bountyData.boss,
+                _G.handler(self, self.AcceptBossTask)
+            )
+        else
+            --   _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, 52)
+            _G.PopWindowManager:GetInstance():ShowAllTips(350112)
+        end
+    elseif name == "@_aorbtn_GetBoss" then
+        require("BountySystemManager"):GetInstance():FinshBossTask(_G.handler(self, self.FinishBossTask))
+    elseif name == "@_aorbtn_Privilege" then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LimitedTimePrivilegeView.Name, 405006)
+    elseif go == self.go_table.aorbtn_box then
+        self:OnClickNode()
+    elseif go == self.go_table.aorbtn_TipsView then
+        _G.GameUtil.SetActiveByCondition(self.go_table.aorbtn_TipsView, false)
+    end
+end
+
+function BountyLobbyView:OnClickNode()
+    _G.GameUtil.SetActiveByCondition(self.go_table.aorbtn_TipsView, true)
+
+    if not self.itemTable then
+        self.itemTable = {}
+    end
+    for key, value in pairs(self.itemTable) do
+        value.Despawn(value)
+        self.itemTable[key] = nil
+    end
+    local power = require "BountySystemManager":GetInstance():GetBossPower()
+    local powerTb = self.cfg.power
+    local NowItems = self.cfg.reward
+    local count = #NowItems
+    local count2 = 0
+    for i = 1, count do
+        if powerTb[i][2] <= power then
+            count2 = count2 + 1
+            self:CareatItem(NowItems[i], self.go_table.obj_Parent, self.itemTable)
+        end
+    end
+    local tf = self.go_table.obj_ItemTips:GetComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform))
+    if not _G.IsNil(tf) then
+        tf:SetSizeWithCurrentAnchors(_G.CS.UnityEngine.RectTransform.Axis.Horizontal, count2 * 68)
+    end
+end
+
+function BountyLobbyView:CareatItem(tb, Parent, itemTable)
+    if _G.IsNil(Parent) or Parent:GetctiveInHierarchy() == 0 then
+        return
+    end
+    _G.StorageManager:GetInstance():GetItemBaseViewNew(
+        tb,
+        Parent,
+        function(item)
+            item.gameObject:SetLocalScaleXYZ(0.7)
+            _G.GameUtil.SetActiveByCondition(item.gameObject, true)
+            item:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+            --endregion------------------------------------物品 特效 防止因异步加载 延迟导致显示错误--------
+
+            table.insert(itemTable, item)
+        end,
+        function(go, isOn)
+            require("CommonTipManager"):GetInstance():OpenTip(go.gameObject, tb[1])
+        end
+    )
+end
+
+---接受boss任务
+function BountyLobbyView:AcceptBossTask()
+    -- _G.GameUtil.SetActiveByCondition(self.go_table.obj_BossUnDispath, false)
+    self.BossRTS = self.cfg.duration -
+    math.max(_G.TimeUtil.GetServerUnixTime() - self.bountyData.boss.boss_start_time, 0)
+    self.go_table.aortext_Slider.text = _G.TimeUtil.TimeToString(self.BossRTS, 1)
+    self.go_table.slider_BossTime.value = 0
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_BossDispath, true)
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_BossUnDispath, false)
+    self.go_table.obj_tip:SetActiveE(0)
+    self.bossTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateBossTimer, self, false, false, true)
+    self.bossTimer:Start()
+end
+
+function BountyLobbyView:OnBountyUnDispathEnd()
+    local item = self.playEffect[1]
+    if item then
+        item:PlayUnDispathEffectEnd()
+    end
+    _G.table.remove(self.playEffect, 1)
+end
+
+function BountyLobbyView:AddBountyUnDispathEnd(QuestBase)
+    if not self.playEffect then
+        self.playEffect = {}
+    end
+    _G.table.insert(self.playEffect, QuestBase)
+end
+
+function BountyLobbyView:OnUIClosed(name)
+    self.go_table.toggle_disPatch.isOn = false
+    self.go_table.toggle_hunt.isOn = false
+end
+
+return BountyLobbyView

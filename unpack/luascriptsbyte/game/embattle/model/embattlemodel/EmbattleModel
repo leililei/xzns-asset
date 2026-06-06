@@ -1,0 +1,1086 @@
+--------------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.branches.Alpha.Client.Assets.Resources.LuaScripts.Game.Embattle.Model.EmbattleModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/06/19
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+--[[
+数据内容调整
+取消了守护灵对寄灵人的依赖(可以单独上阵守护灵)
+取消了五行绑定
+取消了人灵绑定 2022.03.09 任意位置上阵任意卡牌(不分人灵)
+上阵数量从6个换成5个 2022.03.24
+]]
+
+local EmbattleNet = require "EmbattleNet"
+local base = require "GameDataModelBase"
+---@class EmbattleModel:GameDataModelBase    上阵数据模型类
+---@field public curEmbattleArray table 布阵的英雄数据{uid,uid,uid,uid,uid}
+---@field public embattleTemporarySids table 临时布阵的英雄数据
+---@field public localEmbattleArray table 本地布阵的英雄数据
+---@field GetInstance EmbattleModel
+local EmbattleModel = _G.BaseClass("EmbattleModel", base)
+
+--存储结构和以前的不兼容, 使用新的存储键(否则将会卡登录)
+local EmbattleSaveKey = "EmbattleLocalDataKey240723"
+local EmbattleSaveKeyByLastAssist = "EmbattleSaveKeyByLastAssist240723"
+local EmbattleTipsRepeatSid = 140101
+local EmbattlePosCount = 10
+local EmbattleLocalVersion = 3
+local EmbattleType = _G.EmbattleType
+--region高阶竞技场
+local function HandleArenaSeniorEmptyEmbattle(self, etype)
+    local ets = { EmbattleType.arenaSeniorAttack1, EmbattleType.arenaSeniorAttack2, EmbattleType.arenaSeniorAttack3 }
+    local maxcard
+    local sids = {}
+    local data
+    local StorageManagerIns = _G.StorageManager:GetInstance()
+    for i = 1, #ets do
+        if ets[i] ~= etype then
+            data = self.curEmbattleArray[ets[i]]
+            for j = 1, #data do
+                if data[j] > 0 then
+                    maxcard = StorageManagerIns:GetItemDataByID(_G.StorageID.Card, data[j])
+                    sids[maxcard.sid] = true
+                end
+            end
+        end
+    end
+    maxcard = nil
+    local cards = _G.StorageManager:GetInstance():GetStrongestCards()
+    for i = 1, #cards do
+        if not sids[cards[i].sid] then
+            if not maxcard then
+                maxcard = cards[i]
+            elseif maxcard:GetPower() < cards[i]:GetPower() then
+                maxcard = cards[i]
+            end
+        end
+    end
+    return maxcard and maxcard.uid or 0
+end
+--endregion
+local emptyEmbattleHandle = {
+    [EmbattleType.arenaAttack] = function(self)
+        local cards = _G.StorageManager:GetInstance():GetStrongestCards()
+        local maxcard
+        for sid, card in pairs(cards) do
+            if not maxcard then
+                maxcard = card
+            elseif maxcard:GetPower() < card:GetPower() then
+                maxcard = card
+            end
+        end
+        self.curEmbattleArray[EmbattleType.arenaAttack][1] = maxcard.uid
+    end,
+    [EmbattleType.arenaSeniorAttack1] = function(self)
+        local uid = HandleArenaSeniorEmptyEmbattle(self, EmbattleType.arenaSeniorAttack1)
+        self.curEmbattleArray[EmbattleType.arenaSeniorAttack1][1] = uid
+    end,
+    [EmbattleType.arenaSeniorAttack2] = function(self)
+        local uid = HandleArenaSeniorEmptyEmbattle(self, EmbattleType.arenaSeniorAttack2)
+        self.curEmbattleArray[EmbattleType.arenaSeniorAttack2][1] = uid
+    end,
+    [EmbattleType.arenaSeniorAttack3] = function(self)
+        local uid = HandleArenaSeniorEmptyEmbattle(self, EmbattleType.arenaSeniorAttack3)
+        self.curEmbattleArray[EmbattleType.arenaSeniorAttack3][1] = uid
+    end
+}
+
+---需要获取放置为默认的布阵枚举ID
+local needDefaultEmbattleType = {
+    [EmbattleType.arenaAttack] = true,
+    [EmbattleType.arenaDefence] = true,
+    [EmbattleType.Tower] = true,
+    ---死魂塔多队第一队
+    [EmbattleType.Tower * 1000 + 1] = true,
+    [EmbattleType.SystemMaterial] = true,
+    [EmbattleType.ResourcesUpMaterial] = true,
+    [EmbattleType.ResourcesEquipmentMaterial] = true,
+    [EmbattleType.ResourcesGemstone] = true,
+    [EmbattleType.ReedCatkins] = true,
+    [EmbattleType.StarSoul] = true,
+    ---星魂试炼不同职业boss
+    [EmbattleType.StarSoul * 1000 + 1] = true,
+    [EmbattleType.StarSoul * 1000 + 2] = true,
+    [EmbattleType.StarSoul * 1000 + 3] = true,
+    [EmbattleType.StarSoul * 1000 + 4] = true,
+    [EmbattleType.StarSoul * 1000 + 5] = true,
+    [EmbattleType.section] = true,
+    [EmbattleType.sociatyBoss] = true,
+    [EmbattleType.SeasonBoss] = true,
+    [EmbattleType.dungones] = true,
+    [EmbattleType.AllHeroesBattle] = true,
+    [EmbattleType.BlackSource] = true,
+    [EmbattleType.MonsterSiege] = true,
+    [EmbattleType.CelebrationTrial] = true,
+    [EmbattleType.AFKGroup1] = true,
+    [EmbattleType.worldBoss1] = true,
+    [EmbattleType.SeasonTower] = true
+}
+---只读取本地阵容
+local LocalEmbattleType = {
+    [EmbattleType.AFKGroup1] = true,
+    [EmbattleType.AFKGroup2] = true,
+    [EmbattleType.AFKGroup3] = true,
+    [EmbattleType.AFKGroup4] = true,
+    [EmbattleType.AFKGroup5] = true
+}
+---终焉之末boss本地阵容类型
+local DecorationBossEmbattleType = {
+    [EmbattleType.DecorationBoss1] = true,
+    [EmbattleType.DecorationBoss2] = true,
+    [EmbattleType.DecorationBoss3] = true,
+    [EmbattleType.DecorationBoss4] = true
+}
+---类的构造函数
+function EmbattleModel:__init()
+    self.curEmbattleArray = {}
+    setmetatable(
+            self.curEmbattleArray,
+            {
+                __index = function(tab, key)
+                    tab[key] = { 0, 0, 0, 0, 0 }
+                    if needDefaultEmbattleType[key] then
+                        --读取放置1队的数据
+                        local data = tab[EmbattleType.AFKOnly]
+                        for i = 1, #data do
+                            tab[key][i] = data[i]
+                        end
+                    end
+                    return tab[key]
+                end
+            }
+    )
+    self.embattleSkillIndexArray = {}
+    setmetatable(
+            self.embattleSkillIndexArray,
+            {
+                __index = function(tab, key)
+                    tab[key] = { 0, 0, 0 }
+                    if needDefaultEmbattleType[key] then
+                        --读取放置1队的数据
+                        local data = tab[EmbattleType.AFKOnly]
+                        for i = 1, #data do
+                            tab[key][i] = data[i]
+                        end
+                    end
+                    return tab[key]
+                end
+            }
+    )
+    ---@type any 宠物技布阵数据
+    self.embattlePetSkillIndexArray = {}
+    setmetatable(
+            self.embattlePetSkillIndexArray,
+            {
+                __index = function(tab, key)
+                    tab[key] = { 0, 0, 0 }
+                    if needDefaultEmbattleType[key] then
+                        --读取放置1队的数据
+                        local data = tab[EmbattleType.AFKOnly]
+                        for i = 1, #data do
+                            tab[key][i] = data[i]
+                        end
+                    end
+                    return tab[key]
+                end
+            }
+    )
+    if _G.AppSetting.IsXzns then
+        ---@type any 圣兽技布阵数据（星座使用）
+        self.embattleBeastSkillIndexArray = {}
+        setmetatable(
+                self.embattleBeastSkillIndexArray,
+                {
+                    __index = function(tab, key)
+                        tab[key] = { 0, 0, 0 }
+                        if needDefaultEmbattleType[key] then
+                            --读取放置1队的数据
+                            local data = tab[EmbattleType.AFKOnly]
+                            for i = 1, #data do
+                                tab[key][i] = data[i]
+                            end
+                        end
+                        return tab[key]
+                    end
+                }
+        )
+    end
+    self.embattleTemporarySids = {}
+    self.localEmbattleArray = {}
+    local PlayerPrefsManager = _G.PlayerPrefsManager
+    if PlayerPrefsManager.GetInt("EmbattleLocalVersion") ~= EmbattleLocalVersion then
+        PlayerPrefsManager.DeleteKey(EmbattleSaveKey)
+        PlayerPrefsManager.SetInt("EmbattleLocalVersion", EmbattleLocalVersion)
+    end
+    local conds = _G.ConfigManager.discrete_cfg[105001]
+    ---1.等级解锁, 4关卡解锁, 50服务器时间解锁
+    self.curSkillPosState = { 0, 0, 0 }
+    for i = 1, #conds do
+        self.curSkillPosState[i] = conds[i]
+    end
+end
+
+---类的析构函数
+function EmbattleModel:Dispose()
+    self.curEmbattleArray = nil
+    self.embattleTemporarySids = nil
+    self.localEmbattleArray = nil
+end
+
+--region 重写父类方法
+function EmbattleModel:GetDataFormServer()
+    local sits = _G.PlayerPrefsManager.GetTable(EmbattleSaveKey) or {}
+    for id, sit in pairs(sits) do
+        self.embattlePetSkillIndexArray[id] = sit.pet
+        self.embattleSkillIndexArray[id] = sit.combine
+        if _G.AppSetting.IsXzns then
+            self.embattleBeastSkillIndexArray[id] = sit.beast
+        end
+
+        if sit.embattle then
+            self.localEmbattleArray[id] = sit.embattle
+        else
+            sit.pet = nil
+            sit.beast = nil
+            sit.combine = nil
+            self.localEmbattleArray[id] = sit
+        end
+    end
+    for key, value in pairs(self.localEmbattleArray) do
+        self.curEmbattleArray[key] = value
+    end
+    EmbattleNet:GetInstance():GetAllEmbattleInfo(
+            function(msg)
+                local data = msg.garrays or {}
+                self:ParseData(data)
+            end
+    )
+end
+
+function EmbattleModel:ParseData(data)
+    if not table.isEmptyOrNil(data) then
+        for i = 1, #data do
+            if not LocalEmbattleType[data[i].id] then
+                self.curEmbattleArray[data[i].id] = data[i].sits
+                self.curEmbattleArray[data[i].id][6] = nil
+                self.embattleSkillIndexArray[data[i].id] = data[i].skill_index
+                self.embattlePetSkillIndexArray[data[i].id] = data[i].pet
+                if _G.AppSetting.IsXzns then
+                    self.embattleBeastSkillIndexArray[data[i].id] = data[i].beast
+                end
+            end
+        end
+    end
+    base.ParseData(self)
+end
+
+--endregion
+
+--region私有方法
+---保存本地布阵数据
+function EmbattleModel:SaveLocalEmbattleData()
+    local sits = {}
+    for id, sit in pairs(self.localEmbattleArray) do
+        sits[id] = {}
+        sits[id].embattle = {}
+        for i = 1, #sit do
+            sits[id].embattle[i] = sit[i]
+        end
+        sits[id].combine = self.embattleSkillIndexArray[id]
+        sits[id].pet = self.embattlePetSkillIndexArray[id]
+        if _G.AppSetting.IsXzns then
+            sits[id].beast = self.embattleBeastSkillIndexArray[id]
+        end
+    end
+    _G.PlayerPrefsManager.SetTable(EmbattleSaveKey, sits)
+end
+
+--endregion
+---保存助战前一次战斗布阵数据
+---@param isAssist boolean 当前是否是助战场次 是就不存
+---@param id number _G.EmbattleType
+function EmbattleModel:SaveLocalEmbattleDataByLastAssist(isAssist, id, sits)
+    if not isAssist then
+        return
+    end
+    self.lastAssist = id
+    local tb = {}
+    if _G.PlayerPrefsManager.HasKey(EmbattleSaveKeyByLastAssist) then
+        tb = _G.PlayerPrefsManager.GetTable(EmbattleSaveKeyByLastAssist)
+    end
+    tb[id] = sits
+    _G.PlayerPrefsManager.SetTable(EmbattleSaveKeyByLastAssist, tb)
+end
+
+---清楚上次助战阵容
+function EmbattleModel:ClearLastAssist()
+    _G.PlayerPrefsManager.DeleteKey(EmbattleSaveKeyByLastAssist)
+end
+
+function EmbattleModel:GetLocalEmbattleDataByAssist(id)
+    if _G.PlayerPrefsManager.HasKey(EmbattleSaveKeyByLastAssist) then
+        local tb = _G.PlayerPrefsManager.GetTable(EmbattleSaveKeyByLastAssist)
+        return tb[id]
+    end
+end
+
+--region 对外获取数据接口
+
+--region 卡牌
+
+------获取上阵数据
+---@param id EmbattleType 布阵类型
+---@return table 上阵的英雄数据UID数组
+function EmbattleModel:GetEmbattleData(id)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("未传入ID 返回默认0数据")
+        end
+        return { 0, 0, 0, 0, 0 }
+    end
+    return _G.DeepCopy(self.curEmbattleArray[id])
+end
+
+------获取上阵数据
+---@param id EmbattleType 布阵类型
+---@return table 上阵的英雄数据UID数组
+function EmbattleModel:GetEmbattleDataWithoutMetatable(id)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("未传入ID 返回默认0数据")
+        end
+        return
+    end
+    local tab = rawget(self.curEmbattleArray, id)
+    if tab then
+        return _G.DeepCopy(self.curEmbattleArray[id])
+    end
+    return
+end
+
+---获取出战卡牌SID数组
+---@param id EmbattleType 布阵类型
+---@return table 上阵的英雄数据SID数组
+function EmbattleModel:GetEmbattleSidsData(id)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("未传入ID 返回默认0数据")
+        end
+        return { 0, 0, 0, 0, 0 }
+    end
+    --临时存储的UID为卡牌SID
+    local sids = self.embattleTemporarySids[id]
+    if sids then
+        return sids
+    end
+    sids = _G.DeepCopy(self.curEmbattleArray[id])
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        for i = 1, #sids do
+            if sids[i] == 0 then
+                sids[i] = 0
+            else
+                local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, sids[i])
+                sids[i] = card and card.sid or 0
+            end
+        end
+        return sids
+    end
+    return { 0, 0, 0, 0, 0 }
+end
+
+------检测卡牌是否上阵
+---@param uid number 卡牌uid
+---@return boolean 是否出站
+---@return number 出站位置
+function EmbattleModel:CheckHeroEmbattle(uid)
+    for _, data in pairs(self.curEmbattleArray) do
+        for i = 1, #data do
+            if data[i] == uid then
+                return true, i
+            end
+        end
+    end
+    return false, 0
+end
+
+---@param uid number 玩家uid
+function EmbattleModel:CheckInEmbattle(uid, id)
+    local uids = self.curEmbattleArray[id] or {}
+    return _G.table.indexof(uids, uid)
+end
+
+---设置卡牌下阵
+---@param uid number 卡牌uid
+---@return boolean 下阵是否成功
+-- function EmbattleModel:SetEmbattleDownByUid(uid)
+--     local typeArray = {}
+--     local insert = _G.table.insert
+--     for etype, earray in pairs(self.curEmbattleArray) do
+--         for index = 1, #earray do
+--             local value = earray[index]
+--             if value == uid then
+--                 self.curEmbattleArray[etype][index] = 0
+--                 insert(typeArray, etype)
+--                 break
+--             end
+--         end
+--     end
+--     if not _G.table.isEmptyOrNil(typeArray) then
+--         self:HandleEmptyEmbattle(typeArray)
+--         self:SaveEmbattleDataTable(typeArray, nil)
+--     end
+--     return true
+-- end
+
+---设置卡牌下阵
+---@param uids table 卡牌uid数组
+---@return boolean 下阵是否成功
+function EmbattleModel:SetEmbattleDownByUidTable(uids)
+    local typeArray = {}
+    local typeArrayLocal = {}
+    for i = 1, #uids do
+        for etype, earray in pairs(self.curEmbattleArray) do
+            for index = 1, #earray do
+                local value = earray[index]
+                if value == uids[i] then
+                    if 400 <= etype and etype <= 409 then
+                        self.curEmbattleArray[etype][index] = 0
+                        typeArrayLocal[etype] = etype
+                    else
+                        self.curEmbattleArray[etype][index] = 0
+                        typeArray[etype] = etype
+                    end
+                end
+            end
+        end
+    end
+    if not _G.table.isEmptyOrNil(typeArray) then
+        typeArray = _G.table.toArray(typeArray)
+        self:HandleEmptyEmbattle(typeArray)
+        self:SaveEmbattleDataTable(typeArray, nil)
+    end
+    if not _G.table.isEmptyOrNil(typeArrayLocal) then
+        typeArrayLocal = _G.table.toArray(typeArrayLocal)
+        self:HandleEmptyEmbattle(typeArrayLocal)
+        self:SaveEmbattleDataTable(typeArrayLocal, nil, nil, _G.EmbattleSaveType.localfile)
+    end
+    return true
+end
+
+---处理因卡牌被消耗导致的空阵容
+---@param etypes table 布阵枚举组
+function EmbattleModel:HandleEmptyEmbattle(etypes)
+    local data
+    for i = 1, #etypes do
+        data = self.curEmbattleArray[etypes[i]]
+        for j = 1, #data do
+            if data[j] > 0 then
+                break
+            end
+            if j == #data then
+                --阵容为空了
+                local func = emptyEmbattleHandle[etypes[i]]
+                if func then
+                    func(self)
+                end
+            end
+        end
+    end
+end
+
+---设置上阵数据(uids)
+---@param uids number 卡牌uid数组，共6位，没有的传0
+---@param id _G.EmbattleType 布阵id
+---@param islocal boolean 是否存本地
+function EmbattleModel:SetEmbattleByUids(uids, id, islocal)
+    for i = 1, #uids do
+        self.curEmbattleArray[id][i] = uids[i]
+    end
+    if islocal then
+        self.localEmbattleArray[id] = self.curEmbattleArray[id]
+    end
+end
+
+-----检测是否可以进入战斗(不为全空即可)
+---@param id number 阵型id
+---@param func function 判定方法
+---@return boolean 是否可以进入战斗
+function EmbattleModel:CheckBattle(id, func)
+    if func then
+        return func(), true
+    end
+    if not id then
+        return false
+    end
+    local uids = self.curEmbattleArray[id]
+    for i = 1, #uids do
+        if uids[i] > 0 then
+            return true
+        end
+    end
+    return false
+end
+
+---获取布阵战力
+---@param id number 布阵类型
+---@param isView boolean 是否为界面显示(用于处理试玩卡战力问题)
+---@return number 战力
+function EmbattleModel:GetEmbattlePower(id, isView)
+    if not id then
+        return 0
+    end
+    local uids = self.curEmbattleArray[id]
+    local power = 0
+    local uid = 0
+    local card
+    local StorageManager = _G.StorageManager:GetInstance()
+    for i = 1, #uids do
+        card = StorageManager:GetItemDataByID(_G.StorageID.Card, uids[i])
+        if card then
+            power = power + card:GetPower(isView)
+        end
+    end
+    return power
+end
+
+---获取布阵战力 不进行元表操作
+---@param id number 布阵类型
+---@return number 战力
+function EmbattleModel:GetEmbattlePowerWithoutMetatable(id)
+    if not id then
+        return 0
+    end
+    local uids = rawget(self.curEmbattleArray, id)
+    if uids == nil then
+        return 0
+    end
+    local power = 0
+    local uid = 0
+    local card
+    local StorageManager = _G.StorageManager:GetInstance()
+    for i = 1, #uids do
+        card = StorageManager:GetItemDataByID(_G.StorageID.Card, uids[i])
+        if card then
+            power = power + card:GetPower()
+        end
+    end
+    return power
+end
+
+---获取布阵最高战力角色
+---@param id number 布阵类型
+---@return table {sid=number,uid=number}
+function EmbattleModel:GetEmbattleMaxPowerData(id)
+    if not id then
+        return 0
+    end
+    local uids = self.curEmbattleArray[id]
+    local power = 0
+    local uid = 114200000
+    local sid = 114200000
+    local card
+    local StorageManager = _G.StorageManager:GetInstance()
+    for i = 1, #uids do
+        card = StorageManager:GetItemDataByID(_G.StorageID.Card, uids[i])
+        if card then
+            if card:GetPower() > power then
+                power = card:GetPower()
+                sid = card.sid
+                uid = card.uid
+            end
+        end
+    end
+    return { sid = sid, uid = uid }
+end
+
+---保存布阵数据
+---@param id number 阵型id
+---@param callback function 保存回调
+---@param saveType number 保存类型 nil or 0 保存服务器 1 保存本地 2临时存储
+---@param NotPassServer boolean 不通知服务器
+---@param data table 布阵数据(传入 则替换掉当前 不传则采用当前数据{uid,uid,uid,uid,uid,uid})
+---@param firstEmbattle bool 是不是第一次设置五行竞技场阵容
+function EmbattleModel:SaveEmbattleDataNew(id, callback, saveType, NotPassServer, data, firstEmbattle)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("传入的布阵ID为nil 保存失败")
+        end
+        if callback then
+            callback(-1)
+        end
+        return
+    end
+    local lastTemp = self.curEmbattleArray[id] or { 0, 0, 0, 0, 0 }
+    if (id == _G.EmbattleType.arenaElementAttack and firstEmbattle) then
+        for index, v in pairs(data) do
+            self.curEmbattleArray[id][index] = v
+        end
+    else
+        self.curEmbattleArray[id] = data or self.curEmbattleArray[id]
+    end
+
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        --未创建角色，就只能作为临时阵容保存(不持久化)
+        NotPassServer = true
+        saveType = _G.EmbattleSaveType.temporary
+    end
+    local serverid = (not saveType or saveType == _G.EmbattleSaveType.server) and id or 0
+    if DecorationBossEmbattleType[serverid] then
+        serverid = EmbattleType.DecorationBoss
+    end
+    if NotPassServer and saveType ~= _G.EmbattleSaveType.server then
+        if _G.EmbattleSaveType.localfile == saveType then
+            self.localEmbattleArray[id] = self.curEmbattleArray[id]
+            self:SaveLocalEmbattleData()
+        end
+        if callback then
+            callback(0)
+        end
+    else
+        data = self.curEmbattleArray[id]
+        EmbattleNet:GetInstance():UpdateEmbattle(
+                { serverid },
+                { data },
+                function(msg)
+                    if msg.ack == 1 then
+                        self:EmbattleidSkillCount3(id, self.embattleSkillIndexArray[id])
+
+                        if _G.EmbattleSaveType.localfile == saveType then
+                            self.localEmbattleArray[id] = self.curEmbattleArray[id]
+                            self:SaveLocalEmbattleData()
+                        end
+                        if
+                        id == _G.EmbattleType.AFKOnly or id == _G.EmbattleType.AFKGroup or
+                                id == _G.EmbattleType.AFKGroup2 or
+                                id == _G.EmbattleType.AFKGroup3 or
+                                id == _G.EmbattleType.AFKGroup4 or
+                                id == _G.EmbattleType.AFKGroup5
+                        then
+                            _G.Events:GetInstance():Broadcast(
+                                    _G.eRedPointAFKEquip.RedPointRefreshAFkEquip,
+                                    self.curEmbattleArray[id],
+                                    self:GetChangePosUid(lastTemp, self.curEmbattleArray[id])
+                            )
+                        end
+                        if callback then
+                            callback(0)
+                        end
+                    else
+                        if callback then
+                            callback(-1)
+                        end
+                    end
+                end,
+                { self.embattleSkillIndexArray[id] },
+                { self.embattlePetSkillIndexArray[id] },
+                { _G.AppSetting.IsXzns and self.embattleBeastSkillIndexArray[id] or nil }
+
+        )
+    end
+    ---当保存的是五行竞技场的防御阵容且进攻阵容是空的时候
+    ---以同样的阵容保存进攻阵容
+    if
+    (id == _G.EmbattleType.arenaElementDefence and
+            require("EmbattleController"):GetInstance():CheckArenaDefenceIsEmpty(
+                    _G.EmbattleType.arenaElementAttack,
+                    saveType,
+                    NotPassServer,
+                    _G.EmbattleControllerItemType.arenaElementAttack
+            ))
+    then
+        self:SaveEmbattleDataNew(_G.EmbattleType.arenaElementAttack, nil, saveType, NotPassServer, data, true)
+    end
+end
+
+---获取变动阵容的uids(用于更新阵容)
+---@param last table 上次保存的阵容
+---@param cur table 本次保存的阵容
+---@return table
+function EmbattleModel:GetChangePosUid(last, cur)
+    local have = {}
+    for _, v in pairs(cur) do
+        if v > 0 then
+            have[v] = true
+        end
+    end
+    local tb = { down = {}, up = {} }
+    for _, v in pairs(last) do
+        if v > 0 and not have[v] then
+            _G.table.insert(tb.down, v)
+        elseif v > 0 and have[v] then
+            have[v] = nil
+        end
+    end
+    tb.up = _G.table.keys(have)
+    return tb
+end
+
+---多组布阵数据上传
+---@param ids table 布阵枚举组
+---@param callback function 保存回调
+---@param embattleData table 布阵数据(传入 则替换掉当前 不传则采用当前数据{{uid,uid,uid,uid,uid,uid}})
+---@param saveType number 保存类型 nil or 0 保存服务器 1 保存本地 2临时存储
+function EmbattleModel:SaveEmbattleDataTable(ids, callback, embattleData, saveType)
+    local data = {}
+    local skill = {}
+    local pets = {}
+    local beasts = {}
+    for i = 1, #ids do
+        self.curEmbattleArray[ids[i]] = embattleData and embattleData[i] or self.curEmbattleArray[ids[i]]
+        data[i] = self.curEmbattleArray[ids[i]]
+        skill[i] = self.embattleSkillIndexArray[ids[i]]
+        pets[i] = self.embattlePetSkillIndexArray and self.embattlePetSkillIndexArray[ids[i]] or { 0, 0, 0 }
+        if _G.AppSetting.IsXzns then
+            beasts[i] = self.embattleBeastSkillIndexArray and self.embattleBeastSkillIndexArray[ids[i]] or { 0, 0, 0 }
+        end
+    end
+    if not saveType or saveType == _G.EmbattleSaveType.server then
+        --保存在服务器
+        EmbattleNet:GetInstance():UpdateEmbattle(
+                ids,
+                data,
+                function(msg)
+                    for i = 1, #ids do
+                        self:EmbattleidSkillCount3(ids[i], skill[i])
+                    end
+                    if callback then
+                        callback(msg.ack == 1 and 0 or -1)
+                    end
+                end,
+                skill,
+                pets,
+                _G.AppSetting.IsXzns and beasts or nil
+        )
+    else
+        if saveType == _G.EmbattleSaveType.localfile then
+            --保存在本地
+            for i = 1, #ids do
+                self.localEmbattleArray[ids[i]] = self.curEmbattleArray[ids[i]]
+            end
+            self:SaveLocalEmbattleData()
+        end
+        if callback then
+            callback(0)
+        end
+    end
+end
+
+---清理布阵数据
+---@param id number 布阵枚举
+function EmbattleModel:ClearEmbattleData(id)
+    self.curEmbattleArray[id] = nil
+    self.embattleSkillIndexArray[id] = nil
+    self.embattlePetSkillIndexArray[id] = nil
+    if _G.AppSetting.IsXzns then
+        self.embattleBeastSkillIndexArray[id] = nil
+    end
+end
+
+---检测是否有布阵数据
+---@param id number 是否有布阵数据
+function EmbattleModel:CheckEmbattleData(id)
+    if not id then
+        return false
+    end
+    for _, v in pairs(self.curEmbattleArray[id]) do
+        if v > 0 then
+            ---@type CardData
+            local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, v)
+            if cardData then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--endregion
+
+--region --------------------------------------检测并广播合击技数量到达三--------
+
+---@param id number 阵容id
+---@param list number 合击技 数组
+function EmbattleModel:EmbattleidSkillCount3(id, list)
+    local count = 0
+    for i = 1, #list do
+        if list[i] ~= 0 then
+            count = count + 1
+        end
+    end
+    if count >= 3 then
+        _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.Embattle.EmbattleidSkillCount3,
+                    id
+                },
+                1,
+                false,
+                true
+        )
+    end
+end
+
+--endregion------------------------------------检测合击挤数量到达三--------
+--region 合击技
+local localCombineSkillEffectPlayKey = "CombineSkillEffectPlaySaveKey"
+---获取布阵合击技数据
+---@param id number 布阵ID
+---@return table 数据{id,id,id}
+function EmbattleModel:GetSkillIndex(id)
+    return _G.DeepCopy(self.embattleSkillIndexArray[id])
+end
+
+---设置布阵合击技释放数据
+---@param id number 布阵ID
+---@param data table 数据{id,id,id}
+function EmbattleModel:SetSkillIndex(id, data)
+    local count = 0
+    for i = 1, #data do
+        self.embattleSkillIndexArray[id][i] = data[i]
+        if data[i] > 0 then
+            count = count + 1
+        end
+    end
+end
+
+---检测合击技位置是否解锁
+---@param pos number 合击技序列号
+---@return boolean 是否解锁
+function EmbattleModel:CheckSkillPosUnLock(pos)
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return false
+    end
+    if self.curSkillPosState[pos] and self.curSkillPosState[pos] ~= 0 then
+        local type, param = table.unpack(self.curSkillPosState[pos])
+        if type == 1 and _G.PlayerModel:GetInstance():GetLevel() >= param or
+                type == 4 and require("AfkModel"):GetInstance():CheckSectionIsPass(param) or
+                type == 50 and _G.PlayerModel:GetInstance():GetServerOpenDuration() >= param * 86400 or
+                type == 0 then
+            self.curSkillPosState[pos] = 0
+        end
+    end
+    return self.curSkillPosState[pos] == 0
+end
+
+---获取合击技解锁放置的关卡ID
+---@param pos number 合击技序列号
+---@return string 提示
+function EmbattleModel:GetSkillPosUnLockParam(pos)
+    if not self.curSkillPosState[pos] or self.curSkillPosState[pos] == 0 then
+        return nil
+    end
+    local type, param = table.unpack(self.curSkillPosState[pos])
+    if type == 1 then
+        return _G.LangUtil.GetLangPackValue(9002010022, param), type, param
+    elseif type == 4 then
+        ---@type afk_cfg
+        local cfg = _G.ConfigManager.afk_cfg[param]
+        if cfg then
+            return _G.LangUtil.GetLangPackValue(90025100003, cfg.chapter, cfg.section), type, param
+        end
+    elseif type == 50 then
+        local remainTime = param * 86400 - _G.PlayerModel:GetInstance():GetServerOpenDuration()
+        if remainTime > 0 then
+            return _G.GetLangPackValue(90023800019, param), type, param
+        end
+    end
+    return nil
+end
+
+---获取布阵宠物数据
+---@param id number 布阵ID
+---@return table 数据{id,id,id}
+function EmbattleModel:GetPetSkillIndex(id)
+    return _G.DeepCopy(self.embattlePetSkillIndexArray[id])
+end
+
+---设置布阵宠物数据
+---@param id number 布阵ID
+---@param data table 数据{id,id}
+function EmbattleModel:SetPetSkillIndex(id, data)
+    if not data then
+        return
+    end
+    for i = 1, #data do
+        self.embattlePetSkillIndexArray[id][i] = data[i]
+    end
+end
+
+---检查宠物技是否解锁
+---@param pos number 序号
+---@return boolean 是否解锁
+function EmbattleModel:CheckPetSkillPosUnLock(pos)
+    if _G.AppSetting.IsXzns then
+        -- 星座屏蔽宠物，改为使用圣兽(Beast)
+        return false
+    end
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return false
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(251) then
+        return false
+    end
+    --初始化解锁条件
+    if not self.curPetSkillPosState then
+        self.curPetSkillPosState = {}
+        --TODO: 宠物技解锁条件未配置时, 使用合击技解锁配置
+        local conditions = _G.ConfigManager.discrete_cfg[114402]
+        if conditions then
+            for _, v in ipairs(conditions) do
+                table.insert(self.curPetSkillPosState, v)
+            end
+        end
+    end
+
+    local condition = self.curPetSkillPosState[pos]
+    if not condition or condition == 0 then
+        return true
+    end
+    if not _G.GlobalConditionManager.CheckCondition(condition[1], condition[2]) then
+        return false
+    end
+    self.curPetSkillPosState[pos] = 0
+    return true
+end
+
+---获取宠物技解锁条件
+---@param pos number 序号
+---@return string,number,number 提示,类型,参数
+function EmbattleModel:GetPetSkillPosUnlockCondition(pos)
+    if not self.curPetSkillPosState then
+        self:CheckPetSkillPosUnLock(pos)
+    end
+    local condition = self.curPetSkillPosState and self.curPetSkillPosState[pos] or nil
+    if not condition or condition == 0 then
+        return nil
+    end
+    local type, param = table.unpack(condition)
+    if type == 1 then
+        return _G.LangUtil.GetLangPackValue(9002010022, param), type, param
+    elseif type == 4 then
+        ---@type afk_cfg
+        local cfg = _G.ConfigManager.afk_cfg[param]
+        if cfg then
+            return _G.LangUtil.GetLangPackValue(90025100003, cfg.chapter, cfg.section), type, param
+        end
+    elseif type == 50 then
+        local remainTime = param * 86400 - _G.PlayerModel:GetInstance():GetServerOpenDuration()
+        if remainTime > 0 then
+            return _G.GetLangPackValue(90023800019, param), type, param
+        end
+    end
+    return nil
+end
+
+---获取合击技开放特效是否播放
+---@param pos number 合击技序列号
+---@return boolean 是否播放
+function EmbattleModel:GetCombineSkillOpenEffectPlay(pos)
+    if not self.combineSkillEffectPlay then
+        self.combineSkillEffectPlay = _G.PlayerPrefsManager.GetTable(localCombineSkillEffectPlayKey) or { false, false, false }
+    end
+    return self.combineSkillEffectPlay[pos]
+end
+
+---设置合击技开放特效播放
+---@param pos number 合击技序列号
+function EmbattleModel:SetCombineSkillOpenEffectPlay(pos)
+    if not self.combineSkillEffectPlay then
+        self.combineSkillEffectPlay = { false, false, false }
+    end
+    self.combineSkillEffectPlay[pos] = true
+    _G.PlayerPrefsManager.SetTable(localCombineSkillEffectPlayKey, self.combineSkillEffectPlay)
+end
+
+---获取布阵圣兽数据
+---@param id number 布阵ID
+---@return table 数据{id,id,id}
+function EmbattleModel:GetBeastSkillIndex(id)
+    return _G.DeepCopy(self.embattleBeastSkillIndexArray[id])
+end
+
+---设置布阵圣兽数据
+---@param id number 布阵ID
+---@param data table 数据{id,id}
+function EmbattleModel:SetBeastSkillIndex(id, data)
+    if not data then
+        return
+    end
+    for i = 1, #data do
+        self.embattleBeastSkillIndexArray[id][i] = data[i]
+    end
+end
+
+---检查圣兽槽位是否解锁
+---@param pos number 序号
+---@return boolean 是否解锁
+function EmbattleModel:CheckBeastSkillPosUnLock(pos)
+    if not _G.AppSetting.IsXzns then
+        return false
+    end
+    if not _G.PlayerModel:GetInstance():CheckCreateRole() then
+        return false
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(1001) then
+        return false
+    end
+    --初始化解锁条件
+    if not self.curBeastSkillPosState then
+        self.curBeastSkillPosState = {}
+        --TODO: 宠物技解锁条件未配置时, 使用合击技解锁配置
+        local conditions = _G.ConfigManager.discrete_cfg[200202]
+        if conditions then
+            for _, v in ipairs(conditions) do
+                table.insert(self.curBeastSkillPosState, v)
+            end
+        end
+    end
+
+    local condition = self.curBeastSkillPosState[pos]
+    if not condition or condition == 0 then
+        return true
+    end
+    if not _G.GlobalConditionManager.CheckCondition(condition[1], condition[2]) then
+        return false
+    end
+    self.curBeastSkillPosState[pos] = 0
+    return true
+end
+
+---获取圣兽技解锁条件
+---@param pos number 序号
+---@return string,number,number 提示,类型,参数
+function EmbattleModel:GetBeastSkillPosUnlockCondition(pos)
+    if not self.curBeastSkillPosState then
+        self:CheckPetSkillPosUnLock(pos)
+    end
+    local condition = self.curBeastSkillPosState and self.curBeastSkillPosState[pos] or nil
+    if not condition or condition == 0 then
+        return nil
+    end
+    local type, param = table.unpack(condition)
+    if type == 1 then
+        return _G.LangUtil.GetLangPackValue(9002010022, param), type, param
+    elseif type == 4 then
+        ---@type afk_cfg
+        local cfg = _G.ConfigManager.afk_cfg[param]
+        if cfg then
+            return _G.LangUtil.GetLangPackValue(90025100003, cfg.chapter, cfg.section), type, param
+        end
+    elseif type == 50 then
+        local remainTime = param * 86400 - _G.PlayerModel:GetInstance():GetServerOpenDuration()
+        if remainTime > 0 then
+            return _G.GetLangPackValue(90023800019, param), type, param
+        end
+    end
+    return nil
+end
+
+--endregion
+
+--endregion
+
+return EmbattleModel

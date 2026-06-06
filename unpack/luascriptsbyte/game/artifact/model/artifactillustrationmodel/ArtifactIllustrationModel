@@ -1,0 +1,511 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Artifact.Model.ArtifactIllustrationModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/11/17
+-- Description: 神器图鉴数据类
+-----------------------------------------------------------------------
+local ArtifactNet = require("ArtifactNet")
+
+---@class ArtifactIllustrationModel : GameDataModelBase
+---@field level number 图鉴等级
+---@field exp number 图鉴当前等级经验
+---@field illList artifact_illustration.i_artifact_illustration[] 图鉴数据
+local ArtifactIllustrationModel = _G.BaseClass("ArtifactIllustrationModel", _G.GameDataModelBase)
+local PlayerTreeID = _G.PlayerTreeID
+local ProfSort = {
+    [PlayerTreeID.tank] = 2,
+    [PlayerTreeID.warrior] = 5,
+    [PlayerTreeID.master] = 3,
+    [PlayerTreeID.support] = 1,
+    [PlayerTreeID.ranger] = 4
+}
+
+---品质
+---@field Purple number 紫
+---@field Orange number 橙
+---@field Red number 红
+---@field Colour number 彩
+local ArtifactQuality = {
+    Purple = 1,
+    Orange = 2,
+    Colour = 3,
+    All = 4
+}
+---@return ArtifactIllustrationModel ArtifactIllustrationModel
+function ArtifactIllustrationModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+local ConfigManager = _G.ConfigManager
+local TimeUtil = _G.TimeUtil
+local UIManager = _G.UIManager
+local ArtifactCfg = ConfigManager.artifact_cfg
+local lvCfg = ConfigManager.illustrations_artifact_lv_cfg
+local card_skills_cfg = ConfigManager.card_skills_cfg
+
+---创建对象时,入口构造函数
+function ArtifactIllustrationModel:__init()
+    self.illLevel = 0
+    self.exp = 0
+    self.repointID = _G.ConfigManager.redpoint_cfg.ArtifactAtlas.id
+    _G.Events:GetInstance():AddListener(_G.eCertificateMall.Buy, self.OnBuy, self)
+end
+
+---从服务器拉取数据
+function ArtifactIllustrationModel:GetDataFormServer()
+    self:GetInfo()
+end
+function ArtifactIllustrationModel:OnSixClockUpdate(endcall)
+    if endcall  then
+        endcall()
+    end
+   self:GetDataFormServer()
+end
+---获取信息
+function ArtifactIllustrationModel:GetInfo()
+    ArtifactNet:GetInstance():IllustrationInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg artifact_illustration.s2c_info
+function ArtifactIllustrationModel:ParseData(msg)
+    self.illLevel = msg.level
+    self.exp = msg.exp
+    self.needExp = 0
+    if lvCfg[self.illLevel + 1] then
+        self.needExp = lvCfg[self.illLevel + 1].exp - lvCfg[self.illLevel].exp
+    end
+    local insert = _G.table.insert
+    self.illAllList = {}
+    self.career = {
+        [ArtifactQuality.Purple] = {},
+        [ArtifactQuality.Orange] = {},
+        [ArtifactQuality.Colour] = {},
+        [ArtifactQuality.All] = {},
+    }
+    for k, v in pairs(ArtifactCfg) do
+        local condition = v.condition_type
+        if (condition == nil or #condition == 0 or _G.GlobalConditionManager.CheckConditionByArray(condition)) then
+            local data = {}
+            data.sid = v.id
+            data.icon = v.Icon
+            data.image = v.image_1
+            data.name = v.image_2
+            data.effect = v.effect
+            data.professional = v.Professional
+            data.exp = v.exp
+            data.maxStar = -1
+            data.curStar = -1
+            data.unLock = 0
+            data.cfg = v
+            data.star = v.star
+            data.order = v.Order
+            data.own = false
+            data.desc = require("ArtifactModel").GetStarSkillDes(v.id, 0)
+            -- if v.skill_2_id ~= 0 then
+            --     local skillData = card_skills_cfg[v.skill_2_id] or {}
+            --     data.awakeDesc = skillData.describe1
+            -- end
+            self.illAllList[v.id] = data
+        end
+    end
+    if msg.info then
+        for k, v in pairs(msg.info) do
+            if self.illAllList[v.sid] then
+                self.illAllList[v.sid].unLock = v.is_unlock
+                self.illAllList[v.sid].maxStar = v.high_star
+                self.illAllList[v.sid].curStar = v.is_unlock == 0 and -1 or v.display_star
+                self.illAllList[v.sid].own = true
+            end
+        end
+    end
+    if msg.skin_list then
+        for k,v in pairs(msg.skin_list) do
+            if self.illAllList[v.sid] then
+                self.illAllList[v.sid].skin_list=v.skin_list
+            end
+        end
+    end
+    for k, v in pairs(self.illAllList) do
+        insert(self.career[v.order], v)
+        insert(self.career[ArtifactQuality.All], v)
+    end
+    -- _G.SortList(
+    --     self.career[4],
+    --     function(a)
+    --         return ProfSort[a.professional]
+    --     end
+    -- )
+    self:RefreshAttr()
+    self.super.ParseData(self)
+end
+
+---图鉴升星
+---@param sid number 神器sid
+function ArtifactIllustrationModel:UpStar(sids, index, callback)
+    local pbData = { sid = sids }
+    ArtifactNet:GetInstance():IllustrationUpStar(pbData, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        local datas = {}
+        local isAddExp = false
+        local exp = 0
+        for _, sid in pairs(sids) do
+            local data = self.illAllList[sid]
+            if data.unLock == 0 then
+                data.unLock = 1
+                exp = exp + (data.exp[data.curStar + 1] or 0)
+            end
+            for i= data.curStar + 1, data.maxStar do
+                local addExp = data.exp[i + 1]
+                if addExp and addExp > 0 then
+                    exp = exp + addExp
+                end
+            end
+            data.curStar = data.maxStar
+            self.illAllList[sid] = data
+            table.insert(datas, data)
+        end
+        local upPower
+        if exp > 0 then
+            isAddExp = true
+            upPower = self:ChangeExp(exp)
+        end
+        if callback then
+            callback(datas)
+        end
+        require("RedPointManager"):GetInstance():RefreshNode(self.repointID)
+    end)
+end
+
+---更新图鉴经验
+function ArtifactIllustrationModel:ChangeExp(exp)
+    self.exp = self.exp + exp
+    local upPower = false
+    while (self.exp >= self.needExp) do
+        self.illLevel = self.illLevel + 1
+        self.exp = self.exp - self.needExp
+        self.needExp = lvCfg[self.illLevel + 1].exp - lvCfg[self.illLevel].exp
+        upPower = true
+    end
+    self:RefreshAttr(upPower)
+    return upPower
+end
+
+---更新属性加成
+function ArtifactIllustrationModel:RefreshAttr(upPower)
+    local data = lvCfg[self.illLevel]
+    local attributeManager = _G.AttributeClassManager:GetInstance()
+    self.attribute = attributeManager:GetAttribtueClass()
+    self.attribute:AddValueByName("atk", data.atk, nil, _G.AttCountType.other)
+    self.attribute:AddValueByName("bre", data.bre, nil, _G.AttCountType.other)
+    self.attribute:AddValueByName("def", data.def, nil, _G.AttCountType.other)
+    self.attribute:AddValueByName("max_hp", data.max_hp, nil, _G.AttCountType.other)
+    self.attributeChangeType = attributeManager:GetChangeAttrTypes(self.attribute)
+    if upPower then
+        local mypower = _G.StorageManager:GetInstance():GetPlayerPower()
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.ArtifactIll)
+        local offset = _G.StorageManager:GetInstance():GetPlayerPower() - mypower
+        if offset > 0 then
+            require "CommonTipManager".OpenPowerUpView(mypower, offset)
+        end
+    end
+end
+
+function ArtifactIllustrationModel:GetillAttr()
+    if not self.attribute then
+        self:RefreshAttr()
+    end
+    return self.attribute, self.attributeChangeType
+end
+
+---获取光武皮肤卡牌专属属性
+function ArtifactIllustrationModel:GetSkinAttr(id)
+    local cfg = _G.ConfigManager.card_cfg[id]
+    local attributeManager = _G.AttributeClassManager:GetInstance()
+    local attribute = attributeManager:GetAttribtueClass()
+    if not table.isEmptyOrNil(self.illAllList) then
+        local data=self.illAllList[cfg.artifactid]
+        local skinCfg
+        if data and not table.isEmptyOrNil(data.skin_list) then
+            for i = 1, #data.skin_list do
+                skinCfg=_G.ConfigManager.artifact_skin_cfg[data.skin_list[i]]
+                for _, v in pairs(skinCfg.base_att) do
+                    attribute:AddValueByName(
+                            v[1],
+                            attributeManager:GetValueWithName(v[1], v[3], _G.tonumber(v[2])),
+                            nil,
+                            _G.tonumber(v[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+                    )
+                end
+            end
+        end
+    end
+    return attribute, _G.AttributeClassManager:GetInstance():GetChangeAttrList(attribute)
+end
+---获得全局光武皮肤属性
+function ArtifactIllustrationModel:GetSkinAllAttr()
+    local changeAttrTypes
+    if self.allSkinAttr == nil then
+        changeAttrTypes = self:UpdateAllSkinAttr()
+    else
+        changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrList(self.allSkinAttr)
+    end
+    return self.allSkinAttr, changeAttrTypes
+end
+
+---更新皮肤全局属性（获得生效）
+function ArtifactIllustrationModel:UpdateAllSkinAttr()
+    local attributeManager = _G.AttributeClassManager:GetInstance()
+    local attribute = attributeManager:GetAttribtueClass()
+    local cfg
+    if not table.isEmptyOrNil(self.illAllList) then
+        for k,v in pairs(self.illAllList) do
+            if v.skin_list and #v.skin_list>0 then
+                for i = 1, #v.skin_list do
+                    cfg=_G.ConfigManager.artifact_skin_cfg[v.skin_list[i]]
+                    for _, t in pairs(cfg.team_base_att) do
+                        attribute:AddValueByName(
+                                t[1],
+                                attributeManager:GetValueWithName(t[1], t[3], _G.tonumber(t[2])),
+                                nil,
+                                _G.tonumber(t[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+                        )
+                    end
+                end
+            end
+        end
+    end
+    local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrList(attribute)
+    self.allSkinAttr = attribute
+    return changeAttrTypes
+end
+
+
+---改变神器最大星级
+---@param sid number 神器sid
+---@param newStar number 新的星级
+function ArtifactIllustrationModel:ChangeMaxStar(sid, newStar)
+    if self.illAllList[sid] then
+        local data = self.illAllList[sid]
+        data.maxStar = data.maxStar > newStar and data.maxStar or newStar
+        self.illAllList[data.sid] = data
+        for k, v in pairs(self.career[data.order]) do
+            if v.sid == data.sid then
+                v = data
+                break
+            end
+        end
+
+        for k, v in pairs(self.career[ArtifactQuality.All]) do
+            if v.sid == data.sid then
+                v = data
+                break
+            end
+        end
+
+        require("RedPointManager"):GetInstance():RefreshNode(self.repointID)
+    end
+end
+
+---获取目标图鉴列表
+---@param type number 职业类型
+function ArtifactIllustrationModel:GetIllustrationList()
+    return self.career
+end
+
+---获取图鉴等级
+function ArtifactIllustrationModel:GetCurIllLevel()
+    return self.illLevel, self.exp
+end
+
+---获取目标图鉴等级信息
+function ArtifactIllustrationModel:GetIllLevelAddition(level)
+    return _G.DeepCopy(lvCfg[level])
+end
+
+---获得神器
+function ArtifactIllustrationModel:GainArtifact(sid)
+    if not self.illAllList then
+        self.illAllList = {}
+    end
+    local data = self.illAllList[sid]
+    if data and not data.own then
+        data.own = true
+        data.maxStar = 0
+        self.illAllList[data.sid] = data
+        for k, v in pairs(self.career[data.order]) do
+            if v.sid == data.sid then
+                v = data
+                break
+            end
+        end
+        for k, v in pairs(self.career[ArtifactQuality.All]) do
+            if v.sid == data.sid then
+                v = data
+                break
+            end
+        end
+        require("RedPointManager"):GetInstance():RefreshNode(self.repointID)
+    end
+end
+
+---检测红点
+function ArtifactIllustrationModel:RedPointCheck()
+    for k, v in pairs(self.illAllList) do
+        if v.curStar < v.maxStar then
+            return 1
+        end
+    end
+    return 0
+end
+
+---检测是否已拥有对应光武皮肤
+function ArtifactIllustrationModel:CheckIsHasSkinBySid(sid)
+    local artifactId = _G.ConfigManager.artifact_skin_cfg[sid].card
+    if self.illAllList[artifactId] and self.illAllList[artifactId].skin_list then
+        return _G.table.ContainsValue(self.illAllList[artifactId].skin_list, sid)
+    end
+    return false
+end
+
+---检测是否拥有神器光武皮肤
+---@param Artifactsid number 神器sid
+---@param skinsid number 光武皮肤sid
+function ArtifactIllustrationModel:ChectIsHasArtifactSkin(Artifactsid,skinsid)
+    local data=self.illAllList[Artifactsid]
+    if not data.own then
+        return false
+    end
+    ---原皮光武默认拥有
+    if skinsid==data.cfg.skin[1] then
+        return true
+    end
+    if not data.skin_list or #data.skin_list==0 then
+        return false
+    end
+    return table.ContainsValue(data.skin_list,skinsid)
+end
+---通过卡片sid检测是否拥有光武皮肤
+---@param cardid number 卡牌sid
+---@param skinsid number 光武皮肤sid
+function ArtifactIllustrationModel:ChectIsHasArtifactSkinByCardData(cardid,skinsid)
+    local cardcfg=_G.ConfigManager.card_cfg[cardid]
+    if cardid==skinsid then
+        local data=self.illAllList[cardcfg.artifactid]
+        return data.unLock==1
+    end
+    return self:ChectIsHasArtifactSkin(cardcfg.artifactid,skinsid)
+end
+---判断卡片信息是否显示光武皮肤
+function ArtifactIllustrationModel:CheckCardIsShowArtifactSkin(cardid)
+    local cardcfg=_G.ConfigManager.card_cfg[cardid]
+    local data=self.illAllList[cardcfg.artifactid]
+    return data and data.cfg.skin and table.count(data.cfg.skin)>0
+end
+---判断光武形态是否解锁
+---@param id number 神器id
+---@param star number 星级
+function ArtifactIllustrationModel:CheckIsUnLockArtifactStage(id,star)
+    local data=self.illAllList[id]
+    if star==0 then
+        return data.unLock==1
+    elseif data.unLock==1 then
+        return data.maxStar>=star
+    else
+        return false
+    end
+end
+---获取当前光武形态
+---@param id number 神器id
+function ArtifactIllustrationModel:GetNowArtifactStage(id)
+    local data=self.illAllList[id]
+    if  not data or data.unlock == 0 then
+        return 0
+    end
+    local stage=1
+    for i = 2, #data.cfg.form_name do
+        if data.cfg.form_name[i][1]<=data.maxStar then
+            stage=i
+        end
+    end
+    return stage
+end
+---激活光武皮肤
+function ArtifactIllustrationModel:AddArtifactSkin(skinid)
+    local skincfg=_G.ConfigManager.artifact_skin_cfg[skinid]
+    local data=self.illAllList[skincfg.card]
+    if not data.skin_list then
+        data.skin_list={}
+    end
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.ArtifactSkinAttr)
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.ArtifactSkinAllAttr)
+    table.insert(data.skin_list,skinid)
+    
+end
+---通过皮肤id判断对应神器是否解锁
+function ArtifactIllustrationModel:CheckArtifaceIsUnLockBySkinId(skinid)
+    local skincfg=_G.ConfigManager.artifact_skin_cfg[skinid]
+    local data=self.illAllList[skincfg.card]
+    return data.unlock==1
+end
+---通过id获得神器是否解锁
+function ArtifactIllustrationModel:CheckArtifactIsUnLockById(id)
+    local data=self.illAllList[id]
+    return data.unlock==1
+end
+---通过卡牌皮肤id获取对应光武皮肤id
+---@param cardid number 卡牌id
+---@param skinid number 卡牌皮肤id
+function ArtifactIllustrationModel:GetArtifactSkinidByCardSkinid(cardid,skinid)
+    local cardcfg=_G.ConfigManager.card_cfg[cardid]
+    local data=self.illAllList[cardcfg.artifactid]
+    if not data or not data.cfg.skin or #data.cfg.skin==0 then
+        return nil
+    end
+    if cardid==skinid  then
+        return data.cfg.skin[1]
+    end
+    ---@type artifact_skin_cfg
+    local artifactskincfg=nil
+    for i = 1, #data.cfg.skin do
+        artifactskincfg=_G.ConfigManager.artifact_skin_cfg[data.cfg.skin[i]]
+        if artifactskincfg.skin_id==skinid then
+            return artifactskincfg.id
+        end
+    end
+    return  nil
+end
+
+---皮肤购买回调
+function ArtifactIllustrationModel:OnBuy(data)
+    if not data then
+        return
+    end
+    local type = data[1]
+    if type ~= 10 then
+        return
+    end
+    local sid = data[2]
+    if not _G.ConfigManager.artifact_skin_cfg[sid] then
+        sid = tonumber(_G.ConfigManager.item_cfg[sid].UseParameter[1][1])
+    end
+    local artifactId = _G.ConfigManager.artifact_skin_cfg[sid].card
+    if not self.illAllList[artifactId] then
+        self.illAllList[artifactId] = {
+            skin_list = {}
+        }
+    end
+    if not self.illAllList[artifactId].skin_list then
+        self.illAllList[artifactId].skin_list = {}
+    end
+    _G.table.insert(self.illAllList[artifactId].skin_list, sid)
+    _G.Events:GetInstance():Broadcast(_G.eCertificateMall.Parsed)
+end
+
+---销毁对象时,析构函数
+function ArtifactIllustrationModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eCertificateMall.Buy, self.OnBuy, self)
+end
+
+return ArtifactIllustrationModel

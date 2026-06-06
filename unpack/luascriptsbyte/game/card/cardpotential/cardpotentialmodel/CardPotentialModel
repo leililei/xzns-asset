@@ -1,0 +1,335 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Card.CardPotential.CardPotentialModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/12/13
+-- Description: 魂将觉醒数据类
+-----------------------------------------------------------------------
+local CardPotentialNet = require("CardPotentialNet")
+
+---@class CardPotentialModel : GameDataModelBase
+local CardPotentialModel = _G.BaseClass("CardPotentialModel", _G.GameDataModelBase)
+
+---@return CardPotentialModel CardPotentialModel
+function CardPotentialModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function CardPotentialModel:__init()
+    self:CreatePotentialDict()
+    self.materialDic = {}
+    self.starLimit = _G.ConfigManager.discrete_cfg[120001][1][1]
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.OnResUpdate, self)
+end
+
+---创建觉醒点位映射表
+function CardPotentialModel:CreatePotentialDict()
+    local card_potential_cfg = _G.ConfigManager.card_potential_cfg
+    self.potentialCfgs = {}
+    self.potentialIndex = {}
+    for _, cfg in pairs(card_potential_cfg) do
+        if cfg.bef_id == 0 then
+            self.potentialCfgs[1] = cfg
+            self.potentialIndex[cfg.id] = 1
+            break
+        end
+    end
+    local count = _G.table.count(card_potential_cfg)
+    local cfg
+    for i = 2, count do
+        cfg = card_potential_cfg[self.potentialCfgs[i - 1].next_id]
+        self.potentialCfgs[i] = cfg
+        self.potentialIndex[cfg.id] = i
+    end
+    self.needMat = {}
+    for i, v in pairs(self.potentialCfgs[count].material) do
+        self.needMat[v[1]] = true
+    end
+end
+
+---判断是否解锁前置点
+function CardPotentialModel:CheckBeforUnlock(curSid, sid)
+    if not self.potentialIndex then
+        self:CreatePotentialDict()
+    end
+    local cur = self.potentialIndex[curSid] or 0
+    local check = self.potentialIndex[sid] or 0
+
+    if sid == 0 then
+        return true
+    end
+    ---第一点不算
+    if check == 1 then
+        return true
+    end
+
+    return cur > 0 and cur >= check
+end
+
+---获取是第几个觉醒点
+function CardPotentialModel:GetIndexBySid(sid)
+    if not self.potentialIndex then
+        self:CreatePotentialDict()
+    end
+    return self.potentialIndex[sid] or 0
+end
+
+function CardPotentialModel:GetMaxPotential()
+    local card_potential_cfg = _G.ConfigManager.card_potential_cfg
+    local max = 0 
+    for k, v in pairs(card_potential_cfg) do  
+        if max < v.id then 
+            max = v.id
+        end
+    end 
+    return max
+end
+
+---获取点位的属性Sid
+function CardPotentialModel:GetAttributeSid(cardSid, sid)
+    local cfg = _G.ConfigManager.card_cfg[cardSid]
+    local num = self:GetIndexBySid(sid)
+    for i = 1, #cfg.potential do
+        for j = 1, #cfg.potential[i] do
+            num = num - 1
+            if num <= 0 then
+                return cfg.potential[i][j]
+            end
+        end
+    end
+end
+
+function CardPotentialModel:GetAllAttribute(cardData)
+    local num = self:GetIndexBySid(cardData:GetPotential())
+    local cfg = _G.ConfigManager.card_cfg[cardData.sid]
+    local attTable = {}
+    local skillTable = {}
+    local lv = 0
+    local preSkill = 0 ---ZHJH-3599 改为覆盖型
+    local iMax = #cfg.potential
+    local attCfg
+    for i = 1, iMax do
+        for j = 1, #cfg.potential[i] do
+            attCfg = _G.ConfigManager.attribute_cfg[cfg.potential[i][j]]
+            lv = lv + 1
+            if attCfg.skill and attCfg.skill ~= 0 and attCfg.skill ~= preSkill then
+                _G.table.insert(skillTable, {lv, attCfg.skill})
+                preSkill = attCfg.skill
+            end
+        end
+    end
+    ---ZHJH-3599 改为覆盖型
+    attCfg = _G.ConfigManager.attribute_cfg[self:GetAttributeSid(cardData.sid, cardData:GetPotential())]
+    local tempIndex
+    for a = 1, #attCfg.attribute do
+        local T = _G.DeepCopyCfgTable(attCfg.attribute[a])
+        _G.table.insert(attTable, T)
+    end
+    return attTable, skillTable
+end
+
+---魂将觉醒
+---@param cardData CardData
+function CardPotentialModel:PotentialUp(cardData, sid, uids, call)
+    local pbData = {uid = cardData.uid, lv = sid, c_uid = uids}
+    CardPotentialNet:GetInstance():CardPotentialUp(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            cardData:PotentialUp(sid)
+            cardData:CalcNowSumProp(_G.AttrFunType.Potential)
+            if uids then
+                for _, uid in pairs(uids) do
+                    _G.StorageManager:GetInstance():ConsumeItem(cardData.sid, uid, 1)
+                end
+            end
+            local mat = self:GetMaterial(sid)
+            for _, v in pairs(mat.material) do
+                _G.StorageManager:GetInstance():ConsumeItem(v[1], nil, v[2])
+            end
+            _G.Events:GetInstance():Broadcast(_G.eCard.CardPotential, cardData.uid)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.CardPotential.id)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+function CardPotentialModel:PotentialReset(cardData, call)
+    local pbData = {uid = cardData.uid}
+    CardPotentialNet:GetInstance():CardPotentialReset(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            cardData.potential = 0
+            if cardData:IsSp() then 
+                cardData:UpdataGetSkills()
+            end
+            cardData:CalcNowSumProp(_G.AttrFunType.Potential)
+            for _, v in pairs(_G.ConfigManager.discrete_cfg[120002]) do
+                _G.StorageManager:GetInstance():ConsumeItem(v[1], nil, v[2])
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.Events:GetInstance():Broadcast(_G.eCard.CardPotential, cardData.uid)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.CardPotential.id)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+function CardPotentialModel:GetMaterial(sid)
+    if self.materialDic[sid] then
+        return self.materialDic[sid]
+    end
+    ---@type card_potential_cfg
+    local cfg = _G.ConfigManager.card_potential_cfg[sid]
+    if cfg.bef_id == 0 then
+        if _G.AppSetting.IsXzns then
+            return {material = cfg.material, materials_oneself = cfg.materials_oneself, materials_elements = cfg.materials_elements}
+        end
+        return {material = cfg.material, materials_oneself = cfg.materials_oneself}
+    end
+    local preCfg = _G.ConfigManager.card_potential_cfg[cfg.bef_id]
+    local mat = {}
+    mat.materials_oneself = {}
+    if #cfg.materials_oneself > 0 then
+        if #preCfg.materials_oneself > 0 then
+            if cfg.materials_oneself[2] ~= preCfg.materials_oneself[2] then
+                mat.materials_oneself = {
+                    cfg.materials_oneself[1],
+                    cfg.materials_oneself[2] - preCfg.materials_oneself[2]
+                }
+            end
+        else
+            mat.materials_oneself = {cfg.materials_oneself[1], cfg.materials_oneself[2]}
+        end
+    end
+    mat.material = {}
+    if #cfg.material > 0 then
+        local matDic = {}
+        for _, v in pairs(cfg.material) do
+            matDic[v[1]] = v[2]
+        end
+        for _, v in pairs(preCfg.material) do
+            if matDic[v[1]] then
+                matDic[v[1]] = matDic[v[1]] - v[2]
+                if matDic[v[1]] <= 0 then
+                    matDic[v[1]] = nil
+                end
+            end
+        end
+        for k, v in pairs(matDic) do
+            _G.table.insert(mat.material, {k, v})
+        end
+    end
+    if _G.AppSetting.IsXzns then
+        mat.materials_elements = {}
+        if #cfg.materials_elements > 0 then
+            if #preCfg.materials_elements > 0 then
+                if cfg.materials_elements[2] ~= preCfg.materials_elements[2] then
+                    mat.materials_elements = {
+                        cfg.materials_elements[1],
+                        cfg.materials_elements[2] - preCfg.materials_elements[2]
+                    }
+                end
+            else
+                mat.materials_elements = {cfg.materials_elements[1], cfg.materials_elements[2]}
+            end
+        end
+    end
+    self.materialDic[sid] = mat
+    return mat
+end
+
+function CardPotentialModel:GetSelfDogFoodNum(sid, uid, star)
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local CardResonanceModel= require("CardResonanceModel"):GetInstance()
+    local num = 0
+    for _, v in pairs(cards) do
+        if v.sid == sid and v.star == star and v.uid ~= uid  and not CardResonanceModel:CheckCardIsInPos(v.uid) then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+function CardPotentialModel:GetElementDogFoodNum(element, star)
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local CardResonanceModel= require("CardResonanceModel"):GetInstance()
+    local num = 0
+    for _, v in pairs(cards) do--同族卡牌
+        if v:GetElement() and v.star == star and not CardResonanceModel:CheckCardIsInPos(v.uid) then
+            num = num + 1
+        end
+    end
+    local sid, count
+    for _, v in pairs(_G.ConfigManager.item_card_cfg) do--材料卡
+        sid = v.id
+        if v.Elements == _G.CardElementType.Common or v.Elements == element then
+            count = _G.StorageManager:GetInstance():GetItemCountBySid(sid)
+            if count > 0 then
+                num = num + count
+            end
+        end
+    end
+    return num
+end
+
+function CardPotentialModel:OnResUpdate(data)
+    local needRefresh = false
+    for _, v in pairs(data) do
+        if self.needMat[v.type[1]] then
+            needRefresh = true
+            break
+        end
+    end
+    if needRefresh then
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.CardPotential.id)
+    end
+end
+
+function CardPotentialModel:CheckRedPoint(uid)
+    local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+    if cardData.star < self.starLimit then --未解锁
+        return false
+    end
+    local nextIndex = self:GetIndexBySid(cardData:GetPotential()) + 1
+    if self.potentialCfgs[nextIndex] == nil then --已满级
+        return false
+    end
+    if cardData.star < self.potentialCfgs[nextIndex].condition_star then --星级不够
+        return false
+    end
+    local mat = self:GetMaterial(self.potentialCfgs[nextIndex].id)
+    if #mat.materials_oneself > 0 then --本体不够
+        if self:GetSelfDogFoodNum(cardData.sid, cardData.uid, mat.materials_oneself[1]) < mat.materials_oneself[2] then
+            return false
+        end
+    end
+    if _G.AppSetting.IsXzns then--星座觉醒有同族卡牌需求，需要额外判断一下
+        if mat.materials_elements and #mat.materials_elements > 0 then --同族不够
+            if self:GetElementDogFoodNum(cardData:GetElement(), mat.materials_elements[1]) < mat.materials_elements[2] then
+                return false
+            end
+        end
+    end
+    for i, v in pairs(mat.material) do
+        if not _G.StorageManager:GetInstance():CheckItem(v[1], v[2]) then --材料不够
+            return false
+        end
+    end
+    return true
+end
+
+function CardPotentialModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.OnResUpdate, self)
+end
+
+return CardPotentialModel

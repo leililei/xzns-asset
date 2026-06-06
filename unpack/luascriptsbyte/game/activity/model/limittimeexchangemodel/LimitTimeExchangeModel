@@ -1,0 +1,370 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DailyDelivery.Model.LimitTimeExchangeModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/12/17
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ActivitySynNet = require "ActivitySynNet"
+local ExchangeNet = require "ExchangeNet"
+local MonsterSiegeManager = require "MonsterSiegeManager"
+local base = require "ActivitySynTypeBase"
+---@class LimitTimeExchangeModel : ActivitySynTypeBase
+local LimitTimeExchangeModel = _G.BaseClass("LimitTimeExchangeModel", base)
+function LimitTimeExchangeModel:__init()
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    self.curActivityClass:AddStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+    self.curActivityState = false
+end
+---@param msg s2c_activity_recruiting_info
+function LimitTimeExchangeModel:OnHandleGMData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+function LimitTimeExchangeModel:OnActivityStateChanged(state)
+    self:RefreshRedPointExchange()
+end
+---初始化功能逻辑
+function LimitTimeExchangeModel:InitFunction()
+    if not self.curActivityState then
+        return
+    end
+    if self.type_enum == 2 then
+        if self.CoinSid == 101 then
+            MonsterSiegeManager:GetInstance():SetJumpActivityID(self.curActivityClass:GetActivityID())
+        elseif self.CoinSid == 103 then
+            require "ArenaFairManager":GetInstance():SetExchangeId(self.curActivityClass:GetActivityID())
+        end
+    end
+    self:RefreshRedPointExchange()
+end
+function LimitTimeExchangeModel:GetActivityCommonData()
+    return self.curActivityClass
+end
+
+function LimitTimeExchangeModel:GetCurActivitySelfData()
+    ---ZHJ-26112过滤掉不满足条件的礼包
+    local selfData = {}
+    local checkArray
+    if self.CoinSid == 74 or self.CoinSid == 19 or self.CoinSid == 191 then
+        --战歌争锋兑换商品 不会过滤不满足条件的礼包
+        for i = 1, #self.SelfData do
+            _G.table.insert(selfData, self.SelfData[i])
+        end
+    else
+        for i = 1, #self.SelfData do
+            checkArray = {}
+            for _, v in pairs(self.SelfData[i].Conditions) do
+                _G.table.insert(checkArray, { v.k, v.v })
+            end
+            if _G.GlobalConditionManager.CheckConditionByArray(checkArray) then
+                _G.table.insert(selfData, self.SelfData[i])
+            end
+        end
+    end
+    return selfData
+end
+
+function LimitTimeExchangeModel:GetCurActivitySelfDataAll()
+    return self.SelfData
+end
+
+-- ---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function LimitTimeExchangeModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckHaveExchangeItem }
+    self.redpointTree = { { 2 }, false }
+end
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function LimitTimeExchangeModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+---刷新奖励红点
+function LimitTimeExchangeModel:RefreshRedPointExchange()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+---是否有可以足够兑换次数可以兑换的item
+function LimitTimeExchangeModel:CheckHaveExchangeItem()
+    if self.curActivityClass:GetCurActivityState() ~= require "ActivitySynManager".State.Open then
+        return 0
+    else
+        local closeRedPoint = _G.PlayerPrefsManager.GetInt("LimitTimeExchangeCloseRedPoint" .. self.curActivityClass:GetActivityID(), 0)
+        if closeRedPoint == 1 then
+            return 0
+        end
+        local curDate = _G.TimeUtil.GetServerUnixTime()
+        local locationTime = _G.PlayerPrefsManager.GetInt("LimitTimeExchangeModelDaily" .. self.curActivityClass:GetActivityID())
+        if locationTime == 0 then
+            return 1
+        else
+            if _G.TimeUtil.GetInterValDayByGame(curDate, locationTime) >= 1 then
+                return 1
+            end
+        end
+        local myCount, checkArray, unlock
+        if not _G.table.isEmptyOrNil(self.SelfData) then
+            for k, v in pairs(self.SelfData) do
+                for i = 1, #v.NeedItem do
+                    if v.NeedItem[i].sid == 101 then
+                        --活动代币（恶灵入侵）
+                        myCount = require "MonsterSiegeManager":GetInstance():GetCoinActivity()
+                    elseif v.NeedItem[i].sid == 103 then
+                        --公平竞技场
+                        myCount = require "ArenaFairManager":GetInstance():GetCoin()
+                    elseif v.NeedItem[i].sid == 104 then
+                        --竞猜
+                        myCount = require "GuessGameModel":GetInstance():GetCoin()
+                    elseif v.NeedItem[i].sid == 109 then
+                        myCount = require "SixVsSixCoinModel":GetInstance():GetCoin()
+                    elseif v.NeedItem[i].sid == 125 then
+                        myCount = require "LimitTimeDropCoinModel":GetInstance():GetCoin()
+                    elseif v.NeedItem[i].sid == 19 then
+                        --巅峰演武不判断能否兑换的红点
+                        return 0
+                    else
+                        myCount = _G.StorageManager:GetInstance():GetOtherItemCountBySid(v.NeedItem[i].sid)
+                        if not myCount or myCount == 0 then
+                            local _, storageId = _G.StorageManager:GetInstance():CheckSidType(v.NeedItem[i].sid)
+                            myCount = _G.StorageManager:GetInstance():GetItemCountByID(storageId, v.NeedItem[i].sid)
+                        end
+                    end
+                    -- 判断是否达到条件 eq.有活动要求没有达到条件也要显示所以需要判断是否能够兑换
+                    checkArray = {}
+                    for _, v in pairs(v.Conditions) do
+                        _G.table.insert(checkArray, { v.k, v.v })
+                    end
+                    unlock = _G.GlobalConditionManager.CheckConditionByArray(checkArray)
+                    ---ZHJ-19208【客户端】通用限时兑换界面翻新 勾选提醒才显示红点
+                    if myCount >= v.NeedItem[i].num and v.ExchangeTime < v.LimitTime and v.isGou > 0 and unlock then
+                        return 1
+                    end
+                end
+            end
+        end
+        return 0
+    end
+end
+function LimitTimeExchangeModel:OnEnterActivity()
+
+    -----@type DrawUpBattlePassModel
+    --local model = require("DrawUpBattlePassModel")
+    if self.CoinSid == 125 then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LimitTimeDropShopView.Name, self:GetActivityCommonData())
+    elseif self.CoinSid == 74 or self.CoinSid == 19 or self.CoinSid == 191 then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ExchangeShopView.Name, self:GetActivityCommonData())
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LimitTimeExchange.Name, self:GetActivityCommonData())
+    end
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+function LimitTimeExchangeModel:OnGetMainViewName()
+    if self.CoinSid == 74 or self.CoinSid == 19 then
+        return _G.ConfigManager.ui_cfg.ExchangeShopView.Name
+    else
+        return _G.ConfigManager.ui_cfg.LimitTimeExchange.Name
+    end
+end
+---获得活动类型 (区分 是活动代币兑换 = 2 或是普通兑换 1)
+function LimitTimeExchangeModel:GetTypeActivity()
+    return self.type_enum
+end
+---处理活动私有信息
+---@param info activity.i_activity_self_info
+---@field type_enum number 1 = 普通 2 = 活动代币兑换
+function LimitTimeExchangeModel:SetSelfData(info)
+    self.NeedMoneyType = {}
+    ---兑换所需货币类型表
+    self.SelfData = {}
+    self.type_enum = 1
+    local _data
+    self.curActivityState = true
+    for _, v in pairs(info.exchange.item) do
+        _data = {}
+        _data.Sid = v.sid
+        ---包含
+        if v.siege_coin and v.siege_coin > 0 then
+            local id = self:CheckType(v.type)
+            self.type_enum = 2
+            local da = {
+                sid = id,
+                num = v.siege_coin
+            }
+            _data.NeedItem = { da }
+            if not self.NeedMoneyType[id] then
+                self.NeedMoneyType[id] = id
+            end
+        else
+            ---@type prop.i_item
+            _data.NeedItem = v.need_item --{num,sid}
+            if not self.NeedMoneyType[v.need_item[1].sid] then
+                self.NeedMoneyType[v.need_item[1].sid] = v.need_item[1].sid
+            end
+        end
+        if not self.CoinSid then
+            if self.type_enum == 1 then
+                ---当前兑换活动消耗的货币类型
+                self.CoinSid = v.need_item[1].sid
+            elseif self.type_enum == 2 then
+                local id = self:CheckType(v.type)
+                self.CoinSid = id
+            end
+        end
+        ---@type prop.i_item[]
+        _data.GetItem = v.get_item
+        _data.LimitTime = v.count_limit
+        _data.recommend = v.recommend
+        _data.ExchangeTime = 0
+        _data.State = 1
+        _data.Conditions = v.con or {}
+        local isGou = _G.PlayerPrefsManager.GetInt("LimitTimeExchangeModelGou" .. self.curActivityClass:GetActivityID() .. v.sid, -1)
+        if isGou == -1 and v.remind then
+            if v.remind == 2 then
+                isGou = 1
+            end
+        end
+        if isGou == -1 then
+            isGou = 0
+        end
+        _data.isGou = isGou
+        _data.ShowGou = true
+        if v.remind then
+            _data.ShowGou = v.remind ~= 1
+        end
+        if not _G.table.isEmptyOrNil(info.exchange.bought_times) then
+            for _, a in pairs(info.exchange.bought_times) do
+                if a.sid == v.sid then
+                    _data.ExchangeTime = a.times
+                    _data.State = a.times < v.count_limit and 1 or 0
+                end
+            end
+        end
+        _G.table.insert(self.SelfData, _data)
+    end
+    self.LiHuiPath = (info.exchange.pos ~= nil and info.exchange.pos ~= "") and string.trim(info.exchange.pos) or nil
+    self.LiHuiSpine = (info.exchange.spe ~= nil and info.exchange.spe ~= "") and string.trim(info.exchange.spe) or nil
+    if info.exchange.dev then
+        local pos = {}
+        local scale = 1
+        local dev = string.split(info.exchange.dev, "#")
+        for _, v in pairs(dev) do
+            if string.contains(v, "|") then
+                scale = string.split(v, "|")[2]
+                table.insert(pos, tonumber(string.split(v, "|")[1]))
+            else
+                table.insert(pos, tonumber(v))
+            end
+        end
+        self.LiHuiPos = pos
+        self.LihuiScale = tonumber(scale)
+    end
+end
+---获取立绘资源路径
+function LimitTimeExchangeModel:GetLiHuiPath()
+    return (self.LiHuiPath or self.LiHuiSpine), self.LiHuiPath ~= nil
+end
+---获取立绘资源坐标
+function LimitTimeExchangeModel:GetLiHuiPos()
+    return self.LiHuiPos
+end
+---获取立绘资源缩放
+function LimitTimeExchangeModel:GetLiHuiScale()
+    return self.LihuiScale
+end
+
+function LimitTimeExchangeModel:GetCoinSid()
+    return self.CoinSid
+end
+function LimitTimeExchangeModel:Exchange(data, award, call, cost)
+    local sid = data.Sid
+    require "ExchangeNet":GetInstance():Exchange(
+        sid,
+        cost.num,
+        self.curActivityClass:GetActivityID(),
+        function(_data)
+            if _data.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(_data)
+                if award.sid == 101 then
+                    -- 不是 活动代币
+                    require "MonsterSiegeManager":GetInstance():SetCoinActivity(-cost.count)
+                elseif award.sid == 103 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetFairCoin, -cost.count)
+                elseif award.sid == 104 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetGuessCoin, -cost.count)
+                elseif award.sid == 109 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetSixVsSix, -cost.count)
+                elseif award.sid == 125 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetLimitTimeDropCoin, -cost.count)
+                elseif award.sid == 74 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetDrawUp, { award.sid, -cost.count })
+                elseif award.sid == 19 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetGMArenaPeak, { { key = 19, value = -cost.count } })
+                elseif award.sid == 191 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetDrawUp, {  award.sid, -cost.count })
+                else
+                    _G.StorageManager:GetInstance():ConsumeItem(award.sid, 0, cost.count)
+                end
+                data.ExchangeTime = data.ExchangeTime + cost.num
+                if data.ExchangeTime >= data.LimitTime then
+                    data.ExchangeTime = data.LimitTime
+                    data.State = 0
+                end
+                if call then
+                    call(_data)
+                end
+            end
+        end
+    )
+    self:RefreshRedPointExchange()
+end
+function LimitTimeExchangeModel:ResUpdata(data)
+    for _, value in pairs(data) do
+        local sid = value.type[1]
+        if self.NeedMoneyType[sid] then
+            self:RefreshRedPointExchange()
+        end
+    end
+end
+function LimitTimeExchangeModel:Dispose()
+    self.curActivityState = nil
+    self.SelfData = nil
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+end
+
+function LimitTimeExchangeModel:CheckType(type)
+    if type == 1 then
+        ---竞猜
+        return 104
+    elseif type == 2 then
+        ---恶灵入侵
+        return 101
+    elseif type == 3 then
+        ---公平竞技场
+        return 103
+    elseif type == 6 then
+        ---灵弈对决
+        return 109
+    elseif type == 11 then
+        ---限时掉落活动代币
+        return 125
+    elseif type == 191 then
+        ---限时掉落活动代币
+        return 191
+    end
+    return 101
+end
+
+function LimitTimeExchangeModel:IsShowBtn()
+    if self.CoinSid == 74 or self.CoinSid == 19 then
+        return false
+    end
+    return true
+end
+
+return LimitTimeExchangeModel

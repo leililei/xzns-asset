@@ -1,0 +1,847 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.World.Object.WorldOtherPlayerItem	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/01/05
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+local base = require "WorldBasePlayer"
+
+---@class WorldOtherPlayerItem:WorldBaseItem
+---@field public MoveSendDuration number 当玩家移动时，和服务器通信的周期
+---@field public WorldCameraControl WorldCameraControl 摄像机控制器
+---@field public FixPoint number 错误移动时的玩家修复位置,二进制UV数据
+---@field ItemData WorldPlayerData
+---@field isCopy boolean 是否为镜像玩家(尽在)
+local WorldOtherPlayerItem = _G.BaseClass("WorldOtherPlayerItem", base)
+
+--region 创建与销毁
+function WorldOtherPlayerItem:Init()
+    self.MoveSpeed = self.ItemData.MoveSpeed
+    self.AllNode = {}
+    self.StandActionTime =
+        _G.ConfigManager.discrete_cfg[103202][1][1] and _G.ConfigManager.discrete_cfg[103202][1] or {10, 20}
+    self.isCopy = false
+    self.isFirst = true
+    self.isChangeModel = true
+    self.DataType = _G.WorldItemDataType.Player
+    base.Init(self)
+end
+
+function WorldOtherPlayerItem:Dispose()
+    _G.UpdateManager:GetInstance():RemoveFixedUpdate(self.UpdateMove, self)
+    if self.stopMoveToNextNodeCoroutine then
+        _G.coroutine.stopwaiting(self.stopMoveToNextNodeCoroutine)
+        self.stopMoveToNextNodeCoroutine = nil
+    end
+    if self.stopMoveAllNodeCoroutine then
+        _G.coroutine.stopwaiting(self.stopMoveAllNodeCoroutine)
+        self.stopMoveAllNodeCoroutine = nil
+    end
+    self.AllNode = nil
+    self:StopStandActionTimer()
+end
+
+---玩家进入刷新数据
+---@param point number 格子
+function WorldOtherPlayerItem:RefreshPostionOnEnter(point)
+    local v3 = {x = 0, y = 0, z = 0}
+    v3.x, v3.y, v3.z = self.Transform:GetLocalPosition()
+    local nowPoint = _G.WorldUtils.PosToPoint(v3)
+    if nowPoint == point then
+        return
+    end
+    local newPos = _G.WorldUtils.PointToPos(point, true)
+    self.Transform:SetLocalPosition(newPos.x, newPos.y, newPos.z)
+end
+
+---初始化闲置动画
+function WorldOtherPlayerItem:InitStandActionName()
+    self.StandActionName = {}
+    self.StandActionCount = 0
+    if self.ItemData.skin <= 0 then
+        return
+    end
+    ---@type card_cfg
+    local cfg = _G.ConfigManager.card_cfg[self.ItemData.skin]
+    if cfg then
+        for k, v in pairs(cfg.display_click) do
+            self.StandActionCount = self.StandActionCount + 1
+            self.StandActionName[self.StandActionCount] = {sid = self:GetActionSid(v), name = v}
+        end
+    end
+end
+---获取动作sid
+function WorldOtherPlayerItem:GetActionSid(name)
+    local cfg = _G.ConfigManager.character_special_cfg
+    for _, v in pairs(cfg) do
+        if v.display_xiuxian == name then
+            return v.id
+        end
+    end
+    return nil
+end
+
+--endregion
+
+function WorldOtherPlayerItem:InitPosition()
+    --设置玩家的位置。
+    local data = self.ItemData
+    local pos, move = _G.WorldUtils.CaculateLocalPos(data.start_point, data.end_point, data.start_time, self.MoveSpeed)
+    self.Transform:SetLocalPosition(pos.x, pos.y, pos.z)
+    --判定是否开启移动
+    if move then
+        self:UpdateMovePosition(self.ItemData.end_point)
+    elseif self.isFirst then
+        self:SetRandomPos()
+    end
+    self.isFirst = nil
+end
+
+function WorldOtherPlayerItem:SetRandomPos()
+    if _G.WorldManager:GetInstance():GetCurWorld().Cfg.Sid ~= 600 then
+        base.SetRandomPos(self)
+    else
+        self.Transform:SetLocalPositionToZero()
+    end
+end
+
+---添加效果
+function WorldOtherPlayerItem:AddCommonEffect()
+    self:UpdateEffect()
+end
+
+---移除动效
+function WorldOtherPlayerItem:RemoveCommonEffect()
+    if not _G.IsNil(self.Halo) then
+        _G.DestroyObject(self.Halo)
+        self.Halo = nil
+    end
+    if self.haloTimer then
+        self.haloTimer:Stop()
+        self.haloTimer = nil
+    end
+end
+
+--region 资源加载
+---加载资源完成
+function WorldOtherPlayerItem:OnLoadResObjComplete()
+    local name = "<color=#ffffff>" .. self.ItemData.role_name .. "</color>"
+    base.InitTitle(self, name, nil, _G.handler(self, self.UpdateTitle))
+    ---添加Update
+    _G.UpdateManager:GetInstance():AddFixedUpdate(self.UpdateMove, self)
+    base.OnLoadResObjComplete(self)
+end
+
+--endregion
+function WorldOtherPlayerItem:OnEnterWorld()
+    self:PlayAnimByName(_G.WorldManager.AnimNames.IDLE)
+    base.OnEnterWorld(self)
+    _G.UpdateManager:GetInstance():AddFixedUpdate(self.UpdateMove, self)
+end
+
+function WorldOtherPlayerItem:InitObjectModel(model)
+    base.InitObjectModel(self, model)
+    if _G.WorldManager:GetInstance():GetCurWorld().Cfg.Scene_Type == _G.SceneType.MainWorld then
+        self:SetInitScale(0.8)
+    else
+        self:SetInitScale(1)
+    end
+    self:InitStandActionName()
+end
+
+---设置缩放
+---@param scale number 缩放值
+function WorldOtherPlayerItem:SetInitScale(scale)
+    self.ObjectMod:SetLocalScaleXYZ(scale)
+end
+function WorldOtherPlayerItem:ShowOrHide(show, force)
+    if show == true then
+        --- 对话中 不显示其他玩家  防止新上线的玩家 显示出来
+        local IdHide = _G.StoryManager:GetInstance():GetIdHideOtherPlayer()
+        if IdHide == true then
+            base.ShowOrHide(self, false)
+            return
+        end
+    end
+    base.ShowOrHide(self, show, force)
+    if show and self.isChangeModel and self.Transform:GetctiveInHierarchy() == 1 then
+        self:PlayAnimByName(_G.WorldManager.AnimNames.IDLE)
+        self.setTitlePosTimer = _G.TimerManager:GetInstance():GetTimer(2, self.SetTitlePos, self, true)
+        self.setTitlePosTimer:Start()
+        self.isChangeModel = false
+    end
+end
+
+function WorldOtherPlayerItem:OnGameObjShow()
+    self:StartStandActionTimer()
+    self:ChangeCityRole(self.changeSkinID)
+    self:ChangeTitle(self.changeTitleID)
+    self:ChangeEffect(self.changeCircleID)
+    if self.isCopy then
+        local x =
+            _G.math.random(_G.ConfigManager.discrete_cfg[101615][2][1], _G.ConfigManager.discrete_cfg[101615][1][1])
+        local z =
+            _G.math.random(_G.ConfigManager.discrete_cfg[101615][2][3], _G.ConfigManager.discrete_cfg[101615][1][3])
+        self.Transform:SetPosition(x, 0, z)
+        self:OpenSociatyTimer()
+    end
+end
+
+function WorldOtherPlayerItem:OnGameObjHide()
+    self:StopStandActionTimer()
+    if self.sociatyTimer then
+        self.sociatyTimer:Stop()
+        self.sociatyTimer = nil
+    end
+end
+
+function WorldOtherPlayerItem:OnExitWorld()
+    ---清除动画的回调
+    _G.AnimatorPlayEndCallback.RemoveCallback(_G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE())
+    base.OnExitWorld(self)
+    _G.UpdateManager:GetInstance():RemoveFixedUpdate(self.UpdateMove, self)
+    if self.stopMoveToNextNodeCoroutine then
+        coroutine.stopwaiting(self.stopMoveToNextNodeCoroutine)
+        self.stopMoveToNextNodeCoroutine = nil
+    end
+    if self.stopMoveAllNodeCoroutine then
+        coroutine.stopwaiting(self.stopMoveAllNodeCoroutine)
+        self.stopMoveAllNodeCoroutine = nil
+    end
+    self:StopStandActionTimer()
+    ---清除公会计时器
+    if self.sociatyTimer then
+        self.sociatyTimer:Stop()
+        self.sociatyTimer = nil
+    end
+    if self.titleTimer then
+        self.titleTimer:Stop()
+        self.titleTimer = nil
+    end
+end
+
+--region 交互
+function WorldOtherPlayerItem:OnClick()
+    ---进入公会界面
+    if _G.WorldManager:GetInstance():GetCurWorld().Cfg.Sid == 600 then
+        local isExit, target = _G.UIManager:GetInstance():IsLoadedWindow(_G.ConfigManager.ui_cfg.SociatyMainView.Name)
+        if isExit then
+            _G.SystemSettingManager:GetInstance():GetOtherPlayerData(
+                self.Uid,
+                function(data)
+                    target.View:ShowOtherPlayerInfo(data)
+                end
+            )
+        end
+    else
+        ---点击其他玩家进行寻路 然后出现头像
+        local isExit, target = _G.UIManager:GetInstance():IsLoadedWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+        if isExit and player then
+            player:GotoPoint(_G.Vector3.New(self.Transform:GetPosition()), _G.handler(self, self.GotoPointSuc))
+        end
+    end
+end
+
+function WorldOtherPlayerItem:GotoPointSuc()
+    _G.SystemSettingManager:GetInstance():OpenView(self.Uid)
+end
+--endregion
+
+--region 操作
+
+--region移动
+---执行移动
+---@param moveStep number 移动状态
+function WorldOtherPlayerItem:Move(moveStep)
+    self.MoveStep = moveStep
+    if moveStep == 0 then
+        if self.stopMoveAllNodeCoroutine then
+            coroutine.stopwaiting(self.stopMoveAllNodeCoroutine)
+            self.stopMoveAllNodeCoroutine = nil
+        end
+        self.PlayAnimByName(self, _G.WorldManager.AnimNames.IDLE)
+    else
+        --self.PlayAnimByName(self, _G.WorldManager.AnimNames.MOVE)
+        if self.World.Cfg.Scene_Type == _G.SceneType.MainWorld then
+            --todo 别的玩家设置动作
+            -- local param = _G.ConfigManager.discrete_cfg[100003][1]
+            -- if table.indexof(param, self.Sid) == false then
+            --     self.PlayAnimByName(self, _G.WorldManager.AnimNames.MOVE)
+            -- else
+            --     self.PlayAnimByName(self, _G.WorldManager.AnimNames.WALK)
+            -- end
+            self.PlayAnimByName(self, _G.WorldManager.AnimNames.MOVE)
+        elseif self.World.Cfg.Scene_Type == _G.SceneType.Section then
+            self.PlayAnimByName(self, _G.WorldManager.AnimNames.MOVE)
+        elseif self.World.Cfg.Scene_Type == _G.SceneType.Sociaty then
+            -- self:SetSpeed(3)
+            self.PlayAnimByName(self, _G.WorldManager.AnimNames.MOVE)
+        else
+            self.PlayAnimByName(self, _G.WorldManager.AnimNames.MOVE)
+        end
+    end
+end
+---@param end_point number 到达的点
+---获取新的终点
+function WorldOtherPlayerItem:UpdateMovePosition(end_point)
+    local fPos, tPos
+    if (#self.AllNode > 0) then
+        fPos = self.AllNode[#self.AllNode].to
+    else
+        local v3 = {x = 0, y = 0, z = 0}
+        v3.x, v3.y, v3.z = self.Transform:GetLocalPosition()
+        fPos = v3
+    end
+    tPos = _G.WorldUtils.PointToPos(end_point, true)
+    table.insert(
+        self.AllNode,
+        {
+            from = fPos,
+            to = tPos
+        }
+    )
+    if #self.AllNode > 0 then
+        if nil == self.stopMoveAllNodeCoroutine then
+            self.stopMoveAllNodeCoroutine = coroutine.start(_G.handler(self, self.MoveAllNodeCoroutine))
+        end
+    end
+end
+---移动完所有的点
+function WorldOtherPlayerItem:MoveAllNodeCoroutine()
+    local Distance = _G.Vector3.Distance
+    while #self.AllNode > 0 do
+        local from = self.AllNode[1].from
+        local to = self.AllNode[1].to
+        local delay = Distance(from, to) / self.MoveSpeed
+        self:NavDirection(to)
+        self:Move(1)
+        coroutine.waitforseconds(delay)
+        table.remove(self.AllNode, 1)
+    end
+    self:Move(0)
+    if self.isCopy then
+        self:OpenSociatyTimer()
+    end
+end
+---通过路线来设置方向
+---@param to UnityEngine.Vector3
+function WorldOtherPlayerItem:NavDirection(to)
+    --是否有完整路线
+    local isNode = _G.CS.UnityObjectExtends.CalculatePath(self.Transform, to.x, to.y, to.z, self.NavNodes)
+    if isNode then
+        if self.stopMoveToNextNodeCoroutine then
+            coroutine.stopwaiting(self.stopMoveToNextNodeCoroutine)
+            self.stopMoveToNextNodeCoroutine = nil
+        end
+        self.stopMoveToNextNodeCoroutine = coroutine.start(_G.handler(self, self.MoveToNextNodeCoroutine))
+    else
+        self.NavNodes:ClearCorners()
+    end
+end
+---移动到指定位置方向
+function WorldOtherPlayerItem:MoveToNextNodeCoroutine()
+    local index = 1
+    local corners = self.NavNodes.corners
+    local len = corners.Length
+    while index < len do
+        local to = corners[index]
+        local delay = self.Transform:SetDirection(to.x, to.y, to.z, self.MoveSpeed)
+        coroutine.waitforseconds(delay)
+        index = index + 1
+    end
+end
+---玩家移动
+function WorldOtherPlayerItem:UpdateMove()
+    if self.MoveStep ~= 0 then
+        self.Transform:SetForwardPosition(self.MoveSpeed, 1, 1)
+    end
+end
+function WorldOtherPlayerItem:InitCfgMove()
+end
+--endregion
+
+--region 同步
+---播放闲置动作
+---@param name string 动作名称
+function WorldOtherPlayerItem:PlayeStandAction(name)
+    -- if not self.curSetEnable then
+    --     return
+    -- end
+    if not self.ObjectModActive then
+        return
+    end
+    _G.AnimatorPlayEndCallback.AddCallback(self.Transform:GetInstanceIDE(), _G.handler(self, self.PlayeStandActionCall))
+    self.PlayAnimByName(self, name, true)
+end
+
+---播放闲置动画回调
+function WorldOtherPlayerItem:PlayeStandActionCall()
+    _G.AnimatorPlayEndCallback.RemoveCallback(self.Transform:GetInstanceIDE())
+    self.PlayAnimByName(self, _G.WorldManager.AnimNames.IDLE)
+end
+
+---改名
+---@param name string 改名
+function WorldOtherPlayerItem:ChangeName(name)
+    self.ItemData.role_name = name
+    if not _G.IsNil(self.TitleTextName) then
+        self.TitleTextName.text = name
+    end
+    local obj = self.TitleTransform:FindE("@_trans_root/title")
+    if not _G.IsNil(obj) then
+        _G.GameUtil.ReBuildRTF(obj)
+    end
+end
+---更换主城形象
+---@param 变量名 变量类型 中文描述
+function WorldOtherPlayerItem:ChangeCityRole(id)
+    -- if not self.curSetEnable then
+    --     self.changeSkinID = id
+    --     return
+    -- end
+
+    if not self.ObjectModActive then
+        self.changeSkinID = id
+        return
+    end
+    if not id or self.ItemData.skin == id then
+        return
+    end
+    ---@type card_cfg
+    local cfg = require "CardCommentManager":GetInstance():GetCfgs(id)
+    if cfg then
+        self.ItemData.skin = id
+        self.ItemData.rolePath = cfg.ModelPathLow
+        self:ClearObjectModel()
+        self.Cfg.Res = cfg.ModelPathLow
+        self.isChangeModel = true
+        self:CreateObjectModel()
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到对应的模型配置 card_cfg   sid=" .. id)
+        end
+    end
+end
+---更换称号
+---@param data role.i_effect 称号
+function WorldOtherPlayerItem:ChangeTitle(id, end_time)
+    -- if not self.curSetEnable then
+    --     if id then
+    --         self.changeTitleID = {sid = id, end_time = end_time}
+    --     end
+    --     return
+    -- end
+    if not self.ObjectModActive then
+        if id then
+            self.changeTitleID = {sid = id, end_time = end_time}
+        end
+        return
+    end
+    if not id or self.ItemData.title.sid == id then
+        return
+    end
+    self.ItemData.title = {sid = id, end_time = end_time}
+    self:UpdateTitle()
+end
+---更换光环
+---@param id number 光环ID
+function WorldOtherPlayerItem:ChangeEffect(id, time)
+    -- if not self.curSetEnable then
+    --     if id then
+    --         self.changeCircleID = {sid = id, end_time = time}
+    --     end
+    --     return
+    -- end
+    if not self.ObjectModActive then
+        if id then
+            self.changeCircleID = {sid = id, end_time = time}
+        end
+        return
+    end
+    if not id or self.ItemData.circle.sid == id then
+        return
+    end
+    self.ItemData.circle = {sid = id, end_time = time}
+    self:UpdateEffect(time)
+end
+---更新光环显示
+function WorldOtherPlayerItem:UpdateEffect()
+    if self.World.Cfg.WorldType ~= _G.WorldType.MainWorld then
+        return
+    end
+    if self.haloTimer then
+        self.haloTimer:Stop()
+        self.haloTimer = nil
+    end
+    local id = self.ItemData.circle.sid
+    if not _G.IsNil(self.Halo) then
+        _G.DestroyObject(self.Halo)
+    end
+    if id == 0 then
+        return
+    end
+    local cfg = _G.ConfigManager.player_halo_effect_cfg[id]
+    if cfg then
+        if cfg.time_duration > 0 then
+            local time = _G.TimeUtil.GetServerUnixTime()
+            if self.ItemData.circle.end_time <= time then
+                if not _G.IsNil(self.Halo) then
+                    _G.DestroyObject(self.Halo)
+                end
+                return
+            else
+                self.haloTimer =
+                    _G.TimerManager:GetInstance():GetTimer(
+                    self.ItemData.circle.end_time - time,
+                    self.RefreshHalo,
+                    self,
+                    true,
+                    false,
+                    true
+                )
+                self.haloTimer:Start()
+            end
+        end
+        _G.PoolsManager:GetInstance():Spawn(
+            cfg.halo,
+            _G.ePoolType.World,
+            self.Transform,
+            function(trans)
+                if _G.IsNil(self.Transform) or _G.IsNil(self.ObjectMod) then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                self.Halo = trans
+                if self.RolePoint then
+                    if cfg.type_halo == 2 then
+                        trans:SetParentE(self.RolePoint.Point_Chest)
+                    else
+                        if self.RolePoint and not _G.IsNil(self.RolePoint.Point_Shadow) then
+                            trans:SetParentE(self.RolePoint.Point_Shadow)
+                        else
+                            trans:SetParentE(self.Transform)
+                        end
+                        trans:SetLocalPosition(0, 0.01, 0)
+                        trans:SetLocalScaleXYZ(_G.ConfigManager.discrete_cfg[103901][1][1])
+                    end
+                end
+                trans:SetEulerAngles(0, 0, 0)
+                trans:AddComponentE(_G.typeof(_G.CS.KeepRotate))
+                local effScript = trans:GetComponentE(_G.typeof(_G.CS.EffectLevel))
+                if not _G.IsNil(effScript) then
+                    effScript:SetIsShow(false)
+                end
+            end
+        )
+    end
+end
+---更新标题显示
+function WorldOtherPlayerItem:UpdateTitle()
+    local id = self.ItemData.title.sid
+    if self.Designation then
+        self.Designation.obj.obj_effect:RemoveAllChildren()
+    end
+    if self.titleTimer then
+        self.titleTimer:Stop()
+        self.titleTimer = nil
+    end
+
+    local cfg = _G.ConfigManager.player_title_effect_cfg[id]
+    if cfg then
+        if cfg.time_duration > 0 then
+            local time = _G.TimeUtil.GetServerUnixTime()
+            if self.ItemData.title.end_time <= time then
+                if self.Designation then
+                    _G.GameUtil.SetActiveByCondition(self.Designation.title, false)
+                end
+                return
+            else
+                self.titleTimer =
+                    _G.TimerManager:GetInstance():GetTimer(
+                    self.ItemData.title.end_time - time,
+                    self.RefreshTitle,
+                    self,
+                    true,
+                    false,
+                    true
+                )
+                self.titleTimer:Start()
+            end
+        end
+        if not self.Designation then
+            local go_table = _G.GetAutoGoTable(self.TitleTransform)
+            self.Designation = {obj = go_table, title = go_table.aorrawimage_Title, type = cfg.type_title}
+        else
+            self.Designation.type = cfg.type_title
+        end
+        if self.Designation.type == 1 then
+            self.Designation.title:LoadImage(
+                cfg.title,
+                function()
+                    self.Designation.title:SetNativeSize()
+                end
+            )
+            self.Designation.title:SetLocalScaleXYZ(_G.ConfigManager.discrete_cfg[103902][1][1] * 0.0035)
+            self.Designation.title:SetActiveE(1)
+        else
+            self.Designation.title:SetActiveE(0)
+            _G.UIUtils.LoadEffectTitleOrFrame(
+                cfg.title,
+                self.Designation.obj.obj_effect,
+                function(trans)
+                    if _G.IsNil(self.TitleTransform) then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    trans:SetLayerAndChild(30)
+                    -- local x, y, z = self.Designation.title:GetPosition()
+                    -- trans:SetPosition(x, y + 0.2, z)
+                    trans:SetLocalScaleXYZ(_G.ConfigManager.discrete_cfg[103902][1][1] * 0.0035)
+                end
+            )
+        end
+    elseif self.Designation then
+        self.Designation.title:SetActiveE(0)
+        self.Designation.title:SetLocalScaleXYZ(_G.ConfigManager.discrete_cfg[103902][1][1] * 0.0035)
+    end
+end
+--endregion
+
+function WorldOtherPlayerItem:RefreshTitle()
+    if self.titleTimer then
+        self.titleTimer:Stop()
+        self.titleTimer = nil
+    end
+
+    self:UpdateTitle()
+end
+
+function WorldOtherPlayerItem:RefreshHalo()
+    if self.haloTimer then
+        self.haloTimer:Stop()
+        self.haloTimer = nil
+    end
+    self:UpdateEffect()
+end
+
+---播放idle动画
+function WorldOtherPlayerItem:PlayAnimByName(name, isCallBack, sid)
+    if name == _G.WorldManager.AnimNames.IDLE then
+        self:StartStandActionTimer()
+    else
+        self:StopStandActionTimer()
+    end
+    base.PlayAnimByName(self, name, isCallBack)
+end
+
+---
+function WorldOtherPlayerItem:PlayeIdleAnim()
+    if self == nil or self.StandActionTimer == nil then
+        return
+    end
+    if self.StandActionCount <= 0 then
+        return
+    end
+    local index = _G.GetRandomNum(1, self.StandActionCount)
+    self:PlayAnimByName(self.StandActionName[index].name, true, self.StandActionName[index].sid)
+    _G.AnimatorPlayEndCallback.AddCallback(
+        _G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE(),
+        _G.handler(self, self.PlayeIdleAnimCall)
+    )
+    -- local cfg = _G.ConfigManager.character_special_cfg[self.StandActionName[index].sid]
+    -- if cfg and #cfg.acoustics > 0 then
+    --   --  _G.AudioManager.Dialogue_PlayPath( cfg.acoustics[_G.GetRandomNum(1, #cfg.acoustics)])
+    -- end
+end
+
+function WorldOtherPlayerItem:PlayeIdleAnimCall(name)
+    _G.AnimatorPlayEndCallback.RemoveCallback(_G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE())
+    self.StandActionTimer = nil
+    if self.AnimName == name then
+        self:PlayAnimByName(_G.WorldManager.AnimNames.IDLE)
+    end
+end
+
+---停止播放闲置动画计时器
+function WorldOtherPlayerItem:StopStandActionTimer()
+    if self.StandActionTimer then
+        self.StandActionTimer:Stop()
+        self.StandActionTimer = nil
+    end
+end
+
+---开始闲置动画计时器
+function WorldOtherPlayerItem:StartStandActionTimer()
+    if not self.StandActionCount or self.StandActionCount <= 0 then
+        return
+    end
+    if self.StandActionTimer then
+        self:StopStandActionTimer()
+    end
+    self.StandActionTimer =
+        _G.TimerManager:GetInstance():GetTimer(
+        _G.Mathf.Random(self.StandActionTime[1], self.StandActionTime[2]),
+        self.PlayeIdleAnim,
+        self,
+        true,
+        false,
+        true
+    )
+    self.StandActionTimer:Start()
+end
+
+--region 公会定时移动
+function WorldOtherPlayerItem:OpenSociatyTimer()
+    self.isCopy = true
+    if self.sociatyTimer then
+        self.sociatyTimer:Stop()
+        self.sociatyTimer = nil
+    end
+    self.posRange = _G.ConfigManager.discrete_cfg[101615]
+    self.sociatyTimer =
+        _G.TimerManager:GetInstance():GetTimer(
+        _G.math.random(_G.ConfigManager.discrete_cfg[101616][1][1], _G.ConfigManager.discrete_cfg[101616][1][2]),
+        self.SociatyMove,
+        self,
+        true,
+        false,
+        true
+    )
+    self.sociatyTimer:Start()
+end
+---开始进行移动
+function WorldOtherPlayerItem:SociatyMove()
+    local x, y, z = self.Transform:GetPosition()
+    self:UpdateMovePosition(_G.WorldUtils.PosToPoint({x = x, y = y, z = z}))
+    self.sociatyDelay =
+        _G.math.random(_G.ConfigManager.discrete_cfg[101617][1][1], _G.ConfigManager.discrete_cfg[101617][1][2])
+    while self.sociatyDelay > 0 do
+        local endPos = self:GetNextPos(x, y, z)
+        if endPos then
+            x = endPos.x
+            y = endPos.y
+            z = endPos.z
+            self:UpdateMovePosition(_G.WorldUtils.PosToPoint(endPos))
+        end
+    end
+end
+
+---获取下次移动的位置（公会使用）
+function WorldOtherPlayerItem:GetNextPos(x, y, z)
+    local math = _G.math
+    local isMoveX = _G.math.random(0, 2) > 1 and true or false
+    local isRight = math.abs(x - self.posRange[1][1]) < math.abs(x - self.posRange[2][1])
+    local isUp = math.abs(x - self.posRange[1][3]) < math.abs(x - self.posRange[2][3])
+    local endPos = {x = x, y = y, z = z}
+    if isMoveX then
+        local endValue = self.posRange[1][1]
+
+        if isRight then
+            endValue = self.posRange[2][1]
+        end
+        local offset = self.sociatyDelay * self.MoveSpeed
+        local endZ = math.random(self.posRange[2][3] * 100, self.posRange[1][3] * 100) / 100
+        local move = _G.Vector3.Distance(_G.Vector3.New(x, y, z), _G.Vector3(endValue, y, endZ))
+        if move > offset then
+            self.sociatyDelay = 0
+            local angle = math.floor(math.atan(math.abs(endZ - z), math.abs(endValue - x)) / math.pi * 180)
+            endPos.x = offset * math.cos(math.rad(angle)) + x
+            endPos.z = offset * math.sin(math.rad(angle)) + z
+            if isRight then
+                endPos.x = x - offset * math.cos(math.rad(angle))
+            else
+                endPos.x = x + offset * math.cos(math.rad(angle))
+            end
+            if isUp then
+                endPos.z = z - offset * math.sin(math.rad(angle))
+            else
+                endPos.z = z + offset * math.sin(math.rad(angle))
+            end
+            return endPos
+        else
+            self.sociatyDelay = self.sociatyDelay - move / self.MoveSpeed
+            return {x = endValue, y = y, z = endZ}
+        end
+    else
+        local endValue = self.posRange[1][3]
+        if isUp then
+            endValue = self.posRange[2][3]
+        end
+        local offset = self.sociatyDelay * self.MoveSpeed
+        local endX = math.random(self.posRange[2][1] * 100, self.posRange[1][1] * 100) / 100
+        local move = _G.Vector3.Distance(_G.Vector3.New(x, y, z), _G.Vector3(endX, y, endValue))
+        if move > offset then
+            self.sociatyDelay = 0
+            local angle = math.floor(math.atan(math.abs(endValue - z), math.abs(endX - x)) / math.pi * 180)
+            if isRight then
+                endPos.x = x - offset * math.sin(math.rad(90 - angle))
+            else
+                endPos.x = x + offset * math.sin(math.rad(90 - angle))
+            end
+            if isUp then
+                endPos.z = z - offset * math.cos(math.rad(90 - angle))
+            else
+                endPos.z = z + offset * math.cos(math.rad(90 - angle))
+            end
+            return endPos
+        else
+            self.sociatyDelay = self.sociatyDelay - move / self.MoveSpeed
+            return {x = endX, y = y, z = endValue}
+        end
+    end
+end
+
+function WorldOtherPlayerItem:TriggerEvent(isEnter, tarInstId, tarObj)
+    local sceneCamera = _G.WorldManager:GetInstance():GetCurWorld():GetCanmeraPosBox()
+    if sceneCamera then
+        if tarInstId == sceneCamera:GetInstanceIDE() then
+            self:ShowOrHideChild(isEnter)
+            if isEnter then
+                _G.WorldManager:GetInstance():GetCurWorld():AddCameraPosBoxItem(self)
+            else
+                _G.WorldManager:GetInstance():GetCurWorld():RemoveCameraPosBoxItem(self)
+            end
+        end
+    end
+end
+
+function WorldOtherPlayerItem:ShowOrHideChild(show)
+    --self.curSetEnable = show
+    if show then
+        if not self.FootEffectActive and self.footEffect then
+            self.footEffect:SetActiveE(1)
+            self.FootEffectActive = true
+        end
+        if not self.TitleTransformActive and self.TitleTransform then
+            self.TitleTransform:SetActiveE(1)
+            self.TitleTransformActive = true
+        end
+        if not self.ObjectModActive and self.ObjectMod then
+            self.ObjectMod:SetActiveE(1)
+            self.ObjectModActive = true
+            base.CheckMoveing(self)
+        end
+    else
+        if self.FootEffectActive and self.footEffect then
+            self.footEffect:SetActiveE(0)
+            self.FootEffectActive = false
+        end
+        if self.TitleTransformActive and self.TitleTransform then
+            self.TitleTransform:SetActiveE(0)
+            self.TitleTransformActive = false
+        end
+        if self.ObjectModActive and self.ObjectMod then
+            self.ObjectMod:SetActiveE(0)
+            self.ObjectModActive = false
+        end
+    end
+end
+
+---sin 9
+
+--endregion
+
+--endregion
+return WorldOtherPlayerItem

@@ -1,0 +1,411 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha_ft.Client.Assets.Resources.LuaScripts.Game.SoulSupport.Model.SoulSupportModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/07/11
+-- Description: 魂将应援数据类
+-----------------------------------------------------------------------
+local base = require "ActivitySynTypeBase"
+local ActivitySynManager = require "ActivitySynManager"
+local SoulSupportManager = require "SoulSupportManager"
+local RedPointManager = require"RedPointManager":GetInstance()
+
+---@class SoulSupportModel : ActivitySynTypeBase
+---@field supClock number[] 每日开启时间点列表
+---@field battleTime number 每场战斗时常
+---@field horseRaceLampTime number 主城跑马灯播放间隔
+---@field randomNameList string[] 弹幕NPC随机名字列表
+---@field isNotOver boolean 今日应援是否还没结束
+---@field times number 当前应援场次序号
+---@field sessionInfo activity_support.i_support_session[] 每场应援信息列表
+---@field recordAward number[] 奖励记录列表 0未领取，1已领取
+---@field state number 阶段SoulSupportManager.stage
+local SoulSupportModel = _G.BaseClass("SoulSupportModel", base)
+
+local TimeUtil = _G.TimeUtil
+local ConfigManager = _G.ConfigManager
+local discrete_cfg = _G.ConfigManager.discrete_cfg
+local SecOfHour = 3600
+
+function SoulSupportModel:__init()
+    self.supClock = discrete_cfg[108301][1]
+    self.battleTime = discrete_cfg[108302][1][1]
+    self.horseRaceLampTime = discrete_cfg[108317][1][1]
+    local EventsIns = _G.Events:GetInstance()
+    local net_map = _G.ConfigManager.net_map
+    EventsIns:AddListener(net_map.support_result.Cmd, self.OnSupportResultCall, self)
+end
+
+---获取GM数据
+function SoulSupportModel:OnHandleGMData(info)
+    self:ParseData(info)
+end
+
+---解析GM数据
+---@param info activity.i_activity_self_info
+function SoulSupportModel:ParseData(info)
+    self.isNotOver = true
+    self.times = info.support.times
+    ---@type activity_support.i_support_session[]
+    self.sessionInfo = info.support.session_info
+    self:ChangeStateByStage()
+    SoulSupportManager:GetInstance():SetActivity(self)
+    base.ParseData(self)
+    if self.onSixUpdateCall then
+        for key, call in pairs(self.onSixUpdateCall) do
+            call()
+        end
+    end
+    if not self.timer and self:CheckIsOpen() and self:GetLastTimes() > 0 then
+        self.timer = _G.TimerManager:GetInstance():GetTimer(self.horseRaceLampTime, self.OnHorseRace, self, false, false)
+        self.timer:Start()
+    end
+    self.recordAward = {}
+    SoulSupportManager:GetInstance():GetSupportRecord(_G.handler(self, self.ParseRecord))
+end
+
+---解析领取记录
+---@param msg activity_support.s2c_support_log
+function SoulSupportModel:ParseRecord(msg)
+    if msg.ack == 1 and msg.info then
+        for k, v in pairs(msg.info) do
+            self.recordAward[v.time] = v.award
+        end
+    end
+end
+
+---改变状态
+---@param state number
+function SoulSupportModel:ChangeState(state)
+    self.state = state
+end
+
+---根据阶段改变状态
+---@return number,number,number 活动阶段状态，距离下一阶段时间，当前场次
+function SoulSupportModel:ChangeStateByStage()
+    local stateEnum = SoulSupportManager.state
+    local stageEnum = SoulSupportManager.stage
+    local session = self.sessionInfo[self.times]
+    local stage, delta, step = self:GetStage()
+    if session.is_end and stage ~= stageEnum.InBattle then
+        if session.support == 0 then
+            self:ChangeState(stateEnum.NotClaimable)
+        elseif session.award == 0 then
+            self:ChangeState(stateEnum.Unclaimed)
+        else
+            self:ChangeState(stateEnum.Claimed)
+        end
+    else
+        if stage == stageEnum.InBattle then
+            self:ChangeState(stateEnum.Battle)
+        elseif session.support == 0 then
+            self:ChangeState(stateEnum.Before)
+        else
+            self:ChangeState(stateEnum.Support)
+        end
+    end
+    return stage, delta, step
+end
+
+---打开宝箱回调，更改数据状态
+---@param time number 场次id
+function SoulSupportModel:OpenBoxHandler(time)
+    self.recordAward[time] = 1
+    if time == self:GetCurTimeId() then
+        self.sessionInfo[self.times].award = 1
+        self:ChangeState(SoulSupportManager.state.Claimed)
+        self:RefreshRedPointBox()
+    end
+    self:RefreshRedPointRecord()
+end
+
+---应援确认回调
+---@param sid number 支援的队伍sid
+function SoulSupportModel:SelectArrayHandler(sid)
+    self.sessionInfo[self.times].support = sid
+    self:ChangeState(SoulSupportManager.state.Support)
+end
+
+---进入下一场回调
+function SoulSupportModel:EnterNextHandler()
+    self.times = _G.Mathf.Min(self.times + 1, #self.sessionInfo)
+    self:ChangeStateByStage()
+end
+
+--region ------------- 获取数据 -------------
+
+---获取当前场次ID
+---@return number 场次id
+function SoulSupportModel:GetCurTimeId()
+    return self.sessionInfo[self.times].time_end
+end
+
+---获取当前场次排名
+---@return number 排名
+function SoulSupportModel:GetCurRank()
+	return self.sessionInfo[self.times].rank
+end
+
+---获取今日剩余应援次数
+---@return number 剩余应援次数
+function SoulSupportModel:GetLastTimes()
+    local times = 0
+    for _, v in pairs(self.sessionInfo) do
+        if not v.is_end and v.support == 0 then
+            times = times + 1
+        end
+    end
+    return times
+end
+
+---获取当前应援序列号
+---@return number 当前应援序号
+function SoulSupportModel:GetCurTimes()
+    return self.times
+end
+
+---获取当前阶段所有应援队伍
+---@return activity_support.i_team[] 应援队伍列表
+function SoulSupportModel:GetCurAllArray()
+    return self.sessionInfo[self.times].team_info
+end
+
+---获取当前阶段已应援队伍sid
+---@return number 应援队伍sid
+function SoulSupportModel:GetCurChoose()
+    return self.sessionInfo[self.times].support
+end
+
+---获取当前boss技能组
+---@return number[],string boss技能组，boss名字
+function SoulSupportModel:GetCurBossSkill()
+    ---@type monster_group_cfg
+    local mgCfg = ConfigManager.monster_group_cfg[self.sessionInfo[self.times].boss]
+    local bossSid = 101
+    for _, v in pairs(mgCfg.DefaultDefenserSids[1]) do
+        if v ~= 0 then
+            bossSid = v
+            break
+        end
+    end
+    ---@type monster_cfg
+    local mCfg = ConfigManager.monster_cfg[bossSid]
+    local cardName = ConfigManager.card_cfg[mCfg.CardID].Name
+    return mCfg.MonsterSkills, cardName
+end
+
+---获取当前阶段敌我立绘
+---@return table,table 应援角色立绘，boss立绘 {立绘，偏移，缩放}
+function SoulSupportModel:GetCurSoulCard()
+    local groupSid = self.sessionInfo[self.times].group_sid
+    local bossId = self.sessionInfo[self.times].boss
+    ---@type support_normal_cfg
+    local groupCfg = ConfigManager.support_normal_cfg[groupSid]
+    local index = 1
+    for i = 1, #groupCfg.monster do
+        if bossId == groupCfg.monster[i] then
+            index = i
+            break
+        end
+    end
+    local roleDraw = { groupCfg.portrait[1][1], groupCfg.pos_portrait[1], groupCfg.size[1][1] }
+    local bossPos = { groupCfg.pos_portrait[2][3 * index + -2], groupCfg.pos_portrait[2][3 * index - 1], groupCfg.pos_portrait[2][3 * index] }
+    local bossDraw = { groupCfg.portrait[2][index], bossPos, groupCfg.size[2][index] }
+    return roleDraw, bossDraw
+end
+
+---获取阶段信息
+---@return number,number,number 活动阶段状态，距离下一阶段时间，当前场次
+function SoulSupportModel:GetStage()
+    local stageEnum = SoulSupportManager.stage
+    local now = TimeUtil.GetSecondsOfDay()
+    if now <= _G.TimeUtil.GAME_DAY_TIME then
+        now = now + 24 * SecOfHour
+    end
+    local delta, delta1, step
+    for i = 1, #self.supClock do
+        step = i
+        delta = now - self.supClock[i] * SecOfHour
+        delta1 = delta - self.battleTime
+        if delta < 0 then
+            return stageEnum.Pre, -delta, step
+        elseif delta1 <= 0 then
+            self.isInBattle = true
+            return stageEnum.InBattle, -delta1, step
+        end
+    end
+    self.isNotOver = false
+    return stageEnum.Ended, (24 + _G.TimeUtil.GAME_DAY_HOUR) * SecOfHour - now, step
+end
+
+--endregion ----------- 获取数据 end -----------
+
+--region ------------- 红点相关 -------------
+
+---初始化红点
+function SoulSupportModel:InitRedPointTree()
+    self.checkRedPointFunc = {self.CheckRedPointSupport, self.CheckRedPointRecord, self.CheckRedPointBox}
+    self.redpointTree = {{2, 3}, false, false}
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function SoulSupportModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---刷新宝箱红点
+function SoulSupportModel:RefreshRedPointBox()
+    RedPointManager:RefreshNode(self:GetRedpointIDByIndex(3))
+end
+
+---刷新历史记录红点
+function SoulSupportModel:RefreshRedPointRecord()
+    RedPointManager:RefreshNode(self:GetRedpointIDByIndex(2))
+end
+
+---刷新主界面红点
+function SoulSupportModel:RefreshRedPointSupport()
+    RedPointManager:RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+---检测宝箱红点
+---@return number 有红点1无红点0
+function SoulSupportModel:CheckRedPointBox()
+    self:ChangeStateByStage()
+    if self.state == SoulSupportManager.state.Unclaimed then
+        return 1
+    end
+    return 0
+end
+
+---检测历史记录红点
+---@return number 有红点1无红点0
+function SoulSupportModel:CheckRedPointRecord()
+    for k, v in pairs(self.recordAward) do
+        if v == 0 then
+            return 1
+        end
+    end
+    return 0
+end
+
+---检测主界面红点
+---@return number 有红点1无红点0
+function SoulSupportModel:CheckRedPointSupport()
+    local stage, delta, step = self:GetStage()
+    if step == #self.supClock and stage ~= SoulSupportManager.stage.Pre then
+        return 0
+    end
+    return self.sessionInfo[step].support == 0 and 1 or 0
+end
+
+---每阶段红点刷新
+function SoulSupportModel:OnRedPointTimerCall()
+    if not self:CheckIsOpen() then
+        return
+    end
+    self:RefreshRedPointBox()
+    self:RefreshRedPointRecord()
+    self:RefreshRedPointSupport()
+end
+
+--endregion ----------- 红点相关 end -----------
+
+---进入活动
+function SoulSupportModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SoulSupportView.Name)
+    base.OnEnterActivity(self)
+end
+
+---检测活动是否开放
+---@return boolean 是否开放
+function SoulSupportModel:CheckIsOpen()
+    return self.curActivityClass:GetCurActivityState() == ActivitySynManager.State.Open
+end
+
+---注册六点刷新回调
+---@param name string 函数key
+---@param callback function 回调
+function SoulSupportModel:SetOnSixUpdateCall(name, callback)
+    if not self.onSixUpdateCall then
+        self.onSixUpdateCall = {}
+    end
+    self.onSixUpdateCall[name] = callback
+end
+
+---应援结果推送
+---@param msg activity_support.p2c_support_result
+function SoulSupportModel:OnSupportResultCall(msg)
+    if msg.id == self:GetActivityID() then
+        self.isInBattle = false
+        self.sessionInfo[msg.times].is_end = true
+        self.sessionInfo[msg.times].support = msg.team or 0
+        self.sessionInfo[msg.times].rank = msg.rank
+        if self.sessionInfo[msg.times].support ~= 0 then
+            self.recordAward[self.sessionInfo[msg.times].time_end] = 0
+        end
+        local stage, delta, step = self:GetStage()
+        self.redPointTimer = _G.TimerManager:GetInstance():GetTimer(delta + 1, self.OnRedPointTimerCall, self, true, false)
+        self.redPointTimer:Start()
+    end
+end
+
+---获取活动ID
+---@return number 活动id
+function SoulSupportModel:GetActivityID()
+    return self.curActivityClass:GetActivityID()
+end
+
+---活动是否开启
+---@return boolean 是否开启
+function SoulSupportModel:CheckActivityOpened()
+    if self.curActivityClass:GetCurActivityState() == require("ActivitySynManager").State.Notice then
+        --TODO:提示活动开启时间
+        return false
+    end
+    return self.curActivityClass:GetCurActivityState() == require("ActivitySynManager").State.Open
+end
+
+---跑马灯播放
+function SoulSupportModel:OnHorseRace()
+    if not self:CheckIsOpen() then
+        if self.timer ~= nil then
+            self.timer:Stop()
+            self.timer = nil
+            return
+        end
+    end
+    if self:GetLastTimes() == 0 then
+        return
+    end
+    _G.PopWindowManager:GetInstance():ShowAllTips(440216)
+end
+
+---获取随机名字
+---@return string NPC名字
+function SoulSupportModel:RandomName()
+    return _G.LoginManager:GetInstance():GetRandomName()
+end
+
+---@private
+function SoulSupportModel:Dispose()
+    local EventsIns = _G.Events:GetInstance()
+    local net_map = _G.ConfigManager.net_map
+    --TODO:移除推送监听
+    EventsIns:RemoveListener(net_map.support_result.Cmd, self.OnSupportResultCall, self)
+    if self.timer ~= nil then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.redPointTimer ~= nil then
+        self.redPointTimer:Stop()
+        self.redPointTimer = nil
+    end
+end
+
+return SoulSupportModel

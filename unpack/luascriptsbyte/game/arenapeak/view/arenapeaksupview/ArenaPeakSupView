@@ -1,0 +1,754 @@
+-----------------------------------------------------------------------
+-- C:.workspace.alpha_FT.Client.Assets.Resources.LuaScripts.Game.ArenaPeak.View.ArenaPeakSupView	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/09/06
+-- Description: 巅峰演武主页面
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local ArenaPeakModel = require("ArenaPeakModel")
+local ArenaPeakNet = require("ArenaPeakNet")
+local ItemCardAllView = require("ItemCardAllView")
+
+--加载角色
+local function LoadRoleScene(view, rolepath, callback)
+    view:RoleRecycle()
+    view.cancelSpawnItem =
+    require("CardInfoManager").GetRole(
+            rolepath,
+            _G.ePoolType.Temporary,
+            view.sceneTrans,
+            _G.RoleEffTypeEnum.RoleShow,
+            function(trans)
+                if trans == nil then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("角色无法加载 path:" .. rolepath .. "    CardInfoView LoadRoleScene")
+                    end
+                    return
+                end
+                local parent = view.sceneTrans
+                local environment = parent:GetComponentInChildren(_G.typeof(_G.CS.FrameWork.Environment.EnvironmentSetting))
+                if environment then
+                    environment.SceneCamera.fieldOfView = 30 * _G.CS.Launcher.Inst.FovScale
+                end
+                trans:SetParentE(view.sceneTrans)
+                trans:SetLocalPosition(1000, 0, 0)
+                local card_show_cfg = _G.ConfigManager.card_show_cfg
+                local myCard_show_cfg = card_show_cfg[view.curRoleData.cfg.id]
+                local Scale = 0.9
+                if myCard_show_cfg == nil then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("card_show_cfg 未找到配置 sid:" .. view.curRoleData.cfg.id)
+                    end
+                else
+                    --设置  缩放
+                    Scale = (myCard_show_cfg.Size1 > 0 and myCard_show_cfg.Size1 or 1) * 0.9
+                end
+                trans:SetLocalScale(Scale, Scale, Scale)
+
+                view.roleTrans = trans
+                view.RolePoint = trans:GetComponentE(_G.typeof(_G.CS.RolePoint))
+                if view.RolePoint then
+                    view.bip = view.RolePoint.Point_Chest
+                    view.head = view.RolePoint.Point_Head
+                else
+                    view.RolePoint = trans:AddComponentE(_G.typeof(_G.CS.RolePoint))
+                    view.RolePoint:FindAll()
+                    view.bip = view.RolePoint.Point_Chest
+                    view.head = view.RolePoint.Point_Head
+                end
+
+                view.AnimComponent = _G.RoleAnimatorController.GetOrCreateAnimatorController(view.roleTrans)
+                view.state = view.AnimComponent.animator.cullingMode
+                view.AnimComponent.animator.cullingMode = _G.CS.UnityEngine.AnimatorCullingMode.AlwaysAnimate
+                trans:SetActiveE(0)
+                trans:SetActiveE(1)
+                if callback then
+                    callback(trans)
+                end
+            end
+    )
+end
+
+---@class ArenaPeakSupView : UIBaseView    中文描述
+---@field public go_table ArenaPeakSupView_GoTable GoTable
+---@field curModel number 当前模式(1排位赛2友谊赛)
+local ArenaPeakSupView = _G.BaseClass("ArenaPeakSupView", _G.UIBaseView)
+
+local GetLangPackValue = _G.GetLangPackValue
+local ConfigManager = _G.ConfigManager
+local UIManager = _G.UIManager
+local GetAutoGoTable = _G.GetAutoGoTable
+local TimeUtil = _G.TimeUtil
+local UIUtils = _G.UIUtils
+local Events = _G.Events
+local net_map = _G.ConfigManager.net_map
+
+local unLight = "ui_dfyw_xingxing_weidianliang"
+
+function ArenaPeakSupView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+---界面的入口函数
+function ArenaPeakSupView:OnCreate()
+    ---角色展示常驻特效 缓存  清空
+    self.ActionEffArr = {}
+    ---角色展示临时特效 缓存  清空
+    self.ActionEffTempArr = {}
+    self:InitView()
+    self:InitRenderTexture()
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(false, true)
+    self:InitScene()
+    self:InitDrag()
+    --self.go_table.scrollloopvectical_cardList:InitItemData(0, _G.handler(self, self.RefreshList))
+end
+
+---UI初始化
+function ArenaPeakSupView:InitView()
+    self.go_table.aortext_support.text = GetLangPackValue(90029400085, ArenaPeakModel:GetInstance():GetCurSeasonID())
+    self.cards = ArenaPeakModel:GetInstance():GetSupportCards()
+    self.curIndex = 1
+    self.cardData = self.cards[self.curIndex]
+    self.cardSid = self.cardData.sid
+    self:UpdateSkill()
+    self.curRoleData = {cfg = ConfigManager.card_cfg[self.cards[self.curIndex].sid]}
+    self.go_table.scrollloopvectical_cardList:InitItemData(#self.cards, _G.handler(self, self.RefreshList))
+end
+
+---@private
+function ArenaPeakSupView:RefreshList(index, obj)
+	index = index + 1
+    local cardData = self.cards[index]
+    local tb = GetAutoGoTable(obj, _G.handlerbind(self, self.OnClickCard, index))
+    local card = ItemCardAllView.New(tb.obj_card)
+    card:ShowCardData(cardData, nil, false, true)
+    card:ShowLevel(cardData.lv)
+end
+
+---@private
+function ArenaPeakSupView:OnClickCard(go, isOn, index)
+    self.curIndex = index
+    self.cardData = self.cards[self.curIndex]
+    self.cardSid = self.cardData.sid
+    self:UpdateSkill()
+	self:SetData({cfg = ConfigManager.card_cfg[self.cards[self.curIndex].sid]})
+end
+
+---@private
+function ArenaPeakSupView:UpdateSkill()
+    local skillId, skillCfg ,lv
+    for i = 1, 5 do
+        if i ~= 2 then
+            skillId = self.cardData.Skills["skill_" .. i]
+            if skillId == 0 then
+                skillId = self.cardSid + i * 100 + 1
+                --skillId = skillId * -1
+            end
+            skillCfg = _G.ConfigManager.card_skills_cfg[skillId]
+            local tb = _G.GetAutoGoTable(self.go_table["obj_skill" .. i], _G.handlerbind(self, self.OnClickSkill, skillId))
+            _G.GameUtil.SetActiveByCondition(tb.aorimage_nuqi, skillCfg.skill_pos == 1)
+            tb.aortext_skilllevel.text = skillCfg.level
+            require("CardInfoManager").LoadRawImage(tb.aorrawimage_skill, skillCfg.icon)
+        end
+    end
+end
+
+---@private
+function ArenaPeakSupView:OnClickSkill(go, isOn, skillId)
+    local card_skills_cfg = _G.ConfigManager.card_skills_cfg[skillId]
+    require("CommonTipManager"):GetInstance():OpenSkillTip(skillId, nil, card_skills_cfg.condition_star > self.cardData.lv)
+end
+
+
+function ArenaPeakSupView:InitRenderTexture()
+    local mRT =
+    _G.CS.FrameWork.Graphic.Utility.RenderTextureUtility.New(
+            _G.math.floor(_G.CS.Launcher.Inst.ScreenSize.x),
+            _G.math.floor(_G.CS.Launcher.Inst.ScreenSize.y),
+            8
+    )
+    self.go_table.aorrawimage_scene.texture = mRT
+    self.go_table.aorrawimage_scene:SetNativeSize()
+
+    if _G.CS.Launcher.Inst.UIScaler.matchWidthOrHeight then
+        self.scale = _G.CS.Launcher.Inst.ScreenSize.y / 720
+    else
+        self.scale = _G.CS.Launcher.Inst.ScreenSize.x / 1280
+    end
+    if self.scale >= 1 then
+        self.scale = 1
+        self.scale = self.scale * 0.8
+    end
+
+    self.go_table.aorrawimage_scene:SetLocalScaleXYZ(self.scale)
+    --self.go_table.aorrawimage_scene.color = _G.CS.UnityEngine.Color.gray
+    --_G.GraphicsManager.Instance.MainCamera.targetTexture = mRT
+    -- self.camera_3d = _G.GameObject.Find("3DUICam"):GetComponentE(_G.typeof(_G.Camera))
+    -- self.camera_3d.targetTexture = mRT
+    self.texture = mRT
+    local obj = _G.GameObject()
+    self.camera = obj:AddComponentE(_G.typeof(_G.CS.UnityEngine.Camera))
+    self.camera:SetName("settingcamera")
+    self.camera.clearFlags = _G.CS.UnityEngine.CameraClearFlags.Depth
+    self.camera.depth = 5
+    self.camera.targetTexture = mRT
+    _G.GraphicsManager.Instance.MainCamera.enabled = false
+    self.CPostProcessLayer = self.camera:AddComponentE(_G.typeof(_G.CS.PostProcessing.CPostProcessLayer))
+    self.mainCPostProcessLayer =
+    _G.GraphicsManager.Instance.MainCamera:GetComponentE(_G.typeof(_G.CS.PostProcessing.CPostProcessLayer))
+    self.CPostProcessLayer.m_Quality = self.mainCPostProcessLayer.m_Quality
+    self.CPostProcessLayer.m_SpecificName = self.mainCPostProcessLayer.m_SpecificName
+    self.CPostProcessLayer.m_SpecificQuality = self.mainCPostProcessLayer.m_SpecificQuality
+    self.mainCPostProcessLayer.enabled = false
+    self.CPostProcessLayer.enabled = true
+
+    local index = _G.SystemSettingManager:GetInstance():GetState(_G.SystemSettingManager.SettingType.ImageQuality)
+    self:SetCameraLevel(index)
+end
+
+function ArenaPeakSupView:SetCameraLevel(level)
+    if level == 0 then
+        self.camera.allowHDR = true
+        self.camera.allowMSAA = true
+    elseif level == 1 then
+        self.camera.allowHDR = true
+        self.camera.allowMSAA = false
+    elseif level == 2 then
+        self.camera.allowHDR = false
+        self.camera.allowMSAA = false
+    end
+end
+
+function ArenaPeakSupView:InitScene()
+    if not self.scene then
+        local prefab = _G.ConfigManager.ui_scens_cfg[2].Scene
+        self:LoadScenePrefab(
+                prefab,
+                function(trans)
+                    local environment =
+                    trans:GetComponentInChildren(_G.typeof(_G.CS.FrameWork.Environment.EnvironmentSetting))
+                    if environment then
+                        environment.SceneCamera.fieldOfView = 30 * _G.CS.Launcher.Inst.FovScale
+                        self.camera.fieldOfView = 30 * _G.CS.Launcher.Inst.FovScale
+                    end
+
+                    self.scene = trans
+                    self.cameraQua = self.objDataList[prefab].qua
+                    self.cameraPos = self.objDataList[prefab].pos
+                    --self:LoadSceneEffect(id)
+                    if self.cameraPos then
+                        self.camera:SetPosition(self.cameraPos.x, self.cameraPos.y, self.cameraPos.z)
+                        if self.cameraQua then
+                            self.camera:SetRotation(self.cameraQua.x, self.cameraQua.y, self.cameraQua.z, self.cameraQua.w)
+                        end
+                    end
+                    self.camera.targetTexture = self.texture
+                    self.go_table.aorrawimage_scene.Alpha = 1
+                    _G.DelayFrameDo( function()
+                        self:SetData(self.curRoleData)
+                    end)
+                end
+        )
+    end
+end
+
+function ArenaPeakSupView:LoadScenePrefab(path, call)
+    if not self.objDataList then
+        self.objDataList = {}
+    end
+    if self.loadSceneCancel then
+        self.loadSceneCancel:Dispose()
+        self.loadSceneCancel = nil
+    end
+    local isOver = false
+    self.loadSceneCancel =
+    _G.GameUtil.SpawnWithCancel(
+            path,
+            _G.ePoolType.Temporary,
+            nil,
+            function(trans)
+                if self:IsNil() then
+                    self.loadSceneCancel:Dispose()
+                    self.loadSceneCancel = nil
+                    return
+                end
+                isOver = true
+                self.loadSceneCancel = nil
+                local camera = _G.GraphicsManager.Instance.CurrentVisualCamera
+                if not self.objDataList[path] then
+                    local x, y, z, w = camera:GetRotation()
+                    local cameraQua = {x = x, y = y, z = z, w = w}
+                    x, y, z = camera:GetPosition()
+                    local cameraPos = {x = x, y = y, z = z}
+                    self.objDataList[path] = {pos = cameraPos, qua = cameraQua}
+                else
+                    local temp = self.objDataList[path].pos
+                    camera:SetPosition(temp.x, temp.y, temp.z)
+                    temp = self.objDataList[path].qua
+                    camera:SetRotation(temp.x, temp.y, temp.z, temp.w)
+                end
+                if call then
+                    call(trans)
+                end
+            end,
+            true
+    )
+    if isOver then
+        self.loadSceneCancel = nil
+    end
+end
+
+---设置卡牌数据
+---@param roleData  ChangeRoleData	卡牌类
+function ArenaPeakSupView:SetData(roleData)
+    if roleData == nil then
+        return
+    end
+
+    self.isCur = false
+
+    --local pos = self.ControlCameraPosArr[1]
+    --self.camera:SetPosition(pos[1], pos[2], pos[3])
+    --
+    --local qua = self.ControlCameraQuaArr[1]
+    --self.camera:SetRotation(qua[1], qua[2], qua[3], qua[4])
+    if self.sceneTrans == nil then
+        self.sceneTrans = self.scene
+        LoadRoleScene(
+                self,
+                roleData.cfg.ModelPathHi,
+                function(roleTrans)
+                    if roleData.cfg.id ~= self.curRoleData.cfg.id then
+                        _G.DestroyObject(roleTrans)
+                        return
+                    end
+                    if self:IsNil() then
+                        return
+                    end
+                    if self.AnimComponent then
+                        self.AnimComponent:Play("idle_1")
+                    end
+                    self:InitRotPos()
+                end
+        )
+    else
+        if roleData.cfg.id ~= self.curRoleData.cfg.id then
+            self.curRoleData = roleData
+            LoadRoleScene(
+                    self,
+                    roleData.cfg.ModelPathHi,
+                    function(roleTrans)
+                        if roleData.cfg.id ~= self.curRoleData.cfg.id then
+                            _G.DestroyObject(roleTrans)
+                            return
+                        end
+                        if self:IsNil() then
+                            return
+                        end
+                        if self.AnimComponent then
+                            self.AnimComponent:Play("idle_1")
+                        end
+                        self:InitRotPos()
+                    end
+            )
+        else
+            self.isCur = true
+            self:InitRotPos()
+        end
+    end
+end
+
+---初始化角色位置
+function ArenaPeakSupView:InitRotPos()
+    if _G.IsNil(self.roleTrans) then
+        return
+    end
+    if self.isCur and self.entr then
+        return
+    end
+    --if self.co2 then
+    --    self.entr = false
+    --    _G.coroutine.stopwaiting(self.co2)
+    --    self.co2 = nil
+    --end
+    _G.DelayDo(
+            0.1,
+            function()
+                if _G.IsNil(self.roleTrans) then
+                    return
+                end
+                self.roleTrans:SetLocalPositionToZero()
+            end
+    )
+
+    self.roleTrans:SetLocalEulerAngles(0, 0, 0)
+    --播放一次 初始化 RoleAnimatorController.cs--> animationTime
+    ---@type card_show_cfg
+    local cfg = _G.ConfigManager.card_show_cfg[self.curRoleData.cfg.id]
+    local display_entr = cfg and cfg.display_entr or ""
+    if not string.IsNullOrEmpty(display_entr) then
+        if self.AnimComponent:isHaveAni(display_entr) and (display_entr ~= "idle_1" or display_entr ~= "stand_1") then
+            self.entr = true
+            --self.co2 = _G.coroutine.start(_G.handlerbind(self, self.CoTitleAndHolePosition, display_entr))
+            self.AnimComponent:Play(display_entr, true)
+            _G.AnimatorPlayEndCallback.AddCallback(
+                    self.AnimComponent:GetInstanceIDE(),
+                    _G.handler(self, self.PlayAniCallBack)
+            )
+            self:LoadActionEff(cfg.display_entr_ef)
+            self:PlaySound(cfg.audio_enter, cfg.sound_enter)
+        else
+            self.AnimComponent:Play(display_entr, true)
+        end
+    else
+        --- 否则默认播放 idle配置
+        self.AnimComponent:Play("idle_1", true)
+        self:PlayAniCallBack()
+    end
+end
+
+---加载动效
+function ArenaPeakSupView:LoadActionEff(idArr)
+    if idArr == nil or #idArr == 0 then
+        return
+    end
+
+    local effcfg = _G.ConfigManager.card_effect_cfg
+
+    for i = 1, #idArr do
+        local id = idArr[i]
+        local myEff = effcfg[id]
+        if myEff == nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" card_effect_cfg 未找到id: " .. tostring(id))
+            end
+        else
+            self:LoadFunc(myEff, self.sceneTrans)
+        end
+    end
+end
+
+---@param cfg card_effect_cfg
+function ArenaPeakSupView:LoadFunc(cfg, parent, loadedCall)
+    if self.curRoleData == nil then
+        return
+    end
+    if not self.EfDic then
+        self.EfDic = {}
+    end
+    local pos = cfg.pos or {0, 0, 0}
+    local scale = cfg.scale > 0 and cfg.scale or 1
+    --region --------------------------------------当前特效 要隐藏的其他特效--------
+    if #cfg.ef_false > 0 then
+        for i = #cfg.ef_false, 1, -1 do
+            local tranPath = cfg.ef_false[i]
+            local efobj = self.roleTrans:FindE(tranPath)
+            if efobj ~= nil then
+                _G.GameUtil.SetActiveByCondition(efobj, false)
+            end
+        end
+    end
+    --endregion
+
+    --region --------------------------------------如果加载过 或者本身有这特效--------
+    local efTran = self.EfDic[cfg.id]
+    if efTran ~= nil then
+        ---  特效要隐藏在显示  确保动画重播
+        _G.GameUtil.SetActiveByCondition(efTran, false)
+        _G.GameUtil.SetActiveByCondition(efTran, true)
+    else
+        if string.IsNullOrEmpty(cfg.ef_point) == false then
+            if cfg.ef_point == "1" then
+                parent = self.roleTrans
+            else
+                parent = self.roleTrans:FindE(cfg.ef_point)
+                if parent == nil then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError(cfg.id .. " 挂点路径未找到: " .. cfg.ef_point)
+                    end
+                    return
+                end
+            end
+        end
+        local efName
+        if _G.string.contains(cfg.Ef_Path, "/") then
+            efName = _G.string.split2tbl(cfg.Ef_Path, "/")
+            efName = efName[#efName]
+            local efobj = parent:FindE(efName)
+            if _G.IsNil(efobj) == false then
+                efobj:SetLocalPosition(pos[1], pos[2], pos[3])
+                efobj:SetLocalScaleXYZ(scale)
+                _G.GameUtil.SetActiveByCondition(efobj, false)
+                _G.GameUtil.SetActiveByCondition(efobj, true)
+                self.EfDic[cfg.id] = efobj
+                if loadedCall ~= nil then
+                    loadedCall()
+                end
+                --endregion
+                return
+            end
+        end
+        --- 否则 加载
+        _G.UIUtils.LoadEffectByPath(
+                cfg.Ef_Path,
+                parent,
+                function(tran)
+                    if cfg.lifeTime == 0 then
+                        table.insert(self.ActionEffArr, tran)
+                    else
+                        table.insert(self.ActionEffTempArr, tran)
+                    end
+                    self.EfDic[cfg.id] = tran
+                    if loadedCall ~= nil then
+                        loadedCall()
+                    end
+                end,
+                nil,
+                0,
+                pos,
+                scale,
+                1,
+                true
+        )
+    end
+end
+
+---播放动画的回调
+function ArenaPeakSupView:PlayAniCallBack(isShow)
+    if _G.IsNil(self.roleTrans) or _G.IsNil(self.AnimComponent) then
+        return
+    end
+    --if self.co2 then
+    --    _G.coroutine.stopwaiting(self.co2)
+    --    self.entr = false
+    --end
+    --播放一次 初始化 RoleAnimatorController.cs--> animationTime
+    local display_idle = self.curRoleData.cfg.display_idle
+    if not string.IsNullOrEmpty(display_idle) then
+        self.AnimComponent:Play(display_idle, true)
+    end
+    _G.AnimatorPlayEndCallback.RemoveCallback(self.AnimComponent:GetInstanceIDE())
+end
+
+function ArenaPeakSupView:InitDrag()
+    _G.SetEventTrigger(self.go_table.trans_rotate, "onDragBegin", _G.handler(self, self.onDragBegin_Drag))
+    _G.SetEventTrigger(self.go_table.trans_rotate, "onDrag", _G.handler(self, self.onDrag_Drag))
+    _G.SetEventTrigger(self.go_table.trans_rotate, "onDragEnd", _G.handler(self, self.onDragEnd_Drag))
+end
+
+---@param eventData UnityEngine.EventSystems.PointerEventData
+function ArenaPeakSupView:onDragBegin_Drag(go, eventData)
+    self.Rotate_startPoint = eventData.position.x
+end
+
+---@param eventData UnityEngine.EventSystems.PointerEventData
+function ArenaPeakSupView:onDrag_Drag(go, eventData)
+    if eventData.position.x > self.Rotate_startPoint + 0.2 then
+        self:Ontemp_rotate(false)
+    elseif eventData.position.x < self.Rotate_startPoint - 0.2 then
+        self:Ontemp_rotate(true)
+    end
+end
+
+---@param eventData UnityEngine.EventSystems.PointerEventData
+function ArenaPeakSupView:onDragEnd_Drag(go, eventData)
+    self.isRoate = false
+    self.Rotate_lr = 0
+end
+------角色旋转控制
+---@param isRotate_L boolean true顺时针旋转 默认false
+---@param Rotate_speed int 旋转速度
+function ArenaPeakSupView:Ontemp_rotate(isRotate_L, Rotate_speed)
+    if isRotate_L then
+        self.Rotate_lr = 1
+    else
+        self.Rotate_lr = -1
+    end
+    if Rotate_speed then
+        self.Rotate_speed = Rotate_speed
+    else
+        self.Rotate_speed = 5
+    end
+
+    self.isRoate = true
+    if self.temp_rotate == nil then
+        self.temp_rotate = _G.coroutine.start(_G.handler(self, self.RotateCoOnProgress))
+    end
+end
+
+function ArenaPeakSupView:RotateCoOnProgress()
+    while true do
+        if self.isRoate == true and self.roleTrans ~= nil then
+            self.roleTrans:Rotate(_G.Vector3.up * self.Rotate_lr, self.Rotate_speed)
+        end
+        _G.coroutine.waitforendofframe()
+    end
+end
+
+function ArenaPeakSupView:PlaySound(audioCfg, soundPath)
+    self:ClearSound()
+    self.ActionAudioArr = {}
+    if _G.string.IsNullOrEmpty(audioCfg) == false then
+        local path = audioCfg
+        if path ~= nil then
+            self.ActionAudioArr[path] = true
+            _G.AudioManager.Dialogue_PlayPath(path)
+        end
+    end
+    if _G.string.IsNullOrEmpty(soundPath) == false then
+        local path = soundPath
+        if path ~= nil then
+            self.LinesPath = path
+            _G.AudioManager.PlayPathBackFun(path)
+        end
+    end
+end
+function ArenaPeakSupView:ClearSound()
+    if self.ActionAudioArr ~= nil then
+        for path, value in pairs(self.ActionAudioArr) do
+            _G.AudioManager.StopSoundByPath(path)
+            self.ActionAudioArr[path] = nil
+        end
+    end
+    if self.LinesPath ~= nil then
+        _G.AudioManager.Dialogue_StopPath(self.LinesPath)
+    end
+end
+
+---角色回收
+function ArenaPeakSupView:RoleRecycle()
+    if not _G.IsNil(self.roleTrans) then
+        self.EfDic = {}
+        --  self:InitRotPos()
+        self.AnimComponent = _G.RoleAnimatorController.GetOrCreateAnimatorController(self.roleTrans)
+        self.AnimComponent.animator.cullingMode = self.state
+        _G.PoolsManager:GetInstance():Despawn(self.roleTrans, _G.ePoolType.Temporary)
+        self.roleTrans = nil
+        --如果之前对象有 则销毁之前的回调
+        if self.AnimComponent ~= nil then
+            _G.AnimatorPlayEndCallback.RemoveCallback(self.AnimComponent:GetInstanceIDE())
+            self.AnimComponent = nil
+        end
+        if self.Title then
+            self.Title.transform:SetParentE(self.sceneTrans)
+            _G.GameUtil.SetActiveByCondition(self.Title.gameObject, false)
+        end
+        if self.Halo then
+            self.Halo.transform:SetParentE(self.sceneTrans)
+            _G.GameUtil.SetActiveByCondition(self.Halo.gameObject, false)
+        end
+        if self.ActionEffArr ~= nil then
+            for i = #self.ActionEffArr, 1, -1 do
+                local efftran = table.remove(self.ActionEffArr, i)
+                if _G.IsNil(efftran) == false then
+                    _G.UIUtils.RemoveEffect(efftran, 1)
+                end
+            end
+        end
+        if self.ActionEffTempArr ~= nil then
+            for i = #self.ActionEffTempArr, 1, -1 do
+                local efftran = table.remove(self.ActionEffTempArr, i)
+                if _G.IsNil(efftran) == false then
+                    _G.UIUtils.RemoveEffect(efftran, 1)
+                end
+            end
+        end
+    end
+    if self.cancelSpawnItem then
+        if not self.roleTrans then
+            self.cancelSpawnItem:DisposeItem()
+        end
+        self.cancelSpawnItem:Dispose()
+    end
+end
+
+---重置相机位置
+function ArenaPeakSupView:ResetCameraPos(isNotMove, call)
+    if isNotMove then
+        self.camera:SetPosition(self.cameraPos.x, self.cameraPos.y, self.cameraPos.z)
+        if self.cameraQua then
+            self.camera:SetRotation(self.cameraQua.x, self.cameraQua.y, self.cameraQua.z, self.cameraQua.w)
+        end
+    else
+        if self.tweer4 then
+            self.tweer4:Kill()
+        end
+        if self.tweer5 then
+            self.tweer5:Kill()
+        end
+        self.tweer4 =
+        self.camera:DoMove(
+                self.cameraPos.x,
+                self.cameraPos.y,
+                self.cameraPos.z,
+                function()
+                    if call then
+                        call()
+                    end
+                end,
+                0.3
+        )
+        if self.cameraQua then
+            self.tweer5 =
+            self.camera:DORotateQuaternion(
+                    self.cameraQua.x,
+                    self.cameraQua.y,
+                    self.cameraQua.z,
+                    self.cameraQua.w,
+                    0.3
+            )
+        end
+    end
+end
+
+
+---@private
+function ArenaPeakSupView:OnDisable()
+end
+
+function ArenaPeakSupView:OnStartClose()
+    self:ClearSound()
+    --if self.co2 then
+    --    _G.coroutine.stopwaiting(self.co2)
+    --    self.co2 = nil
+    --end
+    self:RoleRecycle()
+    if self.AnimComponent then
+        self.AnimComponent = _G.RoleAnimatorController.GetOrCreateAnimatorController(self.roleTrans)
+        self.AnimComponent.animator.cullingMode = self.state
+    end
+    _G.PoolsManager:GetInstance():ClearPoolAll(_G.ePoolType.Temporary)
+    if self.camera then
+        self:ResetCameraPos(true)
+        self.camera.targetTexture = nil
+        self.CPostProcessLayer.enabled = false
+        self.mainCPostProcessLayer.enabled = true
+        _G.DestroyObject(self.camera.gameObject)
+    end
+    if self.scene then
+        _G.DestroyObject(self.scene)
+    end
+    if self.texture then
+        _G.CS.FrameWork.Graphic.Utility.RenderTextureUtility.Release(self.texture)
+        self.texture = nil
+    end
+    _G.GraphicsManager.Instance.MainCamera.enabled = true
+end
+
+---界面的销毁函数
+function ArenaPeakSupView:OnDestroy()
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+end
+
+---按钮点击事件在这里派发
+function ArenaPeakSupView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_close then
+        self:Close()
+    elseif go == self.go_table.aorbtn_close2 then
+       self:Close()
+    elseif go == self.go_table.aorbtn_detail then
+        UIManager:GetInstance():OpenWindow(ConfigManager.ui_cfg.ArenaPeakSupDetailView.Name, self.cards[self.curIndex])
+    end
+end
+
+return ArenaPeakSupView

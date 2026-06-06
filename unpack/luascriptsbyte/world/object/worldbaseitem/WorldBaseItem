@@ -1,0 +1,816 @@
+-----------------------------------------------------------------------
+-- Created by 此处填写创建者姓名 on 04. 十二月 2019 10:51
+-- @Description 世界物件基类
+-----------------------------------------------------------------------
+
+local base = require "BaseItem"
+
+---@class WorldBaseItem:BaseItem
+---@field public ItemData WorldItemData 数据
+---@field public IsTrigger boolean 触发状态
+---@field protected BubblesIsOn boolean 下次循环是否播放常态气泡
+---@field protected BubblesUnixTime number 气泡播放标识 只存在一个循环队列
+local WorldBaseItem = _G.BaseClass("WorldBaseItem", base)
+
+---初始特效序列
+local ActionEffectInit = 1
+---交互特效序列
+local ActionEffectInteract = 2
+---交互后特效序列
+local ActionEffectInteracted = 3
+---交互完后的待机动画序列
+local ActionIdleEnd = 2
+---交互图标是否显示序列号
+local InteractionIconShowIndex = 1
+---交互图标Y轴偏移值序列号
+local InteractionIconPosIndex = 2
+
+---@param info BaseItemParam 类型
+---@param data WorldItemData 数据
+---@param world BaseWorld 所属世界
+function WorldBaseItem:__init(info, data, world)
+    self.ItemType = info.itemType
+    self.ItemData = data
+    self.OriginalShowState = not self.ItemData.IsHidden
+end
+function WorldBaseItem:Dispose()
+    self.ItemType = nil
+    self:RemoveAllListeners()
+    _G.WorldCsListener.RemoveTriggerCall(self.InstID)
+    self.RandomNum = nil
+    self.EventRandomNum = nil
+    self.TitleTransform = nil
+    self.ItemData = nil
+    self.OriginalShowState = nil
+    self.TitleTextName = nil
+    self.TriggerComponent = nil
+    self.RolePoint = nil
+    self.actionEffect1 = nil
+    self.actionEffect3 = nil
+    -- if self.setTitlePosTimer then
+    --     self.setTitlePosTimer:Stop()
+    -- end
+    -- self.setTitlePosTimer = nil
+end
+
+function WorldBaseItem:GetShowState()
+    return not self.ItemData.IsHidden
+end
+
+--region 创建
+---世界物件模型创建延迟到进入世界时，因为切换场景做了资源缓存
+function WorldBaseItem:LoadResObj()
+    self:OnLoadResObjComplete()
+end
+---初始化头顶标题
+---@param nameStr string 名字
+function WorldBaseItem:InitTitle(nameStr, resPath, callback)
+    local path = "CommonPrefab/World/Common_Title"
+    if resPath then
+        path = resPath
+    end
+    self.TitleLoading = true
+    _G.PoolsManager:GetInstance():Spawn(
+        path,
+        _G.ePoolType.Default,
+        self.World:GetTitleRoot(),
+        function(title)
+            local go_table = _G.GetAutoGoTable(title)
+            self.TitleTransform = title
+            self.TitleTransform:SetName(self.Uid)
+            self.TitleTextName = go_table.aortext_TextName
+            self.TitleScaleRoot = go_table.trans_root
+            self.TitleTextName.text = nameStr
+            self.TitleTransform:SetLocalPosition(0, 100, 0)
+            if _G.WorldManager:GetInstance():CheckCurSceneType(_G.SceneType.MainWorld) then
+                self.TitleTransform:SetActiveE(0)
+                self.TitleTransformActive = false
+            else
+                self.TitleTransform:SetActiveE(1)
+                self.TitleTransformActive = true
+            end
+            self:SetTitlePos()
+            self.TitleLoading = false
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+function WorldBaseItem:InitObjectModel(model)
+    self.ObjectMod = model
+    if self.ItemData.IsInShadow then
+        _G.GraphicsManager.Instance:SetTargetDarken(self.ObjectMod, 1)
+    end
+    self.IdleEffetTrans = model:FindE("Bone077")
+    self.ObjectMod:SetParentE(self.Transform)
+    self.ObjectMod:SetLocalPosition(0, 0, 0)
+    self.ObjectMod:SetLocalEulerAngles(0, 0, 0)
+    self.AnimComponent = _G.RoleAnimatorController.GetOrCreateAnimatorController(self.Transform, true)
+    self.AnimComponent:HandInit()
+    self.RolePoint = self.ObjectMod:GetComponentE(_G.typeof(_G.CS.RolePoint))
+    self:ShowOrHide(not self.ItemData.IsHidden or self.OriginalShowState)
+
+    if not self.TitleLoading then
+        if _G.IsNil(self.TitleTransform) then
+            self:CreateCurPlayerTitle()
+        else
+            _G.DelayFrameDo(_G.handler(self, self.SetTitlePos))
+            self:AddCommonEffect()
+        end
+    end
+    self:InitSkinnedMeshRenderer()
+    if _G.WorldManager:GetInstance():CheckCurSceneType(_G.SceneType.MainWorld) then
+        if self.Uid ~= 707010810 and self.Uid ~= 707010814 then
+            self.ObjectMod:SetActiveE(0)
+        end
+    else
+        self.ObjectMod:SetActiveE(1)
+    end
+end
+
+function WorldBaseItem:CreateCurPlayerTitle()
+    if self.World.Cfg.IsDisplay then
+        local name
+        if self.ItemData.role_name then
+            name = "<color=#ffee9c>" .. self.ItemData.role_name .. "</color>"
+            self:InitTitle(
+                name,
+                nil,
+                function()
+                    _G.DelayFrameDo(_G.handler(self, self.SetTitlePos))
+                    self:AddCommonEffect()
+                end
+            )
+        end
+    end
+end
+
+---隐藏绑定特效
+function WorldBaseItem:HideEffect(hide)
+    if self.IdleEffetTrans then
+        _G.GameUtil.SetActiveByCondition(self.IdleEffetTrans, not hide)
+    end
+end
+
+---清理模型
+function WorldBaseItem:ClearObjectModel()
+    if _G.IsNil(self.ObjectMod) then
+        return
+    end
+    self:ShowShadow()
+    if self.ItemData.IsInShadow then
+        _G.GraphicsManager.Instance:SetTargetDarken(self.ObjectMod, 0)
+    end
+    self:RemoveCommonEffect()
+
+    if not _G.IsNil(self.ObjectMod) then
+        _G.DestroyImmediate(self.ObjectMod)
+        self.ObjectMod = nil
+    end
+
+    if not _G.IsNil(self.TitleTransform) then
+        _G.DestroyImmediate(self.TitleTransform)
+        self.TitleTransform = nil
+    end
+
+    self.ObjectModActive = false
+    self.TitleTransformActive = false
+    self.FootEffectActive = false
+end
+---创建模型
+function WorldBaseItem:CreateObjectModel()
+    if self.loadModelObj or not _G.IsNil(self.ObjectMod) then
+        return
+    end
+    if self.Cfg and not _G.string.IsNullOrEmpty(self.Cfg.Res) then
+        self.loadModelObj = true
+        local loadfunc = function(tran)
+            self.loadModelObj = nil
+            if _G.IsNil(self.Transform) then
+                tran:DestroyObject()
+                return
+            end
+            self:InitObjectModel(tran)
+        end
+        if _G.string.contains(self.Cfg.Res, "/") then
+            require("CardInfoManager").GetRole(
+                self.Cfg.Res,
+                _G.ePoolType.World,
+                self.Transform,
+                _G.RoleEffTypeEnum.Main,
+                loadfunc
+            )
+        else
+            local trans = _G.WorldManager:GetInstance():GetItemGameObj(self.Cfg.Res)
+            loadfunc(trans)
+        end
+    else
+        self:ShowOrHide(not self.ItemData.IsHidden or self.OriginalShowState)
+    end
+end
+--endregion
+
+---初始化位置
+function WorldBaseItem:InitPosition()
+    if self.ItemData.IsMove and self.AllNode and #self.AllNode > 0 then
+        return
+    end
+    local dicTab = self.ItemData.InitPoint
+    ---@type CS.YoukiaCore.Int2 points
+    local points = dicTab[1]
+    if points ~= nil then
+        self.Transform:SetPosition(points.p_x, points.p_y, points.p_z)
+        self.Transform:SetLocalEulerAngles(points.r_x, points.r_y, points.r_z)
+    end
+end
+---获取名称Y轴偏移值
+---@return number Y轴偏移值
+function WorldBaseItem:GetTitleDeltaY()
+    return _G.ConfigManager.discrete_cfg[103501][1][1]
+end
+---初始化头顶名称位置
+---@param deltaY number Y轴便宜值
+function WorldBaseItem:SetTitlePos()
+    if not _G.IsNil(self.TitleTransform) then
+        local x, y, z = self:GetHeadPoint()
+        if x then
+            self.titleDeltaY = self:GetTitleDeltaY()
+            local x1, y1, z1 = self.Transform:GetPosition()
+            local s = self.TitleTransform:GetLocalScale()
+            self.titleDeltaY = (y - y1 + self.titleDeltaY)
+            self.titlePosX = 0
+            self.titlePosY = 0
+            self.titlePosZ = 0
+            if self.World.WorldSetting then
+                self.World.WorldSetting:TranLookAtCamera(self.TitleTransform, self.Transform)
+            end
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("未找到名字挂载点 Point_Hp.请检测模型 " .. self.Uid)
+            end
+            self.TitleTransform:SetActiveE(0)
+        end
+    end
+end
+function WorldBaseItem:SetTitleScale(scale)
+    if self.TitleScaleRoot then
+        self.TitleScaleRoot:SetworldScaleXYZ(scale)
+    end
+end
+function WorldBaseItem:UpdateTitlePos()
+    if not self.titleDeltaY then
+        return
+    end
+    if _G.IsNil(self.TitleTransform) then
+        return
+    end
+    self.TitleTransform:SetPositionAddY(self.Transform, self.titleDeltaY)
+    -- self.titlePosX, self.titlePosY, self.titlePosZ = self.Transform:GetPosition()
+    -- self.titlePosY = self.titlePosY + self.titleDeltaY
+    -- self.TitleTransform:SetPosition(self.titlePosX, self.titlePosY, self.titlePosZ)
+end
+--region 对触发器响应
+local childTriggerCount = 2
+---添加子触发器
+function WorldBaseItem:AddTriggerComponent(callback)
+    local loadTimes = 0
+    local loadDoneFunc = function()
+        loadTimes = loadTimes + 1
+        if loadTimes >= childTriggerCount then
+            if callback then
+                callback()
+            end
+        end
+    end
+    if not self.TriggerComponent and self.Cfg.Radius > 0 then
+        self:CreateSphereTriggerComponent(
+            "LookAtPlayer",
+            function(trigger)
+                trigger:SetSphereColliderArgs(0, 0, 0, self.Cfg.Radius)
+                trigger:SetTriggerEvent(_G.handler(self, self.NodeTriggerEvent))
+                self.TriggerComponent = trigger
+                loadDoneFunc()
+            end
+        )
+    else
+        loadDoneFunc()
+    end
+    if not self.ActionTriggerComponent and self.Cfg.ActionRadius > 0 then
+        self:CreateSphereTriggerComponent(
+            "ActionTrigger",
+            function(trigger)
+                trigger:SetSphereColliderArgs(0, 0, 0, self.Cfg.ActionRadius)
+                trigger:SetTriggerEvent(_G.handler(self, self.NodeActionTriggerEvent))
+                self.ActionTriggerComponent = trigger
+                loadDoneFunc()
+            end
+        )
+    else
+        loadDoneFunc()
+    end
+end
+---创建圆形触发器
+---@param 变量名 name 触发器名称(节点展示名称)
+---@param callback function 创建后的回调
+function WorldBaseItem:CreateSphereTriggerComponent(name, callback)
+    self:CreateTriggerComponent(
+        name,
+        require("TriggerNode").ColliderType.SphereCollider,
+        {"WorldPlayerItem"},
+        function(trigger)
+            if callback then
+                callback(trigger)
+            end
+            trigger:SetTriggerEnable(true)
+        end
+    )
+end
+-----创建子触发器
+---@param 变量名 变量类型 中文描述
+function WorldBaseItem:CreateTriggerComponent(name, colliderType, acceptItemType, callback)
+    ---@type TriggerNodeCreateArgs
+    local args = {}
+    args.Name = name
+    args.Parent = self
+    args.ColliderType = colliderType
+    args.AcceptItemType = acceptItemType
+    args.CallBack = function(trigger)
+        if callback then
+            callback(trigger)
+        end
+    end
+    require("TriggerNode").Create(args, self.World)
+end
+---设置子触发器开关
+---@param enable boolean 开关
+function WorldBaseItem:SetDynamicTriggerEnable(enable)
+    for _, trigger in pairs(self.DynamicTriggerNode) do
+        trigger:SetTriggerEnable(enable)
+    end
+end
+---设置触发器开关
+---@param enable boolean 开关
+function WorldBaseItem:SetColliderEnable(enable)
+    self.Transform:SetColliderEnable(enable and 1 or 0)
+end
+---注册一个Trigger节点
+---@param triggerNode TriggerNode 根节点资源路径
+function WorldBaseItem:AddDynamicTriggerNode(triggerNode)
+    assert(triggerNode, "triggerNode == nil")
+    if self.DynamicTriggerNode[triggerNode.Name] then
+        return
+    end
+    self.DynamicTriggerNode[triggerNode.Name] = triggerNode
+end
+---移除所有子触发器
+function WorldBaseItem:RemoveAllDynamicTriggerNode()
+    for name, _ in pairs(self.DynamicTriggerNode) do
+        assert(name, "name == nil")
+        local triggerNode = self.DynamicTriggerNode[name]
+        if triggerNode then
+            triggerNode:DestroySelf()
+            self.DynamicTriggerNode[name] = nil
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("triggerNode is nil       ", name)
+            end
+        end
+    end
+end
+---子触发器碰撞
+---@param isEnter boolean 是否是进入
+---@param tarInstId number 碰撞到的物体InstId
+---@param tarObj UnityEngine.GameObject 碰撞到的物体
+---@param luaObj WorldBaseItem 碰撞到的物体Lua对象
+function WorldBaseItem:NodeTriggerEvent(isEnter, tarInstId, tarObj, luaObj)
+end
+-----行为触发
+---@param isEnter boolean 是否是进入
+---@param tarInstId number 碰撞到的物体InstId
+---@param tarObj UnityEngine.GameObject 碰撞到的物体
+---@param luaObj WorldBaseItem 碰撞到的物体Lua对象
+function WorldBaseItem:NodeActionTriggerEvent(isEnter, tarInstId, tarObj, luaObj)
+end
+---触发事件
+---@param isEnter boolean True：进入；False：离开
+---@param tarInstId number 碰撞物体InstID
+---@param tarObj UnityEngine.GameObject 碰撞物体
+function WorldBaseItem:TriggerEvent(isEnter, tarInstId, tarObj)
+end
+-----当物件被点击时的处理函数
+---由子类重写具体的逻辑
+function WorldBaseItem:OnClick()
+end
+--endregion
+
+--region 子类重写
+---添加效果
+function WorldBaseItem:AddCommonEffect()
+end
+---移除效果
+function WorldBaseItem:RemoveCommonEffect()
+    if not _G.IsNil(self.ObjectMod) then
+        self.World.CommonEff:SetSelectState(self.ObjectMod, false)
+    end
+end
+function WorldBaseItem:ShowOrHide(show, force)
+    if force then
+        self.OriginalShowState = show
+    end
+    -- if show == self.curSetEnable then
+    --     return
+    -- end
+    base.ShowOrHide(self, show and self.OriginalShowState)
+    if not _G.WorldManager:GetInstance():CheckCurSceneType(_G.SceneType.MainWorld) then
+        if not _G.IsNil(self.TitleTransform) then
+            _G.GameUtil.SetActiveByCondition(self.TitleTransform, show and self.OriginalShowState)
+        end
+    end
+    if show and self.OriginalShowState then --self.curSetEnable then
+        if self.ObjShowTimer then
+            self.ObjShowTimer:Stop()
+            self.ObjShowTimer = nil
+        end
+        self.ObjShowTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnGameObjShow, self, true, true):Start()
+    else
+        if self.ObjShowTimer then
+            self.ObjShowTimer:Stop()
+            self.ObjShowTimer = nil
+        end
+        self:OnGameObjHide()
+    end
+end
+function WorldBaseItem:OnGameObjShow()
+    if
+        self.Cfg and #self.Cfg.InteractionIcon >= InteractionIconShowIndex and
+            self.Cfg.InteractionIcon[InteractionIconShowIndex] > 0
+     then
+        local show, posy = self:GetShowTagData()
+        if show then
+            _G.Events:GetInstance():Broadcast(require("WorldItemManager").ItemEvent.showTag, self.Uid, true, posy or 0)
+        end
+    end
+    self:ContinueCfgMove()
+end
+function WorldBaseItem:OnGameObjHide()
+    if #self.Cfg.InteractionIcon >= InteractionIconShowIndex and self.Cfg.InteractionIcon[InteractionIconShowIndex] > 0 then
+        _G.Events:GetInstance():Broadcast(require("WorldItemManager").ItemEvent.showTag, self.Uid, false)
+    end
+    self:StopCfgMove()
+end
+function WorldBaseItem:Reset()
+    if _G.IsNil(self.ObjectMod) then
+        if not self.ItemData.IsHidden then
+            self:OnEnterWorld()
+        else
+            self:OnExitWorld()
+        end
+    else
+        self:ShowOrHide(not self.ItemData.IsHidden)
+    end
+    self:InitCfgMove()
+end
+function WorldBaseItem:OnEnterWorld()
+    if self.Cfg.Reveal_condition and #self.Cfg.Reveal_condition > 0 then
+        local conditions = _G.DeepCopyCfgTable(self.Cfg.Reveal_condition)
+        local isReveal = true
+        for i = 1, #conditions do
+            local _t = _G.table.remove(conditions[i], 1)
+            if not _G.GlobalConditionManager.CheckMainEventCondition(_t, conditions[i]) then
+                isReveal = false
+                break
+            end
+        end
+        if isReveal then
+            self.OriginalShowState = self.Cfg.reveal
+        end
+    end
+    self:InitPosition()
+    self:InitCfgMove()
+    self:CreateObjectModel()
+end
+-----退出世界时调用，由子类重写
+function WorldBaseItem:OnExitWorld()
+    self:ClearObjectModel()
+    if not _G.table.isEmptyOrNil(self.actionEffect1) then
+        for key, value in pairs(self.actionEffect1) do
+            if _G.IsNil(value) == false then
+                _G.UIUtils.RemoveEffect(value, _G.ConfigManager.ui_effect_cfg[key].DispoeType)
+            end
+        end
+        self.actionEffect1 = nil
+    end
+    if not _G.table.isEmptyOrNil(self.actionEffect3) then
+        for key, value in pairs(self.actionEffect3) do
+            if _G.IsNil(value) == false then
+                _G.UIUtils.RemoveEffect(value, _G.ConfigManager.ui_effect_cfg[key].DispoeType)
+            end
+        end
+        self.actionEffect3 = nil
+    end
+
+    base.OnExitWorld(self)
+end
+--endregion
+
+--region 特效相关加载
+---特效加载回调
+---@param trans UnityEngine.Transform 特效
+function WorldBaseItem:LoadEffectCallback(trans)
+    self.curLoadEffectTransTable[self.curLoadEffectNames[self.curLoadEffectIndex]] = trans
+    self.curLoadEffectIndex = self.curLoadEffectIndex + 1
+    if self.curLoadEffectIndex > #self.curLoadEffectNames then
+        self.curLoadEffectCallback(_G.DeepCopy(self.curLoadEffectTransTable))
+        self.curLoadEffectIndex = nil
+        self.curLoadEffectTransTable = nil
+        self.curLoadEffectNames = nil
+        self.curLoadEffectRoots = nil
+        self.curLoadEffectCallback = nil
+    end
+end
+---加载特效
+---@param names table 特效名字数组(ui_effect_cfg中key)
+---@param roots table 特效挂在点数组
+---@param callback function 加载返回
+function WorldBaseItem:LoadEffects(names, roots, callback)
+    if _G.table.isEmptyOrNil(names) then
+        callback(nil)
+        return
+    end
+    self.curLoadEffectIndex = 1
+    self.curLoadEffectTransTable = {}
+    self.curLoadEffectNames = names
+    self.curLoadEffectRoots = roots or {}
+    self.curLoadEffectCallback = callback
+    for i = 1, #names do
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg[self.curLoadEffectNames[i]],
+            self:GetChildNode(self.curLoadEffectRoots[i]),
+            _G.handler(self, self.LoadEffectCallback)
+        )
+    end
+end
+--endregion
+
+--region初始化检测
+---检测初始化状态表现
+function WorldBaseItem:CheckInitState()
+    if #self.Cfg.Action > 0 then
+        self:PlayAnimByName(self.Cfg.Action[1])
+    end
+    if not self.curLoadEffectNames and _G.table.isEmptyOrNil(self.actionEffect1) then
+        self:LoadEffects(
+            self.Cfg.ActionEffect[ActionEffectInit],
+            self.Cfg.EffectRoute[ActionEffectInit],
+            function(effects)
+                self.actionEffect1 = effects
+            end
+        )
+    end
+end
+
+---检测交互的特效表现
+function WorldBaseItem:CheckInteractionState(callback)
+    self:LoadEffects(
+        self.Cfg.ActionEffect[ActionEffectInteract],
+        self.Cfg.EffectRoute[ActionEffectInteract],
+        function(effects)
+            if callback then
+                callback(effects)
+            end
+        end
+    )
+end
+
+---检测交互后的表现
+---@param isEndCall boolean 结束是否回调
+---@param endcall function 没有动画直接回调
+function WorldBaseItem:CheckInteractionEndState(isEndCall, endcall)
+    if self.Cfg.Action[ActionIdleEnd] then
+        local name = self.Cfg.Action[ActionIdleEnd]
+        self:PlayAnimByName(name, isEndCall)
+    else
+        self.Transform:SetActiveE(0)
+        if isEndCall and endcall then
+            endcall()
+        end
+    end
+    if not self.curLoadEffectNames and _G.table.isEmptyOrNil(self.actionEffect3) then
+        self:LoadEffects(
+            self.Cfg.ActionEffect[ActionEffectInteracted],
+            self.Cfg.EffectRoute[ActionEffectInteracted],
+            function(effects)
+                self.actionEffect3 = effects
+            end
+        )
+    end
+    if not _G.table.isEmptyOrNil(self.actionEffect1) then
+        for key, value in pairs(self.actionEffect1) do
+            _G.UIUtils.RemoveEffect(value, _G.ConfigManager.ui_effect_cfg[key].DispoeType)
+        end
+        self.actionEffect1 = nil
+    end
+end
+--endregion
+
+--region获取节点和坐标
+---获取子节点,以物体根节点为父级往下找，找不到就返回根节点
+---@param path string 路径
+function WorldBaseItem:GetChildNode(path)
+    if _G.IsNil(self.ObjectMod) then
+        return self.Transform
+    end
+    if _G.string.IsNullOrEmpty(path) then
+        return self.ObjectMod
+    end
+    local node = self.ObjectMod:FindE(path)
+    if _G.IsNil(node) then
+        node = self.ObjectMod
+    end
+    return node
+end
+
+---获取头顶点坐标
+---@return number|number|number x,y,z
+function WorldBaseItem:GetHeadPoint()
+    if _G.IsNil(self.RolePoint) then
+        return nil
+    end
+    if _G.IsNil(self.RolePoint.Point_Hp) then
+        if _G.IsNil(self.RolePoint.Point_Head) then
+            return nil
+        else
+            return self.RolePoint.Point_Head:GetPosition()
+        end
+    end
+    return self.RolePoint.Point_Hp:GetPosition()
+end
+--endregion
+
+---检测交互限制条件
+---@param callback function 播完限制条件提示后的回调
+---@return boolean 是否可交互
+function WorldBaseItem:CheckLimitType(callback)
+    if self.Cfg.LimitType and #self.Cfg.LimitType > 0 then
+        local conditions = _G.DeepCopyCfgTable(self.Cfg.LimitType)
+        local isReveal = true
+        for i = 1, #conditions do
+            local _t = _G.table.remove(conditions[i], 1)
+            local resoult, tips, content = _G.GlobalConditionManager.CheckMainEventCondition(_t, conditions[i])
+            if not resoult then
+                if #self.Cfg.Prompt > 1 then
+                    if self.Cfg.Prompt[1] == 2 then
+                        tips = self.Cfg.Prompt[2] or tips
+                        _G.PopWindowManager:GetInstance():ShowAllTips(tips, content)
+                        if callback then
+                            callback()
+                        end
+                    else
+                        _G.AutomaticPlayStory.PlayStoryByID(self.Cfg.Prompt[2], callback)
+                    end
+                else
+                    if callback then
+                        callback()
+                    end
+                end
+                return false
+            end
+        end
+    end
+    return true
+end
+
+--region新增点击目标
+---检测物体是否为点击的目标物体
+---@param uid number 物件uid
+---@return boolean 是否为目标物体
+function WorldBaseItem:CheckPlayerClickTarget()
+    return self.World.WorldPlayer:CheckClickTarget(self.Uid)
+end
+---设置玩家目标为nil
+function WorldBaseItem:SetPlayerClickTargetNil()
+    self.World.WorldPlayer:SetClickTarget(nil)
+end
+--endregion
+
+--region标签
+---获取显示标签的数据
+---@return boolean 是否显示标签
+function WorldBaseItem:GetShowTagData()
+    if #self.Cfg.InteractionIcon == 0 or self.Cfg.InteractionIcon[InteractionIconShowIndex] == 0 then
+        return false
+    end
+    if self.Transform:GetActiveSelf() == 0 then
+        return false
+    end
+    return true, self.Cfg.InteractionIcon[InteractionIconPosIndex] or 0
+end
+--endregion
+
+--region 配置移动
+---初始化配置移动
+function WorldBaseItem:InitCfgMove()
+    if not self.ItemData.IsMove then
+        return
+    end
+    if self.ItemData.RoutePoints[1] == nil then
+        return
+    end
+    if self.AllNode and #self.AllNode > 0 then
+        self.curCfgMoveIndex = 1
+        return
+    end
+    self.AllNode = {}
+    local points = self.ItemData.RoutePoints[1].Point
+    for i = 1, #points do
+        _G.table.insert(
+            self.AllNode,
+            {x = points[i].x, y = points[i].y, z = points[i].z, ani = points[i].ani, speed = points[i].speed}
+        )
+    end
+    self.curCfgMoveIndex = 1
+end
+---停止配置移动
+function WorldBaseItem:StopCfgMove()
+    if not self.ItemData then
+        return
+    end
+    if not self.ItemData.IsMove then
+        return
+    end
+    if not self.AllNode or #self.AllNode <= 0 then
+        return
+    end
+    self:Move(0)
+end
+---继续配置移动
+function WorldBaseItem:ContinueCfgMove()
+    if not self.ItemData then
+        return
+    end
+    if not self.ItemData.IsMove then
+        return
+    end
+    if not self.AllNode or #self.AllNode <= 0 then
+        return
+    end
+    self.MoveSpeed = self.MaxMoveSpeed * self.AllNode[self.curCfgMoveIndex].speed
+    self.cfgMoveDelay =
+        self.Transform:SetDirection(
+        self.AllNode[self.curCfgMoveIndex].x,
+        self.AllNode[self.curCfgMoveIndex].y,
+        self.AllNode[self.curCfgMoveIndex].z,
+        self.MoveSpeed
+    )
+    self:Move(1, self.MoveSpeed)
+end
+---配置帧移动
+function WorldBaseItem:UpdateMove()
+    if self.MoveStep == 0 then
+        return
+    end
+    if self.cfgMoveDelay and self.cfgMoveDelay <= 0 then
+        self:Move(0)
+        if _G.string.IsNullOrEmpty(self.AllNode[self.curCfgMoveIndex].ani) then
+            self:OnCfgMoveAniPlayEnd(self.AllNode[self.curCfgMoveIndex].ani)
+        else
+            _G.AnimatorPlayEndCallback.AddCallback(
+                _G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE(),
+                _G.handler(self, self.OnCfgMoveAniPlayEnd)
+            )
+            self:PlayAnimByName(self.AllNode[self.curCfgMoveIndex].ani, true)
+        end
+    else
+        self.cfgMoveDelay = self.cfgMoveDelay - _G.Time.deltaTime
+        self.Transform:SetDirection(
+            self.AllNode[self.curCfgMoveIndex].x,
+            self.AllNode[self.curCfgMoveIndex].y,
+            self.AllNode[self.curCfgMoveIndex].z,
+            self.MoveSpeed
+        )
+        self.Transform:SetForwardPosition(self.MoveSpeed, 1, 1)
+    end
+end
+---当配置移动动画播放完成
+---@param name string 动画名称
+function WorldBaseItem:OnCfgMoveAniPlayEnd(name)
+    if name == self.AllNode[self.curCfgMoveIndex].ani then
+        self.curCfgMoveIndex = self.curCfgMoveIndex + 1
+        if self.curCfgMoveIndex > #self.AllNode then
+            self.curCfgMoveIndex = 1
+        end
+        self.MoveSpeed = self.MaxMoveSpeed * self.AllNode[self.curCfgMoveIndex].speed
+        self.cfgMoveDelay =
+            self.Transform:SetDirection(
+            self.AllNode[self.curCfgMoveIndex].x,
+            self.AllNode[self.curCfgMoveIndex].y,
+            self.AllNode[self.curCfgMoveIndex].z,
+            self.MoveSpeed
+        )
+        self:Move(1, self.MoveSpeed)
+    end
+end
+--endregion
+
+return WorldBaseItem

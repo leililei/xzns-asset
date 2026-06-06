@@ -1,0 +1,391 @@
+-----------------------------------------------------------------------
+-- Created by wyx on 19. 十一月 2019 16:19
+--
+-- @Description GameNetTipsManager 登陆游戏时的网络控制器
+-----------------------------------------------------------------------
+--[[
+短线重连成功之后，重新走了一次登录,然后将断线前未发送出去的消息再发送一次
+并根据功能需求重新拉取一次数据
+]]
+---@class GameNetTipsManager : Singleton
+---@field GetInstance fun():GameNetTipsManager
+---@field isSendEnterScence bool 是否发送了进入场景
+---@field mIsReconnectDataSending  bool 是否处于断线重连中
+---@field isFirstLogin bool  是否第一次登录成功，第一次登录消息不处理
+---@field isResendMessage bool  开始发送以前没有发送出去的消息了   这个变量用于确保我当前发送消息的时候断线了，重发的过程中，不走回调
+---@field isResendModel bool  开始发送model重连的消息   这个变量用于确保我断线后重新获取某些消息，重发的过程中，不走回调
+---@field isResendEnterScence bool  开始发送进去场景   这个变量用于确保我断线后重新进入场景，重发的过程中，不走回调
+local GameNetTipsManager = _G.BaseClass("GameNetTipsManager", _G.Singleton)
+_G.GameNetTipsManager = GameNetTipsManager
+local reConnectMax = 3
+--不加入重发列表
+local ignoreCMD = {
+    ---移动位置同步
+    [4907] = true,
+    [3701] = true,
+    [3702] = true
+}
+function GameNetTipsManager:__init()
+    self:AddListener(true)
+    self.mAccessMsgCount = 0
+    self.mIsReconnectDataSending = false
+    self.mMsgList = {}
+    self.ReconnectCount = 0
+    self.isAddListener = false
+    self.isSendEnterScence = false
+    self.isFirstLogin = true
+    self.isResendMessage = false
+    self.isResendModel = false
+    self.isResendEnterScence = false
+end
+
+function GameNetTipsManager:Dispose()
+    self:AddListener(false)
+    self.mAccessMsgCount = nil
+    self.mMsgList = nil
+    self.ReconnectCount = nil
+    self.isAddListener = nil
+    self.isSendEnterScence = nil
+    self.mIsReconnectDataSending = nil
+    self.isFirstLogin = nil
+    self.isResendMessage = nil
+    self.isResendModel = nil
+    self.isResendEnterScence = nil
+end
+
+function GameNetTipsManager:AddListener(add)
+    local eventInstance = _G.Events:GetInstance()
+    -- local csDispatchEventManager = _G.CSDispatchEventManager:GetInstance()
+    if add then
+        if self.isAddListener then
+            return
+        end
+        self.isAddListener = true
+        eventInstance:AddListener(_G.eYKNetEvent.ConnectSuccessComplete, self.OnConnectSuccess, self)
+        eventInstance:AddListener(_G.eYKNetEvent.ConnectStart, self.OnConnectStart, self)
+        eventInstance:AddListener(_G.eYKNetEvent.ConnectFail, self.OnConnectFail, self)
+        eventInstance:AddListener(_G.eYKNetEvent.ConnectedDis, self.OnConnectedDis, self)
+        eventInstance:AddListener(_G.eYKNetEvent.Ping, self.OnPing, self)
+        eventInstance:AddListener(_G.eYKNetEvent.AccessMsg, self.OnAccessMsg, self)
+        eventInstance:AddListener(_G.eYKNetEvent.ReceiveMsg, self.OnReceiveMsg, self)
+        eventInstance:AddListener(_G.eYKNetEvent.ReceiveGlobalMsg, self.OnReceiveGlobalMsg, self)
+        eventInstance:AddListener(_G.eNameUI.OnUserLoginOut, self.OnUserLoginOut, self)
+    else
+        if not self.isAddListener then
+            return
+        end
+        self.isAddListener = false
+        eventInstance:RemoveListener(_G.eYKNetEvent.ConnectSuccessComplete, self.OnConnectSuccess, self)
+        eventInstance:RemoveListener(_G.eYKNetEvent.ConnectStart, self.OnConnectStart, self)
+        eventInstance:RemoveListener(_G.eYKNetEvent.ConnectFail, self.OnConnectFail, self)
+        eventInstance:RemoveListener(_G.eYKNetEvent.ConnectedDis, self.OnConnectedDis, self)
+        eventInstance:RemoveListener(_G.eYKNetEvent.Ping, self.OnPing, self)
+        eventInstance:RemoveListener(_G.eYKNetEvent.AccessMsg, self.OnAccessMsg, self)
+        eventInstance:RemoveListener(_G.eYKNetEvent.ReceiveMsg, self.OnReceiveMsg, self)
+        eventInstance:RemoveListener(_G.eYKNetEvent.ReceiveGlobalMsg, self.OnReceiveGlobalMsg, self)
+        eventInstance:RemoveListener(_G.eNameUI.OnUserLoginOut, self.OnUserLoginOut, self)
+    end
+end
+
+--region监听
+---开始连接
+---@param ip string 服务器地址
+---@param port string 端口号
+function GameNetTipsManager:OnConnectStart(ip, port)
+    self.mIp = self.mIp or ip
+    self.mPort = self.mPort or port
+    if self.mIp ~= ip or self.mPort ~= port then
+        return
+    end
+    self:ShowLoading(true)
+end
+---连接成功
+function GameNetTipsManager:OnConnectSuccess()
+    --断线重连才走这里
+    if self.isFirstLogin then
+        self:ShowLoading()
+        return
+    end
+    local loginManager = _G.LoginManager:GetInstance()
+    self.mIsReconnectDataSending = loginManager.isLoginServerOK
+    loginManager:Login()
+end
+---如果需要就单独写断线重连的蒙版 todo
+function GameNetTipsManager:OnLoginSuccess()
+    --没有消息 去掉蒙版，有消息发送消息
+    self.isResendModel = false
+    self.isResendEnterScence = false
+    self.mAccessMsgCount = 0
+    self.isResendMessage = true
+    if #self.mMsgList <= 0 then
+        self.ReMsgList = nil
+        self:OnReSendMsgOK()
+    else
+        --没有开始发送重连model就把以前没有发出去的消息发送一遍
+        self.ReMsgList = _G.DeepCopy(self.mMsgList)
+        if _G.AppSetting.DEBUG then
+            if #self.ReMsgList > 10 then
+                _G.LogError("重连消息已超过10条，服务器只会缓存10条消息，超过的消息将会导致数据异常，请及时修改")
+            end
+        end
+        --发送前没有发送完成的消息
+        self:ReSendMsg()
+    end
+end
+
+---断线重连发送没有发送的消息完成
+function GameNetTipsManager:OnReSendMsgOK()
+    if not self.isResendMessage then
+        return
+    end
+    self.isResendMessage = false
+    self.isResendModel = true
+    ---发送完成后，判断是否进入了主城，没有进入主城就什么也不管，上面的消息列表会继续走断线重连
+    ---每次都重新发送消息
+    local loginManager = _G.LoginManager:GetInstance()
+    --进入了主城就断线重连每个消息的reconnect
+    if loginManager.GotoMainFinish then
+        _G.LoginManager:GetInstance():ReConnectInitGameData(_G.handler(self, self.OnModelMsgOK))
+    else
+        self:OnModelMsgOK()
+    end
+end
+
+function GameNetTipsManager:OnModelMsgOK()
+    if not self.isResendModel then
+        return
+    end
+    self.isResendModel = false
+    self.isResendEnterScence = true
+    if _G.LoginManager:GetInstance().GotoMainFinish then
+        --在这里有个bug 如果发送这个消息断线了，会进入重发的列表，到时候会调用回调
+        _G.WorldManager:GetInstance():LoginEnterScene(_G.handler(self, self.OnReConnectOK), true)
+    else
+        self:OnReConnectOK()
+    end
+end
+
+function GameNetTipsManager:OnReConnectOK()
+    if not self.isResendEnterScence then
+        return
+    end
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("重连完成并恢复战斗")
+        end
+        CS.BattleManager.GameNetTipsResumeBattle()
+        local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+        if player then
+            player:SetTransformLock(false)
+            player.sendMoveMsg = false
+        end
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("", "<color=red>" .. "断线重连成功" .. "</color>")
+    end
+    self.mIsReconnectDataSending = false
+    --_G.PopWindowManager:GetInstance():ShowAllTips(670110)
+    --  这里如果有其他消息发送就不能去掉蒙版
+    if #self.mMsgList <= 0 then
+        self.ShowLoading()
+    end
+    self.ReconnectCount = 0
+    _G.Events:GetInstance():Broadcast(_G.eYKNetEvent.ReconnectSuccess)
+end
+
+function GameNetTipsManager:DelayFrameDoReLogin()
+    _G.Net.CloseAllConnects()
+    _G.DelayFrameDo(
+        function()
+            self:OnReLoginClick()
+        end
+    )
+end
+
+---连接失败
+function GameNetTipsManager:OnConnectFail()
+    require("TrackingPointModel"):GetInstance():CloseAFKEmBattleViewTracking()
+    _G.Net.CloseAllConnects()
+    self.isSendEnterScence = false
+    local loginManager = _G.LoginManager:GetInstance()
+    ---没有开始发送登录流程就直接提示
+    if not loginManager.isLoginServerOK then
+        self:ShowLoading()
+        _G.ServerManager:GetInstance().canClick = true
+        _G.PopWindowManager:GetInstance():ShowAllTips(180101)
+        return
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("当前连接次数为    " .. self.ReconnectCount, "<color=red>" .. "ReconnectCount" .. "</color>")
+    end
+    --是否进入过主城 或者没有角色
+    if self.ReconnectCount > reConnectMax then
+        self.ReconnectCount = 0
+        if _G.PlayerModel:GetInstance():CheckCreateRole() and not loginManager.GotoMainFinish then
+            _G.PopWindowManager:GetInstance():ShowAllTips(180101)
+            _G.DelayFrameDo(
+                function()
+                    self:OnReLoginClick()
+                end
+            )
+        else
+            self:ShowLoading()
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                180302,
+                nil,
+                _G.handler(self, self.OnReConnectClick),
+                _G.handler(self, self.OnReLoginClick),
+                nil,
+                true
+            )
+        end
+    else
+        self.ReconnectCount = self.ReconnectCount + 1
+        self:ShowLoading(true)
+        if _G.PlayerModel:GetInstance():CheckCreateRole() then
+            CS.BattleManager.GameNetTipsPauseBattle()
+        end
+        _G.Net.NewConnect(self.mIp, self.mPort)
+    end
+end
+
+function GameNetTipsManager:OnReLoginClick()
+    _G.GameMain:ResetGame()
+end
+function GameNetTipsManager:OnReConnectClick()
+    self:ShowLoading(true)
+    self.ReconnectCount = 0
+    self:OnConnectFail()
+end
+---掉线
+function GameNetTipsManager:OnConnectedDis()
+    self:OnConnectFail()
+end
+---心跳包，更新时间
+function GameNetTipsManager:OnPing()
+end
+---OnAccessMsg 发出消息，准备显示loading
+---@param reSendArgs NetSendData 缓存发送的数据
+function GameNetTipsManager:OnAccessMsg(reSendArgs)
+    if not reSendArgs then
+        return
+    end
+    if ignoreCMD[reSendArgs.pbMap.PBCmd] then
+        return
+    end
+    self:ShowLoading(true)
+    self.mAccessMsgCount = self.mAccessMsgCount + 1
+    for i = 1, #self.mMsgList do
+        if self.mMsgList[i].sn == reSendArgs.sn then
+            return
+        end
+    end
+    _G.table.insert(self.mMsgList, reSendArgs)
+end
+
+---断开连接后消息处理（先不管）
+-- function GameNetTipsManager:OnNotConnectMsg(reSendArgs)
+--     _G.table.insert(self.mMsgList, reSendArgs)
+-- end
+
+---OnReceiveMsg 接收消息，如果收到消息和发出消息数量匹配
+---改动原因:cmd和发送的cmd对不上，采用消息序列号判定
+---@param cmd number
+function GameNetTipsManager:OnReceiveMsg(cmd, port)
+    ---@param v NetSendData 清理发送的数据
+    for i, v in ipairs(self.mMsgList) do
+        if v.sn == port then
+            table.remove(self.mMsgList, i)
+            self.mAccessMsgCount = self.mAccessMsgCount - 1
+            --
+            if _G.AppSetting.DEBUG then
+                _G.Log(self.mAccessMsgCount, "消息剩余未处理的数据量>>>>>>>>>>>>>>>>>>>>")
+            end
+            if (self.mAccessMsgCount <= 0) then
+                self.mAccessMsgCount = 0
+                self:ShowLoading()
+            end
+            break
+        end
+    end
+    if self.isResendMessage then
+        self:SendMsg(port)
+    end
+end
+---OnReceiveMsgError消息格式错误
+---@param errorStr string
+function GameNetTipsManager:OnReceiveMsgError(errorStr)
+    if _G.AppSetting.DEBUG then
+        _G.LogError(errorStr, "GameNetTipsManager:OnReceiveMsgError")
+    end
+end
+---OnReceiveGlobalMsg 接收广播推送
+function GameNetTipsManager:OnReceiveGlobalMsg(cmd, args)
+end
+---登出
+function GameNetTipsManager:OnUserLoginOut()
+    self.mAccessMsgCount = 0
+    _G.Net.CloseAllConnects()
+    self:ShowLoading()
+end
+--endregion
+------发送没有发送成功的消息
+function GameNetTipsManager:ReSendMsg()
+    ---@param ReMsgList NetSendData 缓存发送的数据
+    local reSendArgs = self.ReMsgList[1]
+    _G.Net.SendSocket(reSendArgs.pbMap, reSendArgs.sendPBData, reSendArgs.func, reSendArgs.sn)
+end
+
+---循环发送remsglist里面的消息，当这个消息回来的时候在收消息的地方继续循环直到消息发送完为止
+---@param sn number 消息的流水号
+function GameNetTipsManager:SendMsg(sn)
+    --没有或者为空的时候直接返回
+    if self.ReMsgList == nil then
+        return
+    end
+    local count = #self.ReMsgList
+    if count <= 0 then
+        return
+    end
+    --如果收到的消息里面有相同的流水号，就接着发送下一个，如果这里面没有了，就返回OnReSendMsgOK()
+    local isRe = false
+    for i = 1, count do
+        if self.ReMsgList[i].sn == sn then
+            _G.table.remove(self.ReMsgList, i)
+            isRe = true
+            break
+        end
+    end
+    if isRe then
+        if count > 1 then
+            local msg = self.ReMsgList[1]
+            _G.Net.SendSocket(msg.pbMap, msg.sendPBData, msg.func, msg.sn)
+        else
+            self.ReMsgList = nil
+            self:OnReSendMsgOK()
+        end
+    end
+end
+
+---ShowLoading 是否需要遮罩
+---@param showMask boolean 遮罩开关
+function GameNetTipsManager:ShowLoading(showMask)
+    if nil == showMask then
+        showMask = false
+    end
+    if _G.AppSetting.DEBUG then
+        _G.Log(showMask, "<color=red><size=18>" .. "网络通信遮罩开关接口调用，设置状态为" .. "</size></color>")
+    end
+    local name = _G.ConfigManager.ui_cfg.GameNetTipsView.Name
+    if not showMask or require("BaseGameNet"):GetInstance().IsLocal then
+        _G.UIManager:GetInstance():HideWindow(name)
+        return
+    end
+    if _G.UIManager:GetInstance():IsActiveWindow(name) then
+        _G.UIManager:GetInstance():ShowWindow(name)
+    else
+        _G.UIManager:GetInstance():OpenWindow(name)
+    end
+end

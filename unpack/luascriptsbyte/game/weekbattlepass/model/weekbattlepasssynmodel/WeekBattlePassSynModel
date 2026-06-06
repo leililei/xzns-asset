@@ -1,0 +1,204 @@
+-----------------------------------------------------------------------
+-- 功能名称：    WeekBattlePassSynModel.lua
+-- Created by cy
+-- DateTime: 2025/11/03
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+local ActivitySynManager = require "ActivitySynManager"
+local base = require "ActivitySynTypeBase"
+---@class WeekBattlePassSynModel : Singleton    中文描述
+local WeekBattlePassSynModel = _G.BaseClass("WeekBattlePassSynModel", base)
+
+function WeekBattlePassSynModel:__init()
+    self.curActivityClass:AddStateChanged(self.StateChanged, self)
+end
+
+function WeekBattlePassSynModel:OnHandleGMData(msg)
+    self:ParseData(msg)
+end
+
+function WeekBattlePassSynModel:StateChanged(state)
+    if state == ActivitySynManager.State.Close then
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.WeekBattlePassView.Name)
+        if view then
+            view:Close()
+        end
+    end
+end
+
+---进入活动主体
+function WeekBattlePassSynModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.WeekBattlePassView.Name, self.curActivityClass)
+end
+
+---
+---@protected
+function WeekBattlePassSynModel:CheckIsGet(sid)
+    return _G.table.ContainsValue(self.award_list, sid) == true
+end
+
+---获取当前拍脸图显示
+function WeekBattlePassSynModel:GetShowPLT()
+    if self.curActivityClass.curState and self.curActivityClass.curState == ActivitySynManager.State.Open then
+        -- body
+        local time = _G.PlayerPrefsManager.GetInt("WeekBattlePass")
+        if time == 0 or _G.PlayerPrefsManager.GetInt("WeekBattlePass") ~= _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime()) then
+            if self.state == 0 or (self.state == 1 and self:CheckGetAward() == 1) then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---
+---@protected
+function WeekBattlePassSynModel:GetGiftState()
+    return self.state
+end
+
+function WeekBattlePassSynModel:GetAwardCfg()
+    return self.awardCfg
+end
+
+function WeekBattlePassSynModel:GetGiftCfg()
+    return self.giftCfg
+end
+
+---@param msg activity_dispatch.i_activity_dispatch_brief
+function WeekBattlePassSynModel:ParseData(msg)
+    self.data = msg.week_sign
+    self.award_list = self.data.award_list or {}
+    self.state = self.data.state
+    self.giftCfg = self.data.activity_week_sign_cfg
+    self.awardCfg = self.data.award_cfg
+    base.ParseData(self)
+end
+
+---购买礼包
+function WeekBattlePassSynModel:BuyGift(callBack)
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    self.mallCall = callBack
+    -- self.state = 1
+
+    require("MallManager"):GetInstance():BuyActiveGift(self.giftCfg.price, self.curActivityClass:GetActivityID(),
+        self.giftCfg.sid)
+end
+
+function WeekBattlePassSynModel:OnMallCashListener(data)
+    if data.sid == self.giftCfg.sid then
+        self.state = 1
+
+        if self.mallCall then
+            self.mallCall()
+            self.mallCall = nil
+        end
+        self:UpdateRedPoint(2)
+        _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    end
+end
+
+---获取结算奖励
+function WeekBattlePassSynModel:GetAward(ids, callback)
+    self:GetActivityAward(ids, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        for i, v in ipairs(ids) do
+            _G.table.insert(self.award_list, v)
+        end
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        self:UpdateRedPoint(2)
+        if callback then
+            callback()
+        end
+    end
+    )
+end
+
+---
+---@protected
+function WeekBattlePassSynModel:ChangeOpenViewRed()
+    local popView = _G.PlayerPrefsManager.GetInt("WeekBattlePass" .. self.curActivityClass:GetActivityID(), 0)
+    if popView == 0 then
+        _G.PlayerPrefsManager.SetInt("WeekBattlePass" .. self.curActivityClass:GetActivityID(), 1)
+        self:UpdateRedPoint(1)
+    end
+end
+
+---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function WeekBattlePassSynModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckOpnVew, self.CheckGetAward }
+    self.redpointTree = { { 2 }, false }
+end
+
+---检测是否打开界面
+function WeekBattlePassSynModel:CheckOpnVew()
+    if _G.PlayerPrefsManager.GetInt("WeekBattlePass" .. self.curActivityClass:GetActivityID(), 0) == 0 then
+        return 1
+    end
+    return 0
+end
+
+---检测是否有奖励可领
+function WeekBattlePassSynModel:CheckGetAward()
+    if self.state == 1 then
+        local num = self:GetDayNum()
+        for i, v in ipairs(self.awardCfg) do
+            if _G.table.ContainsValue(self.award_list, v.sid) == false then
+                if num >= v.week then
+                    return 1
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---
+---@protected
+function WeekBattlePassSynModel:CheckCanGetAward(data)
+    local num = self:GetDayNum()
+    if num >= data.week then
+        return true
+    end
+    return false
+end
+
+---获取是第几周
+function WeekBattlePassSynModel:GetDayNum()
+    local day = _G.TimeUtil.GetInterValDayByGame(self.curActivityClass.cfg.time.start_time,
+        _G.TimeUtil.GetServerUnixTime())
+    return (day / 7) + 1
+end
+
+---刷新红点
+function WeekBattlePassSynModel:UpdateRedPoint(index)
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(index))
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function WeekBattlePassSynModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---是否显示按钮(用于功能作为某一界面中的功能使用，建议将该功能设置为独立按钮)
+function WeekBattlePassSynModel:IsShowBtn()
+    return true
+end
+
+---销毁对象时,析构函数
+function WeekBattlePassSynModel:Dispose()
+    if self.curActivityClass then
+        self.curActivityClass:RemoveStateChanged(_G.handler(self, self.StateChanged), self)
+    end
+end
+
+return WeekBattlePassSynModel

@@ -1,0 +1,265 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.CardInherit.Model.CardInheritModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2025/02/24
+-- Description: 角色传承数据类
+-----------------------------------------------------------------------
+local CardInheritNet = require("CardInheritNet")
+
+local base = _G.GameDataModelBase
+---@class CardInheritModel : GameDataModelBase
+---@field posData card.i_field[]
+local CardInheritModel = _G.BaseClass("CardInheritModel", base)
+
+---@return CardInheritModel CardInheritModel
+function CardInheritModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function CardInheritModel:__init()
+    self.inheritInfo = {}
+end
+
+---从服务器拉取数据
+function CardInheritModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+function CardInheritModel:GetInfo()
+    CardInheritNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg card_inherit.s2c_card_inherit_info
+function CardInheritModel:ParseData(msg)
+    local inherits = msg.inherits or {}
+    self.inheritInfo = {}
+    for _, v in pairs(inherits) do
+        if self.inheritInfo[v.sid] == nil then
+            self.inheritInfo[v.sid] = {}
+        end
+        if v.index_list then
+            for _, index in pairs(v.index_list) do
+                self.inheritInfo[v.sid][index] = true
+            end
+        end
+    end
+    self.attribute = nil --清空缓存数据(如果有)
+    self.super.ParseData(self)
+end
+
+---解锁单个传承
+function CardInheritModel:UnlockSingleInherit(sid, index, call)
+    self:UnlockMultiInherit(sid, {index}, call)
+end
+
+---解锁多个传承
+function CardInheritModel:UnlockMultiInherit(sid, indexLis, call)
+    local pbData = {sid = sid, index_list = indexLis}
+    CardInheritNet:GetInstance():Unlock(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if self.inheritInfo[sid] == nil then
+                self.inheritInfo[sid] = {}
+            end
+            for _, v in pairs(indexLis) do
+                self.inheritInfo[sid][v] = true
+            end
+            self:UpdateAttribut()
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Inherit)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.CardInherit.id)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---计算所有传承总星级, 理论能解锁的点位
+function CardInheritModel:GetInheritStar()
+    local showGod = _G.GlobalConditionManager.CheckConditionArrays(_G.ConfigManager.discrete_cfg[106706])
+    local sidStar = {}
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    for _, card in pairs(cards) do
+        --传奇角色必须满足showgod条件
+        if #card.cfg.inherit > 0 and (not require "CardInfoManager":GetInstance():CheckMultiMatchCOP(card.cfg.Elements_new, _G.CardElementType.God) or showGod) then
+            if sidStar[card.sid] == nil or card.star > sidStar[card.sid].star then
+                sidStar[card.sid] = card
+            end
+        end
+    end
+    local inheritStar = {}
+    local inheritIndex = {}
+    for _, cfg in pairs(_G.ConfigManager.card_inherit_cfg) do
+        inheritStar[cfg.id] = 0
+        for _, _sid in pairs(cfg.cards) do
+            if sidStar[_sid] then
+                inheritStar[cfg.id] = inheritStar[cfg.id] + sidStar[_sid].star
+            end
+        end
+        inheritIndex[cfg.id] = {}
+        for i, _star in pairs(cfg.condition_star1) do
+            if inheritStar[cfg.id] >= _star then
+                _G.table.insert(inheritIndex[cfg.id], i)
+            end
+        end
+    end
+    return sidStar, inheritStar, inheritIndex
+end
+
+---检测传承失效（回退、吃卡、升星、获得卡牌后）
+---@param isAdd boolean 是否是升星/获得卡牌调用，需要刷新红点
+function CardInheritModel:CheckInheritBuffLock(isAdd)
+    local isChange = false
+    local sidStar, inheritStar, inheritIndex = self:GetInheritStar()
+    local card_inherit_cfg = _G.ConfigManager.card_inherit_cfg
+    ---@type card_inherit_cfg
+    local iCfg
+
+    for sid, v in pairs(self.inheritInfo) do
+        iCfg = card_inherit_cfg[sid]
+        if iCfg then
+            for index, _ in pairs(v) do
+                if inheritStar[sid] < iCfg.condition_star1[index] then ---不再满足条件
+                    self.inheritInfo[sid][index] = nil
+                    isChange = true
+                end
+            end
+        end
+    end
+    if isChange then
+        self:UpdateAttribut()
+        _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Inherit)
+    end
+    if isAdd then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.CardInherit.id)
+    end
+end
+
+---获取可解锁的传承节点
+function CardInheritModel:GetCanUnlockBuff(sidStar, inheritStar, inheritIndex)
+    if inheritIndex == nil then
+        sidStar, inheritStar, inheritIndex = self:GetInheritStar()
+    end
+    local canUnlock = {}
+    for sid, indexLis in pairs(inheritIndex) do
+        for _, index in pairs(indexLis) do
+            if not self:GetBuffIsUnlock(sid, index) then
+                if canUnlock[sid] == nil then
+                    canUnlock[sid] = {}
+                end
+                _G.table.insert(canUnlock[sid], index)
+            end
+        end
+    end
+    return canUnlock, sidStar, inheritStar, inheritIndex
+end
+
+---传承点位是否激活
+function CardInheritModel:GetBuffIsUnlock(sid, index)
+    return self.inheritInfo[sid] and self.inheritInfo[sid][index] or false
+end
+
+function CardInheritModel:GetAttributeDicById(sid, split)
+    ---@type card_inherit_cfg
+    local cfg = _G.ConfigManager.card_inherit_cfg[sid]
+    local attribute_cfg = _G.ConfigManager.attribute_cfg
+    local attrs = {}
+    ---@type attribute_cfg
+    local aCfg
+    if split then
+        for i = 1, #cfg.att1 do
+            aCfg = attribute_cfg[cfg.att1[i][1]]
+            for j = 1, #aCfg.attribute do
+                if self:GetBuffIsUnlock(sid, i) then
+                    _G.table.insert(attrs, aCfg.attribute[j])
+                end
+            end
+        end
+    else
+        local attrDic = {}
+        local att
+        for i = 1, #cfg.att1 do
+            aCfg = attribute_cfg[cfg.att1[i][1]]
+            for j = 1, #aCfg.attribute do
+                att = aCfg.attribute[j]
+                if attrDic[att[1]] == nil then
+                    attrDic[att[1]] = {}
+                end
+                if attrDic[att[1]][att[2]] == nil then
+                    attrDic[att[1]][att[2]] = 0
+                end
+                if self:GetBuffIsUnlock(sid, i) then
+                    attrDic[att[1]][att[2]] = attrDic[att[1]][att[2]] + _G.tonumber(att[3])
+                end
+            end
+        end
+        for k, v in pairs(attrDic) do
+            for _type, num in pairs(v) do
+                _G.table.insert(attrs, {k, _type, _G.tostring(num)})
+            end
+        end
+    end
+    return attrs
+end
+
+function CardInheritModel:UpdateAttribut()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    local tonumber = _G.tonumber
+    local card_inherit_cfg = _G.ConfigManager.card_inherit_cfg
+    local attribute_cfg = _G.ConfigManager.attribute_cfg
+    ---@type card_inherit_cfg
+    local iCfg
+    ---@type attribute_cfg
+    local aCfg
+    local value, name, aType
+    for sid, v in pairs(self.inheritInfo) do
+        iCfg = card_inherit_cfg[sid]
+        if iCfg then
+            for index, _ in pairs(v) do
+                aCfg = attribute_cfg[iCfg.att1[index][1]]
+                for _, attr in pairs(aCfg.attribute) do
+                    value = tonumber(attr[3])
+                    name = attr[1]
+                    aType = attr[2] == "1" and _G.AttCountType.other or tonumber(attr[2])
+                    attribute:AddValueByName(name, AttributeClassManager:GetValueWithName(name, value, aType), false, aType)
+                end
+            end
+        end
+    end
+    self.attribute = attribute
+end
+
+---获取传承属性
+function CardInheritModel:GetAllAttribute()
+    if self.attribute == nil then
+        self:UpdateAttribut()
+    end
+    local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(self.attribute)
+    return self.attribute, changeAttrTypes
+end
+
+---添加/移除卡牌
+function CardInheritModel:AddOrRemoveCard(add, rem, change)
+    if add then
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.CardInherit.id)
+    end
+end
+
+function CardInheritModel:CheckRedPoint()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.PlayerTree) then
+        return false
+    end
+    local canUnlock, _, _, _ = self:GetCanUnlockBuff()
+    return not _G.table.isEmptyOrNil(canUnlock)
+end
+
+---销毁对象时,析构函数
+function CardInheritModel:Dispose()
+end
+
+return CardInheritModel

@@ -1,0 +1,520 @@
+local TradingCardsNet = require("TradingCardsNet")
+local RedPointManager = require("RedPointManager")
+local TradingCardsCollectAlbumData = require("TradingCardsCollectAlbumData")
+
+---region ===============================枚举定义===============================
+
+---图册品质配置
+local CollectAlbumQualityImgs = {
+    [3] = { "ui_jk_kb_zi", "ui_di_mz_zi", "ui_img_gq_zi", "ui_jk_dikuang_jl_zi" },
+    [4] = { "ui_jk_kb_jin", "ui_di_mz_jin", "ui_img_gq_jin", "ui_jk_dikuang_jl_jin" },
+    [5] = { "ui_jk_kb_hong", "ui_di_mz_hong", "ui_img_gq_hong", "ui_jk_dikuang_jl_hong" },
+    [6] = { "ui_jk_kb_cheng", "ui_di_mz_cheng", "ui_img_gq_cheng", "ui_jk_dikuang_jl_jin" },
+    [7] = { "ui_jk_kb_cai", "ui_di_mz_cai", "ui_img_gq_cai", "ui_jk_dikuang_jl_cai" },
+}
+
+---颜色品质配置
+local CollectAlbumQualityColor = {
+    [3] = _G.ColorTools.FormatColorByString("071d64"),
+    [4] = _G.ColorTools.FormatColorByString("2e1a74"),
+    [5] = _G.ColorTools.FormatColorByString("633c0a"),
+    [6] = _G.ColorTools.FormatColorByString("46110c"),
+    [7] = _G.ColorTools.FormatColorByString("052e37")
+}
+
+-- endregion
+
+---@class TradingCardsModel: GameDataModelBase
+---@field cfg trading_card_album_cfg                                                @功能基础配置
+---@field extraCoinCallbacks table<number,function>
+--------------------------------------------------------------------------------
+---@field collectFullAward boolean                                                  @全收集奖励领取状态
+---@field collectAlbums table<number,TradingCardsCollectAlbumData>                  @集卡图册列表_<图册id, 图册实例>
+---@field coolectAlbumReverseCards table<number,TradingCardsCollectAlbumData>       @集卡图册_<卡牌id, 图册实例>_反向映射
+--------------------------------------------------------------------------------
+local TradingCardsModel = _G.BaseClass("TradingCardsModel", _G.GameDataModelBase)
+
+TradingCardsModel.CollectAlbumQualityImgs = CollectAlbumQualityImgs
+TradingCardsModel.CollectAlbumQualityColor = CollectAlbumQualityColor
+
+function TradingCardsModel:__init()
+    self.isOpen = false
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.game_trading_card_exchange_list_change.Cmd,
+    self.P2CUpdateChangeList, self)
+end
+
+function TradingCardsModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.game_trading_card_exchange_list_change.Cmd,
+    self.P2CUpdateChangeList, self)
+end
+
+---@param activity TradingCardsSynModel
+function TradingCardsModel:GetInfo(albumId, activity, initCall)
+    self.albumId = albumId
+    self.activity = activity
+    self.initCall = initCall
+    self.RedPointTree = activity.RedPointTree
+    TradingCardsNet:GetInstance():GetInfo(albumId, _G.handler(self, self.GetInfoCall))
+end
+
+function TradingCardsModel:GetInfoCall(msg)
+    self.isOpen = true
+    self.alibumList = msg.alibum_list or {}
+    self.record_list = msg.record_list or {}
+    _G.table.insert(self.alibumList, self.albumId)
+    _G.SortList(self.alibumList, function (item)
+        return item
+    end)
+    self:InitCollect(msg.album_info)
+    self:InitChangeList(msg.self_info)
+    require("RedPointManager"):GetInstance():AddRedPointChild(_G.ConfigManager.redpoint_cfg.TradingCards.id, self:GetRedpointIDByIndex(1))
+    if self.initCall then
+        self.initCall()
+    end
+end
+
+function TradingCardsModel:CheckOpen()
+    return self.isOpen
+end
+
+--- 获取属性加成
+function TradingCardsModel:GetAllAttr()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    if self.collectAlbums then
+        for _, album in pairs(self.collectAlbums) do
+            album:GetAttr(attribute)
+        end
+    end
+    local changeAttrTypes = AttributeClassManager:GetChangeAttrTypes(attribute)
+    return attribute, changeAttrTypes
+end
+
+--region 红点
+
+function TradingCardsModel:GetRedpointIDByIndex(index)
+    return self.activity:GetRedpointIDByIndex(index)
+end
+
+--endregion
+
+
+---region ===============================集卡===============================
+
+---初始化集卡数据
+function TradingCardsModel:InitCollect(msg)
+    self.collectAlbums = {}
+    self.coolectAlbumReverseCards = {}
+    self.collectFullAward = {}
+    for _, v in pairs(msg) do
+        local cfg = _G.ConfigManager.trading_card_album_cfg[v.album_sid]
+        -- 初始化图集数据
+        if cfg then
+            for _, sid in ipairs(cfg.albums) do
+                local collectCfg = _G.ConfigManager.trading_card_collection_cfg[sid]
+                if cfg then
+                    self.collectAlbums[sid] = TradingCardsCollectAlbumData.New(collectCfg, v.album_sid)
+                else
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError(string.format("找不到trading_card_collection_cfg配置id=%s", sid))
+                    end
+                end
+            end
+            -- 反向映射
+            for _, album in pairs(self.collectAlbums) do
+                local cardIds = album:GetCards()
+                if cardIds and #cardIds > 0 then
+                    for _, cardId in ipairs(cardIds) do
+                        if _G.AppSetting.DEBUG and self.coolectAlbumReverseCards[cardId] then
+                            _G.LogError(string.format("图册%s和%s 包含的卡牌id %s 重复",
+                                self.coolectAlbumReverseCards[cardId].cfg.id, album.cfg.id, cardId))
+                        end
+                        self.coolectAlbumReverseCards[cardId] = album
+                    end
+                end
+            end
+            self.collectFullAward[v.album_sid] = v.album_claimed
+        end
+
+        -- 拥有的卡牌数量
+        if v.card_list then
+            for _, card in ipairs(v.card_list) do
+                local album = self.coolectAlbumReverseCards[card.key]
+                if album then
+                    album:SetCardNumber(card.key, card.value)
+                end
+            end
+        end
+        -- 图册卡牌激活进度
+        if v.album_progress then
+            for _, progress in ipairs(v.album_progress) do
+                local album = self.collectAlbums[progress.collection_id]
+                if album and progress.card_sid then
+                    for _, cardId in ipairs(progress.card_sid) do
+                        album:SetCardActive(cardId)
+                    end
+                end
+            end
+        end
+        -- 图册奖励领取状态
+        if v.claimed_collections then
+            for _, collect in ipairs(v.claimed_collections) do
+                local album = self.collectAlbums[collect]
+                if album then
+                    album:SetReceivedAward(true)
+                end
+            end
+        end
+    end
+end
+
+---获取图册列表
+---@return TradingCardsCollectAlbumData[]
+function TradingCardsModel:GetCollectAlbums(albumId)
+    local results = {}
+    for _, id in pairs(_G.ConfigManager.trading_card_album_cfg[albumId].albums) do
+        if self.collectAlbums[id] then
+            _G.table.insert(results, self.collectAlbums[id])
+        end
+    end
+    return results
+end
+
+---全图集收集奖励
+---@return number[][]
+function TradingCardsModel:GetCollectAwardCfg(albumId)
+    local cfg = _G.ConfigManager.trading_card_album_cfg[albumId]
+    if not cfg then
+        return nil
+    end
+    return cfg.reward
+end
+
+---是否已领取全收集奖励
+---@return boolean
+function TradingCardsModel:IsReceiveCollectAward(albumId)
+    return self.collectFullAward[albumId] or false
+end
+
+---卡牌是否已激活
+---@param cardId number
+---@return boolean
+function TradingCardsModel:IsCollectActiveCard(cardId)
+    local album = self.coolectAlbumReverseCards[cardId]
+    if not album then
+        return false
+    end
+    return album:IsCardActive(cardId)
+end
+
+---获取可用卡牌数量
+---@param cardId number
+---@return number
+function TradingCardsModel:GetCollectCardNumber(cardId)
+    local album = self.coolectAlbumReverseCards[cardId]
+    if not album then
+        return 0
+    end
+    return album:GetCardNumber(cardId)
+end
+
+function TradingCardsModel:GetCanUseCardNum(cardId)
+    local count = self:GetCollectCardNumber(cardId)
+    if count > 0 then
+        local lis = self:GetChangeList()
+        local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+        for _, v in pairs(lis) do
+            if v.from_role_uid == uid then
+                if _G.table.ContainsValue(v.give_card_sids, cardId) then
+                    count = count - 1
+                end
+            end
+        end
+    end
+    return count
+end
+
+--- 获取
+function TradingCardsModel:GetCollectActiveNum()
+end
+
+-- endregion
+
+---region ===============================换卡===============================
+
+function TradingCardsModel:InitChangeList(msg)
+    self.exchangeCount = msg.exchange_times or 0
+    self.pubilshCount = msg.publish_times or 0
+    self.pubilshTime = msg.last_publish_time or 0
+    self.changeList = {}
+    self.selfChangeList = {}
+    self:GetExchangeCardList(function(msg)
+        self.changeList = msg.exchanges or {}
+    end)
+end
+
+function TradingCardsModel:GetChangeList()
+    return self.changeList
+end
+
+--- 获取自己的被交换的交换
+function TradingCardsModel:GetSelfChangeList()
+    return self.selfChangeList
+end
+
+function TradingCardsModel:ResetSelfChangeList()
+    self.selfChangeList = {}
+end
+
+--- 确认当前的交换是否存在
+function TradingCardsModel:CheckExistExchange(exchange_id)
+    for _, v in pairs(self.changeList) do
+        if exchange_id == v.exchange_id then
+            return true
+        end
+    end
+    return false
+end
+
+---判断发布交换的cd
+function TradingCardsModel:CheckPubilshCd()
+    return self.pubilshTime + _G.ConfigManager.discrete_cfg[202203][1][1] < _G.TimeUtil.GetServerUnixTime()
+end
+
+-- endregion
+
+---region ===============================网络接口===============================
+
+---获取换卡列表
+---@param page number       页码
+---@param count number      每页数量
+---@param callback fun(msg:trading_card.s2c_get_exchange_list):void 回调
+function TradingCardsModel:GetExchangeCardList(callback)
+    TradingCardsNet:GetInstance():GetExchangeCardList(function(msg)
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---发布交换请求
+function TradingCardsModel:PubilshExchange(give_card_sids, want_card_sid, callback)
+    TradingCardsNet:GetInstance():PubilshExchange(self.albumId, give_card_sids, want_card_sid, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.pubilshTime = _G.TimeUtil.GetServerUnixTime()
+        self.pubilshCount = self.pubilshCount + 1
+        _G.table.insert(self.changeList, 1, msg.exchange)
+        if callback then
+            callback()
+        end
+    end)
+end
+
+---交换卡牌
+---@param exchangeData trading_card.i_exchange_info    交换信息
+---@param cardId number                                         交换的卡牌id
+function TradingCardsModel:ExchangeCard(exchangeData, cardId, callback)
+    TradingCardsNet:GetInstance():Exchange(self.albumId, exchangeData.exchange_id, cardId, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.exchangeCount = self.exchangeCount + 1
+        local albumRedpointId = self:GetRedpointIDByIndex(self.RedPointTree.Collect)
+        -- 添加卡牌
+        if self.coolectAlbumReverseCards then
+            local album = self.coolectAlbumReverseCards[cardId]
+            if album then
+                album:ChangeCardNumber(cardId, 1)
+                if not album:IsCardActive(cardId) then
+                    RedPointManager:GetInstance():RefreshNode(albumRedpointId, cardId)
+                end
+            end
+            album = self.coolectAlbumReverseCards[exchangeData.want_card_sid]
+            if album then
+                album:ChangeCardNumber(exchangeData.want_card_sid, -1)
+            end
+        end
+
+        local delIndex = false
+        for k, v in pairs(self.changeList) do
+            if v.exchange_id == exchangeData.exchange_id then
+                delIndex = k
+                break
+            end
+        end
+        if delIndex then
+            _G.table.remove(self.changeList, delIndex)
+        end
+
+        _G.Events:GetInstance():Broadcast(_G.TradingCards.NewCards)
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---执行抽卡
+---@param albumId number        @卡册id
+---@param itemSid number        @道具id
+---@param num number        @抽卡次数
+---@param callback fun(msg:activity_trading_card.s2c_draw):void 完成回调
+function TradingCardsModel:Draw(itemList, callback)
+    TradingCardsNet:GetInstance():Draw(itemList, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+
+        local albumList = {}
+        if msg.award and self.coolectAlbumReverseCards then
+            for _, v in ipairs(msg.award.item) do
+                local album = self.coolectAlbumReverseCards[v.type[1]]
+                if album then
+                    album:ChangeCardNumber(v.type[1], v.type[2])
+                    albumList[album.albumId] = album.albumId
+                end
+            end
+        end
+        for _,item in pairs(itemList) do
+            _G.StorageManager:GetInstance():ConsumeItem(item.key, 0, item.value)
+        end
+
+        -- 广播事件
+        _G.Events:GetInstance():Broadcast(_G.TradingCards.NewCards)
+
+        local albumRedpointId = self:GetRedpointIDByIndex(self.RedPointTree.Album)
+        for _,albumId in pairs(albumList) do
+            RedPointManager:GetInstance():RefreshNode(albumRedpointId, albumId)
+        end
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---激活卡牌
+---@param albumId number
+---@param cardId number
+---@param callback fun(msg:public.s2c_common_ack):void
+function TradingCardsModel:ActiveCard(albumId, cardId, callback)
+    local album = self.coolectAlbumReverseCards[cardId]
+    if not albumId or not album or album:IsCardActive(cardId) or album:GetCardNumber(cardId) <= 0 then
+        return
+    end
+    local id = _G.ConfigManager.trading_card_cfg[cardId].card_collection
+    TradingCardsNet:GetInstance():ActiveCard(albumId, id, cardId, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        -- 扣除卡牌奖励
+        album:SetCardActive(cardId)
+        album:ChangeCardNumber(cardId, -1)
+        -- 获取奖励
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        -- 广播事件
+        _G.Events:GetInstance():Broadcast(_G.TradingCards.UpdateCard, cardId)
+        _G.Events:GetInstance():Broadcast(_G.TradingCards.UpdateAlbum, album.cfg.id)
+
+        -- 刷新红点
+        RedPointManager:GetInstance():RefreshNode(self:GetRedpointIDByIndex(self.RedPointTree.Album), albumId)
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---领取图集收集奖励
+---@param albumId number    @卡册id
+---@param collectionId number    @图集id
+---@param callback fun(msg:public.s2c_common_ack):void 完成回调
+function TradingCardsModel:GetCollectAward(albumId, collectionId, callback)
+    local album = self.collectAlbums and self.collectAlbums[collectionId]
+    if not album or album:IsReceivedAward() then
+        return
+    end
+
+    TradingCardsNet:GetInstance():GetCollectAward(albumId, collectionId, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        -- 激活奖励
+        album:SetReceivedAward(true)
+        -- 获取奖励
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        -- 广播事件
+        _G.Events:GetInstance():Broadcast(_G.TradingCards.UpdateAlbum, collectionId)
+
+        -- 刷新红点
+        RedPointManager:GetInstance():RefreshNode(self:GetRedpointIDByIndex(self.RedPointTree.Album), albumId)
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---全部卡牌激活奖励
+---@param albumId number 卡册id
+---@param callback fun(msg:public.s2c_common_ack):void 完成回调
+function TradingCardsModel:GetAlbumAward(albumId, callback)
+    TradingCardsNet:GetInstance():GetAlbumAward(albumId, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        -- 全收集奖励
+        self.collectFullAward[albumId] = true
+        -- 获取奖励
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        -- 刷新红点
+        RedPointManager:GetInstance():RefreshNode(self:GetRedpointIDByIndex(self.RedPointTree.Album), albumId)
+
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---服务器推送卡牌交换
+---@param info activity_trading_card.p2c_exchange_list_change
+function TradingCardsModel:P2CUpdateChangeList(info)
+    if info.exchanges and info.exchanges.from_role_uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+        return
+    end
+    if info.type == 1 then
+        -- 发布
+        _G.table.insert(self.changeList, 1, info.exchanges)
+    elseif info.type == 2 then
+        -- 交换
+        local delIndex = false
+        local playerUid = _G.PlayerModel:GetInstance():GetPlayerUid()
+        for k, v in pairs(self.changeList) do
+            if v.exchange_id == info.exchange_id then
+                delIndex = k
+                if v.from_role_uid == playerUid then
+                    _G.Events:GetInstance():Broadcast(_G.TradingCards.NewCards)
+                    local albumRedpointId = self:GetRedpointIDByIndex(self.RedPointTree.Album)
+                    _G.table.insert(self.selfChangeList, {v.want_card_sid, info.give_card_sid})
+                    -- 获取的卡牌
+                    self.coolectAlbumReverseCards[v.want_card_sid]:ChangeCardNumber(v.want_card_sid, 1)
+                    -- 交换出去的卡牌
+                    self.coolectAlbumReverseCards[info.give_card_sid]:ChangeCardNumber(info.give_card_sid, -1)
+                    if not self.coolectAlbumReverseCards[v.want_card_sid]:IsCardActive(v.want_card_sid) then
+                        RedPointManager:GetInstance():RefreshNode(albumRedpointId, self.coolectAlbumReverseCards[v.want_card_sid].albumId)
+                    end
+                end
+                break
+            end
+        end
+        if delIndex then
+            _G.table.remove(self.changeList, delIndex)
+        end
+    end
+end
+
+-- endregion
+
+return TradingCardsModel

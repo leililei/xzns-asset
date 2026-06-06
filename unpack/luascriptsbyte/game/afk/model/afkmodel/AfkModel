@@ -1,0 +1,1400 @@
+-----------------------------------------------------------------------
+-- E:01.zhj.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Afk.Model.AfkModel.lua	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/09/28
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+local AfkNet = require "AfkNet"
+local AfkBattleManager = require "AfkBattleManager"
+local base = require "GameDataModelBase"
+local ActiveTaskManager = require "ActiveTaskManager"
+---@class AfkModel : GameDataModelBase
+local AfkModel = _G.BaseClass("AfkModel", base)
+
+local tipsID = {
+    MaxReward = 210101,
+    LimitAwardTime = 210102,
+    BackTips = 210105
+}
+local ticketId = 203030701
+local mission_cfg = _G.ConfigManager.mission_cfg
+local discreteID = {
+    MaxAfkTime = 101103,
+    ResultIntervalTime = 101104,
+    RewardConsume = 101106,
+    MaxRewardTime = 101107,
+    FailShowBtn = 100106,
+    QuickGetPlace = 101102
+}
+
+function AfkModel:__init()
+    self.CurAfkCfgAward = {}
+    self.CurAfkQuickAward = {}
+    self.CurChapterEndAward = nil
+    self.AfkTask = nil
+    ---新章节成就奖励
+    self.ChapterAward = false
+    self.CurAfkChapter = 0
+    self.MainImportItemShowList = {} ---放置效率重要道具提示缓存
+    ---@type afk_cfg[]
+    self.cfg = _G.ConfigManager.afk_cfg
+    self.AfkStartTime = 0
+    self.MaxTimer = _G.ConfigManager.discrete_cfg[discreteID.MaxAfkTime][1][1]
+    self.RewardTime = 0
+    self.RewardConsume = _G.ConfigManager.discrete_cfg[discreteID.RewardConsume][1]
+    self.pass = {}
+    ---缓存已通过的场次中使用的sid(试用角色过期后, 本地CardData和布阵数据将被清除, 导致其他队伍可重复上阵)
+    ---@type number[]
+    self.passCardSids = {}
+
+    self.FreeRewardTime = 0
+    self.FreeRewardTimeNum = 0
+    self.ActiveTaskChapterEndAward = {} ---章节成就奖励
+    self.MaxRewardTime = _G.ConfigManager.discrete_cfg[discreteID.MaxRewardTime][1][1]
+    ---@type number 当前关卡首次失败时间，0表示没有失败过
+    self.CurFailTime = 0
+    ---@type number 本次登录查看了哪些阶段的敌方详情界面，用来做红点判断
+    self.ClickDefDetailStage = 0
+    ---主页有无未显示的挂机提升提示
+    self.HasShowTips = false
+    _G.Events:GetInstance():AddListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.UpdatMaxRewardTime, self)
+    _G.Events:GetInstance():AddListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.SetPrivilegeAward, self)
+    _G.Events:GetInstance():AddListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.SetMonthlyModel, self)
+
+    _G.Events:GetInstance():AddListener(_G.eAFKAactionEnum.AfkSectionPass, self.OnAactionEnent, self)
+    if (_G.PlayerPrefsManager.GetInt("IsInitFightSpeed4", 999) == 999) then
+        _G.Events:GetInstance():AddListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.OnOpenCfgFunction, self)
+    end
+    self.curFunctionOpenID = 1
+end
+
+function AfkModel:Dispose()
+    self:StopAfkAwardBox()
+    self.ActiveTaskChapterEndAward = nil
+    self.CurAfkChapter = nil
+    self.cfg = nil
+    self.CurAfkQuickAward = nil
+    self.AfkTask = nil
+    self.AfkStartTime = nil
+    self.MaxTimer = nil
+    self.ChapterAward = nil
+    self.MainImportItemShowList = nil
+    self.CurAfkQuickAward = nil
+    self.CurAfkCfgAward = nil
+    self.ZengyiAward = nil
+    self.RewardTime = nil
+    self.RewardConsume = nil
+    self.pass = nil
+    self.passCardSids = nil
+    self.FreeRewardTime = nil
+    self.MaxRewardTime = nil
+    self.CurFailTime = nil
+    self.ClickDefDetailStage = nil
+    self.HasShowTips = nil
+    _G.Events:GetInstance():RemoveListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.UpdatMaxRewardTime, self)
+    _G.Events:GetInstance():RemoveListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.SetPrivilegeAward, self)
+    _G.Events:GetInstance():RemoveListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.SetMonthlyModel, self)
+    _G.Events:GetInstance():RemoveListener(_G.eAFKAactionEnum.AfkSectionPass, self.OnAactionEnent, self)
+    _G.Events:GetInstance():RemoveListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.OnOpenCfgFunction, self)
+end
+
+---@return AfkModel PlayerModel
+function AfkModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---重连成功调用
+---@param endcall function 完成回调
+function AfkModel:ReConnect(endcall)
+    local win = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GetawardView.Name)
+    if win and win.View then
+        win.View:Close()
+    end
+    if endcall ~= nil then
+        endcall(self.__cname)
+    end
+end
+
+function AfkModel:OnAactionEnent()
+    self:SetCurAfkQuickAward()
+    self:CheckMainViewHasImportItemTips()
+    self:CheckPlace()
+    -- self:CheckMonthlyGoals()
+    self:CheckAfkLvUpPop()
+end
+
+function AfkModel:GetDataFormServer()
+    AfkNet:GetInstance():GetAfkInfo(_G.handler(self, self.ParseData))
+end
+
+function AfkModel:ParseData(data)
+    self.FreeRewardTimeNum = 0
+    self.FreeRewardTime = 0
+    self.RewardConsume = _G.ConfigManager.discrete_cfg[discreteID.RewardConsume][1]
+    if data ~= nil then
+        self.LastSid = data.sid
+        self.RewardTime = data.num
+        self.AfkStartTime = data.time
+        if _G.AppSetting.IsDouYin then
+            require("DouyinModel"):GetInstance():StoreFeedData(self.AfkStartTime)
+        end
+        self:SetCurFailTime(data.fail_time or 0)
+        self:CheckAfkAwardBox()
+        self.checkTime = data.check_time
+    end
+    for i = 1, #self.RewardConsume do
+        if self.RewardConsume[i] > 0 then
+            break
+        end
+        self.FreeRewardTime = self.FreeRewardTime + 1
+    end
+    self.BaseFreeTime = self.FreeRewardTime
+    self.FreeRewardTime = self.FreeRewardTime - self.RewardTime
+    -- if self.FreeRewardTime < 0 then
+    --     self.FreeRewardTime = 0
+    -- end
+    self.MonthlyModelIs = false
+    self:UnlockSection()
+    self.ticketNum = _G.StorageManager:GetInstance():GetItemCountBySid(ticketId)
+    base.ParseData(self)
+    require "AfkTaskModel":GetInstance():GetAfkDataCallback(data)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.AfkQuick.id)
+end
+
+---设置首次失败时间
+---@param time number
+function AfkModel:SetCurFailTime(time)
+    self.CurFailTime = time
+    if time == 0 then
+        self:ResetClickDefDetailStage()
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.EmbattleDefDetailBtn.id)
+end
+
+function AfkModel:ResetClickDefDetailStage()
+    self.ClickDefDetailStage = 0
+end
+
+---点击布阵地方详情当前阶段
+---@param stage number
+function AfkModel:SetClickDefDetailStage(stage)
+    self.ClickDefDetailStage = stage
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.EmbattleDefDetailBtn.id)
+end
+
+---红点是否显示
+---@return boolean 是否显示红点
+function AfkModel:IsShowRedPoint()
+    if self.CurFailTime == 0 then
+        return 0
+    else
+        ---@type number 总共阶段数量
+        local maxStateCount = 3
+        ---@type number 开阶段间隔天数
+        local stateOffsetDay = 1
+        local time = _G.TimeUtil.GetServerUnixTime()
+        local day = _G.TimeUtil.GetInterValDayByGame(self.CurFailTime, time)
+        local curState = math.floor(day / stateOffsetDay) + 1
+        curState = math.min(maxStateCount, curState)
+        if curState > self.ClickDefDetailStage then
+            return true
+        else
+            return false
+        end
+    end
+end
+
+function AfkModel:InitFunction()
+    require "AfkTaskModel":GetInstance():InitFunction()
+    ---缓存所有类型为53的章节奖励数据
+    self:GetAllActiveGoal()
+    self:SetCurAfkQuickAward()
+    self:CacheAfkStageCfgToArrayByChapter()
+    --self:CacheAfkShowAwardTask()
+end
+
+local insertAfkQuickAward = function(award, Sid, Count, Zengyi)
+    _G.table.insert(award, { Zengyi or false, Sid, Count })
+end
+function AfkModel:GetCurAfkQuickAwawrd()
+    self.CurAfkQuickAward = {}
+    self.CurAfkQuickAward[1] = {}
+    self.CurAfkQuickAward[2] = {}
+    if self.ZengyiAward then
+        for i, v in pairs(self.ZengyiAward) do
+            if v[2] == 11 or v[2] == 21 or v[2] == 22 then
+                _G.table.insert(self.CurAfkQuickAward[1], v)
+            else
+                _G.table.insert(self.CurAfkQuickAward[2], v)
+            end
+        end
+    end
+    if self.CurAfkCfgAward then
+        for i, v in pairs(self.CurAfkCfgAward) do
+            if v[2] == 11 or v[2] == 21 or v[2] == 22 then
+                _G.table.insert(self.CurAfkQuickAward[1], v)
+            else
+                _G.table.insert(self.CurAfkQuickAward[2], v)
+            end
+        end
+    end
+    if self:CheckQuickLimitDrop() then
+        local data = require "ActivitySynManager":GetInstance():GetActivityByType(10052) or {}
+        for k, v in pairs(data) do
+            local totalTime = _G.ConfigManager.discrete_cfg[discreteID.QuickGetPlace][1][1]
+            local intervalTime = _G.ConfigManager.discrete_cfg[101104][1][1]
+            local times = math.floor(totalTime / intervalTime)
+            for key, value in pairs(v.typeClass.info.award_cfg.award or {}) do
+                if value.type[1] ~= 0 then
+                    insertAfkQuickAward(self.CurAfkQuickAward[1], value.type[1], value.type[2] * times)
+                else
+                    insertAfkQuickAward(self.CurAfkQuickAward[1], value.type[4], value.type[5] * times)
+                end
+            end
+            for key, value in pairs(v.typeClass.info.award_cfg.rand_award or {}) do
+                if value.type[1] ~= 0 then
+                    insertAfkQuickAward(self.CurAfkQuickAward[2], value.type[1], value.type[2])
+                else
+                    insertAfkQuickAward(self.CurAfkQuickAward[2], value.type[4], value.type[5])
+                end
+            end
+        end
+    end
+    return _G.DeepCopy(self.CurAfkQuickAward)
+end
+
+function AfkModel:SetPrivilegeAward()
+    if not self.CurAfkCfgAward then
+        return
+    end
+    self:CheckZengyi()
+end
+
+function AfkModel:SetMonthlyModel()
+    if self.MonthlyModelIs then
+        return
+    end
+    self.FreeRewardTimeNum = 0
+    if require "MonthlyModel":GetInstance():IsHavePrivi(405005, 1) then
+        self.MonthlyModelIs = true
+
+        local store_month_cfg = _G.ConfigManager.store_month_cfg[405005]
+        local num = _G.ConfigManager.privilege_cfg[store_month_cfg.extra_first[1]]
+        -- self.FreeRewardTime = self.FreeRewardTime + num.privilege[1][2]
+        -- self.MaxRewardTime = self.MaxRewardTime + num.privilege[1][2]
+        self.FreeRewardTimeNum = num.privilege[1][2]
+        local data = { 0 }
+        for key, value in pairs(self.RewardConsume) do
+            _G.table.insert(data, value)
+        end
+        self.RewardConsume = data
+    end
+
+    ---VIP特权增加的次数
+    local count = require "HellRoadModel":GetInstance():GetNumber({ _G.PrivilegeType.QuickGetReward.Privileged })
+    self.FreeRewardTimeNum = self.FreeRewardTimeNum + count
+end
+
+--镇魂街ZHJ-34446 Beta_1.0.0公测BuglistZHJ-34967
+--【快速挂机】VIP等级到达9级买完快速挂机次数后重登，显示购买次数-1
+--重新计算一下self.FreeRewardTimeNum，因为刚进游戏算出来缓存的可能不是实时完整的
+--重新计算一下self.RewardConsume,避免消耗显示不一致
+function AfkModel:UpdateFreeRewardTimeNum()
+    self.FreeRewardTimeNum = 0
+    --重置self.RewardConsume，按照最新的免费次数在消耗里面添加0的个数
+    self.RewardConsume = _G.DeepCopyCfgTable(_G.ConfigManager.discrete_cfg[discreteID.RewardConsume][1])
+    if require "MonthlyModel":GetInstance():IsUnlockMonthCard(401003, 1) then
+        self.MonthlyModelIs = true
+
+        local store_month_cfg = _G.ConfigManager.store_month_cfg[401003]
+        local num = _G.ConfigManager.privilege_cfg[store_month_cfg.extra_first[1]]
+        self.FreeRewardTimeNum = num.privilege[1][2]
+        _G.table.insert(self.RewardConsume, 1, 0)
+    end
+
+    ---VIP特权增加的次数
+    local count = require "HellRoadModel":GetInstance():GetNumber({ _G.PrivilegeType.QuickGetReward.Privileged })
+    self.FreeRewardTimeNum = self.FreeRewardTimeNum + count
+    for i = 1, count do
+        _G.table.insert(self.RewardConsume, 1, 0)
+    end
+end
+
+local CheckPrivilege = function()
+    local datas = require "PrivilegeManager":GetInstance():GetPrivilegeDataNew({ _G.PrivilegeType.Afk.ItemPer })
+    local tb = {}
+    for _, v in pairs(datas) do
+        tb[v[2]] = v[3]
+    end
+    return { _G.table.count(tb) > 0, tb }
+end
+
+function AfkModel:OnOpenCfgFunction()
+    ---镇魂街ZHJ-25224 【0722】【双版本】需进热更任务ZHJ-26226【客户端】战斗4倍速开启优化
+    ---解锁四倍速时默认设置为四倍速
+    if (_G.PlayerPrefsManager.GetInt("IsInitFightSpeed4", 999) == 999) then
+        if self:CheckVipSpeed4() then
+            ---获取4倍速功能解锁关卡
+            _G.CS.BattleManager.Inst:SetExSpeedIndex(1)
+            _G.CS.BattleManager.Inst:LuaCallCsSetSpeed(2)
+            _G.PlayerPrefsManager.SetInt("IsInitFightSpeed4", 1)
+            _G.Events:GetInstance():RemoveListener(
+                    _G.eHellRoadPrivilegeEvent.HellRoadPrivilege,
+                    self.OnOpenCfgFunction,
+                    self
+            )
+        end
+    end
+end
+
+---判断vip是否开启了4倍速特权
+function AfkModel:CheckVipSpeed4()
+    local flag = false
+    local data1 = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.VIP.unlockFunction })
+    if data1 and data1[1] then
+        local check_type = type(data1[1])
+        local count = 1
+        if check_type == "number" then
+            -- 检测是不是数值类型
+            count = 1
+        else
+            count = 2
+        end
+        for i = 1, #data1 do
+            if count < 2 then
+                if data1[i] == _G.FunctionID.Speed4 then
+                    flag = true
+                end
+            else
+                if data1[i][2] == _G.FunctionID.Speed4 then
+                    flag = true
+                end
+            end
+        end
+    end
+    return flag
+end
+
+---判断是否弹出限时礼包
+function AfkModel:CheckPlace()
+    require "PopUpGiftBagModel":GetInstance():IsArrivePlace(self.LastSid)
+end
+
+---判断是否弹出AfkLvUpPopView弹窗
+function AfkModel:CheckAfkLvUpPop()
+    if self.cfg[self.LastSid].level_up and self.cfg[self.LastSid].level_up > 0 then
+        -- local func = function()
+        --     _G.UIManager:GetInstance():OpenWindow(
+        --     _G.ConfigManager.ui_cfg.AfkLvUpPopView.Name,
+        --     self.LastSid
+        -- )
+        -- end
+        local PopOpenViewFunItem = {}
+        PopOpenViewFunItem.OpenViewFun = function(callback)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AfkLvUpPopView.Name, self.LastSid, callback)
+        end
+        _G.PopWindowManager:GetInstance():AddPopWindowQuene(PopOpenViewFunItem, _G.PopViewShowOrder.AfkLevelUp)
+    end
+end
+
+---判断是否弹出月度目标
+function AfkModel:CheckMonthlyGoals()
+    require "MonthlyGoalsModel":GetInstance():IsArriveSection(self.LastSid)
+end
+
+function AfkModel:CheckMainViewHasImportItemTips()
+    local itemlist = self.cfg[self.LastSid].precious_show
+    if not _G.table.isEmptyOrNil(itemlist) then
+        _G.table.insert(self.MainImportItemShowList, itemlist)
+    end
+end
+
+function AfkModel:GetImportItem()
+    return self.MainImportItemShowList
+end
+
+function AfkModel:CheckZengyi()
+    self.ZengyiAward = {}
+    if not self.CurAfkCfgAward then
+        return
+    end
+    local PriRes = CheckPrivilege()
+    if PriRes[1] and _G.table.count(PriRes[2]) > 0 then
+        local tb = PriRes[2]
+        local num
+        local time = _G.ConfigManager.discrete_cfg[discreteID.QuickGetPlace][1][1]
+        ---@type afk_cfg
+        local Afkcfg = _G.ConfigManager.afk_cfg[self.LastSid]
+        if not Afkcfg then
+            return
+        end
+        for _, v in pairs(Afkcfg.eff_item) do
+            if tb[v[1]] then
+                num = math.floor(time / v[2] * (tb[v[1]] * 0.0001))
+                insertAfkQuickAward(self.ZengyiAward, v[1], num, true)
+            end
+        end
+        if tb[11] then
+            num = math.floor(time / 30 * Afkcfg.eff_coin * (tb[11] * 0.0001))
+            insertAfkQuickAward(self.ZengyiAward, 11, num, true)
+        end
+        if tb[22] then
+            num = math.floor(time / 30 * Afkcfg.eff_exp_hero * (tb[22] * 0.0001))
+            insertAfkQuickAward(self.ZengyiAward, 22, num, true)
+        end
+    end
+end
+
+function AfkModel:SetCurAfkQuickAward()
+    self.CurAfkCfgAward = {}
+    local lastSid = self.LastSid
+    if lastSid == 0 then
+        return
+    end
+
+    if self.quickAfkSid ~= lastSid then
+        local DropPreciousCfg = {}
+        local DropCfg
+        local Afkcfg = _G.ConfigManager.afk_cfg[lastSid]
+        if #Afkcfg.eff_precious > 0 then
+            for i = 1, #Afkcfg.eff_precious do
+                _G.table.insert(DropPreciousCfg, _G.ConfigManager.afk_drop_cfg[Afkcfg.eff_precious[i][1]])
+            end
+        end
+        if Afkcfg.eff_equip[1] then
+            DropCfg = _G.ConfigManager.afk_drop_cfg[Afkcfg.eff_equip[#Afkcfg.eff_equip][1]]
+        end
+        local num
+        local time = _G.ConfigManager.discrete_cfg[discreteID.QuickGetPlace][1][1]
+        num = math.floor(time / 30) * Afkcfg.eff_exp_team
+        insertAfkQuickAward(self.CurAfkCfgAward, 21, num)
+        num = math.floor(time / 30) * Afkcfg.eff_exp_hero
+        insertAfkQuickAward(self.CurAfkCfgAward, 22, num)
+        num = math.floor(time / 30) * Afkcfg.eff_coin
+        insertAfkQuickAward(self.CurAfkCfgAward, 11, num)
+        for i = 1, #Afkcfg.eff_item do
+            num = math.floor(time / Afkcfg.eff_item[i][2])
+            if num > 0 then
+                insertAfkQuickAward(self.CurAfkCfgAward, Afkcfg.eff_item[i][1], num)
+            end
+        end
+        if not _G.table.isEmptyOrNil(DropPreciousCfg) then
+            for k, v in pairs(DropPreciousCfg) do
+                for i = 1, #v.equip do
+                    insertAfkQuickAward(self.CurAfkCfgAward, v.equip[i], 1)
+                end
+            end
+        end
+        if DropCfg then
+            for i = 1, #DropCfg.equip do
+                insertAfkQuickAward(self.CurAfkCfgAward, DropCfg.equip[i], 1)
+            end
+        end
+        if #self.CurAfkCfgAward > 0 then
+            _G.SortList(
+                    self.CurAfkCfgAward,
+                    function(a)
+                        local grade = 0
+                        local Id = 0
+                        if a[2] == 21 then
+                            Id = 999
+                        end
+                        if a[2] == 22 then
+                            Id = 998
+                        end
+                        if a[2] == 11 then
+                            Id = 997
+                        end
+                        local typeA = _G.StorageManager:GetInstance():CheckSidType(a[2])
+                        local CurrencyCfg = _G.ConfigManager.currency_type_cfg --货币资源
+                        local ItemCfg = _G.ConfigManager.item_cfg --道具资源
+                        local EquipmentCfg = _G.ConfigManager.equipment_cfg --装备资源
+                        if CurrencyCfg[a[2]] then
+                            grade = CurrencyCfg[a[2]].Quality
+                        elseif ItemCfg[a[2]] then
+                            grade = ItemCfg[a[2]].Quality
+                        elseif EquipmentCfg[a[2]] then
+                            grade = EquipmentCfg[a[2]].grade
+                        else
+                            grade = 0
+                        end
+                        return Id, -typeA, grade, -a[2]
+                    end
+            )
+        end
+    end
+end
+
+---是否屏蔽新功能开启检测
+---@param id afkid
+function AfkModel:CheckIsShieldSection(id)
+    for _, v in pairs(self.ShieldSections) do
+        if id == v then
+            return true
+        end
+    end
+    return false
+end
+
+function AfkModel:GetAllActiveGoal()
+    self.AfkTask = {}
+    for k, v in pairs(mission_cfg) do
+        if v.condition[1][1] == 53 then
+            self.ActiveTaskChapterEndAward[v.id] = v.condition[1][2]
+            _G.table.insert(self.AfkTask, { v.id, v.condition[1][2] })
+        end
+    end
+    if self.AfkTask then
+        _G.SortList(
+                self.AfkTask,
+                function(a)
+                    return -a[2]
+                end
+        )
+    end
+end
+
+---找到最接近的任务
+function AfkModel:GetSidTaskCom()
+    if not self.AfkTask then
+        return nil
+    else
+        for k, v in pairs(self.AfkTask) do
+            if self.LastSid <= v[2] then
+                return v[1]
+            end
+        end
+    end
+end
+
+---检测消耗
+function AfkModel:CheckRewardConsume()
+    if self.FreeRewardTime + self.FreeRewardTimeNum > 0 then
+        return true
+    end
+    self.ticketNum = _G.StorageManager:GetInstance():GetItemCountBySid(ticketId)
+    if self.ticketNum > 0 then
+        return true
+    end
+    if self.RewardTime >= self.MaxRewardTime + self.FreeRewardTimeNum then
+        _G.PopWindowManager:GetInstance():ShowAllTips(tipsID.MaxReward)
+        return false
+    end
+    local time = self.RewardTime + 1
+    if time > #self.RewardConsume then
+        time = #self.RewardConsume
+    end
+    if not _G.StorageManager:GetInstance():CheckItem(_G.ResPropID.Diamond, self.RewardConsume[time]) then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, _G.ResPropID.Diamond)
+        return false
+    end
+    return true
+end
+
+---获取快速挂机奖励
+function AfkModel:GetQuickAfkAward(type, call)
+    self.type = type
+    AfkNet:GetInstance():GetAfkReward({ type = type }, _G.handlerbind(self, self.GetQuickAfkAwardSuc, call))
+end
+
+---获取快速挂机奖励
+function AfkModel:GetQuickAfkAwardSuc(data, call)
+    if data.ack ~= 1 then
+        return
+    end
+    local Coin = 0
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    if self.type == 1 then
+        self.RewardTime = self.RewardTime + 1
+        if self.FreeRewardTime + self.FreeRewardTimeNum > 0 then
+            self.FreeRewardTime = self.FreeRewardTime - 1
+        else
+            local haveD = false
+            if data.award and data.award.item then
+                for k, v in pairs(data.award.item) do
+                    if v.type[1] == _G.ResPropID.Diamond then
+                        haveD = true
+                        break
+                    end
+                end
+            else
+                haveD = true
+            end
+            if not haveD then
+                _G.StorageManager:GetInstance():ConsumeItem(
+                        _G.ResPropID.Diamond,
+                        0,
+                        self.RewardConsume[self.RewardTime]
+                )
+            end
+        end
+    elseif self.type == 2 then
+        _G.StorageManager:GetInstance():ConsumeItem(ticketId, 0, 1)
+    end
+    self.type = 0
+    for k, v in pairs(data.award.item) do
+        if v.type[1] == _G.ResPropID.Coin then
+            Coin = v.type[2]
+        end
+    end
+
+    if call ~= nil then
+        call(data)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eAfkEvents.GetAfkAward)
+    -- _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.AfkBox}, 1)
+end
+
+---@param noUITip boolean 不展示UI奖励
+function AfkModel:GetAfkAward(callback, noUITip)
+    local msg = {}
+    local time = _G.TimeUtil.GetServerUnixTime()
+    msg.time = time
+    require "AfkNet":GetInstance():GetAfkAward(
+            msg,
+            function(data)
+                local OldTime = self.AfkStartTime
+                local maxtime = _G.ConfigManager.discrete_cfg[discreteID.ResultIntervalTime][1][1]
+                local extra = 0
+                if (time - OldTime) < self.MaxTimer then
+                    --- 每六十秒一次奖励 保留当前秒  1:26秒领取   领取后 0;26秒开始计时
+                    extra = (time - OldTime) % maxtime
+                else
+                    --- 达到最大挂机时间  不用考虑当前秒
+                end
+                self.checkTime = time
+                self.AfkStartTime = time - extra
+                self:CheckAfkAwardBox()
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                if noUITip then
+                    if callback then
+                        callback(data)
+                    end
+                else
+                    _G.PopWindowManager:GetInstance():AddAwardPopQuene(
+                            data,
+                            callback,
+                            { nil, nil, nil, nil, nil, nil, nil, nil, nil, true }
+                    )
+                end
+                self.data = {}
+                if _G.AppSetting.IsDouYin then
+                    require("DouyinModel"):GetInstance():StoreFeedData(self.AfkStartTime)
+                end
+
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, { _G.SeasonTaskID.AfkBox }, 1)
+                _G.Events:GetInstance():Broadcast(_G.eAfkEvents.GetAfkAward)
+            end
+    )
+end
+
+function AfkModel:CheckAfkAward(call)
+    local msg = {}
+    local time = _G.TimeUtil.GetServerUnixTime()
+    if self.data and time - self.checkTime < _G.ConfigManager.discrete_cfg[discreteID.ResultIntervalTime][1][1] then
+        if call then
+            if _G.table.isEmptyOrNil(self.data) then
+                call(self.AfkStartTime, {})
+            else
+                call(self.AfkStartTime, self.data)
+            end
+        end
+        return
+    end
+    msg.check_time = time
+    require "AfkNet":GetInstance():CheckAfkAward(msg, _G.handlerbind(self, self.CheckAfkAwardSuc, time, call))
+end
+
+---查看挂机奖励成功
+function AfkModel:CheckAfkAwardSuc(data, time, call)
+    local OldTime = self.AfkStartTime
+    self.data = data
+    if call ~= nil then
+        call(OldTime, data)
+    end
+    self.checkTime = time
+    _G.Events:GetInstance():Broadcast(_G.eAfkEvents.GetAfkAward, true)
+end
+
+---放置挂机宝箱是否可以弹出
+function AfkModel:CheckAfkAwardBox()
+    local time = _G.TimeUtil.GetServerUnixTime() - self.AfkStartTime
+    local popTime = _G.ConfigManager.discrete_cfg[120005][1][1]
+    self.canShowAfkBox = time >= popTime
+    self:StopAfkAwardBox()
+    if time < popTime then
+        self.afkAwardTimer = _G.TimerManager:GetInstance():GetTimer(
+                popTime - time,
+                function()
+                    self.canShowAfkBox = true
+                    self:StopAfkAwardBox()
+                end,
+                self,
+                true,
+                false,
+                false
+        )
+        self.afkAwardTimer:Start()
+    else
+        if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(267) then
+            return
+        end
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+        if view then
+            view:ShowAfkBox()
+        end
+    end
+end
+
+function AfkModel:StopAfkAwardBox()
+    if self.afkAwardTimer then
+        self.afkAwardTimer:Stop()
+        self.afkAwardTimer = nil
+    end
+end
+
+---挂机宝箱奖励状态
+function AfkModel:GetAfkAwardBoxStatus()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(267) then
+        self.canShowAfkBox = false
+        return
+    end
+    return self.canShowAfkBox
+end
+
+function AfkModel:CheckAfkWillGoToNextChatper()
+    if not self:CheckSectionIsEnd(self.LastSid) and self.cfg[self.LastSid + 1] then
+        return false
+    end
+    return true
+end
+
+---开始战斗保存当前挑战的关卡
+---@param SceneID monster_group_cfg ID
+function AfkModel:SetCurMonsterID(SceneID)
+    self.CurMonsterID = SceneID
+end
+
+---获取当前挑战的关卡ID
+---@return number monster_group_cfg的ID
+function AfkModel:GetCurMonsterID()
+    return self.CurMonsterID
+end
+
+---设置当前场次
+function AfkModel:SetCurPage()
+    if self:CheckCurChallengeIsPass() then
+        AfkBattleManager:GetInstance():SavePage(1)
+    else
+        local monsterG = self:GetSceneID()
+        for i = 1, #monsterG do
+            if not self:CheckMonsterIsPass(monsterG[i]) then
+                AfkBattleManager:GetInstance():SavePage(i)
+                break
+            end
+        end
+    end
+end
+
+---设置打过的怪物组ID
+function AfkModel:SetMonsterPass()
+    _G.table.removebyvalue(self.pass, self.CurMonsterID)
+end
+
+---增加当前关卡使用的角色uid
+---@param sids number[] 卡牌uid列表
+function AfkModel:AddCurMonsterPassCardSids(sids)
+    self:AddPassCardSids(self.CurMonsterID, sids)
+end
+
+---增加已通关关卡使用的角色uid
+---@param id number
+---@param sids number[] 卡牌uid列表
+function AfkModel:AddPassCardSids(id, sids)
+    if not self.passCardSids then
+        return
+    end
+    self.passCardSids[id] = sids
+end
+
+---获取指定已通关场次的角色uid
+---@param id number
+---@return number[] 卡牌uid列表
+function AfkModel:GetPassCardSids(id)
+    if not self.passCardSids then
+        return
+    end
+    return self.passCardSids and self.passCardSids[id] or nil
+end
+
+---判断当前是否通关
+function AfkModel:CheckCurChallengeIsPass()
+    return _G.table.isEmptyOrNil(self.pass)
+end
+
+---检测当前是否是第一场战斗 多队布阵才需要
+---@return boolean 是否是第一场战斗
+function AfkModel:CheckBattleFirst()
+    local monsterG = self:GetSceneID()
+    return #monsterG > 1 and #self.pass == #monsterG
+end
+
+---开始战斗协议
+function AfkModel:FightBegin(scene, call)
+    ---获取战斗数据和向服务器发送协议请求
+    local msg = {}
+    msg.sid = self.CurSid
+    msg.monster_sid = scene
+    return AfkNet:GetInstance():AfkFight(msg, call)
+end
+
+---获取当前挑战章节
+---@return number 放置章节ID
+function AfkModel:GetCurAfkChapter()
+    return self.CurAfkChapter
+end
+
+---获取场景组ID
+function AfkModel:GetSceneID()
+    return self.cfg[self.CurSid].monster_group
+end
+
+---获取挂机时间
+function AfkModel:GetAfkTime()
+    return self.AfkStartTime
+end
+
+function AfkModel:SetAfkTime(time)
+    if self.AfkStartTime ~= time then
+        self:CheckAfkAwardBox()
+    end
+    self.AfkStartTime = time
+end
+
+---检查当前关卡是否是最后一关
+function AfkModel:CheckSectionIsEnd(sid)
+    if sid == 0 then
+        return false
+    end
+    local tmp = self.cfg[sid]
+    return tmp.next_section == 0
+end
+
+---获取当前关卡
+function AfkModel:GetCurSection()
+    if not self.CurSid or self.CurSid == 0 then
+        self.CurSid = 0
+        if self:GetFunctionOpen() == true then
+            self:UnlockSection()
+        end
+    end
+    return self.CurSid
+end
+
+---获取当前关卡章节名
+function AfkModel:GetCurChapterName()
+    if not self.CurSid or self.CurSid == 0 then
+        self.CurSid = 0
+        if self:GetFunctionOpen() == true then
+            self:UnlockSection()
+        end
+    end
+    local tmp = self.cfg[self.CurSid]
+    for k, v in pairs(self.cfg) do
+        if v.chapter == tmp.chapter and v.section == 1 then
+            return v.Name[1]
+        end
+    end
+end
+
+---是否是当前关卡 已开启未通关
+function AfkModel:IsCurSection(id)
+    return self:GetCurSection() == id
+end
+
+---获取当前关卡配置表
+function AfkModel:GetCurSectionCfg()
+    return self.cfg[self.CurSid]
+end
+
+---获取上一关关卡配置表
+function AfkModel:GetPreviousSectionCfg()
+    if self.LastSid == 0 then
+        return nil
+    end
+    return self.cfg[self.LastSid]
+end
+
+-----放置效率使用
+---获取当前关卡配置表
+function AfkModel:GetCurSectionCfg1()
+    return self.cfg[self.LastSid]
+end
+
+---获取上一关关卡配置表
+function AfkModel:GetPreviousSectionCfg1()
+    if self.LastSid == 0 then
+        return nil
+    end
+    local pre_section = self.cfg[self.LastSid].pre_section
+    return self.cfg[pre_section]
+end
+
+function AfkModel:SetLastSection(sid)
+    self.LastSid = sid
+end
+
+function AfkModel:GetLastSection()
+    return self.LastSid or 0
+end
+
+---获取上一个关卡的章节名
+function AfkModel:GetLastChapterName()
+    local tmp = self.cfg[self:GetLastSection()]
+    for k, v in pairs(self.cfg) do
+        if v.chapter == tmp.chapter and v.section == 1 then
+            return v.Name[1]
+        end
+    end
+    return 0
+end
+
+---@return {id,afk} afk_stage_cfg
+function AfkModel:ComputeTarget()
+    if _G.table.isEmptyOrNil(self.AfkStageArray) then
+        return nil
+    end
+    local list
+    local chapter = self.cfg[self.LastSid].chapter
+    local stageArray = self.AfkStageArray[chapter]
+    for i, v in pairs(stageArray) do
+        if self.LastSid == v[2] or self.LastSid < v[2] then
+            list = v
+            return list
+        end
+    end
+    return nil
+end
+
+function AfkModel:GetHaveNewChapterAward()
+    return self.ChapterAward
+end
+
+function AfkModel:CheckNewChapterAwardIsGet()
+    local ActiveTaskManagerIns = require "ActiveTaskManager":GetInstance()
+    for k, v in pairs(self.ActiveTaskChapterEndAward) do
+        if v == self.LastSid then
+            ActiveTaskManagerIns:GetCurAfkChapterEndAward(k, true)
+            self.ChapterAward = true
+            return true
+        end
+    end
+    self.ChapterAward = false
+    return false
+end
+
+function AfkModel:CacheAfkStageCfgToArrayByChapter()
+    self.AfkStageArray = {}
+    for i, v in pairs(_G.ConfigManager.afk_stage_cfg) do
+        if not self.AfkStageArray[v.chapter] then
+            self.AfkStageArray[v.chapter] = {}
+        end
+        _G.table.insert(self.AfkStageArray[v.chapter], { v.id, v.afk })
+    end
+    for i, v in pairs(self.AfkStageArray) do
+        _G.SortList(
+                v,
+                function(a)
+                    return -a[2]
+                end
+        )
+    end
+end
+
+---获取当前剩余免费次数
+function AfkModel:GetFreeRewardTime()
+    self:UpdateFreeRewardTimeNum()
+    if self.FreeRewardTime + self.FreeRewardTimeNum < 0 then
+        return 0
+    end
+    return (self.FreeRewardTime + self.FreeRewardTimeNum) or 0
+end
+
+---获取当前剩余付费次数
+function AfkModel:GetRewardTime()
+    self:UpdateFreeRewardTimeNum()
+    local num = self.MaxRewardTime + self.FreeRewardTimeNum - self.RewardTime
+    return num < 0 and 0 or num
+end
+
+---获取挂机次数
+function AfkModel:GetSectionInfo()
+    return self.RewardTime or 0
+end
+
+---获取关卡对应章节
+---@return number 章节/nil
+function AfkModel:GetSectionChapter(id)
+    local cfg = self.cfg[id]
+    if cfg then
+        return cfg.chapter
+    end
+end
+
+---重置通关
+function AfkModel:ResetPass()
+    self.pass = _G.DeepCopyCfgTable(self.cfg[self.CurSid].monster_group)
+    self.CurMonsterID = self.pass[1]
+    self.passCardSids = {}
+end
+
+---查看小场次是否通关
+function AfkModel:CheckMonsterIsPass(monsterId)
+    for i = 1, #self.pass do
+        if self.pass[i] == monsterId then
+            return false
+        end
+    end
+    return true
+end
+
+---章节成就任务奖励数据
+---key:taskid value:award
+function AfkModel:SetCurChapterEndAward(data, taskId)
+    self.CurChapterEndAward = { data, taskId }
+end
+
+---查看是否通关
+function AfkModel:CheckSectionIsPass(num)
+    if self:CheckIsOverLevel(num) then
+        return true
+    end
+    return self.CurSid and self.CurSid > num or false
+end
+
+---判断是不是打通了最后一关了
+function AfkModel:CheckIsOverLevel(num)
+    if num == self.LastSid then
+        if self:CheckPassAll() then
+            return true
+        end
+    end
+    return false
+end
+
+---判断当前全部通关
+function AfkModel:CheckPassAll()
+    local finishCfg = _G.ConfigManager.afk_cfg[self.LastSid]
+    if finishCfg and finishCfg.next_section <= 0 then
+        return true
+    end
+    return false
+end
+
+---获取快速挂机消耗钻石数量
+function AfkModel:GetDiamondNum()
+    local count = #self.RewardConsume
+    if self.RewardTime > count then
+        return self.RewardConsume[count]
+    else
+        return self.RewardConsume[self.RewardTime + 1] or self.RewardConsume[self.RewardTime]
+    end
+end
+
+---@param hasShowTips boolean 有未显示的挂机提升提示
+function AfkModel:SetHasShowTips(hasShowTips)
+    self.HasShowTips = hasShowTips
+end
+
+function AfkModel:GetHasShowTips()
+    return self.HasShowTips
+end
+
+function AfkModel.GlobalOpenAfkView()
+    _G.MainManager:GetInstance():ShowAfkWindow()
+end
+
+function AfkModel.GlobalOpenAfkEmbattleView()
+    --切换到afk选项卡
+    _G.MainManager:GetInstance():ShowAfkWindow()
+
+    --先判断是否正在进行战斗, 然后尝试打开布阵面板
+    local isOpenEmbattle = false
+    if require("AfkBattleManager"):GetInstance():IsFighting() then
+        --战斗正在进行中
+        --什么都不做
+    elseif _G.DeadsoulTowerManager:GetInstance():IsFighting() or
+            require("SecretRealmModel"):GetInstance():IsFighting() then
+        --其他战斗正在进行中(死魂塔/大秘境)
+        _G.PopWindowManager:GetInstance():ShowAllTips(46)
+    else
+        isOpenEmbattle = require("AfkModel"):GetInstance():OpenAfkEmbattleView()
+    end
+
+    --没有实际打开布阵面板
+    if not isOpenEmbattle then
+        _G.JumpManager:GetInstance():OnViewOpened(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+    end
+end
+
+---打开放置界面
+function AfkModel:OpenAfkView(...)
+    -- _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AfkView.Name, ...)
+    local mainView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView then
+        mainView.View.go_table.toggle_afk.isOn = true
+    end
+end
+
+---打开放置布阵界面
+function AfkModel:OpenAfkEmbattleView()
+    --- 就打开 关卡选择界面
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Afk) then
+        _G.FunctionManager:GetInstance():ShowFuncitonOpenTips(_G.FunctionID.Afk)
+    elseif not self:CheckNextSectionCondition() then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LevelUpGuideView.Name)
+    else
+        local CurSection = self:GetCurSection()
+        if self:CheckSectionIsEnd(CurSection) then
+            _G.PopWindowManager:GetInstance():ShowAllTips(210108)
+            return
+        end
+        require("AfkBattleManager"):GetInstance():EnterEmbattle()
+        return true
+    end
+    return false
+end
+
+---解锁关卡
+function AfkModel:UnlockSection()
+    if not self.LastSid then
+        return
+    end
+    local tmp, lastTmp
+    ---@param v afk_cfg
+    for _, v in pairs(self.cfg) do
+        if v.pre_section == self.LastSid then
+            tmp = v
+            break
+        else
+            if lastTmp == nil and v.id == self.LastSid then
+                lastTmp = v
+            end
+        end
+    end
+    if tmp ~= nil then
+        -- if not self.OnSixUpdateTag then
+        --     require "DungonesModel":GetInstance():AfkPassLockCollecion()
+        -- end
+        self.CurSid = tmp.id
+        self.pass = _G.DeepCopyCfgTable(self.cfg[self.CurSid].monster_group)
+        self.passCardSids = {}
+        self.CurAfkChapter = tmp.chapter
+        require "CampsiteModel":GetInstance():UnLockCaowei()
+    else
+        ---- 如果未找到可挑战的下一关 用之前的id 防止报错异常
+        self.CurSid = self.LastSid
+        self.pass = _G.DeepCopyCfgTable(self.cfg[self.CurSid].monster_group)
+        self.passCardSids = {}
+        self.CurAfkChapter = lastTmp.chapter
+
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("AFK 未找到配置的 下一关!!!!!!  当前通关" .. self.LastSid)
+        end
+    end
+    self.CurMonsterID = self.pass[1]
+    --region --------------------------------------镇魂街ZHJ-10348【客户端】二倍速开放时为默认开启状态--------
+    ---标记是否设置过默认2倍速
+    if _G.PlayerPrefsManager.GetInt("IsInitFightSpeed", 999) == 999 then
+        if self.LastSid then
+            ---获取2倍速功能解锁关卡
+            ---@type function_open_cfg
+            local function_open_cfg = _G.ConfigManager.function_open_cfg[_G.FunctionID.Speed2]
+            if function_open_cfg.condition_type[1][1] == 4 and self.LastSid == function_open_cfg.condition_type[1][2] then
+                _G.CS.BattleManager.Inst:LuaCallCsSetSpeed(1)
+                _G.PlayerPrefsManager.SetInt("IsInitFightSpeed", 1)
+            end
+        end
+    end
+    --endregion------------------------------------镇魂街ZHJ-10348【客户端】二倍速开放时为默认开启状态--------
+
+    ---镇魂街ZHJ-25224 【0722】【双版本】需进热更任务ZHJ-26226【客户端】战斗4倍速开启优化
+    ---解锁四倍速时默认设置为四倍速
+    if (_G.PlayerPrefsManager.GetInt("IsInitFightSpeed4", 999) == 999) then
+        if self.LastSid then
+            ---获取4倍速功能解锁关卡
+            ---@type function_open_cfg
+            local function_open_cfg = _G.ConfigManager.function_open_cfg[_G.FunctionID.Speed4]
+            if
+            ((function_open_cfg.condition_type[1][1] == 4) and
+                    (self.LastSid == function_open_cfg.condition_type[1][2]))
+            then
+                _G.CS.BattleManager.Inst:SetExSpeedIndex(1)
+                _G.CS.BattleManager.Inst:LuaCallCsSetSpeed(2)
+                _G.PlayerPrefsManager.SetInt("IsInitFightSpeed4", 1)
+            end
+        end
+    end
+end
+
+---获取当前效率  配置的是 每30s   分钟显示时注意！！！
+---@param params table<number,number> 效率ID,时间参数
+function AfkModel:GetCurEfficiency(UseParameter)
+    local params = { _G.tonumber(UseParameter[1]), _G.tonumber(UseParameter[2]) }
+    local data = {}
+    local cfg = self.cfg[self.cfg[self.CurSid].pre_section]
+    local ResPropID = _G.ResPropID
+    data[ResPropID.HoreExp] = cfg and _G.Mathf.RoundToInt(params[2] / 30 * cfg.eff_exp_team) or 0
+    data[ResPropID.CardExp] = cfg and _G.Mathf.RoundToInt(params[2] / 30 * cfg.eff_exp_hero) or 0
+    data[ResPropID.Coin] = cfg and _G.Mathf.RoundToInt(params[2] / 30 * cfg.eff_coin) or 0
+    if data[params[1]] then
+        return data[params[1]]
+    end
+    if cfg then
+        for _, v in pairs(cfg.eff_item) do
+            if v[1] == params[1] then
+                return _G.Mathf.RoundToInt(params[2] / v[2])
+            end
+        end
+    end
+    return 0
+end
+
+function AfkModel:UpdatMaxRewardTime()
+    self.MaxRewardTime = _G.ConfigManager.discrete_cfg[discreteID.MaxRewardTime][1][1] +
+            require "HellRoadModel":GetInstance():GetNumber({ _G.PrivilegeType.Afk.Count })
+end
+
+function AfkModel:GetRecommend(call)
+    require "AfkNet":GetInstance():GetRecommend(
+            { sid = self:GetCurSection() },
+            function(msg)
+                if call then
+                    call(msg)
+                end
+            end
+    )
+end
+
+----------------------------------------ZHJ-15775【客户端】快速挂机界面预制体添加 --------------------------
+---获取某一关的敌方阵容数据
+function AfkModel:GetSectionDefendersBySid(sid)
+    local isShow = true
+    local monster_group_cfg = _G.ConfigManager.monster_group_cfg
+    if sid <= 0 then
+        return nil
+    end
+    local groupId = _G.DeepCopyCfgTable(self.cfg[sid].monster_group)
+    local DefaultDefenserSids
+    local group
+    if #groupId > 0 then
+        DefaultDefenserSids = _G.DeepCopyCfgTable(monster_group_cfg[groupId[1]].DefaultDefenserSids)
+        if #DefaultDefenserSids > 0 then
+            group = DefaultDefenserSids[1]
+        end
+    end
+    if group then
+        _G.SortList(
+                group,
+                function(a)
+                    if a == 0 then
+                        isShow = false
+                    end
+                    return a
+                end
+        )
+    end
+    if not isShow then
+        return nil
+    else
+        return group
+    end
+end
+
+---获取上一关的我方阵容头像id(最多取四个)敌方阵容头像id(最多取三个)
+function AfkModel:GetLastAfkSectionGroupHeads()
+    local monster_cfg = _G.ConfigManager.monster_cfg
+    local group
+    local eHeads = {}
+    if self.LastSid and self.LastSid > 0 then
+        local defenderGroup = self:GetSectionDefendersBySid(self.LastSid)
+        if defenderGroup and #defenderGroup == 5 then
+            for i = 1, 5 do
+                if defenderGroup[i] ~= 0 then
+                    if monster_cfg[defenderGroup[i]] then
+                        local card = require "CardCommentManager":GetInstance():CardData(monster_cfg[defenderGroup[i]].CardID)
+                        _G.table.insert(eHeads, card.Icon)
+                    end
+                end
+            end
+            group = { eHeads = eHeads }
+            return group
+        else
+            return nil
+        end
+    else
+        return nil
+    end
+end
+
+---检测下一关进入条件
+function AfkModel:CheckNextSectionCondition(showTip)
+    local cfg = self:GetCurSectionCfg()
+    if cfg then
+        if _G.table.isEmptyOrNil(cfg.limit_condition) then
+            return true
+        end
+        local pass, tipSid, content = _G.GlobalConditionManager.CheckConditionArrays({ cfg.limit_condition })
+        if not pass and showTip then
+            _G.PopWindowManager:GetInstance():ShowAllTips(tipSid, content)
+        end
+        return pass, content
+    end
+    return false
+end
+
+---检测结算页面是否显示自动挑战
+function AfkModel:CheckAutoNextDisplay()
+    local con = _G.ConfigManager.discrete_cfg[100217]
+    if _G.GlobalConditionManager.CheckConditionArrays({ con[1] }) then
+        return true
+    end
+    return _G.GlobalConditionManager.CheckConditionArrays({ con[2] })
+end
+
+---检测快速挂机奖励里还有没有限时掉落的货币
+function AfkModel:CheckQuickLimitDrop()
+    local dataT = require "ActivitySynManager":GetInstance():GetActivityByType(10052) or {}
+    for k, data in pairs(dataT) do
+        if data.typeClass:CheckOpenCondition() then
+            return true
+        end
+    end
+    return false
+end
+
+---获取玩家到可战斗等级所需要的挂机时间
+function AfkModel:GetCanBattleAfkTime(nextLevel)
+    local sectionCfg = self:GetCurSectionCfg()
+    if not sectionCfg then
+        return 0
+    end
+    local cfg = _G.ConfigManager.afk_cfg[sectionCfg.id]
+    local exp = cfg and cfg.eff_exp_team or 0
+    local privilege = require "PrivilegeManager":GetInstance():GetPrivilegeDataNew({ _G.PrivilegeType.Afk.ItemPer, 22 })
+    if privilege and privilege[1] then
+        exp = (1 + privilege[1][3] / 10000) * exp
+    end
+    ---配置上是配置的30秒的效率
+    exp = exp / 30
+    local level
+    if not nextLevel then
+        level = sectionCfg.limit_condition and sectionCfg.limit_condition[2]
+    end
+    local needExp = _G.PlayerModel:GetInstance():GetNextLevelNeedExp(level)
+    return _G.Mathf.Floor(needExp / exp)
+end
+
+---@return AfkModel
+return AfkModel

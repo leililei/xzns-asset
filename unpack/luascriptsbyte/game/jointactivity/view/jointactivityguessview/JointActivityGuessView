@@ -1,0 +1,635 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.JointActivity.View.JointActivityGuessView	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/11/11
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+---@class JointActivityGuessView : UIBaseView	中文描述
+---@field public go_table JointActivityGuessView_GoTable GoTable
+local JointActivityGuessView = _G.BaseClass("JointActivityGuessView", _G.UIBaseView)
+
+local moveChatWindowRange = { -1305, 435 }
+local distance = _G.ConfigManager.discrete_cfg[105723][1][1]
+---第一轮和第二轮倒计时文本
+local timeKey = {
+    90032200003,
+    90032200004
+}
+
+function JointActivityGuessView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self.skillTipTb = _G.GetAutoGoTable(self.go_table.obj_skillTip, _G.handler(self, self.OnClickSkillTip))
+    self.betInfoItemDic = {}
+    self.chatMsgMaxCount = _G.ConfigManager.discrete_cfg[105717][1][1]
+end
+
+---界面的入口函数
+---@param activity ActivitySynBase
+---@param activitySynModel JointActivityGuessSynModel
+function JointActivityGuessView:OnCreate(activity)
+    self.activity = activity
+    self.activitySynModel = activity.typeClass
+    self.activityId = activity:GetActivityID()
+    self:AddComponent(
+        self.go_table.trans_resources,
+        require("ResourceCompont").New(
+            self.go_table.trans_resources,
+            _G.ConfigManager.ui_cfg.JointActivityGuessView.resources
+        )
+    )
+    self.chatWindowItem = {
+        self.go_table.aorimgtext_1,
+        self.go_table.aorimgtext_2,
+        self.go_table.aorimgtext_3,
+        self.go_table.aorimgtext_4,
+        self.go_table.aorimgtext_5,
+        self.go_table.aorimgtext_6
+    }
+    self.moveChatWindowX = moveChatWindowRange[2]
+    local discrete_cfg = _G.ConfigManager.discrete_cfg
+    self.moveChatWindowSpeed = discrete_cfg[105716][1][1] * moveChatWindowRange[2]
+    self.chatWindowStartTime = discrete_cfg[105719][1][1]
+    local todaySessions = self.activitySynModel:GetTodaySessions()
+    ---默认选中当前战斗未结束的轮次
+    self.sessionIndex = 1
+    for i, v in ipairs(todaySessions) do
+        if _G.TimeUtil.GetServerUnixTime() < v.time_end then
+            self.sessionIndex = i
+            break
+        end
+    end
+    self.go_table.toggle_first.isOn = self.sessionIndex == 1
+    self.go_table.toggle_second.isOn = self.sessionIndex == 2
+    self:RefreshView()
+    self:LoadEffect()
+    if _G.PlayerPrefsManager.GetInt("JointActivityGuess_" .. self.activityId, 0) == 0 then
+        _G.PlayerPrefsManager.SetInt("JointActivityGuess_" .. self.activityId, 1)
+        self.activitySynModel:RefreshRedPoint(1)
+    end
+    self.go_table.obj_courseredpoint:UpdateRedPointItemIDAndParam(
+        self.activitySynModel:GetRedpointIDByIndex(2)
+    )
+end
+
+---特效
+function JointActivityGuessView:LoadEffect()
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.ef_JointActivityGuessView,
+        self.go_table.obj_effect,
+        function(effect)
+            if not self.go_table then
+                _G.UIUtils.RemoveEffect(effect)
+            end
+        end
+    )
+end
+
+---刷新界面
+function JointActivityGuessView:RefreshView()
+    self:RefreshActInfo()
+    self:RefreshPetInfo()
+    self:RefreshPetSkill()
+    self:RefreshPetProp()
+    self:RefreshGuessBtn()
+    self:ShowSessionInfo()
+    self:ShowChatWindow()
+end
+
+---活动信息
+function JointActivityGuessView:RefreshActInfo()
+    self.guessData = self.activitySynModel:GetTodaySessions(self.sessionIndex)
+    self.go_table.aortext_tip.text = _G.GetLangPackValue(
+        90032200002,
+        self.activitySynModel:GetGuessStartTime(1),
+        self.activitySynModel:GetGuessStartTime(2)
+    )
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if self.betEndTimer then
+        self.betEndTimer:Stop()
+        self.betEndTimer = nil
+    end
+    self.betLeftTime = self.guessData.time_end
+    if serverTime < self.betLeftTime then
+        self.go_table.aortext_time.text = _G.GetLangPackValue(
+            timeKey[self.sessionIndex],
+            _G.TimeUtil.TimeToString(self.betLeftTime - serverTime, 1)
+        )
+        self.betEndTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTimer, self, false, false, true)
+        self.betEndTimer:Start()
+        self:UpdateTimer()
+    else
+        self.go_table.aortext_time.text = _G.GetLangPackValue(90032200008)
+    end
+end
+
+function JointActivityGuessView:UpdateTimer()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    if serverTime < self.betLeftTime then
+        self.go_table.aortext_time.text = _G.GetLangPackValue(
+            timeKey[self.sessionIndex],
+            _G.TimeUtil.TimeToString(self.betLeftTime - serverTime, 1)
+        )
+    else
+        if self.betEndTimer then
+            self.betEndTimer:Stop()
+            self.betEndTimer = nil
+        end
+        self.go_table.aortext_time.text = _G.GetLangPackValue(90032200008)
+        _G.PopWindowManager:GetInstance():ShowAllTips(630101)
+        self:RefreshGuessBtn()
+    end
+end
+
+---刷新灵兽数据
+function JointActivityGuessView:RefreshPetInfo()
+    ---加载灵兽的spine
+    local function LoadSpine(parent, spinePath, portrait, scale)
+        _G.UIUtils.LoadEffectByPath(spinePath, parent, function(trans)
+            if self:IsNil() then
+                _G.UIUtils.RemoveEffect(trans)
+                return
+            end
+            trans:SetLocalPosition(portrait[1] or 0, portrait[2] or 0, portrait[3] or 0)
+            trans:SetLocalScale(scale[1] or 1, scale[2] or 1, 1)
+        end)
+    end
+    local monsterCfg = _G.ConfigManager.activity_joint_monster_cfg
+    local array = self.guessData and self.guessData.array or {}
+    if array[1] then
+        local cfg = monsterCfg[array[1]] or {}
+        self.go_table.obj_leftPet:ClearChildren()
+        LoadSpine(self.go_table.obj_leftPet, cfg.pic, cfg.left_portrait or {}, cfg.left_size or {})
+    end
+    if array[2] then
+        local cfg = monsterCfg[array[2]] or {}
+        self.go_table.obj_rightPet:ClearChildren()
+        LoadSpine(self.go_table.obj_rightPet, cfg.pic, cfg.right_portrait or {}, cfg.right_size or {})
+    end
+end
+
+---灵兽属性
+function JointActivityGuessView:RefreshPetProp()
+    local type_attribute_cfg = _G.ConfigManager.type_attribute_cfg
+    local function ShowProp(id, parentObj)
+        local cfg = _G.ConfigManager.activity_joint_monster_cfg[id]
+        local propList = {}
+        _G.table.insert(propList, { key = "atk", sortId = _G.AttrType["atk"].sortid, num = cfg.atk })
+        _G.table.insert(propList, { key = "def", sortId = _G.AttrType["def"].sortid, num = cfg.def })
+        _G.table.insert(propList, { key = "max_hp", sortId = _G.AttrType["max_hp"].sortid, num = cfg.max_hp })
+        _G.table.insert(propList, { key = "all_speed", sortId = _G.AttrType["all_speed"].sortid, num = cfg.all_speed })
+        parentObj:ClearChildren()
+        for _, v in pairs(propList) do
+            local tran = _G.InstantiateObject(self.go_table.obj_propItem, parentObj)
+            if tran then
+                local tb = _G.GetAutoGoTable(tran)
+                tb.aortext_prop.text = _G.GetLangPackValue(type_attribute_cfg[_G.AttrType[v.key].ID].name) ..
+                    "：" .. _G.GameUtil.NumberWY(_G.math.floor(v.num or 0))
+            end
+        end
+    end
+    local array = self.guessData and self.guessData.array or {}
+    if array[1] then
+        ShowProp(array[1], self.go_table.obj_leftPropGrid)
+    end
+    if array[2] then
+        ShowProp(array[2], self.go_table.obj_rightPropGrid)
+    end
+end
+
+---灵兽技能
+function JointActivityGuessView:RefreshPetSkill()
+    local function ShowSkill(id, parentObj)
+        local cfg = _G.ConfigManager.activity_joint_monster_cfg[id]
+        parentObj:ClearChildren()
+        for i, v in ipairs(cfg.skill_icon) do
+            local tran = _G.InstantiateObject(self.go_table.obj_skillItem, parentObj)
+            if tran then
+                local tb = _G.GetAutoGoTable(tran, _G.handlerbind(self, self.OnClickSkillItem, cfg.skill_desc[i]))
+                tb.aorrawimage_icon:LoadImage(v)
+            end
+        end
+    end
+    local array = self.guessData and self.guessData.array or {}
+    if array[1] then
+        ShowSkill(array[1], self.go_table.trans_LeftSkill)
+    end
+    if array[2] then
+        ShowSkill(array[2], self.go_table.trans_RightSkill)
+    end
+end
+
+---技能弹窗tips
+function JointActivityGuessView:OnClickSkillItem(_, _, desc)
+    self.skillTipTb.aortext_desc.text = _G.GetLangPackValue(desc)
+    self.go_table.obj_skillTip:SetActiveE(1)
+end
+
+---刷新竞猜按钮
+function JointActivityGuessView:RefreshGuessBtn()
+    local isGuessFinish = _G.TimeUtil.GetServerUnixTime() >= self.guessData.time_end
+    if self.guessData.bet and self.guessData.bet > 0 then
+        ---如果竞猜已出结果，竞猜按钮隐藏
+        local bluePet = self.guessData.array[1]
+        local redPet = self.guessData.array[2]
+        self.go_table.aorbtn_guessRed:SetActiveE((isGuessFinish or self.guessData.bet == bluePet) and 0 or 1)
+        self.go_table.aorbtn_guessBlue:SetActiveE((isGuessFinish or self.guessData.bet == redPet) and 0 or 1)
+        self.go_table.aorimage_buleResult:SetActiveE((isGuessFinish and self.guessData.bet == bluePet) and 1 or 0)
+        self.go_table.aorimage_redResult:SetActiveE((isGuessFinish and self.guessData.bet == redPet) and 1 or 0)
+        if isGuessFinish then
+            if self.guessData.bet == bluePet then
+                self.go_table.aorimage_buleResult.SpriteName = self.guessData.win == bluePet and "ui_hjdj_txt_jccg" or
+                    "ui_hjdj_txt_jcsb"
+            else
+                self.go_table.aorimage_redResult.SpriteName = self.guessData.win == redPet and "ui_hjdj_txt_jccg" or
+                    "ui_hjdj_txt_jcsb"
+            end
+        else
+            if self.guessData.bet == bluePet then
+                self.go_table.aorimage_guessBlue.SpriteName = "ui_hjdj_txt_yjc"
+            else
+                self.go_table.aorimage_guessRed.SpriteName = "ui_hjdj_txt_yjc"
+            end
+        end
+        self.go_table.obj_buleNotGuess:SetActiveE(0)
+        self.go_table.obj_redNotGuess:SetActiveE(0)
+    else
+        self.go_table.obj_buleNotGuess:SetActiveE(isGuessFinish and 1 or 0)
+        self.go_table.obj_redNotGuess:SetActiveE(isGuessFinish and 1 or 0)
+        self.go_table.aorbtn_guessRed:SetActiveE(isGuessFinish and 0 or 1)
+        self.go_table.aorbtn_guessBlue:SetActiveE(isGuessFinish and 0 or 1)
+        if not isGuessFinish then
+            self.go_table.aorimage_guessBlue.SpriteName = "ui_hjdj_txt_jc"
+            self.go_table.aorimage_guessRed.SpriteName = "ui_hjdj_txt_jc"
+            self.go_table.aorimage_guessBlue:SetActiveE(1)
+            self.go_table.aorimage_guessRed:SetActiveE(1)
+        end
+        self.go_table.aorimage_buleResult:SetActiveE(0)
+        self.go_table.aorimage_redResult:SetActiveE(0)
+    end
+end
+
+function JointActivityGuessView:OnToggle(go, isOn, index)
+    local tb = _G.GetAutoGoTable(go)
+    _G.GameUtil.SetActiveByCondition(tb.aorimage_isOn, isOn)
+    _G.GameUtil.SetActiveByCondition(tb.aorimage_isOff, not isOn)
+    if isOn and self.sessionIndex ~= index then
+        self.sessionIndex = index
+        self:RefreshView()
+    end
+end
+
+---竞猜记录
+function JointActivityGuessView:ShowSessionInfo()
+    self.activitySynModel:GetBetInfo(function(info)
+        self.betInfo = info or {}
+        if self.sessionListView then
+            self.sessionListView:UpdateCount(#self.betInfo)
+        else
+            self.go_table.scrollloopvectical_info:InitItemData(#self.betInfo, _G.handler(self, self.OnBetInfoItemCall))
+            self.sessionListView = self.go_table.scrollloopvectical_info
+        end
+    end)
+end
+
+function JointActivityGuessView:OnBetInfoItemCall(index, obj)
+    index = index + 1
+    local id = obj:GetInstanceIDE()
+    local item = self.betInfoItemDic[id]
+    if not item then
+        item = _G.GetAutoGoTable(obj)
+        self.betInfoItemDic[id] = item
+    end
+    local data = self.betInfo[#self.betInfo - index + 1]
+    local cfg = _G.ConfigManager.activity_joint_monster_cfg[data.direction]
+    if data.index == 1 then
+        item.aortext_info.text = _G.GetLangPackValue(90032200009, data.name, _G.GetLangPackValue(cfg.name))
+    else
+        item.aortext_info.text = _G.GetLangPackValue(90032200010, data.name, _G.GetLangPackValue(cfg.name))
+    end
+end
+
+---打开聊天频道
+function JointActivityGuessView:ShowChatView()
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnChatViewClosed, self)
+    local tab, tab2
+    local channel = _G.ChatType.events
+    local t = _G.TimeUtil.GetServerUnixTime()
+    self.chatViewMsgTab = self.chatViewMsgTab or {}
+    local index = 1
+    for i = 1, #self.chatMsgList do
+        tab = self.chatMsgList[i]
+        if tab.role.uid > 0 then
+            tab2 = self.chatViewMsgTab[index]
+            if not tab2 then
+                tab2 = {
+                    ["channel"] = channel,
+                    ["voice"] = 0,
+                    ["type"] = 1,
+                    ["time"] = 0,
+                    ["n_content"] = { 0, 0 },
+                    ["role_info"] = false
+                }
+            end
+            if not tab2.n_content or type(tab2.n_content) == "string" then
+                tab2.n_content = { 0, 0 }
+            end
+            tab2.role_info = tab.role
+            tab2.n_content[1] = tab.type
+            tab2.n_content[2] = tab.type == 1 and tab.content or tab.sid
+            tab2.time = t
+            self.chatViewMsgTab[index] = tab2
+            index = index + 1
+        end
+    end
+    for i = index, #self.chatViewMsgTab do
+        self.chatViewMsgTab[i] = nil
+    end
+    self.chatView =
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.ChatView.Name,
+            _G.ChatType.events,
+            self.chatViewMsgTab,
+            _G.handler(self, self.OnChatCall)
+        ).View
+end
+
+---聊天界面关闭监听
+function JointActivityGuessView:OnChatViewClosed(name)
+    if name == _G.ConfigManager.ui_cfg.ChatView.Name then
+        self.chatView = nil
+        self.onBtnClick = false
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnChatViewClosed, self)
+    end
+end
+
+---聊天发送监听方法
+---@param params table 消息
+---@param callback  function 发送回调
+function JointActivityGuessView:OnChatCall(params, callback, isAuto)
+    local pbData = { id = self.activityId, type = params.type, auto = 0 }
+    if params.type == 1 then
+        pbData.content = params.content
+    else
+        pbData.sid = params.content
+    end
+    self.activitySynModel:SendGuessBullet(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                params.content = msg.content or params.content
+                if #self.chatMsgList == self.chatMsgMaxCount then
+                    for i = 2, #self.chatMsgList do
+                        self.chatMsgList[i - 1] = self.chatMsgList[i]
+                    end
+                    self.chatMsgList[self.chatMsgMaxCount] = {
+                        role = _G.PlayerModel:GetInstance():GetIRroleTable(),
+                        type = params.type,
+                        content = params.type == 1 and params.content or nil,
+                        sid = params.type == 2 and _G.tonumber(params.content) or nil
+                    }
+                else
+                    self.chatMsgList[#self.chatMsgList + 1] = {
+                        role = _G.PlayerModel:GetInstance():GetIRroleTable(),
+                        type = params.type,
+                        content = params.type == 1 and params.content or nil,
+                        sid = params.type == 2 and tonumber(params.content) or nil
+                    }
+                end
+            end
+            if params.type == 2 then
+                msg.content = { 2, params.content }
+            else
+                msg.content = { 1, msg.content }
+            end
+            msg.time = _G.TimeUtil.GetServerUnixTime()
+            if callback then
+                callback(_G.DeepCopy(msg))
+            end
+        end
+    )
+end
+
+---显示打开弹幕
+function JointActivityGuessView:ShowChatWindow()
+    self.chatMsgList = {}
+    _G.GameUtil.SetActiveByCondition(self.go_table.trans_chatWindow, true)
+    self.activitySynModel:GetBulletInfo(_G.handler(self, self.OnGetChatDataCall))
+end
+
+function JointActivityGuessView:OnGetChatDataCall(info)
+    self.chatMsgList = info or {}
+    self.curShowChatIndex = 1
+    self:UpdateChatWindowView()
+    self:MoveChatWindow(true)
+end
+
+---弹幕计时器
+function JointActivityGuessView:MoveChatWindow(isMove)
+    if isMove then
+        if self.moveChatWindowTimer then
+            self.moveChatWindowTimer:Resume()
+        else
+            self.moveChatWindowTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnChatWindowMove, self, false, true)
+            self.moveChatWindowTimer:Start()
+        end
+    else
+        if self.moveChatWindowTimer then
+            self.moveChatWindowTimer:Pause()
+        end
+        if self.onResetChatTimer then
+            self.onResetChatTimer:Stop()
+            self.onResetChatTimer = nil
+        end
+    end
+end
+
+function JointActivityGuessView:OnChatWindowMove()
+    self.moveChatWindowX = self.moveChatWindowX - _G.Time.deltaTime * self.moveChatWindowSpeed
+    if self.moveChatWindowX < moveChatWindowRange[1] then
+        self.moveChatWindowX = moveChatWindowRange[2]
+        self:UpdateChatWindowView()
+    end
+    self.go_table.trans_chatWindow:SetLocalPosition(self.moveChatWindowX, 0, 0)
+end
+
+function JointActivityGuessView:UpdateChatWindowView()
+    if self.resetChatWindowTag then
+        ---延时等待 然后开启新的循环
+        self.curShowChatIndex = 1
+        self.resetChatWindowTag = false
+        self.onResetChatTimer =
+            _G.TimerManager:GetInstance():GetTimer(
+                _G.ConfigManager.discrete_cfg[105719][1][1],
+                self.OnResetChatWindow,
+                self,
+                true
+            )
+        if self.moveChatWindowTimer then
+            self.moveChatWindowTimer:Pause()
+        end
+        self.onResetChatTimer:Start()
+    end
+    local data, cfg
+    local cfgs = _G.ConfigManager.bullet_chat_cfg
+    local format = _G.string.format
+    local name = ""
+    for i = 1, 6 do
+        data = self.chatMsgList[self.curShowChatIndex]
+        if data then
+            local text = ""
+            if data.role.uid == 0 then
+                name = self.activitySynModel:RandomName()
+            else
+                name = data.role.name
+            end
+            if data.type == 2 then
+                name = name .. ":"
+                cfg = cfgs[data.sid > 5 and 1 or data.sid]
+                if data.role.uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                    text = format("<img=%s>%s", cfg.icon, name) .. GetLangPackValue(cfg.content[2])
+                else
+                    text = format("<img=%s>%s", cfg.icon, name) .. GetLangPackValue(cfg.content[1])
+                end
+            else
+                text = data.content
+            end
+            if i > 3 then
+                local x, y, z = self.chatWindowItem[i - 3]:GetLocalPosition()
+                self.chatWindowItem[i]:SetLocalPosition(x + distance, y, z)
+            end
+
+            self.chatWindowItem[i].text = text
+        end
+        self.curShowChatIndex = self.curShowChatIndex + 1
+        if self.curShowChatIndex > #self.chatMsgList then
+            self.curShowChatIndex = 1
+            self.resetChatWindowTag = true
+        end
+    end
+end
+
+function JointActivityGuessView:OnResetChatWindow()
+    if self.moveChatWindowTimer then
+        self.moveChatWindowTimer:Resume()
+    end
+end
+
+function JointActivityGuessView:OnEnable()
+    if self.onDIsablePauseTag then
+        if self.moveChatWindowTimer then
+            self.moveChatWindowTimer:Resume()
+            self.onDIsablePauseTag = nil
+        end
+    end
+    if self.onResetChatTimer then
+        self.onResetChatTimer:Resume()
+    end
+end
+
+function JointActivityGuessView:OnDisable()
+    if self.onResetChatTimer then
+        self.onResetChatTimer:Pause()
+    end
+    if self.moveChatWindowTimer then
+        self.moveChatWindowTimer:Pause()
+        self.onDIsablePauseTag = true
+    end
+end
+
+---界面的销毁函数
+function JointActivityGuessView:OnDestroy()
+    if self.moveChatWindowTimer then
+        self.moveChatWindowTimer:Stop()
+        self.moveChatWindowTimer = nil
+    end
+    if self.onResetChatTimer then
+        self.onResetChatTimer:Stop()
+        self.onResetChatTimer = nil
+    end
+    if self.betEndTimer then
+        self.betEndTimer:Stop()
+        self.betEndTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnChatViewClosed, self)
+end
+
+function JointActivityGuessView:OnClickSkillTip()
+    self.go_table.obj_skillTip:SetActiveE(0)
+end
+
+---竞猜
+function JointActivityGuessView:GuessBet(index)
+    if self.guessData.bet and self.guessData.bet > 0 then
+        return
+    end
+    if self.guessData.time_end - _G.TimeUtil.GetServerUnixTime() <= 0 then
+        return
+    end
+    self.activitySynModel:GuessBet(
+        self.guessData.f_index,
+        self.guessData.array[index],
+        self.sessionIndex,
+        function()
+            self:RefreshGuessBtn()
+            self:ShowSessionInfo()
+            ---添加弹幕
+            local params = {}
+            params.type = 1
+            local roleName = _G.PlayerModel:GetInstance():GetName()
+            local cfg = _G.ConfigManager.activity_joint_monster_cfg[self.guessData.array[index]]
+            if index == 1 then
+                params.content = _G.GetLangPackValue(90032200009, roleName, _G.GetLangPackValue(cfg.name))
+            else
+                params.content = _G.GetLangPackValue(90032200010, roleName, _G.GetLangPackValue(cfg.name))
+            end
+            self:OnChatCall(params, nil, 0)
+        end
+    )
+end
+
+---活动结束，关闭界面
+function JointActivityGuessView:OnCloseActivity(activityId)
+    if self.activityId == activityId then
+        local view1 = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.JointActivityGuessRecordView.Name)
+        if view1 then
+            view1:Close()
+        end
+
+        local view2 = _G.UIManager:GetInstance():GetWindowCtrl(
+            _G.ConfigManager.ui_cfg.JointActivityGuessPlayBackView.Name
+        )
+        if view2 then
+            view2:Close()
+        end
+        self:Close()
+    end
+end
+
+---按钮点击事件在这里派发
+function JointActivityGuessView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_Close then
+        self:Close()
+    elseif go == self.go_table.aorbtn_course then
+        ---赛程
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.JointActivityGuessRecordView.Name, self.activityId,
+            self.activitySynModel)
+    elseif go == self.go_table.aorbtn_help then
+        ----打开玩法说明页面
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 146)
+    elseif go == self.go_table.aorbtn_guessBlue then
+        self:GuessBet(1)
+    elseif go == self.go_table.aorbtn_guessRed then
+        self:GuessBet(2)
+    elseif go == self.go_table.aorbtn_chat then
+        self:ShowChatView()
+    elseif go == self.go_table.toggle_first then
+        ---第一轮页签
+        self:OnToggle(go, isOn, 1)
+    elseif go == self.go_table.toggle_second then
+        ---第二轮页签
+        self:OnToggle(go, isOn, 2)
+    end
+end
+
+return JointActivityGuessView

@@ -1,0 +1,947 @@
+-------------------------------------------------------
+-- Description:     世界基类
+-- Author:          csw
+-- Create Date:     2019/12/17
+-------------------------------------------------------
+local WorldPlayerData = require "WorldPlayerData"
+require "WorldPlayerItem"
+
+---@class BaseWorld 世界基类
+---@field public Procedure Procedure 流程
+---@field public Progress_call function 进度回调
+---@field public Sid number 世界Sid
+---@field public Cfg scene_cfg 世界配置表
+---@field public GameObject UnityEngine.GameObject 世界里面的对象
+---@field public SceneObject UnityEngine.Transform 加载的预设
+---@field public Data MapData 世界数据
+---@field public WorldSetting WorldSetting 世界管理器
+---@field public ItemRoot UnityEngine.Transform 当前世界所有对象父节点
+---@field public AllWorldItems table<number, BaseItem> 当前世界所有对象
+---@field public AllWorldItemsByInstId table<number, BaseItem> 当前世界所有对象InstId
+---@field public CameraPosBoxList table<number, BaseItem> 当前被camres覆盖到节点
+---@field public WorldPlayer WorldPlayerItem 主角
+local BaseWorld = _G.BaseClass("BaseWorld")
+
+---@field public from ProcedureType 开始点
+---@field public to ProcedureType 结束点
+---@class ProcedureItem 加载场景流程进度
+--region 本地声明
+---@class ProcedureType 加载场景流程进度
+local ProcedureType = {
+    loading = "loading",
+    preload_loading = "preload_loading",
+    loadData = "loadData",
+    instWorld = "instWorld",
+    initPlayer = "initPlayer",
+    initOtherPlayer = "initOtherPlayer",
+    initObjs = "initObjs",
+    complete = "complete"
+}
+--endregion
+
+--region 生命周期
+---@param sid number
+function BaseWorld:__init(sid, progressCall)
+    self.Procedure = _G.Procedure.New()
+    self.IsInitOver = false
+    self.Progress_call = progressCall
+    self.Sid = sid
+    self.GameObject = nil
+    self.Data = nil
+    self.WorldSetting = nil
+    self.ItemRoot = nil
+    self.WorldPlayer = nil
+    self.SceneObject = nil
+    self.Cfg = _G.ConfigManager.scene_cfg[self.Sid]
+    self.ItemDataList = {}
+    self.AllWorldItems = {}
+    self.AllWorldItemsByInstId = {}
+    self.CameraPosBoxList = {}
+    --self.NpcPoss = {}
+    self.CommonEff = _G.CS.EngineCenter.CommonEffect.Instance
+    self.CommonEff:ReInit()
+    self:Init()
+end
+---清理工作
+function BaseWorld:Dispose()
+    for k, value in pairs(self.AllWorldItems) do
+        value:DisWorldItem()
+    end
+    self.CommonEff:Clear()
+    self.ItemDataList = nil
+    self.Procedure:Dispose()
+    self.Procedure = nil
+    --self.NpcPoss = nil
+    self.CameraPosBoxList = nil
+    self.AllWorldItemsByInstId = nil
+    self.AllWorldItems = nil
+    self.followPlayer = nil
+    self.ItemRoot = nil
+    if not _G.IsNil(self.GameObject) then
+        _G.GameObject.Destroy(self.GameObject)
+    end
+    self.GameObject = nil
+    self.SceneObject = nil
+    self.Cfg = nil
+    self.WorldPlayer = nil
+    self.WorldSetting = nil
+    self.Sid = nil
+    self.Progress_call = nil
+    self.IsInitOver = nil
+    self.Data = nil
+    self.curAllItemShow = nil
+    _G.UpdateManager:GetInstance():RemoveUpdate(self.SortTitle, self)
+end
+--endregion
+
+--region 对外接口
+---处理点击地表事件
+---@param name string 点击物体名字
+function BaseWorld:OnClick(tag, name, point)
+    if tag == "Walk" then --点地板
+        if self.Cfg.Scene_Type ~= _G.SceneType.Dungones then
+            self.WorldPlayer:GotoPoint(point)
+            _G.Events:GetInstance():Broadcast(_G.eNav.HideFlag, self.WorldPlayer.Uid)
+            self.WorldPlayer:SetClickTarget(nil)
+            -- else
+            --
+            if _G.AppSetting.DEBUG then
+                _G.Log("千机黑刹场景不需要移动")
+            end
+        end
+    elseif tag == "WorldObject" then --点物件
+        local ID = _G.tonumber(name)
+        local itemInfo = self:GetItemInfo(ID)
+        if itemInfo and itemInfo.OnClick then
+            _G.Events:GetInstance():Broadcast(_G.eGuideEvent.WorldObjRespond)
+            self.WorldPlayer:SetClickTarget(ID)
+            itemInfo:OnClick()
+        end
+    end
+end
+---获取对应ID的场景物体
+function BaseWorld:GetItemInfo(uid)
+    return self.AllWorldItems[uid]
+end
+---从世界对象中删除
+---@param uid number
+function BaseWorld:RemoveWorldItems(uid)
+    local item = self.AllWorldItems[uid]
+    if item then
+        if self.setTransparentEffectIds and self.setTransparentEffectIds[uid] then
+            self.CommonEff:StopRoleTransparentEffect(item.ObjectMod)
+            self.setTransparentEffectIds[uid] = nil
+        end
+        item:OnExitWorld()
+        item:DisWorldItem()
+        self.AllWorldItems[uid] = nil
+        self:RemoveCameraPosBoxById(uid)
+        self.setTransparentEffectIds[uid] = nil
+        self.allItemDis[uid] = nil
+    end
+end
+
+---从世界删除除角色外的对象
+---@param uid number
+function BaseWorld:RemoveWorldAllObjItems()
+    local keys = {}
+    for key, value in pairs(self.AllWorldItems) do
+        if key ~= _G.PlayerModel:GetInstance():GetPlayerUid() then
+            table.insert(keys, key)
+        end
+    end
+    for i = 1, #keys do
+        self:RemoveWorldItems(keys[i])
+    end
+end
+
+---从世界删除除角色外的对象
+---@param uid number
+function BaseWorld:RemoveWorldAllObjItemsButid(id)
+    local keys = {}
+    for key, value in pairs(self.AllWorldItems) do
+        if key ~= _G.PlayerModel:GetInstance():GetPlayerUid() and value.ItemData.EventId ~= id then
+            table.insert(keys, key)
+        end
+    end
+    for i = 1, #keys do
+        self:RemoveWorldItems(keys[i])
+    end
+end
+
+---对场景所有物体分发事件
+---@param enumclass BaseEvent @枚举类
+---@param event string @枚举事件
+---@param ... any @事件参数
+function BaseWorld:DispatchEventToAllItems(enumclass, event, ...)
+    for _, v in pairs(self.AllWorldItems) do
+        v:DispatchEvent(enumclass, event, ...)
+    end
+end
+---设置世界是否可见(同步隐藏和显示物件)
+---@param isVisible boolean
+function BaseWorld:Visible(isVisible)
+    if self.isEnterWorld == isVisible then
+        return
+    end
+    self.isEnterWorld = isVisible
+    if not _G.IsNil(self.GameObject) then
+        self.GameObject:SetActiveE(isVisible and 1 or 0)
+    end
+    if isVisible then
+        for _, value in pairs(self.AllWorldItems) do
+            value:CheckMoveing()
+        end
+    end
+    if not _G.WorldManager:GetInstance():CheckCurSceneType(_G.SceneType.MainWorld) then
+        for _, value in pairs(self.AllWorldItems) do
+            value:ShowOrHide(isVisible)
+        end
+    end
+    -- if isVisible then
+    --     if self.curPlayerState == false then
+    --         self:EnablePlayer()
+    --         self.curPlayerState = true
+    --     end
+    -- elseif self.curPlayerState ~= false then
+    --     self.curPlayerState = false
+    --     self:DisablePlayer()
+    -- end
+    if isVisible then
+        self:StartObjectAlphaCheck()
+    else
+        self:StopObjectAlphaCheck()
+    end
+end
+-----进入世界
+function BaseWorld:EnterWorld(immediately)
+    self.CameraPosBoxList = {}
+    self:InstWorld()
+    self:InstAllItem()
+    self:Visible(true, false, false)
+
+    if self.curPlayerState == false then
+        self:EnablePlayer()
+        self.curPlayerState = true
+    end
+
+    if not self.Cfg.LockMainCamera then
+        self.WorldSetting.SceneCamera:Look(self.WorldPlayer.Transform)
+        self.WorldSetting.SceneCamera:UpdatePos(true)
+        self:InitObjectAlphaCheck()
+        self:StartObjectAlphaCheck()
+    end
+    self:OnChangeWorldOver()
+    self:ChangeCameraBattle()
+end
+-----离开世界
+function BaseWorld:LeaveWorld()
+    self:ClearObjectAlphaCheck()
+    if self.curPlayerState ~= false then
+        self.curPlayerState = false
+        self:DisablePlayer()
+    end
+    for uid, value in pairs(self.AllWorldItems) do
+        if uid ~= _G.PlayerModel:GetInstance().role_uid then
+            value:OnExitWorld(true)
+        end
+    end
+    self.battleCamera = nil
+    self.normalCamera = nil
+    self.CameraPosBoxList = nil
+end
+---回收场景GameObject
+function BaseWorld:DespawnWorld()
+    if not _G.IsNil(self.SceneObject) then
+        _G.WorldManager:GetInstance():PutSceneGameObj(self.SceneObject)
+        self.SceneObject = nil
+    end
+    self:Visible(false)
+end
+-----获取物件列表
+---@return table 物件列表{sid=num}
+function BaseWorld:GetItemsData()
+    local items = {}
+    local sid = 0
+    if self.ItemDataList and #self.ItemDataList > 0 then
+        for i = 1, #self.ItemDataList do
+            sid = self.ItemDataList[i].Sid
+            if items[sid] then
+                items[sid] = items[sid] + 1
+            else
+                items[sid] = 1
+            end
+        end
+    end
+    return items
+end
+---显示或者隐藏所有物件
+---@param show boolean 是否显示
+function BaseWorld:ShowOrHideAllItem(show)
+    -- self.curAllItemShow = show
+    -- for key, value in pairs(self.AllWorldItems) do
+    --     if show then
+    --         value:OnEnterWorld()
+    --     else
+    --         value:OnExitWorld()
+    --     end
+    --     value:ShowOrHide(show)
+    -- end
+end
+---重置所有的物件
+function BaseWorld:ResetAllItem()
+    for key, value in pairs(self.AllWorldItems) do
+        value:Reset()
+    end
+end
+---切换战斗镜头
+---@param change boolean 是否切战斗镜头
+function BaseWorld:ChangeCameraBattle(change)
+end
+---清理其他玩家
+function BaseWorld:ClearOtherPlayer()
+end
+---创建其他玩家
+---@param other otherplayerdata 其他玩家数据
+function BaseWorld:CreateOtherPlayer(other)
+end
+--endregion
+
+--region 创建流程
+function BaseWorld:Init()
+    self:LoadData()
+    self:CreateWorld()
+end
+---加载世界场景数据
+function BaseWorld:LoadData()
+    if self.Cfg.TiledResLua == nil or self.Cfg.TiledResLua == "" then
+        return
+    end
+    self.Data = setmetatable({}, {__index = require(self.Cfg.TiledResLua)})
+    local _datas = self.Data.WorldItemDatas
+
+    ---引导特效模型判定数组
+    --local guideROle = {707010549, 707010550, 700000168, 700000169, 700000170}
+    local guideROle = {}
+    ---无用角色临时使用代码屏蔽掉
+    --local blockObj = {707020142, 707020143, 707020144, 707020145, 300070002}
+    local blockObj = {}
+
+    ---@type WorldItemDataItem value
+    for itype, value in pairs(_datas) do
+        for _, itemData in pairs(value) do
+            local canCreate = true
+            if false ~= table.indexof(guideROle, itemData.Uid) then
+                local ccr = _G.StoryUtilities.HasStoryIDSavedUID(800000109)
+                if ccr then
+                    canCreate = false
+                end
+            end
+            if false ~= table.indexof(blockObj, itemData.Uid) then
+                canCreate = false
+            end
+            if canCreate then
+                local wid = _G.WorldItemData.New()
+                wid:CloneData(itemData)
+                wid.ItemType = _G.WorldItemType[itype]
+                table.insert(self.ItemDataList, wid)
+            end
+        end
+    end
+end
+-----创建世界
+function BaseWorld:CreateWorld()
+    -- 初始化场景流程控制器
+    local pros = {
+        {from = ProcedureType.preload_loading, to = ProcedureType.instWorld},
+        {from = ProcedureType.instWorld, to = ProcedureType.initObjs},
+        {from = ProcedureType.initObjs, to = ProcedureType.initPlayer},
+        {from = ProcedureType.initPlayer, to = ProcedureType.complete}
+    }
+    self:InitProcedure(ProcedureType.preload_loading, ProcedureType.complete, pros)
+end
+---检查状态并切换
+---@param callback function
+---@param state string
+function BaseWorld:CheckState(callback, state)
+    _G.coroutine.start(
+        function()
+            local op = _G.Opearation.New()
+            callback(op)
+            while op.option ~= _G.Opearation.Close do
+                _G.coroutine.waitforendofframe()
+            end
+            self.Procedure:DoProcedure(state)
+        end
+    )
+end
+---场景流程变换回调
+function BaseWorld:ChangeProcedureHandler(event)
+    local to_state = event.name
+    if to_state == ProcedureType.preload_loading then
+        self:CheckState(_G.handler(self, self.LoadSceneEffect), ProcedureType.instWorld)
+    elseif to_state == ProcedureType.instWorld then
+        self:CheckState(_G.handler(self, self.CacheWorld), ProcedureType.initObjs)
+    elseif to_state == ProcedureType.initObjs then
+        self:CheckState(_G.handler(self, self.InitObjs), ProcedureType.initPlayer)
+    elseif to_state == ProcedureType.initPlayer then
+        self:CheckState(_G.handler(self, self.InitPlayer), ProcedureType.complete)
+    elseif to_state == ProcedureType.complete then
+        self:OnComplete()
+    end
+end
+-----加载场景开始的特效
+---@param op Opearation 状态
+function BaseWorld:LoadSceneEffect(op)
+    local count = #self.Cfg.StartEffect
+    if count <= 0 then
+        op.option = _G.Opearation.Close
+    else
+        local loadCount = 0
+        local callback = function()
+            loadCount = loadCount + 1
+            if loadCount >= count then
+                op.option = _G.Opearation.Close
+            end
+        end
+        if self.Cfg.StartEffect and #self.Cfg.StartEffect > 0 then
+            for i = 1, #self.Cfg.StartEffect do
+                _G.UIUtils.CacheEffectByCfg(_G.ConfigManager.ui_effect_cfg[self.Cfg.StartEffect[i]], callback)
+            end
+        end
+    end
+end
+---创建根节点
+function BaseWorld:CacheWorld(op)
+    local _obj = _G.GameObject()
+    _obj:SetName(self.Cfg.Name)
+    self.GameObject = _obj
+    self:Visible(false)
+    local _obj2 = _G.GameObject()
+    _obj2:SetName("AllItemRoot")
+    self.ItemRoot = _obj2
+    self.ItemRoot:SetParentE(self.GameObject)
+    local _obj3 = _G.GameObject()
+    _obj3:SetName("AllTitleRoot")
+    self.TitleRoot = _obj3
+    self.TitleRoot:SetParentE(self.GameObject)
+    _obj3:AddComponentE(_G.typeof(_G.CS.UnityEngine.Canvas))
+    _obj3:SetLayer("3DUI")
+    ---傻逼策划成天提一些要换包的需求还不让我换包
+    if not _G.GameObject.Find("3DUIRoot") then
+        _G.PoolsManager:GetInstance():Spawn(
+            "CommonPrefab/World/3DUIRoot",
+            _G.ePoolType.World,
+            nil,
+            function(trans)
+                local Canvas = trans:GetComponentE(_G.typeof(_G.CS.UnityEngine.Canvas))
+                local camera_go_3D = _G.GameObject.Find("3DUICamera"):GetComponentE(_G.typeof(_G.CS.UnityEngine.Camera))
+                Canvas.worldCamera = camera_go_3D
+            end
+        )
+    end
+    op.option = _G.Opearation.Close
+    _G.UpdateManager:GetInstance():AddUpdate(self.SortTitle, self)
+    self.upTitleCount = 0
+end
+---名称排序
+function BaseWorld:SortTitle()
+    if self.upTitleCount < 5 then
+        self.upTitleCount = self.upTitleCount + 1
+        return
+    end
+    self.upTitleCount = 0
+    self.TitleRoot:SortChildByZ()
+end
+---初始化场景物件
+---@param op Opearation 状态
+function BaseWorld:InitObjs(op)
+    local _datas = self.ItemDataList
+    if #_datas <= 0 then
+        op.option = _G.Opearation.Close
+        return
+    end
+    local index = 0
+    ---@param item WorldBaseItem item
+    local cb = function(item)
+        self.AllWorldItems[item.Uid] = item
+        index = index + 1
+        if index >= #_datas then
+            op.option = _G.Opearation.Close
+        end
+    end
+
+    ---@type WorldItemDataItem value
+    for _, value in pairs(_datas) do
+        local itemType = value.ItemType
+        local item = self:CreateWorldItem(itemType, value, cb)
+        if item and item.Init then
+            item:Init()
+        end
+    end
+end
+---初始化主角
+---@param callback function 完成回调
+function BaseWorld:InitPlayer(op)
+    self:InitPlayerBySid(
+        function()
+            op.option = _G.Opearation.Close
+        end,
+        _G.PlayerModel:GetInstance():GetRoleSid()
+    )
+end
+---初始化其余玩家
+---@param callback function 完成回调
+function BaseWorld:InitOtherPlayer(callback)
+    if callback then
+        callback()
+    end
+end
+---场景加载完毕
+function BaseWorld:OnComplete()
+    self.IsInitOver = true
+end
+--endregion
+
+--region 内部调用方法
+-----释放主角
+function BaseWorld:DisablePlayer()
+    if self.WorldPlayer then
+        self.WorldPlayer:OnExitWorld()
+    end
+end
+-----显示主角
+function BaseWorld:EnablePlayer()
+    if self.WorldPlayer then
+        self.WorldPlayer:OnEnterWorld()
+    end
+end
+---加载世界场景
+function BaseWorld:InstWorld()
+    self.SceneObject = _G.WorldManager:GetInstance():GetSceneGameObj(self.Cfg.SceneName)
+    self.SceneObject:SetParentE(self.GameObject)
+    self.WorldSetting = self.SceneObject:GetComponentE(_G.typeof(_G.CS.WorldSetting))
+    self.SceneObject:SetLocalPosition(self.Data.BaseInfo.OffSetX, 0, self.Data.BaseInfo.OffSetZ)
+    self.SceneObject:SetActiveE(1)
+    self.WorldSetting:Init()
+    self.WorldPlayer.WorldCameraControl.CurrentBindCamera = self.WorldSetting.SceneCamera
+    self.WorldPlayer.WorldCameraControl.CurrentBindCamera.DisablePositionSynchronization = self.Cfg.LockMainCamera
+
+    local cameraPosBox = self:GetCanmeraPosBox()
+    if cameraPosBox then
+        cameraPosBox:AddComponentE(typeof(CS.WorldItemControl))
+        local bc = cameraPosBox:GetComponentE(typeof(CS.UnityEngine.BoxCollider))
+        local ide = cameraPosBox:GetInstanceIDE()
+        _G.WorldCsListener.AddTriggerCall(ide, nil)
+        self.AllWorldItemsByInstId[ide] = cameraPosBox
+        _G.DelayFrameDo(
+            function()
+                bc.enabled = true
+                cameraPosBox:SetLocalPosition(0, 0, -0.2)
+            end
+        )
+    end
+end
+
+---获取相机碰撞体
+function BaseWorld:GetCanmeraPosBox()
+    local num = self.WorldSetting.SceneCamera:GetChildCountE()
+    if num > 0 then
+        local cameraPosBox = self.WorldSetting.SceneCamera:GetChildE(0)
+        return cameraPosBox
+    end
+    return nil
+end
+
+---初始化所有物件
+function BaseWorld:InstAllItem()
+    for k, value in pairs(self.AllWorldItems) do
+        value:OnEnterWorld()
+    end
+end
+function BaseWorld:InstOtherPlayerItem()
+end
+-- 初始化状态机
+---@param initial ProcedureType 初始流程
+---@param final ProcedureType 结束流程
+---@param pros ProcedureItem[] 流程数据
+function BaseWorld:InitProcedure(initial, final, pros)
+    self.Procedure:StartInitialize(initial, final, pros, _G.handler(self, self.ChangeProcedureHandler))
+    self.Procedure:DoProcedure(self.Procedure.initial)
+end
+---创建玩家的基础构造信信息，其他玩家数据通用
+---@param data WorldPlayerData 玩家数据信息
+---@param callback function 创建玩家的后的回掉
+---@return BaseItemParam
+function BaseWorld:CreatePlayerBaseData(data, callback)
+    local cfg = {}
+    cfg.Res = data.rolePath
+    ---@type BaseItemParam tab
+    local info = {}
+    info.dataType = _G.WorldItemDataType.Player
+    info.uid = data.role_uid
+    info.sid = data.sid
+    info.cfg = cfg
+    info.world = self
+    info.callback = callback
+    return info
+end
+-----创建主角
+---@param callback function 创建完成回调
+---@param sid number 卡牌sid
+function BaseWorld:InitPlayerBySid(callback, sid)
+    local data = WorldPlayerData.New()
+    data:SetPlayerSelfData()
+    data.sid = sid
+    data.rolePath = sid ~= 0 and require "CardCommentManager":GetInstance():GetCfgs(sid).ModelPathLow or ""
+    local info =
+        self:CreatePlayerBaseData(
+        data,
+        function(item)
+            if callback then
+                callback()
+            end
+            item.Transform:SetActiveE(not self.Cfg.HideSelfPlayer and 1 or 0)
+        end
+    )
+    local player = require("WorldPlayerItem").New(info, data, self)
+    self.AllWorldItems[player.Uid] = player
+    self.WorldPlayer = player
+    player:Init()
+end
+---切换世界结束
+---隐藏主界面，播放特效
+function BaseWorld:OnChangeWorldOver()
+    if self.isPlayEffect then
+        return
+    end
+    self.isPlayEffect = true
+    if self.Cfg.StartEffect and #self.Cfg.StartEffect > 0 then
+        self.StartEffectIndex = 1
+        self:OnLoadEffect()
+    else
+        self.WorldSetting:EnableCameraAnimator(true)
+    end
+end
+---加载特效
+function BaseWorld:OnLoadEffect()
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg[self.Cfg.StartEffect[self.StartEffectIndex]],
+        self.SceneObject,
+        nil,
+        _G.handler(self, self.OnLoadEffectComplete)
+    )
+end
+---响应特效播放完成
+function BaseWorld:OnLoadEffectComplete()
+    self.StartEffectIndex = self.StartEffectIndex + 1
+    if self.StartEffectIndex > #self.Cfg.StartEffect then
+        self.WorldSetting:EnableCameraAnimator(true)
+    else
+        self:OnLoadEffect()
+    end
+end
+
+--region创建物件
+local worldItemDic = {
+    --基础物件
+    [_G.WorldItemType.Obj] = "WorldBaseItem",
+    --宝箱
+    [_G.WorldItemType.Box] = "WorldBoxItem",
+    --可破坏物
+    [_G.WorldItemType.Fragile] = "WorldFragileItem",
+    --技能特效触发器
+    [_G.WorldItemType.Trigger] = "WorldSkillEffectItem",
+    --传送门
+    [_G.WorldItemType.Door] = "WorldDoorItem",
+    --Npc
+    [_G.WorldItemType.NPC] = "WorldNPCItem",
+    --敌人
+    [_G.WorldItemType.Enemy] = "WorldEnemyItem",
+    --障碍物
+    [_G.WorldItemType.Barrier] = "WorldBarrierItem",
+    --千机事件对象
+    [_G.WorldItemType.Dungones] = "WorldDungonesEventItem",
+    --主城幽灵
+    [_G.WorldItemType.Ghost] = "WorldGhostItem"
+}
+---获取对应的场景物件数据结构
+---@param _world BaseWorld|MainWorld 世界
+---@param item_type WorldItemType 类型
+---@param item_data WorldItemData 物件数据
+---@return WorldBaseItem|WorldBoxItem|WorldNPCItem|WorldDoorItem|WorldBarrierItem 场景物件数据
+function BaseWorld:CreateWorldItem(item_type, item_data, call)
+    if item_data.Sid == nil or item_data.Sid == 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("[BaseWorld]CreateWorldItem sid is " .. (item_data.Sid and "0" or "nil"))
+        end
+        return
+    end
+    ---@type BaseItemParam tab
+    local info = {}
+    info.dataType = _G.WorldItemDataType.NomalItem
+    info.itemType = item_type
+    info.sid = item_data.Sid
+    info.uid = item_data.Uid
+    info.world = self
+    info.callback = call
+    info.cfg = _G.ConfigManager.object_world_cfg[item_data.Sid]
+    local script = worldItemDic[item_type]
+    if string.IsNullOrEmpty(script) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到相关类型的世界对象 type=" .. item_type)
+        end
+        return require("WorldBaseItem").New(info, item_data, self)
+    else
+        local item = require(script).New(info, item_data, self)
+        return item
+    end
+end
+--endregion
+
+--region 物件透明度和显示检测处理
+---初始化物件透明展示检测
+function BaseWorld:InitObjectAlphaCheck()
+    --检测物体透明度离散表ID
+    local cfg = _G.ConfigManager.discrete_cfg[103502]
+    local checkAlphaDisIndex = 1
+    local checkAlphaIndexNear = 1
+    local checkAlphaIndexFar = 2
+    local checkAlphaValueIndex = 2
+    self.checkAlphaDis = {
+        near = cfg[checkAlphaDisIndex][checkAlphaIndexNear]
+    }
+    self.checkAlphaValue = {
+        near = cfg[checkAlphaValueIndex][checkAlphaIndexNear],
+        far = cfg[checkAlphaValueIndex][checkAlphaIndexFar]
+    }
+    --检测是否显示离散表ID
+    cfg = _G.ConfigManager.discrete_cfg[103505]
+    self.checkShowDis = cfg[1][1]
+    self.checkAlphaValue.far = self.checkAlphaValue.far - self.checkAlphaValue.near
+    self.allItemDis = {}
+    self.setTransparentEffectIds = {}
+    self:InitTitleScaleData()
+end
+---初始化名称缩放
+function BaseWorld:InitTitleScaleData()
+    ---头顶名称的缩放范围
+    self.titleScaleRange = _G.ConfigManager.discrete_cfg[103507]
+    local titleScaleOneDis = self.titleScaleRange[2][1]
+    local titleScaleOneFov = 45
+    local pi = 3.1416 / 180
+    titleScaleOneDis =
+        titleScaleOneDis * Mathf.Tan(titleScaleOneFov * pi) /
+        Mathf.Tan(_G.GraphicsManager.Instance.MainCamera.fieldOfView * pi)
+    self.titleScaleRange = _G.DeepCopyCfgTable(self.titleScaleRange[1])
+    self.titleScaleRange[1] = titleScaleOneDis / self.titleScaleRange[1] * 100
+    self.titleScaleRange[2] = titleScaleOneDis / self.titleScaleRange[2] * 100
+    if self.titleScaleRange[1] > self.titleScaleRange[2] then
+        titleScaleOneDis = self.titleScaleRange[1]
+        self.titleScaleRange[1] = self.titleScaleRange[2]
+        self.titleScaleRange[2] = titleScaleOneDis
+    end
+end
+---清理物件透明展示检测
+function BaseWorld:ClearObjectAlphaCheck()
+    self:StopObjectAlphaCheck()
+    self.checkAlphaDis = nil
+    self.checkAlphaValue = nil
+    self.allItemDis = nil
+    if self.setTransparentEffectIds then
+        for uid in pairs(self.setTransparentEffectIds) do
+            self.CommonEff:StopRoleTransparentEffect(self.AllWorldItems[uid].ObjectMod)
+        end
+        self.setTransparentEffectIds = nil
+    end
+    self.alphaCheckUpdate = nil
+    self.titleScaleOneDis = nil
+    self.titleScaleRange = nil
+end
+function BaseWorld:ResetObjectAlphaEffect()
+    if self.setTransparentEffectIds then
+        for uid in pairs(self.setTransparentEffectIds) do
+            self.CommonEff:StopRoleTransparentEffect(self.AllWorldItems[uid].ObjectMod)
+            self.setTransparentEffectIds[uid] = nil
+        end
+    end
+    if self.allItemDis then
+        for uid in pairs(self.allItemDis) do
+            self.allItemDis[uid] = nil
+        end
+    end
+end
+---开启物件透明展示检测
+function BaseWorld:StartObjectAlphaCheck()
+    if not self.isEnterWorld then
+        return
+    end
+    if not self.checkAlphaDis then
+        return
+    end
+    self.needCheckTag = true
+    self.alphaCheckUpdate = self.alphaCheckUpdate or _G.handler(self, self.UpdateObjectAlpha)
+    local updateInstance = _G.UpdateManager:GetInstance()
+    if not updateInstance:HasUpdate(self.alphaCheckUpdate, self) then
+        updateInstance:AddUpdate(self.alphaCheckUpdate, self)
+    end
+end
+---关闭物件透明展示检测
+function BaseWorld:StopObjectAlphaCheck()
+    _G.UpdateManager:GetInstance():RemoveUpdate(self.alphaCheckUpdate, self)
+end
+
+---@param item BaseItem
+function BaseWorld:AddCameraPosBoxItem(item)
+    --LogError(#self.CameraPosBoxList, "添加前")
+    if item.ObjectMod then
+        item.ObjectMod:SetActiveE(1)
+    end
+    local isHas = false
+    for _, v in ipairs(self.CameraPosBoxList) do
+        if item.Uid == v.Uid then
+            isHas = true
+            break
+        end
+    end
+    if not isHas then
+        --LogError(item.Uid, "添加uid")
+        table.insert(self.CameraPosBoxList, item)
+    end
+    --LogError(#self.CameraPosBoxList, "添加后")
+end
+
+---@param item BaseItem
+function BaseWorld:RemoveCameraPosBoxItem(item)
+    if item.ObjectMod then
+        item.ObjectMod:SetActiveE(0)
+    end
+    --LogError(#self.CameraPosBoxList, "移除前")
+    for k, v in ipairs(self.CameraPosBoxList) do
+        if item.Uid == v.Uid then
+            table.remove(self.CameraPosBoxList, k)
+            --LogError(item.Uid, "删除uid")
+            break
+        end
+    end
+    --LogError(#self.CameraPosBoxList, "移除后")
+end
+
+function BaseWorld:RemoveCameraPosBoxById(uid)
+    --LogError(#self.CameraPosBoxList, "移除前")
+    for k, v in ipairs(self.CameraPosBoxList) do
+        if uid == v.Uid then
+            table.remove(self.CameraPosBoxList, k)
+            --LogError(item.Uid, "删除uid")
+            break
+        end
+    end
+    --LogError(#self.CameraPosBoxList, "移除后")
+end
+
+local Abs = _G.Mathf.Abs
+---玩家相对摄像机的Z坐标
+local checkPlayerDisZ = 0
+---玩家相对摄像机的Z坐标
+--local checkPlayerDisX = 0
+---物件相对于摄像机的X坐标
+--local checkAlphaDisX = 0
+---物件相对于摄像机的Z坐标
+local checkAlphaDisZ = 0
+function BaseWorld:UpdateObjectAlpha()
+    if not self.isEnterWorld then
+        return
+    end
+    if nil == self.CameraPosBoxList then
+        return
+    end
+    --if self.WorldPlayer.CurMove then
+    _, checkPlayerDisZ = self.WorldPlayer.Transform:GetPositionOnTarget(self.WorldSetting.SceneCamera)
+    --self.WorldPlayer.CurMove = false
+    --end
+
+    for _, v in ipairs(self.CameraPosBoxList) do
+        if v.ObjectMod then
+            local uid = v.Uid
+            -- if v.Cfg.Type1 == _G.WorldItemType.NPC then
+            --     if nil == self.NpcPoss[uid] then
+            --         local x, z = v.ObjectMod:GetPositionOnTarget(self.WorldSetting.SceneCamera)
+            --         self.NpcPoss[uid] = {x, z}
+            --         checkAlphaDisX = x
+            --         checkAlphaDisZ = z
+            --     else
+            --         checkAlphaDisX = self.NpcPoss[uid][1]
+            --         checkAlphaDisZ = self.NpcPoss[uid][2]
+            --     end
+            -- else
+            _, checkAlphaDisZ = v.ObjectMod:GetPositionOnTarget(self.WorldSetting.SceneCamera)
+            --end
+            if checkPlayerDisZ < 0 then
+                checkAlphaDisZ = checkAlphaDisZ * -1
+                checkPlayerDisZ = checkPlayerDisZ * -1
+            end
+            if checkAlphaDisZ < self.checkAlphaDis.near then --距离过近
+                if self.needCheckTag or not self.allItemDis[uid] or self.allItemDis[uid] >= self.checkAlphaDis.near then
+                    self.allItemDis[uid] = checkAlphaDisZ
+                end
+                v:ShowOrHideChild(false)
+            else
+                if checkAlphaDisZ <= checkPlayerDisZ then --alpha范围内
+                    if
+                        self.needCheckTag or not self.allItemDis[uid] or
+                            Abs(self.allItemDis[uid] - checkAlphaDisZ) >= 0.1
+                     then
+                        if not self.setTransparentEffectIds[uid] then
+                            self.CommonEff:StartRoleTransparentEffect(v.ObjectMod, 1)
+                            self.setTransparentEffectIds[uid] = true
+                        end
+                        self.allItemDis[uid] = checkAlphaDisZ
+                        checkAlphaDisZ =
+                            (checkAlphaDisZ - self.checkAlphaDis.near) / (checkPlayerDisZ - self.checkAlphaDis.near)
+                        local alpha = self.checkAlphaValue.near + (self.checkAlphaValue.far * checkAlphaDisZ)
+                        self.CommonEff:UpdateRoleTransparent(v.ObjectMod, alpha)
+                        v:HideEffect(alpha < 0.9)
+                        v:ShowOrHideChild(alpha > 0.1)
+                    end
+                else --距离远
+                    if self.needCheckTag or not self.allItemDis[uid] or self.allItemDis[uid] < checkPlayerDisZ then
+                        self.allItemDis[uid] = checkAlphaDisZ
+                    end
+                    if not self.setTransparentEffectIds[uid] then
+                        self.CommonEff:StartRoleTransparentEffect(v.ObjectMod, 1)
+                        self.setTransparentEffectIds[uid] = true
+                    end
+                    self.CommonEff:UpdateRoleTransparent(v.ObjectMod, 1)
+                    v:ShowOrHideChild(true)
+                end
+            end
+            v:UpdateTitlePos()
+        end
+    end
+    self.WorldPlayer:CheckNewTitle()
+    self.WorldPlayer:UpdateTitlePos()
+    self.needCheckTag = false
+end
+function BaseWorld:CalculateTitleScale(dis)
+    if dis <= 0 then
+        return 1
+    end
+    if dis < self.titleScaleRange[1] then --距离过近
+        return dis / self.titleScaleRange[1]
+    elseif dis <= self.titleScaleRange[2] then --范围内
+        return 1
+    else --距离过远
+        return dis / self.titleScaleRange[2]
+    end
+end
+--endregion
+
+--region
+function BaseWorld:GetTitleRoot()
+    return self.TitleRoot
+end
+--endregion
+
+--endregion
+
+return BaseWorld

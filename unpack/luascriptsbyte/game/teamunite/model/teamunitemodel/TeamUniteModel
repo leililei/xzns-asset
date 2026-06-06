@@ -1,0 +1,412 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.TeamUnite.Model.TeamUniteModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/05/16
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+---@class TeamUniteModel : GameDataModelBase	中文描述
+---@field cfg season_cfg
+---@field state SeasonState 赛季状态
+---@field timeData SeasonTimeData
+local TeamUniteModel = _G.BaseClass("TeamUniteModel",  _G.GameDataModelBase)
+---@type TeamUniteModel[]
+local modelInstance = {
+    [_G.TeamUniteSubAct.BattlePass] = require "TeamUniteBattlePassModel":GetInstance(),
+    [_G.TeamUniteSubAct.Mission] = require "TeamUniteTaskModel":GetInstance(),
+    [_G.TeamUniteSubAct.Gift] = require "TeamUniteGiftModel":GetInstance(),
+    [_G.TeamUniteSubAct.Login] = require "TeamUniteLoginModel":GetInstance(),
+    [_G.TeamUniteSubAct.Circle]=require "FlyingChessModel":GetInstance()
+    --[_G.FunctionID.SixVsSixPVP] = require "SixVsSixPVPModel":GetInstance()
+}
+---@return TeamUniteModel TeamUniteModel
+function TeamUniteModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function TeamUniteModel:__init()
+    self.curFunctionOpenID = 281
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.AddCoin, self)
+    self.seasonID = 0
+end
+
+---销毁对象时,析构函数
+function TeamUniteModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.AddCoin, self)
+end
+
+--region 子类重写
+---从服务器拉取数据
+function TeamUniteModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---获取赛季信息
+function TeamUniteModel:GetInfo()
+    -- require "TeamUniteNet":GetInstance():GetInfo(_G.handler(self, self.GetInfoCall))
+end
+
+
+function TeamUniteModel:GetInfoCall(activity)
+    self.activity = activity
+    local msg = activity.cfg.self_info.activity_checkers
+    local startTime = activity.cfg.time.start_time
+    local endTime = startTime + activity.cfg.time.run_time
+    self.isNewSeason = msg.term and self.seasonID ~= msg.term
+    self.seasonID = msg.term and msg.term or 0
+    if self.seasonID ~= 0 then
+        self.infoData = msg
+        self.timeData = {
+            startTime = startTime,
+            endTime = endTime,
+            settlementTime = 0
+        }
+        self.totalCoin = msg.battle_info[1].battle_exp
+        self.cfg = _G.ConfigManager.team_cfg[msg.term]
+        modelInstance[_G.TeamUniteSubAct.Circle]:GetInfo(msg)
+        modelInstance[_G.TeamUniteSubAct.BattlePass]:ParseData(msg.battle_info[1])
+        modelInstance[_G.TeamUniteSubAct.Mission]:ParseData(msg)
+        modelInstance[_G.TeamUniteSubAct.Gift]:InitInfo()
+        self:InitSeasonState()
+        self:InitSeasonFunctionData()
+        self:InitTimer()
+        self:InitSignAward(msg)
+        if self.reconnectEndCall then
+            self.reconnectEndCall()
+            self.reconnectEndCall = nil
+        end
+        _G.Events:GetInstance():Broadcast(_G.eTeamUnite.Refresh)
+    else
+        if self.reconnectEndCall then
+            self.reconnectEndCall()
+            self.reconnectEndCall = nil
+        end
+        self:OnEndCall()
+    end
+end
+
+function TeamUniteModel:CheckOpen()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local bol 
+    if self.seasonID and self.seasonID ~= 0 and time < self.timeData.endTime then
+        bol = true
+    else 
+        bol = false 
+    end
+    return bol
+end
+
+function TeamUniteModel.CheckOpen1()
+    return require "TeamUniteModel":GetInstance():CheckOpen()
+end
+
+function TeamUniteModel:OnAactionEnent(id, parmas, isfh, isSet)
+    if self.cfg and self.seasonID == 0 then
+        local array = table.toArray(id)
+        table.sort(
+            array,
+            function(a, b)
+                return a < b
+            end
+        )
+        local index
+        if self.cfg.condition_type[1] then 
+            index = table.indexof(array, self.cfg.condition_type[1][1])
+        else 
+            index = 1
+        end
+        if false ~= index then
+            self:CheckFirstSeason()
+        end
+    end
+end
+
+---初始化登录奖励
+function TeamUniteModel:InitSignAward(msg)
+    self.signAward = {}
+    if msg.sign_award then
+        for i = 1, #msg.sign_award do
+            self.signAward[msg.sign_award[i]] = true
+        end
+    end
+end
+
+function TeamUniteModel:CheckFirstSeason()
+    local condition = _G.ConfigManager.team_cfg[1].condition_type
+    if _G.GlobalConditionManager.CheckConditionArrays(condition) then 
+        self:GetInfo()
+    end
+end
+
+function TeamUniteModel:ReConnect(endcall)
+    if self.super.GetFunctionOpen(self) then
+        self.reconnectEndCall = endcall
+        self.isReConnect = true
+        self:InitData()
+    else
+        if endcall then
+            endcall()
+        end
+    end
+end
+
+---初始化赛季功能数据
+function TeamUniteModel:InitSeasonFunctionData()
+    if self:CheckSeasonIsOpen() then
+        if self.isReConnect then
+            self.isReConnect = false
+        elseif self.OnSixUpdateTag then
+            for k, v in pairs(modelInstance) do
+                if v:CheckIsOpen() then
+                    v:OnSixClockUpdate()
+                end
+            end
+        end
+    end
+    self:OnEndCall()
+end
+
+---初始化赛季状态
+function TeamUniteModel:InitSeasonState()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    self.state = _G.SeasonState.Open
+    self:InitSeasonDay()
+end
+
+---初始化赛季天数
+function TeamUniteModel:InitSeasonDay()
+    self.curDay = 0
+    if self.state == _G.SeasonState.Open then
+        self.curDay = (_G.TimeUtil.GetIntervalDayBySix(
+                self.timeData.startTime,
+                _G.TimeUtil.GetServerUnixTime()
+        ) // 86400) + 1
+    end
+end
+
+---检测是否能领取登录奖励
+---@param index number 天数
+function TeamUniteModel:CheckCanTakeLoginAward(index)
+    return self.curDay >= index and not self:CheckGetLoginAward(index)
+end
+
+---检测奖励是否领取
+---@param index number 天数
+function TeamUniteModel:CheckGetLoginAward(index)
+    if self.signAward and self.cfg then 
+        return self.signAward[self.cfg.login[index]]
+    else 
+        return false 
+    end
+end
+
+function TeamUniteModel:GetSeasonTime()
+    return _G.TimeUtil.GetServerUnixTime(), self.timeData.startTime
+end
+
+function TeamUniteModel:GetSignReward(id, callback)
+    require "TeamUniteNet":GetInstance():GetSignReward(
+        {index = id},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.signAward[id] = true
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---初始化计时器
+function TeamUniteModel:InitTimer()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if not self.cfg then
+        return
+    end
+    if not self:CheckSeasonIsOpen() then
+        return
+    end
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local offset = self.timeData.endTime - time
+    if offset <= 0 then
+        return
+    end
+    self.timer = _G.TimerManager:GetInstance():GetTimer(offset, self.TimerOver, self, true, false, true)
+    self.timer:Start()
+end
+
+---首测结算中
+function TeamUniteModel:TimerOver()
+    self.timer:Stop()
+    self.timer = nil
+    self:OnSeasonEnd()
+end
+
+function TeamUniteModel:OnEndCall(_, call)
+    if call then
+        call()
+    end
+    self:ParseData()
+    if self.isNewSeason then
+        self:OnSeasonStart()
+    else
+        for _, v in pairs(modelInstance) do
+            if v:CheckIsOpen() then
+                v:RefreshRedPoint()
+            end
+        end
+    end
+
+end
+
+---初始化数据
+function TeamUniteModel:InitFunction()
+    for _, v in pairs(modelInstance) do
+        if modelInstance[v] and modelInstance[v]:CheckIsOpen() then
+            modelInstance[v]:OnInitFunction()
+        end
+    end
+end
+
+---获取赛季配置
+function TeamUniteModel:GetCfg()
+    return self.cfg
+end
+
+---获取当前赛季id
+function TeamUniteModel:GetCurSeasonId()
+    return self.infoData and self.infoData.term or 1
+end
+
+---赛季结束
+function TeamUniteModel:OnSeasonEnd()
+    for k, v in pairs(modelInstance) do
+        if v:CheckIsOpen() then
+            v:OnSeasonEnd()
+        end
+    end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.TeamUniteView.Name)
+end
+
+---赛季开始
+function TeamUniteModel:OnSeasonStart()
+    for k, v in pairs(modelInstance) do
+        if v:CheckIsOpen() then
+            v:OnSeasonStart()
+        end
+    end
+end
+
+---获取赛季状态
+---@return SeasonState
+function TeamUniteModel:GetSeasonState()
+    return self.state
+end
+
+---检测赛季功能是否开放
+---@param id number 共能id
+function TeamUniteModel:CheckSeasonFucntionIsOpen(id)
+    if modelInstance[id] then
+        return modelInstance[id]:CheckFunctionIsOpen()
+    end
+    return false
+end
+
+---检测赛季是否开启
+function TeamUniteModel:CheckSeasonIsOpen()
+    return self.state == _G.SeasonState.Open
+end
+
+---获取赛季剩余时间
+function TeamUniteModel:GetSeasonTimeLeft()
+    if not self.infoData then
+        return 0
+    end
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    local time = self:GetTime()
+    return time.endTime - curTime
+end
+
+function TeamUniteModel:OpenView(id, hideFun, openFun, ...)
+    --if modelInstance[id] and modelInstance[id]:CheckIsOpen() then
+    modelInstance[id]:OpenView(hideFun, openFun, ...)
+    --end
+end
+
+---@class SeasonTimeData
+---@field settlementTime number 结算时间
+---@field nextStartTime number 下赛季开始时间
+---@field endTime number 结束时间
+---@field startTime number 开始时间
+---获取赛季相关时间
+---@param return SeasonTimeData
+function TeamUniteModel:GetTime()
+    return self.timeData
+end
+
+function TeamUniteModel:GetActivityID()
+    if self.activity then
+        return self.activity:GetActivityID()
+    end
+    return 0
+end
+
+function TeamUniteModel:GetRedpointIDByIndex(index)
+    return self.activity.typeClass:GetRedpointIDByIndex(index)
+end
+
+function TeamUniteModel:ShowExtraIcon(id)
+    if modelInstance[id] then
+       local isShow,icon,onclick = modelInstance[id]:SetExtraBtn()
+       return isShow,icon,onclick
+    else
+        return 0
+    end
+end
+
+---获取结算时间
+function TeamUniteModel:GetEndTime()
+    return self.timeData.endTime
+end
+
+---检测是否有可领取的奖励
+function TeamUniteModel:CheckHaveSignReward()
+    if not self.cfg then
+        return false
+    end
+    for _, v in pairs(self.cfg.login) do
+        local cfg = _G.ConfigManager.season_login_cfg[v]
+        if cfg then
+            if self:CheckCanTakeLoginAward(cfg.day) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function TeamUniteModel:GetTotalCoin()
+    return self.infoData.battle_info[1].battle_exp or 0
+end
+
+function TeamUniteModel:AddCoin(data)
+    for _, v in pairs(data) do
+        if v.type[1] ==  _G.ResPropID.TeamUniteExp then
+            self.infoData.battle_info[1].battle_exp = self.infoData.battle_info[1].battle_exp + v.type[2]
+        end
+    end
+end
+
+return TeamUniteModel

@@ -1,0 +1,1565 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.ActiveTask.ActiveTaskManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/03/13
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+require "ActiveTaskBase"
+local SDKDef = require("SDKDef")
+---@class ActiveTaskManager : GameDataModelBase    中文描述
+local ActiveTaskManager = _G.BaseClass("ActiveTaskManager", _G.GameDataModelBase)
+
+---@return ActiveTaskManager ActiveTaskManager
+function ActiveTaskManager:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function ActiveTaskManager:__init()
+    self.curFunctionOpenID = _G.FunctionID.ActiveTask
+    self.initFunc = {}
+    --- 累计循环活跃值 (递增)
+    self.all_liveness = 0
+    --- 循环活跃奖励进度  1 可领取
+    self.award_state = nil
+
+    local cfg = _G.ConfigManager.discrete_cfg[103301]
+    local parameters
+    if cfg ~= nil then
+        parameters = cfg
+    end
+    --- 累计循环活跃值 (递增)
+    self.all_livenessDic = {
+        --- 每达到  100
+        value = parameters[1][1],
+        --- 奖励组  12#30
+        award = parameters[2]
+    }
+
+    --- 活跃值
+    self.ActiveValue = 0
+    --- 宝箱状态
+    ---@type _G.ActiveTaskBoxType[]
+    self.Box_status = {}
+
+    --- 任务
+    ---@type ActiveTaskBase[]
+    self.tasks = {}
+
+    --- 宝箱Sid配置
+    self.Box_BoxSid = {}
+
+    --- 成就任务获取与否all_liveness
+    self.IsGetAchieveData = false
+
+    ---成就点数
+    self.PointNum = 0
+
+    ---成就点数等级
+    self.GetCjPointLevel = 0
+
+    --- 每日活跃  阈值
+    -- [1] = 20,
+    -- [2] = 40,
+    -- [3] = 60,
+    -- [4] = 80,
+    -- [5] = 100
+    self.ActiveTaskBoxValue = {}
+    ---@param value active_reward_cfg
+    for _, value in pairs(_G.ConfigManager.active_reward_cfg) do
+        self.ActiveTaskBoxValue[value.grade] = value.value_active
+    end
+
+    for key, _ in pairs(self.ActiveTaskBoxValue) do
+        self.Box_status[key] = _G.ActiveTaskBoxType.Invalid
+    end
+
+    ---任务完成 刷新界面
+    self.taskCompletedFun = _G.handler(self, self.TaskCompleted)
+
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.GetDataFormServer, self)
+    _G.Events:GetInstance():AddListener(_G.GlobalEvents.GlobalResetGame, self.OnEvent_ResetGame, self)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIShow, self.UpdataOnUIShow, self)
+
+    _G.SDKManager:GetInstance():AddListener(SDKDef.GetMsg.onShareAppMessage, self.ShareSuccess, self)
+end
+
+--被动分享成功
+function ActiveTaskManager:ShareSuccess()
+    if _G.AppSetting.DEBUG then
+        _G.Log("被动分享触发>>>>>>")
+    end
+
+    _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {
+                _G.ActiveTaskEnum.ConditionEnum.ShareWx.GotoWX
+            },
+            1
+    )
+
+    _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {
+                _G.ActiveTaskEnum.ConditionEnum.ShareWx.GotoDY
+            },
+            1
+    )
+end
+
+--- 网络请求初始化
+function ActiveTaskManager:GetDataFormServer()
+    --- 累计循环活跃值 (递增)
+    self.all_liveness = 0
+    --- 循环活跃奖励进度  1 可领取
+    --self.award_state = nil
+
+    --- 活跃值
+    self.ActiveValue = 0
+    --- 宝箱状态
+    ---@type _G.ActiveTaskBoxType[]
+    self.Box_status = {}
+
+    --- 任务
+    ---@type ActiveTaskBase[]
+    --self.tasks = {}
+
+    --- 宝箱Sid配置
+    self.Box_BoxSid = {}
+
+    --- 成就任务获取与否
+    self.IsGetAchieveData = false
+
+    ---成就点数
+    self.PointNum = 0
+
+    ---成就点数等级
+    self.GetCjPointLevel = 0
+
+    for key, _ in pairs(self.ActiveTaskBoxValue) do
+        self.Box_status[key] = _G.ActiveTaskBoxType.Invalid
+    end
+
+    if self.all_livenessDic.value == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 每日任务 循环活跃度 活跃值无法获取  discrete_cfg 103301")
+        end
+    end
+    if self.all_livenessDic.award == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 每日任务 循环活跃度 奖励无法获取  discrete_cfg 103301")
+        end
+    end
+
+    -- require("EmbattleNet"):GetInstance():GetAllEmbattleInfo(
+    --     function(msg)
+    --         local data = msg.garrays
+    require("TaskNet"):GetInstance():DailyTask_Get(
+            function(data)
+                if data.ack ~= 1 then
+                    data = nil
+                end
+                self:ParseDataD(data)
+                ---成就是否开放
+                --if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(32) then
+                require("TaskNet"):GetInstance():GetAchieveInfo(
+                        function(datas)
+                            self:ParseDatas(datas)
+                            self.IsGetAchieveData = true
+                            self:InitFunction()
+                        end
+                )
+                -- else
+                --end
+            end
+    )
+
+    --     end
+    -- )
+end
+
+---数据解析完成
+
+function ActiveTaskManager:ParseDataD(data)
+    --- 缓存数据 InitFunction后销毁
+    if data ~= nil then
+        self.dataD = data
+
+        self.award_num = data.award_num or 0
+        self.award_state = nil
+
+        local all_liveness = data.all_liveness or 0
+        if all_liveness > 0 then
+            --- 如果 大于上次领取
+            --- 250> 100+100
+            all_liveness = data.all_liveness - self.award_num
+
+            if data.all_liveness > (self.award_num + self.all_livenessDic.value) then
+                self.award_state = 1
+            end
+        end
+
+        self.all_liveness = all_liveness
+        self.ActiveValue = data.liveness or 0
+
+        local resdata = {
+            type = {}
+        }
+        resdata.type = { _G.ResPropID.ActiveValue, 0, self.ActiveValue }
+
+        ---  初始化仓库 活跃度值  tips查看活跃度道具 会显示当前拥有数量
+        _G.StorageManager:GetInstance():ParseSimpleAward(resdata)
+        _G.Events:GetInstance():Broadcast(_G.FunctionOpenDailyCheckEvent.DailyActive)
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Active.id)
+end
+
+function ActiveTaskManager:ReConnect(call)
+    require("TaskNet"):GetInstance():DailyTask_Get(
+            function(data)
+                if data.ack ~= 1 then
+                    data = nil
+                end
+
+                self:ParseDataD(data)
+                ---成就是否开放
+                --if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(32) then
+                require("TaskNet"):GetInstance():GetAchieveInfo(
+                        function(datas)
+                            self:ParseDatas(datas)
+                            self.IsGetAchieveData = true
+
+                            self:InitFunction()
+                            if call then
+                                call()
+                            end
+                        end
+                )
+                -- else
+                --end
+            end
+    )
+    ---self:InitFunction()
+end
+
+function ActiveTaskManager:InitFunction()
+    if not _G.table.isEmptyOrNil(self.tasks) then
+        for i = 1, _G.table.count(self.tasks) do
+            self.tasks[i]:Dispose()
+            -- _G.table.remove(self.tasks, i)
+        end
+        -- for k, v in pairs(self.tasks) do
+        --     v:Dispose()
+        -- end
+        self.tasks = {}
+    end
+    local blacklist = {}
+    local wxid = _G.ConfigManager.discrete_cfg[103303][1][1]
+    local dyid = _G.ConfigManager.discrete_cfg[103304][1][1]
+
+    if _G.AppSetting.IsXzns then
+        table.insert(blacklist, dyid)
+        table.insert(blacklist, wxid)
+        if _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.shareSwitch) then
+            if _G.AppSetting.IsWeiXin then
+                table.removebyvalue(blacklist, wxid)
+            elseif _G.AppSetting.IsDouYin then
+                table.removebyvalue(blacklist, dyid)
+            end
+        end
+    else
+        if _G.AppSetting.IsWeiXin then
+            table.insert(blacklist, dyid)
+        elseif _G.AppSetting.IsDouYin then
+            table.insert(blacklist, wxid)
+        else
+            table.insert(blacklist, dyid)
+            table.insert(blacklist, wxid)
+        end
+    end
+
+    local data
+    if self.dataD ~= nil then
+        data = self.dataD
+        if data.task ~= nil then
+            for _, value in pairs(data.task) do
+                if false == table.indexof(blacklist, value.sid) then
+                    local ActiveTaskBases = _G.ActiveTaskBase.New(value, self.taskCompletedFun, _G.MarkTaskType.Daily)
+                    table.insert(self.tasks, ActiveTaskBases)
+                end
+            end
+        end
+
+        if data.finish_task ~= nil then
+            for _, taskid in pairs(data.finish_task) do
+                local task = {
+                    sid = taskid,
+                    state = _G.TaskEnum.ETaskState.Completed,
+                    target = {
+                        [1] = 999
+                    }
+                }
+                if false == table.indexof(blacklist, task.sid) then
+                    local ActiveTaskBases = _G.ActiveTaskBase.New(task, self.taskCompletedFun, _G.MarkTaskType.Daily)
+                    table.insert(self.tasks, ActiveTaskBases)
+                end
+            end
+        end
+        if data.box_award ~= nil then
+            for _, boxSid in pairs(data.box_award) do
+                local boxIndex = boxSid % 10
+                self.Box_status[boxIndex] = _G.ActiveTaskBoxType.Claimed
+                --- 宝箱Sid配置
+                self.Box_BoxSid[boxIndex] = boxSid
+            end
+        end
+    end
+    -- self.dataD = nil
+
+    if self.dataA ~= nil then
+        data = self.dataA
+
+        local temp = {}
+        for _, info in pairs(_G.ConfigManager.mission_cfg) do
+            if info.type_mission == 2 and info.pre_sid == 0 then
+                table.insert(temp, info.id)
+            end
+        end
+
+        for i = 1, #temp do
+            self:SetServerInfo(data, temp[i])
+        end
+
+        local tempType = {}
+        for i = 1, #self.tasks do
+            if self.tasks[i].Cfg.type_mission == 2 then
+                table.insert(tempType, self.tasks[i].Cfg.condition[1][1])
+            end
+        end
+
+        local tempKeys = {}
+
+        if data.finish_achieve ~= nil then
+            for _, taskid in pairs(data.finish_achieve) do
+                local cfg = _G.ConfigManager.mission_cfg[taskid]
+                if cfg and cfg.re_sid == 0 then
+                    -- body
+
+                    local task = {
+                        sid = taskid,
+                        state = _G.TaskEnum.ETaskState.Completed,
+                        target = {
+                            [1] = cfg.count
+                        }
+                    }
+                    local keyTask = tempKeys[cfg.condition[1][1]]
+
+                    if nil == keyTask or taskid > keyTask.sid then
+                        tempKeys[cfg.condition[1][1]] = task
+                    end
+                    if false == table.indexof(blacklist, task.sid) then
+                        local ActiveTaskBases = _G.ActiveTaskBase.New(task, self.taskCompletedFun, _G.MarkTaskType.Daily)
+                        table.insert(self.tasks, ActiveTaskBases)
+                    end
+                end
+            end
+        end
+        if data.get_achieve == nil then
+            data.get_achieve = {}
+        end
+        if data.collector ~= nil then
+            -- body
+
+            for _, value in pairs(data.collector) do
+                _G.Events:GetInstance():Broadcast(_G.ePlayAactionEvent.PlayAactionCj, value.key, value.value, nil, true)
+            end
+        end
+    end
+    --self.dataA = nil
+
+    self:UpdataBoxStauts(0)
+    self:UpdataAllLiveness(0)
+    if #self.initFunc then
+        for _, v in pairs(self.initFunc) do
+            v()
+        end
+    end
+    -- self:CheckAfteChapterEndAwardIsGet() ---ZHJH-797 屏蔽掉奖励界面
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AchievementPage.id)
+end
+
+---判断所有章节成就奖励是否全部领取 未领取自动领取
+function ActiveTaskManager:CheckAfteChapterEndAwardIsGet()
+    if self.check then
+        return
+    end
+    self.check = true
+    self.ChapterEndAward = require "AfkModel":GetInstance().ActiveTaskChapterEndAward
+    for _, v in pairs(self.tasks) do
+        if self.ChapterEndAward[v.i_task.sid] then
+            local res = self:CheckChapterEndTaskState(v.i_task.state)
+            if res then
+                self:GetCurAfkChapterEndAward(v.i_task.sid, 1)
+            end
+        end
+    end
+end
+
+---获取显示ID
+---@param data achieve.s2c_achieve_info 成就信息
+---@param id number 成就id
+function ActiveTaskManager:GetId(data, id)
+    local finishInd = -1
+    if data.finish_achieve ~= nil then
+        for k, taskid in pairs(data.finish_achieve) do
+            if taskid == id then
+                finishInd = k
+            end
+        end
+    end
+    if finishInd ~= -1 then
+        local cfg = _G.ConfigManager.mission_cfg[id]
+        if cfg.re_sid > 0 then
+            return self:GetId(data, cfg.re_sid)
+        else
+            return nil
+        end
+    else
+        return id
+    end
+end
+
+---整理服务器数据
+---@param data achieve.s2c_achieve_info 成就信息
+---@param id number 成就id
+function ActiveTaskManager:SetServerInfo(data, id)
+    local endId = self:GetId(data, id)
+    if endId then
+        local endValue
+        if data.get_achieve ~= nil then
+            for _, value in pairs(data.get_achieve) do
+                if endId == value then
+                    endValue = {
+                        sid = endId,
+                        state = _G.TaskEnum.ETaskState.Submited,
+                        target = {
+                            [1] = 0
+                        }
+                    }
+                    break
+                end
+            end
+        end
+        if endValue then
+            local CjTaskData = require("CjTaskData").New(endValue, self.taskCompletedFun, _G.MarkTaskType.Achieve)
+            table.insert(self.tasks, CjTaskData)
+        else
+            local task = {
+                sid = endId,
+                state = _G.TaskEnum.ETaskState.Claimed,
+                target = {
+                    [1] = 0
+                }
+            }
+            local CjTaskData = require("CjTaskData").New(task, self.taskCompletedFun, _G.MarkTaskType.Achieve)
+            table.insert(self.tasks, CjTaskData)
+        end
+    end
+end
+
+function ActiveTaskManager:AddTask(task)
+    local CjTaskData = require("CjTaskData").New(task, self.taskCompletedFun, _G.MarkTaskType.Achieve)
+    table.insert(self.tasks, CjTaskData)
+end
+
+---成就信息
+---@param data achieve.s2c_achieve_info 成就信息
+function ActiveTaskManager:ParseDatas(data)
+    self.dataA = data
+    self.dataB = {}
+
+    for _, value in pairs(data.collector) do
+        local s = value.key[1]
+        self.dataB[s] = value.value
+    end
+    self.GetCjPointLevel = data.finish_lv
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AchievementBadge.id)
+    self:ParseData(self)
+end
+
+function ActiveTaskManager:GetLevel()
+    self.PointNum = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.ResProp, _G.ResPropID.ActiveAch)
+    local exp = 0
+    local lv = 0
+    local curExp = 0
+    local maxExp = 0
+    for i = 1, #_G.ConfigManager.ach_stage_cfg do
+        local item = _G.ConfigManager.ach_stage_cfg[i]
+        exp = exp + item.chapter
+        if self.PointNum == exp then
+            if i == #_G.ConfigManager.ach_stage_cfg then
+                lv = i
+                curExp = exp
+                maxExp = exp
+            else
+                lv = i
+                curExp = self.PointNum
+                maxExp = exp
+            end
+            break
+        elseif self.PointNum < exp then
+            lv = i - 1
+            curExp = self.PointNum
+            maxExp = exp
+            break
+        else
+            if i == #_G.ConfigManager.ach_stage_cfg then
+                lv = i
+                curExp = exp
+                maxExp = exp
+            end
+        end
+    end
+    return lv, curExp, maxExp
+end
+
+--endregion
+
+function ActiveTaskManager:UpdataBoxStauts()
+    for boxIndex, value in pairs(self.Box_status) do
+        local tagerNum = self.ActiveTaskBoxValue[boxIndex]
+
+        --- 如果当前活跃 达到阈值
+        if self.ActiveValue >= tagerNum then
+            if value == _G.ActiveTaskBoxType.Invalid then
+                --- 宝箱可领取
+                self.Box_status[boxIndex] = _G.ActiveTaskBoxType.WaitClaim
+            end
+        end
+
+        --- 宝箱Sid配置
+        if self.Box_BoxSid[boxIndex] == nil then
+            self.Box_BoxSid[boxIndex] = self:GetBoxRewardSid(boxIndex)
+        end
+    end
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DailyBox.id)
+    self:UpdataView()
+end
+
+function ActiveTaskManager:TaskCompleted(taskid)
+    local id = _G.ConfigManager.mission_cfg[taskid].type_mission
+    if id == 1 then
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.DailyTaskPage.id,
+                taskid
+        )
+    elseif id == 2 then
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.AchievementPage.id,
+                taskid
+        )
+    end
+
+    self:UpdataView()
+end
+
+function ActiveTaskManager:UpdataOnUIShow(name)
+    if name == _G.ConfigManager.ui_cfg.ActiveTaskView.Name then
+        -- body
+
+        local view = self:GetView()
+        if view == nil then
+            return
+        end
+        view:InitView()
+    end
+end
+
+function ActiveTaskManager:UpdataView()
+    local view = self:GetView()
+    if view == nil then
+        return
+    end
+    view:InitView()
+end
+
+---@return ActiveTaskView
+function ActiveTaskManager:GetView()
+    if _G.IsNil(self.View) or _G.IsNil(self.View.gameObject) then
+        self.View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActiveTaskView.Name)
+    end
+
+    return self.View
+end
+
+--- 检测任务状态是已完成未提交
+function ActiveTaskManager:CheckChapterEndTaskState(state)
+    if state == _G.TaskEnum.ETaskState.Submited then
+        return true
+    end
+    return false
+end
+
+function ActiveTaskManager:GetBoxStatus()
+    return self.Box_status
+end
+
+---@param type _G.ActiveTaskBoxType
+function ActiveTaskManager:SetBoxStatus(index, ActiveTaskBoxType)
+    if not index or index <= 0 then
+        return
+    end
+    self.Box_status[index] = ActiveTaskBoxType
+end
+
+---@param  task task.i_task
+function ActiveTaskManager:UpdataTask(task)
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask:UpdataData(task)
+
+    return true
+end
+
+function ActiveTaskManager:GetTaskByTaskid(taskid)
+    for i = 1, #self.tasks do
+        if self.tasks[i].i_task.sid == taskid then
+            return self.tasks[i]
+        end
+    end
+
+    return nil
+end
+
+---检测一次日常任务
+function ActiveTaskManager:CheckDaliyFinishAll()
+    local isFinish = true
+    for i = 1, #self.tasks do
+        if self.tasks[i].Cfg.type_mission == 1 then
+            --_G.LogError(self.tasks[i].Cfg.id)
+            if self.tasks[i].i_task.state ~= _G.TaskEnum.ETaskState.Completed then
+                isFinish = false
+                break
+            end
+        end
+    end
+
+    ---如果日常完成了就走一下弹出礼包检测
+    if isFinish then
+        require "PopUpGiftBagModel":GetInstance():IsFinishAllDaily()
+    end
+end
+
+-- 是否有待 提交的每日任务
+function ActiveTaskManager:HaveTaskSubmited()
+    for i = 1, #self.tasks do
+        local tasks = self.tasks[i]
+        if tasks.Cfg.type_mission == 1 and tasks.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            --- 为0 默认显示
+            local isfunction_open = tasks.Cfg.function_open == 0
+            if isfunction_open == false then
+                isfunction_open = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(tasks.Cfg.function_open)
+            end
+            if isfunction_open then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+-- 是否有待 提交的成就
+function ActiveTaskManager:HaveTaskSubmitedCj()
+    for i = 1, #self.tasks do
+        local tasks = self.tasks[i]
+        if tasks.Cfg.type_mission == 2 and tasks.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            --- 为0 默认显示
+            local isfunction_open = tasks.Cfg.function_open == 0
+            if isfunction_open == false then
+                isfunction_open = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(tasks.Cfg.function_open)
+            end
+            if isfunction_open then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+function ActiveTaskManager:OnEvent_ResetGame()
+    --_G.LogError(" ActiveTaskManager:OnEvent_ResetGame ---------")
+
+    _G.TaskModule:GetInstance():Dispose()
+end
+
+function ActiveTaskManager:GetBoxRewardSid(boxIndex)
+    return 100 + boxIndex
+end
+
+---@param data award.i_award_item[]
+function ActiveTaskManager:ResUpdata(data)
+    for _, value in pairs(data) do
+        local sid = value.type[1]
+
+        if sid == _G.ResPropID.ActiveValue then
+            -- body
+            local _, storageId = _G.StorageManager:GetInstance():CheckSidType(sid)
+
+            local activenum = _G.StorageManager:GetInstance():GetItemCountByID(storageId, _G.ResPropID.ActiveValue)
+            if activenum ~= nil then
+                self.ActiveValue = activenum
+                self:UpdataBoxStauts()
+            end
+            break
+        elseif sid == _G.ResPropID.ActiveAch then
+            self:UpdataView()
+        end
+    end
+end
+
+function ActiveTaskManager:UpdataAllLiveness(AddNum)
+    self.all_liveness = self.all_liveness + AddNum
+    self.award_state = nil
+
+    if self.all_liveness >= (self.all_livenessDic.value) then
+        self.award_state = 1
+    end
+    _G.Events:GetInstance():Broadcast(_G.BattlePassExpEvents.BPActive, AddNum)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DailyBigBOX.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Active.id)
+end
+
+---@param onRespCallback fun():void 网络请求成功回调
+function ActiveTaskManager:HuoQuShuJu(onFinishCallback, onRespCallback)
+    self:PanDuanZhi(onFinishCallback, onRespCallback)
+end
+
+function ActiveTaskManager:PanDuanZhi(onFinishCallback, onRespCallback)
+    -- local mission_cfg = _G.ConfigManager.mission_cfg
+    if self.yijianlingqupanduan then
+        return
+    end
+    self.yijianlingqupanduan = true
+    local canGets = {}
+    local mission_cfg = _G.ConfigManager.mission_cfg
+    for _, value in pairs(self.tasks) do
+        if value.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            local idList = self:YiJianLingQu(value.i_task)
+            for _, s in pairs(idList) do
+                _G.table.insert(canGets, s)
+            end
+        end
+    end
+
+    if _G.table.count(canGets) > 0 then
+        require("TaskNet"):GetInstance():GetAchieveAward(
+                { sid = canGets },
+                function(data)
+                    self.yijianlingqupanduan = false
+                    if data == nil then
+                        onFinishCallback()
+                        return
+                    end
+                    local num = {}
+                    if data.sids == nil then
+                        data.sids = {}
+                    end
+                    for _, value in pairs(self.tasks) do
+                        local cfg = mission_cfg[value.i_task.sid]
+                        if cfg.type_mission == 2 then
+                            if self:ShanChu(data.sids, value) then
+                                _G.table.insert(num, value)
+                            end
+                        else
+                            _G.table.insert(num, value)
+                        end
+                    end
+                    self.tasks = num
+
+                    local list = self:LingQuShuaXing(data.sids)
+                    for i = 1, #list do
+                        self:UpdateMangerTasksNew(list[i])
+                    end
+
+                    if onRespCallback then
+                        onRespCallback()
+                    end
+
+                    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                    _G.PopWindowManager:GetInstance():AddAwardPopQuene(
+                            data,
+                            function()
+                                onFinishCallback()
+                            end
+                    )
+                end
+        )
+    else
+        self.yijianlingqupanduan = false
+        onFinishCallback()
+    end
+end
+
+---@param activeTask ActiveTaskBase
+function ActiveTaskManager:ShanChu(achieve, activeTask)
+    local id = activeTask.i_task.sid
+    local cfg = _G.ConfigManager.mission_cfg[id]
+    if achieve == nil then
+        achieve = {}
+    end
+    if cfg.re_sid == 0 and activeTask.i_task.state == _G.TaskEnum.ETaskState.Claimed then
+        return true
+    end
+    for _, value in pairs(achieve) do
+        if value == id then
+            return false
+        end
+    end
+    return true
+end
+
+function ActiveTaskManager:UpdateMangerTasksNew(data)
+    local cfg = _G.ConfigManager.mission_cfg[data]
+    if cfg.re_sid > 0 then
+        --local isAdd = false
+
+        local task = {
+            sid = cfg.re_sid,
+            state = _G.TaskEnum.ETaskState.Claimed,
+            target = { self:TiaoMuPanDuan(cfg.condition) }
+            -- target = self.tasks[data].target
+        }
+        self:AddTask(task)
+    else
+        local task = {
+            sid = data,
+            state = _G.TaskEnum.ETaskState.Completed,
+            target = { cfg.count }
+        }
+        local blacklist = {}
+        local wxid = _G.ConfigManager.discrete_cfg[103303][1][1]
+        local dyid = _G.ConfigManager.discrete_cfg[103304][1][1]
+        if _G.AppSetting.IsXzns then
+            table.insert(blacklist, dyid)
+            table.insert(blacklist, wxid)
+            if _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.shareSwitch) then
+                if _G.AppSetting.IsWeiXin then
+                    table.removebyvalue(blacklist, wxid)
+                elseif _G.AppSetting.IsDouYin then
+                    table.removebyvalue(blacklist, dyid)
+                end
+            end
+        else
+            if _G.AppSetting.IsWeiXin then
+                table.insert(blacklist, dyid)
+            elseif _G.AppSetting.IsDouYin then
+                table.insert(blacklist, wxid)
+            else
+                table.insert(blacklist, dyid)
+                table.insert(blacklist, wxid)
+            end
+        end
+        if false == table.indexof(blacklist, task.sid) then
+            local ActiveTaskBases = _G.ActiveTaskBase.New(task, self.taskCompletedFun, _G.MarkTaskType.Daily)
+            table.insert(self.tasks, ActiveTaskBases)
+        end
+        return
+    end
+end
+
+function ActiveTaskManager:LingQuShuaXing(new_achieve)
+    local mission_cfg = _G.ConfigManager.mission_cfg
+    local list = {}
+    for _, value in pairs(new_achieve) do
+        if self:LingQuachieve(new_achieve, mission_cfg[value].re_sid) then
+            local i = true
+            for _, s in pairs(list) do
+                if s == value then
+                    i = false
+                end
+            end
+            if i then
+                _G.table.insert(list, value)
+                -- body
+            end
+        end
+    end
+    return list
+end
+
+function ActiveTaskManager:LingQuachieve(new_achieve, id)
+    --local mission_cfg = _G.ConfigManager.mission_cfg
+    for _, value in pairs(new_achieve) do
+        if id == value then
+            return false
+        end
+    end
+    return true
+end
+
+---一键领取循环判断服务器端
+function ActiveTaskManager:YiJianLingQu(data)
+    local mission_cfg = _G.ConfigManager.mission_cfg
+    local cfg = mission_cfg[data.sid]
+    local idList = {}
+    if cfg.type_mission ~= 2 then
+        return idList
+    end
+    _G.table.insert(idList, data.sid)
+
+    if cfg.re_sid == nil or cfg.re_sid < 0 then
+        return idList
+    end
+    for _ = 1, 99 do
+        cfg = mission_cfg[cfg.re_sid]
+        if cfg == nil or cfg.id < 0 then
+            return idList
+        end
+        local num = #cfg.condition[1]
+        local count = self:TiaoMuPanDuan(cfg.condition)
+        if self:GetAcfieve(cfg.id) then
+            _G.table.insert(idList, cfg.id)
+        elseif count >= cfg.condition[1][num] then
+            _G.table.insert(idList, cfg.id)
+        else
+            if self:CheckTaskTarget(cfg.condition[1], data) then
+                _G.table.insert(idList, cfg.id)
+            else
+                return idList
+            end
+        end
+        -- if  _G.table.sameByCount(cfg.condition, data[i]) then
+        --     -- body
+        -- end
+        -- if cfg.condition[1][num] <= data.target[1] then
+        --     _G.table.insert(self.tasks, cfg.id)
+        -- else
+        --     return idList
+        -- end
+    end
+end
+
+function ActiveTaskManager:GetAcfieve(condition)
+    if self.dataA.get_achieve ~= nil then
+        for _, value in pairs(self.dataA.get_achieve) do
+            if condition == value then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function ActiveTaskManager:TiaoMuPanDuan(condition)
+    local _ = #condition[1]
+    for key, value in pairs(self.dataB) do
+        if condition[1][1] == key then
+            return value
+        end
+    end
+
+    return 0
+end
+
+function ActiveTaskManager:ShuZhiPanDuan(condition, num)
+    if self.dataB ~= nil and self.dataB[condition] then
+        if self.dataB[condition] < num then
+            self.dataB[condition] = num
+        end
+    end
+end
+
+-----前端检测任务是否完成
+function ActiveTaskManager:CheckTaskTarget(task, taskData)
+    if _G.ActiveTaskEnum.ConditionEnum.CumulativeLogin.specifiedTime == task[1] then
+        --指定时间段登录
+        local starSecond = task[2]
+        local endSecond = task[3]
+        local notSecond = _G.TimeUtil.GetSecondsOfDayOf6Hour()
+        if notSecond >= starSecond and notSecond <= endSecond then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CumulativeLogin.dayAfter == task[1] then
+        --指定接取任务后几天登录
+        local nowSecond = _G.TimeUtil.GetServerUnixTime()
+        local starSecond = (task[2] - 1) * 86400 + _G.TimeUtil.GetDayBySix(taskData.getTime)
+        if nowSecond >= starSecond then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Section.SectionPass == task[1] then
+        --副本是否通关
+        local id = task[2]
+        if _G.GlobalConditionManager.CheckCondition(2, id) then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Section.CompleteTargetEvent == task[1] then
+        -- 完成目标事件
+        local id = task[2]
+        if _G.GlobalConditionManager.CheckCondition(10, id) then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.AFK.IsPass == task[1] then
+        ---该放置关卡是否过关
+        local id = task[2]
+
+        if _G.GlobalConditionManager.CheckCondition(4, id) then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Section.DeadsoulFoor == task[1] then
+        ---死魂塔通关达到X层新增byszs
+        local type = task[2]
+        local num = task[3]
+        local layer = require("DeadsoulTowerModel"):GetInstance():CheckDeadsoulTask(type, num)
+        if layer >= num then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CardLevel.assignCountAssignLevel == task[1] then
+        --- 指定N张卡 升到指定X级
+        --- 检测并直接设置进度  (初始化)
+        local lv = task[2]
+        local num = task[3]
+        if lv > 1 then
+            ---新共鸣系统后端卡牌没有等级概念（此id的配置应换为147）
+            return false
+        end
+        if _G.StorageManager:GetInstance():CheckCardLvCount({ lv = lv }) >= num then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CardLevel.assignSidAssignLevel == task[1] then
+        --- 指定SID卡牌升到N级（检测当前背包）
+        --- 检测并直接设置进度  (初始化)
+        local sid = task[2]
+        local lv = task[3]
+        if _G.StorageManager:GetInstance():CheckCardLvCount({ lv = lv, sid = sid }) >= lv then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CardUpStar.assignSidAssignStar == task[1] then
+        --- 指定SID卡牌升到N星（检测当前背包）
+        --- 检测并直接设置进度  (初始化)
+        local sid = task[2]
+        local star = task[3]
+        if require "IllustrationModel":GetInstance():GetCardMaxStar(sid) >= star then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Section.TzyLevel == task[1] then
+        ---贪字营等级达到X级
+        local lv = task[2]
+        local BountySystemManager = require("BountySystemManager"):GetInstance()
+        if BountySystemManager.BountyData and BountySystemManager.BountyData.level >= lv then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CharacterLevel.Level == task[1] then
+        -- 人物当前等级
+        local Maxlv = task[2]
+        local DQlv = _G.PlayerModel:GetInstance():GetLevel()
+        if DQlv >= Maxlv then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CardLevel.assignCountAssignStar == task[1] then
+        local star = task[2]
+        local num = task[3]
+        if _G.StorageManager:GetInstance():CheckCardStarCount(star, num) >= num then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CumulativeLogin.day == task[1] then
+        _G.PlayerModel:GetInstance():CumulativeLogin()
+
+        local star = task[2]
+        local num = _G.PlayerModel:GetInstance():DayCount()
+        if num >= star then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Equipment.assignGradeCount == task[1] then
+        local grade = task[2]
+        local num = require("EquipmentModel"):GetInstance():GetGradeTopCount(grade)
+        if num >= grade then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.ResonanceCrystal.upCardCount == task[1] then
+        local grade = task[2]
+
+        -- local num = require("StoneModel"):GetInstance():GetAllGridCardNumber()
+        local num = 0
+        if num >= grade then
+            return true -- body
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.HellRoad.FinishTask == task[1] then
+        local grade = task[2]
+
+        local num = require("HellRoadModel"):GetInstance():GetFinishCount()
+        if num >= grade then
+            return true -- body
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Guild.joinOrCreate == task[1] then
+        local num = require("SociatyManager"):GetInstance():HasSociaty() == true and 1 or 0
+
+        if num == 1 then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Section.materialAssignLayer == task[1] then
+        local systemid = task[2]
+        local Index = task[3]
+        local num = require("SystemMaterialController"):GetInstance():GetCurChallengeFloor(systemid)
+        if not require("SystemMaterialController"):GetInstance():CheckIsPass(systemid, num) then
+            num = num - 1
+        end
+        if num >= Index then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.ResonanceCrystal.UnlockGridsuccessful == task[1] then
+        local grade = task[2]
+
+        -- local num = require("StoneModel"):GetInstance():GetJiesuoNumber()
+        local num = 0
+        if num >= grade then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Combine.count == task[1] then
+        local grade = task[2]
+
+        local num = require("CombineModel"):GetInstance():GetActiveSkillCount()
+
+        if num >= grade then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Embattle.EmbattleidSkillCount3 == task[1] then
+        local EmbattleId = task[2]
+        local arr = require("EmbattleModel"):GetInstance():GetSkillIndex(EmbattleId)
+        if arr ~= nil then
+            local count = 0
+            for i = 1, #arr do
+                if arr[i] ~= 0 then
+                    count = count + 1
+                end
+            end
+            if arr >= EmbattleId then
+                return true
+            end
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.HellRoad.id == task[1] then
+        local EmbattleId = task[2]
+
+        local id = require("HellRoadModel"):GetInstance():GetNowHellId()
+        if id >= EmbattleId then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Section.SectionExplore100 == task[1] then
+        local id = task[2]
+        local is100 = require("ChapterModel"):GetInstance():IsSectionExplore100(id)
+        if is100 then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Section.materialDifficulty == task[1] then
+        local id = task[2]
+        local difficulty = task[3]
+        local model = require("SystemMaterialController"):GetInstance():GetModel(id)
+        if model then
+            local nowDifficulty = model:GetCurChallengeFloor()
+            if nowDifficulty >= difficulty then
+                return true
+            end
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Train.chpaterSection == task[1] then
+        local chapter = task[2]
+        local section = task[3]
+        if section == 0 then
+            ---检测是否章节通关
+            local isPass = require("TrainingModel"):GetInstance():IsPass(chapter) == false
+            if isPass then
+                return true
+            end
+        else
+            ---检测是否关卡通关
+            local isPass = require("TrainingModel"):GetInstance():IsPassChpter(section) == false
+            if isPass then
+                return true
+            end
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.PlayerTree.BranchLv == task[1] then
+        local branch = task[2]
+        local lv = task[3]
+        local nowLv
+        if branch == _G.PlayerTreeID.none then
+            ---如果是任意池
+            nowLv = require("PlayerTreeModel"):GetInstance():GetMaxLv(branch)
+        else
+            nowLv = require("PlayerTreeModel"):GetInstance():GetLv(branch)
+        end
+        if nowLv and nowLv >= lv then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Equipment.DecorationSuit4Count == task[1] then
+        local id = task[2]
+
+        local storage = _G.StorageManager:GetInstance():GetDataStorageByID(_G.StorageID.Card)
+        local num = storage:GetSuit_count_noSame()
+        if num >= id then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Equipment.DecorationAllWearCount == task[1] then
+        local id = task[2]
+
+        local storage = _G.StorageManager:GetInstance():GetDataStorageByID(_G.StorageID.Card)
+        local num = storage:GetDecorationUseCount()
+        if num >= id then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Pet.DrawNum == task[1] then
+        local num = task[2]
+
+        if require("PetDrawModel"):GetInstance():GetTotalTimes() >= num then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Pet.PetForestLevel == task[1] then
+        local level = task[2]
+
+        if require("PetForestModel"):GetInstance():GetLevel() >= level then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Pet.PetForestStage == task[1] then
+        local stage = task[2]
+
+        if require("PetForestModel"):GetInstance():GetStage() >= stage then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Pet.PetStar == task[1] then
+        local sid = task[2]
+        local star = task[3]
+
+        local petData = require("PetModel"):GetInstance():GetPet(sid)
+        if petData:GetStar() >= star then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Pet.PetStarNum == task[1] then
+        local order = task[2]
+        local star = task[3]
+        local num = task[4]
+
+        local allPetData = require("PetModel"):GetInstance():GetAllActivePets()
+        local totalNum = 0
+        for _, v in pairs(allPetData) do
+            if v:GetOrder() == order and v:GetStar() >= star then
+                totalNum = totalNum + 1
+
+                if totalNum >= num then
+                    return true
+                end
+            end
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CardResonance.FivePosLevel == task[1] then
+        --- 共鸣等级达到x级（5个槽位均达到x级）
+        local lv = task[2]
+
+        if require("CardResonanceModel"):GetInstance():GetMinLevel() >= lv then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.CardResonance.PosLevelNum == task[1] then
+        ---X个英雄（槽位）达到Y级
+        local lv = task[3]
+        if require("CardResonanceModel"):GetInstance():GetMinLevel(lv) >= task[2] then
+            return true
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Artifact.LevelNum == task[1] then
+        ---界限突破
+        ---X个神器达到Y级
+        return require("LimitBrokenModel"):GetInstance():CheckArtifactLevelCount(task[2], task[3])
+    elseif _G.ActiveTaskEnum.ConditionEnum.Artifact.StarNum == task[1] then
+        ---X个神器达到Y星
+        return require("LimitBrokenModel"):GetInstance():CheckArtifactStarCount(task[2], task[3])
+    elseif _G.ActiveTaskEnum.ConditionEnum.Artifact.AwakenNum == task[1] then
+        ---X个神器觉醒
+        return require("LimitBrokenModel"):GetInstance():CheckArtifactAwakenCount(task[2])
+    elseif _G.ActiveTaskEnum.ConditionEnum.Artifact.SidLevel == task[1] then
+        ---指定神器达到x级
+        return require("LimitBrokenModel"):GetInstance():CheckAppointArtifactLevel(task[2], task[3])
+    elseif _G.ActiveTaskEnum.ConditionEnum.Artifact.SidStar == task[1] then
+        ---指定神器达到x星
+        return require("LimitBrokenModel"):GetInstance():CheckAppointArtifactStar(task[2], task[3])
+    elseif _G.ActiveTaskEnum.ConditionEnum.Artifact.SidAwaken == task[1] then
+        ---指定神器觉醒
+        return require("LimitBrokenModel"):GetInstance():CheckAppointArtifactAwaken(task[2])
+    elseif _G.ActiveTaskEnum.ConditionEnum.CardTalent.LevelNum == task[1] then
+        ---X个英雄天赋达到Y级
+        return require("LimitBrokenModel"):GetInstance():CheckCardTalentCount(task[2])
+    elseif _G.ActiveTaskEnum.ConditionEnum.CardSoulLink.LevelNum == task[1] then
+        ---X个英雄魂链达到Y级
+        return require("LimitBrokenModel"):GetInstance():CheckCardSoulLinkCount(task[2])
+    elseif _G.ActiveTaskEnum.ConditionEnum.SecretRealm.SecretRealmLayer == task[1] then
+        ---通过X层秘境
+        return require("SecretRealmModel"):GetInstance():CheckSecretRealmLayer(task[2])
+    elseif _G.ActiveTaskEnum.ConditionEnum.SecretRealm.SecretRealmLayerType == task[1] then
+        ---通过指定类型X层秘境
+        return require("SecretRealmModel"):GetInstance():CheckSecretRealmLayer(task[3], task[2])
+    elseif _G.ActiveTaskEnum.ConditionEnum.Spiritual.LevelNum == task[1] then
+        ---同时拥有x个y星的彩色品质的饰品
+        local star = task[2]
+        local num = task[3]
+        local totalNum = 0
+
+        ---@type table<number, SpiritualData>
+        local allSpiritual = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Spiritual)
+        if allSpiritual then
+            for _, v in pairs(allSpiritual) do
+                if v:GetStar() >= star and v.cfg.Order >= 4 then
+                    totalNum = totalNum + 1
+                    if totalNum >= num then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    elseif _G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceStarNum == task[1] then
+        ---拥有X个达到Z种族#品质Y星的角色
+        local race = task[2]
+        local order = task[3]
+        local star = task[4]
+        local num = task[5]
+        local totalNum = 0
+
+        ---@type table<number, CardData>
+        local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+        if allCards then
+            for _, v in pairs(allCards) do
+                if require("CardInfoManager"):GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, race) and v.cfg.Order >= order and v:GetStar() >= star then
+                    totalNum = totalNum + 1
+                    if totalNum >= num then
+                        return true
+                    end
+                end
+            end
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceAwakeNum == task[1] then
+        ---拥有X个Z种族#品质觉醒等级达到Y的角色
+        local race = task[2]
+        local order = task[3]
+        local awake = task[4]
+        local num = task[5]
+        local totalNum = 0
+
+        ---@type table<number, CardData>
+        local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+        if allCards then
+            for _, v in pairs(allCards) do
+                local count = require("CardPotentialModel"):GetInstance():GetIndexBySid(v:GetPotential())
+                if require("CardInfoManager"):GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, race) and v.cfg.Order >= order and count >= awake then
+                    totalNum = totalNum + 1
+                    if totalNum >= num then
+                        return true
+                    end
+                end
+            end
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceCurMaxStar == task[1] then
+        ---X种族#品质角色总星级达到Y
+        local race = task[2]
+        local order = task[3]
+        local star = task[4]
+
+        local allstar = {}
+
+        ---@type table<number, CardData>
+        local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+        if allCards then
+            for _, v in pairs(allCards) do
+                local sid = v.sid
+                if require("CardInfoManager"):GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, race) and v.cfg.Order >= order then
+                    if nil == allstar[sid] then
+                        allstar[sid] = v:GetStar()
+                    elseif allstar[sid] < v:GetStar() then
+                        allstar[sid] = v:GetStar()
+                    end
+                end
+            end
+        end
+
+        local totalNum = 0
+        for k, v in pairs(allstar) do
+            totalNum = totalNum + v
+        end
+        return totalNum >= star
+    elseif _G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceAwakeMaxLevel == task[1] then
+        ---X种族#品质角色总觉醒等级达到Y
+        local race = task[2]
+        local order = task[3]
+        local awake = task[4]
+        local allpotential = {}
+
+        ---@type table<number, CardData>
+        local allCards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card)
+        if allCards then
+            for _, v in pairs(allCards) do
+                if require("CardInfoManager"):GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, race) and v.cfg.Order >= order then
+                    local count = require("CardPotentialModel"):GetInstance():GetIndexBySid(v:GetPotential())
+                    if nil == allpotential[v.cfg.id] then
+                        allpotential[v.cfg.id] = count
+                    elseif allpotential[v.cfg.id] < count then
+                        allpotential[v.cfg.id] = count
+                    end
+                end
+            end
+        end
+
+        local totalNum = 0
+        for k, v in pairs(allpotential) do
+            totalNum = totalNum + v
+        end
+
+        return totalNum >= awake
+    elseif _G.ActiveTaskEnum.ConditionEnum.DungeonChallenge.PassChapterNum == task[1] then
+        local chapter = task[2]
+        return require "DungeonChallengeBattleModel":GetInstance():GetLevelID() > chapter
+    elseif _G.ActiveTaskEnum.ConditionEnum.DungeonChallenge.LightSomeEquip == task[1] then
+        local type = task[2]
+        local num = task[3]
+        local list = require "DungeonChallengeIllustrationModel":GetInstance():CheckNumByType(type)
+        return list and #list > num
+    elseif _G.ActiveTaskEnum.ConditionEnum.Gemstone.HasGemWithGradeHistory == task[1] then
+        --- 同时拥有x个y品质或以上的宝石
+        local star = task[2]
+        local num = task[3]
+        local totalNum = 0
+        local gemList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Gemstone)
+        if gemList then
+            for _, gem in pairs(gemList) do
+                if gem:GetStar() >= star then
+                    totalNum = totalNum + 1
+                end
+                if totalNum >= num then
+                    return true
+                end
+            end
+        end
+    elseif _G.ActiveTaskEnum.ConditionEnum.Gemstone.HasGemWithLevelHistory == task[1] then
+        --- 同时拥有x个y等级或以上的宝石
+        local level = task[2]
+        local num = task[3]
+        local totalNum = 0
+        local gemList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Gemstone)
+        if gemList then
+            for _, gem in pairs(gemList) do
+                if gem:GetLevel() >= level then
+                    totalNum = totalNum + 1
+                end
+                if totalNum >= num then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+---一键领取循环判断客户端类型
+function ActiveTaskManager:YiJianLingQus(data)
+    --local num1 = 0
+    local idList = {}
+
+    local mission_cfg = _G.ConfigManager.mission_cfg
+    local cfg = mission_cfg[data.sid]
+    ---判断是否
+    if cfg.type_mission ~= 2 then
+        return idList
+    end
+end
+
+function ActiveTaskManager:UpdateMangerTasks(data)
+    local cfg = _G.ConfigManager.mission_cfg[data]
+    if cfg.re_sid > 0 then
+        for i = 1, #self.tasks do
+            if self.tasks[i].i_task.sid == data then
+                --isAdd = true
+                _G.table.remove(self.tasks, i)
+                local states
+                if self:GetAcfieve(cfg.re_sid) then
+                    states = _G.TaskEnum.ETaskState.Submited
+                else
+                    states = _G.TaskEnum.ETaskState.Claimed
+                end
+                local task = {
+                    sid = cfg.re_sid,
+                    state = states,
+                    target = { self:TiaoMuPanDuan(cfg.condition) }
+                }
+                self:AddTask(task)
+                return
+            end
+        end
+    else
+        -- local states
+        -- if self:GetAcfieve(data) then
+        --     states = _G.TaskEnum.ETaskState.Submited
+        -- else
+        --     states = _G.TaskEnum.ETaskState.Completed
+        -- end
+        local task = {
+            sid = data,
+            state = _G.TaskEnum.ETaskState.Completed,
+            target = { cfg.count }
+        }
+        self:UpdataTask(task)
+        return
+    end
+end
+
+---放置章节末打完主动领取成就章节奖励u
+---登录检测不缓存奖励数据 false 登录 true 战斗结束领取
+function ActiveTaskManager:GetCurAfkChapterEndAward(taskId, type)
+    if taskId ~= nil then
+        require("TaskNet"):GetInstance():GetAchieveAward(
+                { sid = { taskId } },
+                function(data)
+                    if data.sids == nil then
+                        return
+                    end
+                    for i = 1, #data.sids do
+                        self:UpdateMangerTasks(data.sids[i])
+                    end
+                    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                    if type then
+                        require "AfkModel":GetInstance():SetCurChapterEndAward(data, taskId)
+                    end
+                    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AchievementPage.id)
+                    self.check = nil
+                    require("AchieveTipManager"):GetInstance():Show(taskId)
+                end
+        )
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("章节关卡id为空，成就领奖暂停")
+        end
+    end
+end
+
+---销毁对象时,析构函数
+function ActiveTaskManager:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    _G.Events:GetInstance():RemoveListener(_G.GlobalEvents.GlobalResetGame, self.OnEvent_ResetGame, self)
+    _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.onShareAppMessage, self.ShareSuccess, self)
+
+    self.super:Dispose()
+end
+
+-- function ActiveTaskManager:ReConnect(endcall)
+--     self:InitData(
+--         function()
+--             self:InitFunction()
+--             if endcall then
+--                 endcall()
+--             end
+--         end
+--     )
+-- end
+
+---@return ActiveTaskManager
+return ActiveTaskManager

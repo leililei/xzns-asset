@@ -1,0 +1,843 @@
+-----------------------------------------------------------------------
+-- E:\OnePiece\LuaClient\Client\Assets\Resources\LuaScripts\World\Object\WorldNPCItem.lua
+-- Created by csw
+-- DateTime: 2019/12/23 15:44
+-- Description: NPC
+-----------------------------------------------------------------------
+local ItemEvent = _G.WorldItemManager.ItemEvent
+local WorldData = require "WorldData"
+local WorldUtils = require "WorldUtils"
+
+local base = require "WorldBaseItem"
+---@field public Cfg NpcWorldCfg_Item 配置表
+---@class WorldNPCItem:WorldBaseItem    NPC
+---@field protected FightTipHud BaseHUD 怪物头顶上显示的战斗提示
+---@field protected StandActionTime number 休闲动作的等待最长时间
+---@field protected StandActionName table 所有的休闲待机
+---@field StandActionTimer Timer 更换休闲动作倒计时
+---@field IsPlayerEnter boolean 玩家是否在可交互范围内
+local WorldNPCItem = _G.BaseClass("WorldNPCItem", base)
+
+local NpcActionType = {
+    None = 0,
+    Bubble = 1,
+    Dialogue = 2,
+    -- Battle = 3,
+    VIew = 4,
+    -- HP = 5,
+    RoomEvent = 6
+}
+
+local ActionFunction = {
+    [NpcActionType.None] = function(self)
+        _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+    end,
+    ---头顶冒气泡
+    [NpcActionType.Bubble] = function(self)
+        local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+        player:NavInterruptMove()
+        local clickParams = self.Cfg.ClickParams
+        if clickParams == nil or #clickParams == 0 then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("头顶冒气泡 clickParams nil or zero length", "<color=red>" .. ">>>" .. "</color>")
+            end
+        else
+            self:PlayActionAnimation()
+            ---随机选择一个配置的气泡id
+            _G.HUDUtilities.ShowHudID(_G.tonumber(clickParams[_G.GetRandomNum(1, #clickParams)]))
+        end
+        _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+        self:ContinueCfgMove()
+    end,
+    ---进行对话
+    [NpcActionType.Dialogue] = function(self)
+        local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+        player:NavInterruptMove()
+        local clickParams = self.Cfg.ClickParams
+        if clickParams == nil or #clickParams == 0 then
+            self:ContinueCfgMove()
+            require "ChapterModel":GetInstance():SetBehavioralPriority(false)
+        else
+            self:PlayActionAnimation()
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+            _G.StoryManager:GetInstance():PlayDialogueView(
+                _G.tonumber(clickParams[1]),
+                function()
+                    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+                    WorldUtils.SetIdleDialogueSaved(self.Uid, clickParams[1])
+                    --通知头顶提示刷新
+                    WorldUtils.UpdateWorldItemTip(self.Uid)
+                    self:ContinueCfgMove()
+                    require "ChapterModel":GetInstance():SetBehavioralPriority(false)
+                    self.Dialogue = false
+                end
+            )
+        end
+        _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+    end,
+    ---直接打开功能界面
+    [NpcActionType.VIew] = function(self)
+        local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+        player:NavInterruptMove()
+        local clickParams = _G.DeepCopyCfgTable(self.Cfg.ClickParams)
+        if clickParams == nil or #clickParams == 0 then
+            if _G.AppSetting.DEBUG then
+                _G.LogWarning("直接打开功能界面 clickParams nil or zero length", "<color=red>" .. ">>>" .. "</color>")
+            end
+            self:ContinueCfgMove()
+        else
+            self:PlayAnimByName()
+            local name = _G.table.remove(clickParams, 1)
+            local function OnViewOpen(self, vname)
+                if name == vname then
+                    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+                    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, OnViewOpen, self)
+                    self:ContinueCfgMove()
+                end
+            end
+            _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, OnViewOpen, self)
+            if name == "AfkView" then
+                if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Afk) then
+                    local curSid = require "AfkModel":GetInstance():GetCurSection()
+                    if require "AfkModel":GetInstance():CheckSectionIsEnd(curSid) then
+                        _G.PopWindowManager:GetInstance():ShowAllTips(210108)
+                        return
+                    end
+                    if not require "AfkModel":GetInstance():CheckNextSectionCondition(true) then
+                        return
+                    end
+                    _G.Events:GetInstance():Broadcast(_G.eGuideEvent.WorldObjRespond)
+                    require("AfkBattleManager"):GetInstance():EnterEmbattle()
+                else
+                    _G.FunctionManager:GetInstance():ShowFuncitonOpenTips(_G.FunctionID.Afk)
+                end
+            else
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+                _G.UIManager:GetInstance():OpenWindow(name, clickParams)
+            end
+        end
+        _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+    end,
+    ---房间事件
+    [NpcActionType.RoomEvent] = function(self)
+        if self.isInteracted then
+            self:ContinueCfgMove()
+            _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+            return
+        end
+        self:PlayActionAnimation()
+        _G.ChapterRoomManager:GetInstance():TriggerRoomEvent(
+            self.ItemData.EnterFightId,
+            _G.handler(self, self.NpcDoEventDone)
+        )
+    end
+}
+
+---交互前动画序列
+--local ActionIdleBefore = 1
+---交互后交互动画开始序列
+local ActionInteractedAfter = 3
+--local IdleTime
+--region 周期函数
+---初始化
+function WorldNPCItem:Init()
+    self.triggerAction = false
+    self.isInteracted = false
+
+    base.LoadObject(self)
+    self.TaskTipType = WorldData.EWorldItemTipType.None
+    self.StandActionTime =
+        _G.ConfigManager.discrete_cfg[103202][1][1] and _G.ConfigManager.discrete_cfg[103202][1] or {10, 20}
+    self:InitStandActionName()
+end
+
+function WorldNPCItem:InitStandActionName()
+    self.StandActionName = {}
+    self.StandActionCount = 0
+    local cfg = _G.ConfigManager.character_special_cfg
+    if not _G.table.isEmptyOrNil(self.Cfg.display_xiuxian) then
+        self.StandActionName = _G.DeepCopyCfgTable(self.Cfg.display_xiuxian)
+        self.StandActionCount = #self.Cfg.display_xiuxian
+        for i = 1, self.StandActionCount do
+            local data = {sid = self.Cfg.display_xiuxian[i]}
+            if cfg[data.sid] then
+                data.name = cfg[data.sid].display_xiuxian
+            end
+            self.StandActionName[i] = data
+        end
+    end
+end
+
+function WorldNPCItem:Dispose()
+    self.triggerAction = nil
+    self.isInteracted = nil
+    if self.NpcTimer then
+        self.NpcTimer:Stop()
+        self.NpcTimer = nil
+    end
+    self.TaskTipType = nil
+    -- self.AllNode = nil
+    self.TaskSign = nil
+    self.FunctionSign = nil
+    self.StandActionName = nil
+    self:StopStandActionTimer()
+    self.StandActionTime = nil
+    _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+end
+
+---加载资源完成
+function WorldNPCItem:OnLoadResObjComplete()
+    local name
+    if self.Cfg then
+        if self.Cfg.Name ~= 0 then
+            name = _G.GetLangPackValue(self.Cfg.Name)
+        end
+    else
+        if self.ItemData.Name then
+            name = self.ItemData.Name
+        end
+    end
+    if not _G.string.IsNullOrEmpty(name) then
+        name = "<color=#98c1ff>" .. name .. "</color>"
+        if self.Cfg.OverheadDescription > 0 then
+            local tag = _G.GetLangPackValue(self.Cfg.OverheadDescription)
+            if not _G.string.IsNullOrEmpty(tag) then
+                name = tag .. "\n" .. name
+            end
+        end
+        self.ItemData.role_name = name
+        self:InitTitle(name)
+    end
+    --新增模型的缩放设置
+    local scale = self.Cfg.Scale or 1
+    self.Transform:SetLocalScaleXYZ(scale)
+    if self.TitleTransform then
+        scale = 1 / scale
+        self.TitleTransform:SetLocalScaleXYZ(scale)
+    end
+    if not self.isInteracted then
+        self:AddTriggerComponent(
+            function()
+                base.OnLoadResObjComplete(self)
+            end
+        )
+    else
+        base.OnLoadResObjComplete(self)
+    end
+end
+
+--local NPCNameFontSize = 2.5
+
+function WorldNPCItem:ShowOrHide(show, force)
+    base.ShowOrHide(self, show, force)
+    if not _G.IsNil(self.TaskSign) then
+        _G.GameUtil.SetActiveByCondition(self.TaskSign, show)--self.curSetEnable)
+    end
+end
+
+function WorldNPCItem:OnGameObjShow()
+    if not self.ObjectMod then
+        return
+    end
+    if not self.isInteracted and self.Cfg.Params[1] == NpcActionType.RoomEvent then --房间事件
+        self.isInteracted = _G.ChapterRoomManager:GetInstance():CheckNpcEventDone(self.ItemData.EnterFightId)
+    end
+    if self.isInteracted then
+        self:PlayInteractedActionEndCall()
+    else
+        self:CheckInitState()
+    end
+    ---开启闲置动作播放倒计时
+    if not self.AnimComponent.animator then
+        self:StopStandActionTimer()
+    else
+        self:StartStandActionTimer()
+    end
+    base.OnGameObjShow(self)
+    if not _G.table.isEmptyOrNil(self.AllNode) then
+        local WorldItemManagerIns = _G.WorldItemManager:GetInstance()
+        WorldItemManagerIns:RegiestWorldItemEvent(ItemEvent.interactionBoxStart, self.StopCfgMove, self)
+        WorldItemManagerIns:RegiestWorldItemEvent(ItemEvent.interactionBoxEnd, self.ContinueCfgMove, self)
+    end
+end
+
+function WorldNPCItem:OnGameObjHide()
+    self:StopStandActionTimer()
+    base.OnGameObjHide(self)
+    if not _G.table.isEmptyOrNil(self.AllNode) then
+        local WorldItemManagerIns = _G.WorldItemManager:GetInstance()
+        WorldItemManagerIns:UnRegiestWorldItemEvent(ItemEvent.interactionBoxStart, self.StopCfgMove, self)
+        WorldItemManagerIns:UnRegiestWorldItemEvent(ItemEvent.interactionBoxEnd, self.ContinueCfgMove, self)
+    end
+end
+function WorldNPCItem:OnEnterWorld()
+    if not _G.IsNil(self.ObjectMod) then
+        return
+    end
+    --更新头顶提示
+    WorldUtils.UpdateWorldItemTip(self.Uid)
+    ---添加Update
+    self:StartUpdateMove()
+    base.OnEnterWorld(self)
+end
+
+function WorldNPCItem:OnExitWorld(leaveWorld)
+    _G.WorldItemManager:GetInstance():CloseInteractedView(_G.WorldItemType.NPC, self.Transform)
+    base.OnExitWorld(self)
+    if self.FightTipHud then
+        self.FightTipHud:Destroy()
+        self.FightTipHud = nil
+    end
+    if self.StandUpdateFunc then
+        self.StandUpdateFunc:Stop()
+        self.StandUpdateFunc = nil
+    end
+    self.TaskTipType = WorldData.EWorldItemTipType.None
+    self:RemoveTaskSign()
+    ---在切换场景移除回调
+    _G.AnimatorPlayEndCallback.RemoveCallback(_G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE())
+    if leaveWorld then
+        _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+    end
+end
+
+---清理item节点下的对象
+function WorldNPCItem:DisWorldItem()
+    base.DisWorldItem(self)
+end
+
+---移除效果
+function WorldNPCItem:RemoveCommonEffect()
+    if not _G.IsNil(self.ObjectMod) then
+        self.World.CommonEff:SetSelectState(self.ObjectMod, false)
+        --还原渲染状态
+        local renders = self.ObjectMod:GetComponentsInChildren(_G.typeof(_G.Renderer))
+        if not _G.IsNil(renders) then
+            local len = renders.Length - 1
+            for i = 0, len do
+                local render = renders[i]
+                if not _G.IsNil(render) and not _G.IsNil(render.sharedMaterial) then
+                    render.sharedMaterial:SetFloat("_ShadowArea", 0)
+                    render.shadowCastingMode = _G.CS.UnityEngine.Rendering.ShadowCastingMode.On
+                end
+            end
+        end
+    end
+end
+--endregion
+
+function WorldNPCItem:UpdateTitlePos()
+    base.UpdateTitlePos(self)
+    if not self.titleDeltaY then
+        return
+    end
+    if not _G.IsNil(self.TaskSign) then
+        self.titlePosY = self.titlePosY + 1
+        self.TaskSign:SetPosition(self.titlePosX, self.titlePosY, self.titlePosZ)
+    end
+end
+
+--region标记
+---根据状态给NPC添加提示标记
+---@param tiptype EWorldItemTipType @提示类型2
+function WorldNPCItem:CreateTaskSign(tiptype)
+    if self.TaskTipType ~= tiptype then
+        self.TaskTipType = tiptype
+        self:RemoveTaskSign()
+        local tiprespath = WorldData.EWorldItemTipResMap[tiptype]
+        local nameTitleTF = self.TitleTransform
+        if tiprespath ~= nil and nameTitleTF ~= nil then
+            _G.PoolsManager:GetInstance():Spawn(
+                tiprespath,
+                _G.ePoolType.World,
+                self.World:GetTitleRoot(),
+                function(tran)
+                    --- 防止创建中角色被销毁
+                    if _G.IsNil(nameTitleTF) then
+                        self:RemoveTaskSign()
+                        return
+                    end
+                    self.TaskSign = tran
+                    self.World.WorldSetting:TranLookAtCamera(self.TaskSign, self.Transform)
+                    tran:SetLocalPosition(1000, 1000, 1000)
+                end
+            )
+        end
+    end
+end
+
+---移除任务标记
+function WorldNPCItem:RemoveTaskSign()
+    if not _G.IsNil(self.TaskSign) then
+        _G.DestroyObject(self.TaskSign)
+        self.TaskSign = nil
+    end
+end
+
+---移除功能图标标记
+function WorldNPCItem:RemoveFunctionSign()
+    if self.FunctionSign then
+        _G.DestroyObject(self.FunctionSign)
+    end
+end
+--endregion
+--region 触发器
+function WorldNPCItem:OnClick()
+    local radius = 0
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    ---@param isNode boolean item是不是障碍物 有无寻路节点
+    if player then
+        self.triggerAction = false
+        local isArrival, isTooClose =
+            player:GotoPoint(
+            _G.Vector3.New(self.Transform:GetPosition()),
+            function()
+                if not self.isInteracted then
+                    self.NavStepMoveOverPosCheck(
+                        player,
+                        _G.Vector3.New(player.Transform:GetPosition()),
+                        _G.Vector3.New(self.Transform:GetPosition()),
+                        _G.handler(self, self.NpcDoEvent)
+                    )
+                end
+            end,
+            nil,
+            self.Cfg.ActionRadius,
+            true
+        )
+        if not isArrival and not isTooClose then
+            local fun
+            fun = function(param)
+                radius = radius + param
+                if not isArrival and not isTooClose then
+                    local x, y, z = self.Transform:GetPosition()
+                    local pos = player:GetClosestPointByTwoTarget(x, y, z, radius)
+                    isArrival, isTooClose =
+                        player:GotoPoint(
+                        pos,
+                        function()
+                            if not self.isInteracted then
+                                self:NpcDoEvent()
+                            end
+                        end,
+                        nil,
+                        self.Cfg.ActionRadius,
+                        true
+                    )
+                end
+                if isTooClose then
+                    return
+                end
+                if isArrival or radius > self.Cfg.ActionRadius then
+                    return
+                else
+                    fun(0.1)
+                end
+            end
+            fun(0.1)
+        end
+        --点击NPC 不显示自动寻路
+        _G.Events:GetInstance():Broadcast(_G.eNav.HideFlag, player.Uid)
+    end
+end
+
+---子触发器碰撞
+---@param isEnter boolean 是否是进入
+---@param tarInstId number 碰撞到的物体InstId
+---@param tarObj UnityEngine.GameObject 碰撞到的物体
+---@param luaObj WorldBaseItem 碰撞到的物体Lua对象
+function WorldNPCItem:NodeTriggerEvent(isEnter, tarInstId, tarObj, luaObj)
+    if not self:CheckPlayerClickTarget() then
+        return
+    end
+    self:SetPlayerClickTargetNil()
+    if luaObj.Uid == _G.WorldManager:GetInstance():GetCurWorldPlayer().Uid then
+        if self.Cfg.LookAtTarget then
+            if isEnter then
+                self:LookAtItemByUid(luaObj.Uid)
+            else
+                self:LookAtItemByUid()
+            end
+        end
+        if #self.Cfg.shader_type > 0 and not self.isInteracted then
+            if self.ObjectMod then
+                local r = self.Cfg.shader_type[1] and self.Cfg.shader_type[1] or 255
+                local g = self.Cfg.shader_type[2] and self.Cfg.shader_type[2] or 255
+                local b = self.Cfg.shader_type[3] and self.Cfg.shader_type[3] or 255
+                self.World.CommonEff:SetSelectState(self.ObjectMod, isEnter, r, g, b)
+            end
+        end
+    end
+end
+
+-----行为触发
+---@param isEnter boolean 是否是进入
+---@param tarInstId number 碰撞到的物体InstId
+---@param tarObj UnityEngine.GameObject 碰撞到的物体
+---@param luaObj WorldBaseItem 碰撞到的物体Lua对象
+function WorldNPCItem:NodeActionTriggerEvent(isEnter, tarInstId, tarObj, luaObj)
+    -- if not self:CheckPlayerClickTarget() then
+    --     return
+    -- end
+    self:SetPlayerClickTargetNil()
+    if not isEnter then
+        _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+        self:StartStandActionTimer()
+    end
+    if not self.Enable then
+        return
+    end
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    --和主角发生碰撞
+    if tarInstId == player.InstID then
+        if isEnter then
+            self.IsPlayerEnter = true
+            if self.Cfg.TriggerType == 1 then --靠近触发
+                self:NpcDoEvent()
+                self.triggerAction = true
+                _G.EventManager:GetInstance():AddEventDoneListener(self.EventDoneLister, self)
+            elseif self.Cfg.TriggerType == 2 then --交互触发
+                if self:CheckInteractioned() then
+                    _G.WorldItemManager:GetInstance():OpenInteractedView(
+                        _G.WorldItemType.NPC,
+                        function()
+                            self.triggerAction = false
+                            self:NpcDoEvent()
+                            self.triggerAction = true
+                        end,
+                        self.Transform
+                    )
+                end
+            end
+        else
+            self.IsPlayerEnter = false
+            self.triggerAction = false
+            _G.WorldItemManager:GetInstance():CloseInteractedView(_G.WorldItemType.NPC, self.Transform)
+        end
+    end
+end
+
+function WorldNPCItem:TriggerEvent(isEnter, tarInstId, tarObj)
+    ---特殊处理一下公告版，要碰撞，但是不做显隐
+    if self.Uid == 707010810 then
+        return
+    end
+    local sceneCamera = _G.WorldManager:GetInstance():GetCurWorld():GetCanmeraPosBox()
+    if sceneCamera then
+        if tarInstId == sceneCamera:GetInstanceIDE() then
+            self:ShowOrHideChild(isEnter)
+            if isEnter then
+                _G.WorldManager:GetInstance():GetCurWorld():AddCameraPosBoxItem(self)
+            else
+                _G.WorldManager:GetInstance():GetCurWorld():RemoveCameraPosBoxItem(self)
+            end
+        end
+    end
+end
+
+function WorldNPCItem:ShowOrHideChild(show)
+    --self.curSetEnable = show
+    if show then
+        if not self.FootEffectActive and self.footEffect then
+            self.footEffect:SetActiveE(1)
+            self.FootEffectActive = true
+        end
+        if not self.TitleTransformActive and self.TitleTransform then
+            self.TitleTransform:SetActiveE(1)
+            self.TitleTransformActive = true
+        end
+        if not self.ObjectModActive and self.ObjectMod then
+            self.ObjectMod:SetActiveE(1)
+            self.ObjectModActive = true
+        end
+    else
+        if self.FootEffectActive and self.footEffect then
+            self.footEffect:SetActiveE(0)
+            self.FootEffectActive = false
+        end
+        if self.TitleTransformActive and self.TitleTransform then
+            self.TitleTransform:SetActiveE(0)
+            self.TitleTransformActive = false
+        end
+        if self.ObjectModActive and self.ObjectMod then
+            self.ObjectMod:SetActiveE(0)
+            self.ObjectModActive = false
+        end
+    end
+end
+
+function WorldNPCItem:EventDoneLister()
+    -- if not self.Enable then
+    --     return
+    -- end
+    self.triggerAction = false
+    self:NpcDoEvent()
+end
+
+---检测是否可交互
+---@return 变量类型 中文描述
+function WorldNPCItem:CheckInteractioned()
+    -- if #self.Cfg.Params <= 0 then
+    --     return false
+    -- end
+    -- if self.Cfg.Params[1] == NpcActionType.RoomEvent then
+    --     if self.isInteracted then
+    --         return false
+    --     end
+    --     local roomCfg = _G.ChapterRoomManager:GetInstance():GetCurRoomCfg()
+    --     if roomCfg then
+    --         local eventID = roomCfg.event_id[self.ItemData.EnterFightId]
+    --         local eventCfg = _G.ConfigManager.main_event_cfg[eventID]
+    --         if eventCfg then
+    --             return _G.GlobalConditionManager.CheckMainEventCondition(
+    --                 eventCfg.trigger_condition,
+    --                 eventCfg.trigger_params
+    --             )
+    --         end
+    --         return false
+    --     end
+    --     return false
+    -- else
+    --     return self.Cfg.Params[1] > 0 or #self.Cfg.default_interaction_plot > 0
+    -- end
+
+    ---ZHJ-7709 【客户端】剧本交互按钮显示规则移除:“不可交互NPC不显示交互按钮”
+    return true
+end
+
+function WorldNPCItem:NpcDoEvent()
+    _G.WorldItemManager:GetInstance():CloseInteractedView(_G.WorldItemType.NPC, self.Transform)
+    if self.triggerAction then
+        return
+    end
+    self:StopCfgMove()
+    local giftNpcUid = require "MainViewGiftModel":GetInstance():GetCurNpc()
+    if self.Uid == giftNpcUid then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.DialogueNewView.Name,
+            function()
+                WorldUtils.UpdateWorldItemTip(self.Uid)
+            end
+        )
+        return
+    end
+    if not self:CheckLimitType(_G.handler(self, self.ContinueCfgMove)) then
+        return
+    end
+    self:StopStandActionTimer()
+    if self:CheckStandAction(self.AnimName) then
+        base.PlayAnimByName(self, _G.WorldManager.AnimNames.IDLE)
+    end
+
+    local doaction = function()
+        local ishave, t_RelativeDialogueTask = _G.TaskModule:GetInstance():GetNPCRelativeDoingTask(self.Uid)
+        if t_RelativeDialogueTask ~= nil then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+            --- 延迟执行
+            --- 否则  点击有任务的NPC 寻路到NPC 立马执行任务第一步寻路NPC  会导致之前的自动寻路不停止
+            _G.DelayDo(
+                0.02,
+                function()
+                    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+                    _G.TaskModule:GetInstance():ExecuteTask(t_RelativeDialogueTask)
+                end
+            )
+        else
+            --执行NPC 行为前 先执行剧情
+            local len = #self.Cfg.default_interaction_plot
+            --有剧情   且交互类型不为6全局函数
+            ---ZHJ-20054【主线副本】进入传送门的瞬间控制角色触碰巡逻NPC，控制角色位置错误
+            if self.Cfg.Params[1] == NpcActionType.Dialogue then
+                if require "ChapterModel":GetInstance():CheckDoingEvent() then
+                    return
+                else
+                    require "ChapterModel":GetInstance():SetBehavioralPriority(true)
+                end
+            end
+            if len > 0 and self.Cfg.Params[1] ~= NpcActionType.RoomEvent then
+                local RandomIndex = _G.GetRandomNum(1, len)
+                _G.AutomaticPlayStory.PlayStoryByID(
+                    self.Cfg.default_interaction_plot[RandomIndex],
+                    function()
+                        ActionFunction[self.Cfg.Params[1]](self)
+                    end
+                )
+            else
+                ActionFunction[self.Cfg.Params[1]](self)
+            end
+        end
+    end
+
+    if _G.MainManager:GetInstance().isInMainView then
+        doaction()
+    elseif _G.WorldManager:GetInstance().curSceneSid == require("SociatyManager"):GetInstance().ScenceId then
+        ActionFunction[self.Cfg.Params[1]](self)
+    elseif
+        not _G.MainManager:GetInstance().isInMainView and
+            (_G.MainManager:GetInstance().mainView and _G.MainManager:GetInstance().mainView.isSection)
+     then
+        _G.coroutine.start(
+            function()
+                while not _G.MainManager:GetInstance().isInMainView do
+                    _G.coroutine.yield()
+                end
+                doaction()
+            end
+        )
+    end
+end
+function WorldNPCItem:NpcDoEventDone(success)
+    if success then
+        _G.EventManager:GetInstance():RemoveEventDoneListener(self.EventDoneLister, self)
+        self:CheckInteractionState()
+        self.isInteracted = true
+        if not _G.string.IsNullOrEmpty(self.Cfg.Action[ActionInteractedAfter]) then
+            _G.AnimatorPlayEndCallback.AddCallback(
+                _G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE(),
+                _G.handler(self, self.PlayInteractedActionEndCall)
+            )
+            self:PlayAnimByName(self.Cfg.Action[ActionInteractedAfter], true)
+        else
+            self:PlayInteractedActionEndCall()
+        end
+    end
+    if self.ObjectMod then
+        self.World.CommonEff:SetSelectState(self.ObjectMod, false)
+    end
+    self:ContinueCfgMove()
+end
+function WorldNPCItem:PlayInteractedActionEndCall()
+    if _G.IsNil(self.ObjectMod) then
+        return
+    end
+    self:CheckInteractionEndState()
+end
+--endregion
+
+--region 内部调用方法
+
+--设置看向某个场景中的物体
+---@param uid number
+function WorldNPCItem:LookAtItemByUid(uid)
+    if not uid then
+        local point = self.ItemData.InitPoint[1]
+        self.Transform:SetLocalEulerAngles(point.r_x, point.r_y, point.r_z)
+        return
+    end
+    local lookObj = _G.WorldItemManager:GetInstance():GetItemByUid(uid)
+    if lookObj then
+        local x, y, z = lookObj.Transform:GetPosition()
+        local x1, y1 = self.Transform:GetPosition()
+        local lookPos = _G.Vector3(x, y1, z)
+        self.Transform:LookAt(lookPos)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("看向的物体不存在")
+        end
+    end
+end
+
+-----播放互动动画
+function WorldNPCItem:PlayActionAnimation()
+    require("AudioManager").PlayAudioByAudioCfgID(self.Cfg.InteractionAction_audio)
+
+    if _G.string.IsNullOrEmpty(self.Cfg.InteractionAction) then
+        return
+    end
+    self:PlayAnimByName(self.Cfg.InteractionAction)
+end
+--endregion
+
+--region 播放idle动画
+
+---停止闲置动画
+function WorldNPCItem:StopStandActionTimer()
+    if self.StandActionTimer then
+        self.StandActionTimer:Stop()
+        self.StandActionTimer = nil
+    end
+end
+---开启播放下次闲置动画倒计时
+function WorldNPCItem:StartStandActionTimer()
+    if self.StandActionCount <= 0 then
+        return
+    end
+    if self.StandActionTimer then
+        self:StopStandActionTimer()
+    end
+    self.StandActionTimer =
+        _G.TimerManager:GetInstance():GetTimer(
+        _G.Mathf.Random(self.StandActionTime[1], self.StandActionTime[2]),
+        self.PlayeIdleAnim,
+        self,
+        true,
+        false,
+        true
+    )
+    self.StandActionTimer:Start()
+end
+
+---播放闲置动画
+function WorldNPCItem:PlayeIdleAnim()
+    if not self then
+        return
+    end
+    if not self.StandActionName then
+        self:StopStandActionTimer()
+        return
+    end
+    local index = _G.GetRandomNum(1, self.StandActionCount)
+    local name = self.StandActionName[index].name
+    if name then
+        self:PlayAnimByName(name, true)
+        _G.AnimatorPlayEndCallback.AddCallback(
+            _G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE(),
+            _G.handlerbind(self, self.PlayeIdleAnimCall, name)
+        )
+    end
+    if self.IsPlayerEnter then
+        local cfg = _G.ConfigManager.character_special_cfg[self.StandActionName[index].sid]
+        if cfg and #cfg.acoustics > 0 and not _G.AudioManager.CheckIsPlayWithKey(_G.AudioSaveKey.Npc) then
+            local path = cfg.acoustics[_G.GetRandomNum(1, #cfg.acoustics)]
+            _G.AudioManager.Dialogue_PlayPathWithKey(path, _G.AudioSaveKey.Npc)
+        end
+    end
+end
+
+---播放其他闲置动画回调
+function WorldNPCItem:PlayeIdleAnimCall(name)
+    _G.AnimatorPlayEndCallback.RemoveCallback(_G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE())
+    self.StandActionTimer = nil
+    if self.AnimName == name then
+        self:PlayAnimByName(_G.WorldManager.AnimNames.IDLE)
+    end
+end
+
+---播放动画
+function WorldNPCItem:PlayAnimByName(name, isCallBack)
+    if not name then
+        return
+    end
+    self.super.super.PlayAnimByName(self, name, isCallBack)
+    if name == _G.WorldManager.AnimNames.IDLE or name == _G.WorldManager.AnimNames.Stand then
+        self:StartStandActionTimer()
+    else
+        self:StopStandActionTimer()
+    end
+end
+
+---检测是否为idle动画
+function WorldNPCItem:CheckStandAction(name)
+    if self.StandActionCount <= 0 then
+        return false
+    end
+    for _, v in pairs(self.StandActionName) do
+        if v.name == name then
+            return true
+        end
+    end
+    return false
+end
+
+--endregion
+return WorldNPCItem

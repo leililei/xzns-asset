@@ -1,0 +1,706 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.IceFestival.Model.ActivityCumulativeSynModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/12/09
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local base = require "ActivitySynTypeBase"
+---@class ActivityCumulativeSynModel : ActivitySynTypeBase	锁心试炼-挂机收益
+---@field artifactSlotCfg activity_cumulative_award.i_slot_cfg 神器槽位配置
+---@field petSlotCfg activity_cumulative_award.i_slot_cfg 灵兽槽位配置
+---@field awardTime number 上次领奖时间戳
+---@field previewTime number 上次奖励结算时间戳
+---@field artifactSlots activity_cumulative_award.i_slot 神器槽位信息
+---@field petSlots activity_cumulative_award.i_slot 灵兽槽位信息
+---@field coinType number 代币类型
+---@field maxTime number 最大挂机时间
+local ActivityCumulativeSynModel = _G.BaseClass("ActivityCumulativeSynModel", base)
+
+---创建对象时,入口构造函数
+function ActivityCumulativeSynModel:__init()
+    self.activityId = self.curActivityClass:GetActivityID()
+    self.type = {
+        Artifact = 1,
+        Pet = 2
+    }
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.send_cumulative_award_change.Cmd, self.OnCumulativeAwardChange, self)
+    _G.Events:GetInstance():AddListener(_G.eArena.SetDrawUp, self.OnLimitedExchange, self)
+    _G.Events:GetInstance():AddListener(_G.ArtifactShow.GainArtifact, self.RefreshRedPoint, self)
+    _G.Events:GetInstance():AddListener(_G.ePetUpStar.PetUpStarRefresh, self.RefreshRedPoint, self)
+    self.curActivityClass:AddStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+end
+
+function ActivityCumulativeSynModel:OnActivityStateChanged(state)
+    if state == require("ActivitySynManager").State.Close then
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(self.viewName or _G.ConfigManager.ui_cfg.ActivityCumulativeAwardView.Name)
+        if view then
+            view:OnCloseActivity(self.activityId)
+        end
+        require("ActivityCumulativeModel"):GetInstance():OnCloseActivity(self.activityId)
+    end
+end
+
+---数据变更推送
+function ActivityCumulativeSynModel:OnCumulativeAwardChange(msg)
+    if msg.activity_id == self.activityId then
+        self:ParseRoleInfo(msg.role_info)
+    end
+end
+
+function ActivityCumulativeSynModel:OnLimitedExchange(param)
+    if param[1] and self.coinType == param[1] then
+        self.coinNum = self.coinNum + param[2]
+        local tmp = {}
+        _G.table.insert(tmp, self.coinType)
+        _G.table.insert(tmp, param[2])
+        _G.table.insert(tmp, self.coinNum)
+        _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, { { type = tmp } })
+    end
+end
+
+---获取GM数据
+function ActivityCumulativeSynModel:OnHandleGMData(info)
+    self:ParseData(info)
+end
+
+---解析数据
+function ActivityCumulativeSynModel:ParseData(info)
+    if info.cumulative_award then
+        local slotCfg = info.cumulative_award.slot_cfg or {}
+        if not self.petEfficiency then
+            self.petEfficiency = {}
+        end
+        if not self.artifactEfficiency then
+            self.artifactEfficiency = {}
+        end
+        for _, v in pairs(slotCfg) do
+            ---@type slot_type 槽位类型1:神器 2:灵兽
+            if v.slot_type == self.type.Artifact then
+                self.artifactSlotCfg = v.slots
+                if v.efficiencies then
+                    for _, value in pairs(v.efficiencies) do
+                        self.artifactEfficiency[value.sid] = value.efficiency_value
+                    end
+                end
+            elseif v.slot_type == self.type.Pet then
+                self.petSlotCfg = v.slots
+                if v.efficiencies then
+                    for _, value in pairs(v.efficiencies) do
+                        self.petEfficiency[value.sid] = value.efficiency_value
+                    end
+                end
+            end
+        end
+        self.coinType = info.cumulative_award.coin_type
+        self.maxTime = info.cumulative_award.max_time
+
+        local roleInfo = info.cumulative_award.role_info or {}
+        self:ParseRoleInfo(roleInfo)
+    end
+    require("ActivityCumulativeModel"):GetInstance():ParseData(self.curActivityClass)
+    self:SetAwardTimer()
+    base.ParseData(self)
+end
+
+---红点计时
+function ActivityCumulativeSynModel:SetAwardTimer()
+    if self.efficiencyTimer then
+        self.efficiencyTimer:Stop()
+        self.efficiencyTimer = nil
+    end
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    local maxTime = self:GetMaxAwardRedTime()
+    if serverTime < maxTime then
+        self.efficiencyTimer = _G.TimerManager:GetInstance():GetTimer(1, function()
+            if _G.TimeUtil.GetServerUnixTime() >= maxTime then
+                self:RefreshRedPoint(1)
+                self.efficiencyTimer:Stop()
+                self.efficiencyTimer = nil
+            end
+        end, self, false, false)
+        self.efficiencyTimer:Start()
+    end
+end
+
+function ActivityCumulativeSynModel:ParseRoleInfo(roleInfo)
+    self.awardTime = roleInfo.award_time
+    self.previewTime = roleInfo.preview_time
+    self.previewAward = roleInfo.preview_award or 0
+    local isChange = self.coinNum == nil or (roleInfo.coin_num ~= nil and self.coinNum ~= roleInfo.coin_num)
+    self.coinNum = roleInfo.coin_num or 0
+    local slots = roleInfo.slots or {}
+    self.artifactSlots = {}
+    self.petSlots = {}
+    for _, v in pairs(slots) do
+        if v.slot_type == self.type.Artifact then
+            local index = _G.table.indexof(self.artifactSlotCfg, v.slot_id)
+            if index then
+                self.artifactSlots[index] = v
+            end
+        elseif v.slot_type == self.type.Pet then
+            local index = _G.table.indexof(self.petSlotCfg, v.slot_id)
+            if index then
+                self.petSlots[index] = v
+            end
+        end
+    end
+    self:RefreshRedPoint(1)
+    _G.Events:GetInstance():Broadcast(_G.eIceFestival.RefreshCumulativeAward, isChange)
+end
+
+---锁心猎场, 上阵堆叠神器后变成独立实例
+---@param changeUids public.i_kv_64 中文描述
+---@param datas ArtifactData[]
+function ActivityCumulativeSynModel:ParseArtifactUnstack(changeUids, datas)
+    if not changeUids then
+        return
+    end
+    local uids = {}
+    for _, d in pairs(changeUids) do
+        uids[d.key] = d.value
+    end
+    for _, data in pairs(datas) do
+        if data.sid == data.uid and uids[data.sid] then
+            local newMsg = data.GetMsg(data)
+            local newData = _G.ArtifactData.New()
+            newData:Parse(newMsg)
+            newData.uid = uids[data.sid]
+            _G.StorageManager:GetInstance():AddItemByArtifactData(newData)
+            _G.StorageManager:GetInstance():ConsumeItem(data.sid, data.uid, 1)
+        end
+    end
+end
+
+---获取预览累计奖励
+function ActivityCumulativeSynModel:GetPreviewAward()
+    return self.previewAward or 0
+end
+
+---获取代币数量
+function ActivityCumulativeSynModel:GetCoinNum()
+    return self.coinNum
+end
+
+---增加代币
+function ActivityCumulativeSynModel:AddCoinNum(num)
+    self.coinNum = self.coinNum + num
+end
+
+---获取代币类型
+function ActivityCumulativeSynModel:GetCoinType()
+    return self.coinType
+end
+
+---获取灵兽槽位信息
+function ActivityCumulativeSynModel:GetPetSlots()
+    return self.petSlots or {}
+end
+
+---获取神器槽位信息
+function ActivityCumulativeSynModel:GetArtifactSlots()
+    return self.artifactSlots or {}
+end
+
+---获取灵兽槽位id
+function ActivityCumulativeSynModel:GetPetSlotId(index)
+    return self.petSlotCfg[index]
+end
+
+---获取神器槽位id
+function ActivityCumulativeSynModel:GetArtifactSlotId(index)
+    return self.artifactSlotCfg[index]
+end
+
+---灵兽效率
+---@param order number 灵兽品质
+---@param star number 灵兽星级
+---@param type number k效率 v加成 不传同时获取两个数据
+function ActivityCumulativeSynModel:GetPetEfficiency(order, star, type)
+    local id = order * 100 + star
+    if type then
+        return self.petEfficiency[id] and self.petEfficiency[id][type] or 0
+    end
+    return self.petEfficiency[id] or {}
+end
+
+---神器效率
+---@param order number 神器品质
+---@param star number 神器星级
+---@param type number k效率 v加成 不传同时获取两个数据
+function ActivityCumulativeSynModel:GetArtifactEfficiency(order, star, type)
+    local id = order * 100 + star
+    if type then
+        return self.artifactEfficiency[id] and self.artifactEfficiency[id][type] or 0
+    end
+    return self.artifactEfficiency[id] or {}
+end
+
+---每分钟的总效率/总加成
+---@param type number 1效率 2效率加成
+function ActivityCumulativeSynModel:GetTotalEfficiency(type)
+    local total = 0
+    for _, v in pairs(self.artifactSlots) do
+        if v.artifact then
+            local config = _G.ConfigManager.artifact_cfg[v.artifact.sid]
+            total = total + self:GetArtifactEfficiency(config.Order, v.artifact.star, type)
+        end
+    end
+    for _, v in pairs(self.petSlots) do
+        if v.pet then
+            local config = _G.ConfigManager.pet_cfg[v.pet.sid]
+            total = total + self:GetPetEfficiency(config.Order, v.pet.star, type)
+        end
+    end
+    return total
+end
+
+---总收益
+function ActivityCumulativeSynModel:GetTotalAward(serverTime, totalEfficiency, bonus)
+    local endTime = self.awardTime + self.maxTime
+    if serverTime > endTime then
+        serverTime = endTime
+    end
+    local time = serverTime - self.previewTime
+    if time < 0 then
+        time = 0
+    end
+    local num = _G.Mathf.Floor(time / 60) * (totalEfficiency / 10000)
+    return _G.Mathf.Floor(num * (1 + bonus / 10000)) + self.previewAward
+end
+
+---最大收益
+function ActivityCumulativeSynModel:GetMaxAwardRedTime()
+    return self.awardTime + self.maxTime*0.8
+end
+
+---最大收益时间
+function ActivityCumulativeSynModel:GetMaxTime()
+    return self.maxTime
+end
+
+---上一次领奖的收益时间
+function ActivityCumulativeSynModel:GetPreviewTime()
+    return self.previewTime
+end
+
+function ActivityCumulativeSynModel:GetEfficiencyEndTime()
+    return self.awardTime + self.maxTime
+end
+
+---当前收益时间
+function ActivityCumulativeSynModel:GetCurEfficiencyTime()
+    local time = _G.TimeUtil.GetServerUnixTime() - self.awardTime
+    if time > self.maxTime then
+        time = self.maxTime
+    end
+    return time
+end
+
+---是否有收益产出
+function ActivityCumulativeSynModel:CheckHaveEfficiency()
+    if _G.table.isEmptyOrNil(self.artifactSlots) and _G.table.isEmptyOrNil(self.petSlots) then
+        return true
+    end
+    return false
+end
+
+---放置
+function ActivityCumulativeSynModel:PutSlot(slotIndex, data, type, callBack)
+    local slotId
+    if type == self.type.Artifact then
+        ---叠加的神器上阵后神器就会独立；独立神器需要判断背包是否有足够的空间
+        if data.sid == data.uid and not _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Artifact, 1) then
+            _G.PopWindowManager:GetInstance():ShowAllTips(270801)
+            return
+        end
+        slotId = self:GetArtifactSlotId(slotIndex)
+    else
+        slotId = self:GetPetSlotId(slotIndex)
+    end
+    if not slotId or slotId <= 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("ActivityCumulativeSynModel:PutSlot 找不到槽位id的配置")
+        end
+        return
+    end
+    local slots = {
+        { slot_id = slotId, uid = data.uid or data.sid }
+    }
+    require("IceFestivalNet"):GetInstance():PutSlot(
+        { activity_id = self.activityId, slots = slots },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:ParseRoleInfo(msg.role_info)
+            if type == self.type.Artifact then
+                self:ParseArtifactUnstack(msg.uid_change, { data })
+            end
+            _G.Events:GetInstance():Broadcast(_G.eIceFestival.PutSlot, type, slotIndex)
+            if callBack then
+                callBack()
+            end
+        end
+    )
+end
+
+---卸下
+function ActivityCumulativeSynModel:TakeOffSlot(slotIndex, type, callBack)
+    local slotId
+    if type == self.type.Artifact then
+        slotId = self:GetArtifactSlotId(slotIndex)
+    else
+        slotId = self:GetPetSlotId(slotIndex)
+    end
+    require("IceFestivalNet"):GetInstance():TakeOffSlot(
+        { activity_id = self.activityId, slot_id = { slotId } },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:ParseRoleInfo(msg.role_info)
+            if msg.add_num and msg.add_num > 0 then
+                self:ShowAward(msg.add_num)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eIceFestival.TakeOffSlot, type, slotIndex)
+            if callBack then
+                callBack()
+            end
+        end
+    )
+end
+
+---一键放置
+---@param datas (ArtifactData|PetData)[]
+---@param isReplace boolean 空槽位是否置空, 默认false
+function ActivityCumulativeSynModel:PutAllSlots(datas, type, callback, isReplace)
+    local maxSlotIndex = 6 --最大槽位序号
+
+    local slots = {}
+    if type == self.type.Artifact then
+        local freeNum, isStack = 1, false
+        for slotIndex = 1, maxSlotIndex do
+            local slotId = self:GetArtifactSlotId(slotIndex)
+            if slotId then
+                ---叠加的神器上阵后神器就会独立；独立神器需要判断背包是否有足够的空间
+                local canPut = false
+                if datas[slotIndex] then
+                    canPut = datas[slotIndex].sid ~= datas[slotIndex].uid
+                    if not canPut then
+                        if _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Artifact, freeNum) then
+                            freeNum = freeNum + 1
+                            canPut = true
+                        else
+                            isStack = true --有堆叠中的神器
+                        end
+                    end
+                end
+                if canPut then
+                    local v = datas[slotIndex]
+                    table.insert(slots, { slot_id = slotId, uid = v.uid or v.sid })
+                elseif isReplace then
+                    table.insert(slots, { slot_id = slotId, uid = 0 })
+                end
+            end
+        end
+        if #slots <= 0 and isStack then
+            _G.PopWindowManager:GetInstance():ShowAllTips(270801)
+            if callback then
+                callback(nil)
+            end
+            return
+        end
+    else
+        for slotIndex = 1, maxSlotIndex do
+            local slotId = self:GetPetSlotId(slotIndex)
+            if slotId then
+                if datas[slotIndex] then
+                    local uid = datas[slotIndex].uid or datas[slotIndex].sid
+                    table.insert(slots, { slot_id = slotId, uid = uid })
+                elseif isReplace then
+                    table.insert(slots, { slot_id = slotId, uid = 0 })
+                end
+            end
+        end
+    end
+    if #slots <= 0 then
+        return
+    end
+    require("IceFestivalNet"):GetInstance():PutSlot(
+        { activity_id = self.activityId, slots = slots },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                if callback then
+                    callback(msg)
+                end
+                return
+            end
+            self:ParseRoleInfo(msg.role_info)
+            if type == self.type.Artifact then
+                self:ParseArtifactUnstack(msg.uid_change, datas)
+            end
+            for slotIndex = 1, maxSlotIndex do
+                _G.Events:GetInstance():Broadcast(_G.eIceFestival.PutSlot, type, slotIndex)
+            end
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---一键卸载
+function ActivityCumulativeSynModel:TakeOffAllSlots(type, callback)
+    local maxSlotIndex = 6 --最大槽位序号
+
+    ---遍历所有槽位
+    local slotIds = {}
+    if type == self.type.Artifact then
+        if self.artifactSlots then
+            for slotIndex = 1, maxSlotIndex do
+                local slotId = self:GetArtifactSlotId(slotIndex)
+                if slotId and self.artifactSlots[slotIndex] then
+                    table.insert(slotIds, slotId)
+                end
+            end
+        end
+    else
+        if self.petSlots then
+            for slotIndex = 1, maxSlotIndex do
+                local slotId = self:GetPetSlotId(slotIndex)
+                if slotId and self.petSlots[slotIndex] then
+                    table.insert(slotIds, slotId)
+                end
+            end
+        end
+    end
+    if #slotIds <= 0 then
+        if callback then
+            callback(nil)
+        end
+        return
+    end
+
+    require("IceFestivalNet"):GetInstance():TakeOffSlot(
+        { activity_id = self.activityId, slot_id = slotIds },
+        function(msg)
+            if msg.ack ~= 1 then
+                if callback then
+                    callback(msg)
+                end
+                return
+            end
+            self:ParseRoleInfo(msg.role_info)
+            if msg.add_num and msg.add_num > 0 then
+                self:ShowAward(msg.add_num)
+            end
+            for slotIndex = 1, maxSlotIndex do
+                _G.Events:GetInstance():Broadcast(_G.eIceFestival.PutSlot, type, slotIndex)
+            end
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---领奖
+function ActivityCumulativeSynModel:GetCumulativeAward(callBack)
+    require("IceFestivalNet"):GetInstance():GetCumulativeAward(
+        { activity_id = self.activityId },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:ParseRoleInfo(msg.role_info)
+            if msg.add_num and msg.add_num > 0 then
+                self:ShowAward(msg.add_num)
+            end
+            self:RefreshRedPoint(1)
+            self:SetAwardTimer()
+            if callBack then
+                callBack()
+            end
+        end
+    )
+end
+
+function ActivityCumulativeSynModel:ShowAward(addNum)
+    local msg = {}
+    msg.award = {}
+    msg.award.item = {}
+    local tb = _G.StorageManager:GetInstance():SimulationAward(
+        self.coinType,
+        addNum
+    )
+    _G.table.insert(msg.award.item, { type = tb })
+    _G.UIUtils.ShowCommonAward(msg)
+end
+
+---百分比转换
+function ActivityCumulativeSynModel:formatDecimalToString(num)
+    -- 使用 string.format 保留两位小数
+    local formatted = _G.string.format("%.1f", num)
+    -- 移除末尾的零
+    formatted = formatted:gsub("0*$", "")
+    -- 如果小数点后面没有数字，则移除小数点
+    if formatted:sub(-1) == "." then
+        formatted = formatted:sub(1, -2)
+    end
+    return formatted
+end
+
+function ActivityCumulativeSynModel:OnEnterActivity()
+    local _type = require("JointActivityModel"):GetInstance():GetJointActivityType()
+    if _type == _G.JointActivityType.SummerFire then
+        self.viewName = _G.ConfigManager.ui_cfg.SummerFireCumulativeAwardView.Name
+    else
+        self.viewName = _G.ConfigManager.ui_cfg.ActivityCumulativeAwardView.Name
+    end
+    _G.UIManager:GetInstance():OpenWindow(self.viewName, self.curActivityClass)
+    base.OnEnterActivity(self)
+end
+
+function ActivityCumulativeSynModel:OnGetMainViewName()
+    return self.viewName or _G.ConfigManager.ui_cfg.ActivityCumulativeAwardView.Name
+end
+
+---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function ActivityCumulativeSynModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckRedPoint }
+    self.redpointTree = { false }
+end
+
+---是否有可装上的神器
+function ActivityCumulativeSynModel:CheckArtifactRedPoint()
+    local time = self.curActivityClass.cfg.time
+    if (time.start_time + time.run_time) < _G.TimeUtil.GetServerUnixTime() then
+        return 0
+    else
+        local haveEmptySlot = #self.artifactSlotCfg == _G.table.count(self.artifactSlots)
+        if not haveEmptySlot then
+            local slotArtifactUid = {}
+            for _, v in pairs(self.artifactSlots) do
+                if v.artifact then
+                    slotArtifactUid[v.artifact.uid] = true
+                end
+            end
+            local allArtifact = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Artifact)
+            for _, v in pairs(allArtifact) do
+                if not slotArtifactUid[v.uid] then
+                    return 1
+                end
+            end
+        end
+        return 0
+    end
+end
+
+---灵兽红点
+function ActivityCumulativeSynModel:CheckPetRedPoint()
+    local time = self.curActivityClass.cfg.time
+    if (time.start_time + time.run_time) < _G.TimeUtil.GetServerUnixTime() then
+        return 0
+    else
+        local haveEmptySlot = #self.petSlotCfg == _G.table.count(self.petSlots)
+        if not haveEmptySlot then
+            local slotPetSid = {}
+            for _, v in pairs(self.petSlots) do
+                if v.pet then
+                    slotPetSid[v.pet.sid] = true
+                end
+            end
+            local allPet = require("PetModel"):GetInstance():GetAllActivePets()
+            for _, v in pairs(allPet) do
+                if not slotPetSid[v.sid] then
+                    return 1
+                end
+            end
+        end
+        return 0
+    end
+end
+
+---奖励红点
+function ActivityCumulativeSynModel:CheckAwardRedPoint()
+    local time = self.curActivityClass.cfg.time
+    if (time.start_time + time.run_time) < _G.TimeUtil.GetServerUnixTime() then
+        return 0
+    else
+        local serverTime = _G.TimeUtil.GetServerUnixTime()
+        local maxTime = self:GetMaxAwardRedTime()
+        if serverTime >= maxTime then
+            return 1
+        end
+        return 0
+    end
+end
+
+function ActivityCumulativeSynModel:CheckRedPoint()
+    local time = self.curActivityClass.cfg.time
+    if (time.start_time + time.run_time) < _G.TimeUtil.GetServerUnixTime() then
+        return 0
+    else
+        local firstStatus = _G.PlayerPrefsManager.GetInt("ActivityCumulativeSynModel_" .. self.activityId, 0)
+        if firstStatus == 0 then
+            return 1
+        end
+
+
+        if self:CheckArtifactRedPoint() == 1 then
+            return 1
+        end
+
+        if self:CheckPetRedPoint() == 1 then
+            return 1
+        end
+
+        if self:CheckAwardRedPoint() == 1 then
+            return 1
+        end
+
+        return 0
+    end
+end
+
+---隐藏按钮
+function ActivityCumulativeSynModel:IsShowBtn()
+    return false
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@return number 红点数量
+function ActivityCumulativeSynModel:CheckRedPointNumChild(index)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---刷新奖励红点
+function ActivityCumulativeSynModel:RefreshRedPoint(param)
+    param = param or 1
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(param))
+end
+
+---进入活动刷新红点
+function ActivityCumulativeSynModel:RefreshFirstRedPoint()
+    if _G.PlayerPrefsManager.GetInt("ActivityCumulativeSynModel_" .. self.activityId, 0) == 0 then
+        _G.PlayerPrefsManager.SetInt("ActivityCumulativeSynModel_" .. self.activityId, 1)
+        self:RefreshRedPoint(1)
+    end
+end
+
+---销毁对象时,析构函数
+function ActivityCumulativeSynModel:Dispose()
+    if self.curActivityClass then
+        self.curActivityClass:RemoveStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+    end
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.send_cumulative_award_change.Cmd, self.OnCumulativeAwardChange, self)
+    _G.Events:GetInstance():RemoveListener(_G.eArena.SetDrawUp, self.OnLimitedExchange, self)
+    _G.Events:GetInstance():RemoveListener(_G.ArtifactShow.GainArtifact, self.RefreshRedPoint, self)
+    _G.Events:GetInstance():RemoveListener(_G.ePetUpStar.PetUpStarRefresh, self.RefreshRedPoint, self)
+end
+
+return ActivityCumulativeSynModel

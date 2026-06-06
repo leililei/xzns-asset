@@ -1,0 +1,246 @@
+-----------------------------------------------------------------------
+-- 功能名称：    ActivityDispatchBattleView.lua
+-- Created by 此处填写你的名字
+-- DateTime: 2025/07/15
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加   
+-----------------------------------------------------------------------
+local PLAYER_COUNT = 3
+local ActivityDispatchModel = require("ActivityDispatchModel")
+---@class ActivityDispatchBattleView : UIBaseView    中文描述
+---@field public go_table ActivityDispatchBattleView_GoTable GoTable
+local ActivityDispatchBattleView = _G.BaseClass("ActivityDispatchBattleView", _G.UIBaseView)
+
+---构造函数
+---@protected
+function ActivityDispatchBattleView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self:AddListener(_G.eActivityDispatch.BattleInfoChange, self.SetChangeTag, self)
+end
+
+function ActivityDispatchBattleView:Hide()
+    _G.UIManager:GetInstance():HideWindow(self.viewName)
+    if #self.roleList > 0 then
+        for i, v in ipairs(self.roleList) do
+            v.obj_effect:SetActiveE(0)
+        end
+    end
+end
+
+---界面的入口函数
+function ActivityDispatchBattleView:OnCreate()
+    self.ChangeTag = false
+    self.activity = ActivityDispatchModel:GetInstance():GetActivity()
+    self.activityID = self.activity.activityID
+    self.sizeDelta = _G.Vector2.New(self.go_table.aorimage_stiffBar:GetRectTransformSizeDelta())
+    self.roleList = {}
+    self.effectList = {}
+    self:InitView()
+end
+
+---
+---@protected
+function ActivityDispatchBattleView:SetChangeTag()
+    self.ChangeTag = true
+    self:InitView()
+end
+
+function ActivityDispatchBattleView:InitView()
+    local battleInfo = ActivityDispatchModel:GetInstance():GetBattleInfo()
+    if self.battleInfo == nil or (self.battleInfo ~= nil and self.battleInfo.round ~= battleInfo.round) then
+        self.battleInfo = battleInfo
+        self:ClearAllRoleModel()
+        self:UpdateAllRoleModel()
+    end
+    self:SetPlayerView()
+end
+
+function ActivityDispatchBattleView:SetPlayerView()
+    _G.UIUtils.SetPlayerHeadItemNew(self.go_table.obj_HeadItemBase, _G.PlayerModel:GetInstance():GetIRroleTable(), 0.9, true, true, true)
+    self.go_table.aortext_name.text = _G.PlayerModel:GetInstance():GetName()
+    if self.mpower ~= nil then
+        self.lastPower = self.mpower
+    end
+    local itemType = require(_G.EmbattleControllerItemType.ActivityDispatchAttack)
+    local item = itemType.New({ _G.EmbattleType.ActivityDispatchAttack1, _G.EmbattleType.ActivityDispatchAttack2, _G.EmbattleType.ActivityDispatchAttack3 }, _G.EmbattleSaveType.server, nil, _G.ConfigManager.activity_pvp_cfg[101].battle_scene)
+    self.mpower = 0
+    for i = 1, 3 do
+        self.mpower = self.mpower + item:GetMyEmbattlePower(i, true)
+    end
+    local cfg = _G.ConfigManager.mementos_cfg
+    local num = 0
+    --buff增值
+    local add = cfg[self.battleInfo.buffs[1]].power_mul
+    --buff减值
+    for i, v in ipairs(_G.ConfigManager.discrete_cfg[125217]) do
+        if self.battleInfo.stiff >= v[1] and self.battleInfo.stiff <= v[2] then
+            add = add - cfg[v[3]].power_mul
+            break
+        end
+    end
+    local precent = tonumber(add / 10000)
+    num = num + precent
+    local t1, t2 = _G.math.modf(tonumber(self.mpower + self.mpower * num))
+    if self.ChangeTag == true and t1 ~= self.lastPower then
+        require "CommonTipManager".OpenPowerUpView(t1, t1 - self.lastPower, true)
+    end
+    self.mpower = t1
+    self.go_table.aortext_Power.text = _G.GameUtil.NumberToUnitStrFight(self.mpower)
+    --疲劳值
+    local v = self.battleInfo.stiff / 10000
+    v = 1 - v
+    self.go_table.aorimage_stiffBar:SetRectTransformSize(v > 0 and v * (self.sizeDelta.x) or 0, self.sizeDelta.y)
+    self.go_table.aortext_stiffBar.text = (100 - self.battleInfo.stiff / 100) .. "%"
+    --连胜
+    self.go_table.aortext_winNum.text = _G.GetLangPackValue(90032100052, self.battleInfo.round - 1)
+    --跳过
+    self.Toggle = self.go_table.toggle_autoBattle:GetComponentE(_G.typeof(_G.CS.UnityEngine.UI.Toggle))
+    self.isOn = ActivityDispatchModel:GetInstance():GetFightSkip()
+    self.Toggle.isOn = self.isOn == 1 and true or false
+    self.Toggle.onValueChanged:AddListener(_G.handler(self, self.OnToggleChanged))
+    self.go_table.aortext_round.text = _G.GetLangPackValue(90031700039, self.battleInfo.round)
+end
+
+--toggle监听
+function ActivityDispatchBattleView:OnToggleChanged(isOn)
+    if self.Toggle.isOn then
+        ActivityDispatchModel:GetInstance():SetFightSkip(true)
+    else
+        ActivityDispatchModel:GetInstance():SetFightSkip(false)
+    end
+end
+
+---刷新所有角色
+function ActivityDispatchBattleView:UpdateAllRoleModel()
+    if not self.roleTrans then
+        self.roleTrans = {}
+    end
+    if self.battleInfo and self.battleInfo.enemy then
+        _G.table.sort(self.battleInfo.enemy, function(a, b)
+            return a.difficulty < b.difficulty
+        end)
+        for i = 1, PLAYER_COUNT do
+            local data = self.battleInfo.enemy[i]
+            if data then
+                local cfg = require "CardCommentManager":GetInstance():CardData(data.role_info.city_style_id, false)
+                self:LoadRoleModel(cfg, i, data)
+            end
+        end
+    end
+end
+
+---加载单个角色
+---@param view table 视图
+---@param rolepath string 模型路径
+---@param posIndex number 摆放的位置
+---@param data activity_dispatch.i_target_role 玩家信息
+function ActivityDispatchBattleView:LoadRoleModel(cfg, posIndex, data)
+    ---@type ActivityDispatchBattleView._obj_info1_GoTable
+    if self.roleList[posIndex] == nil then
+        self.roleList[posIndex] = _G.GetAutoGoTable(self.go_table["obj_info" .. posIndex], _G.handlerbind(self, self.OnClickPlayerBtn, posIndex))
+    end
+    local info = self.roleList[posIndex]
+    if cfg then
+        local useBattle = _G.UIUtils.IsUseBattleSpine(_G.UseBattleSpine.RankView)
+        local path = _G.UIUtils.GetBattleSpine(cfg, _G.UseBattleSpine.RankView)
+        _G.PoolsManager:GetInstance():Spawn(
+            path,
+            _G.ePoolType.Temporary,
+            nil,
+            function(trans)
+                if trans == nil then
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("角色无法加载 path:" .. cfg.ModelPathHi .. "    CardInfoView LoadRoleScene")
+                    end
+                    return
+                end
+                if self:IsNil() then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                trans:SetParentE(info.trans_role)
+                trans:SetLocalPosition(0, 0, 0)
+                trans:SetLocalScaleXYZ(useBattle and cfg.size2 or cfg.size4)
+                self.roleTrans[posIndex] = trans
+            end
+        )
+    end
+    info.aortext_name.text = data.role_info.name
+    info.aortext_Power.text = _G.GameUtil.NumberToUnitStrFight(data.role_info.power)
+    local add = _G.ConfigManager.discrete_cfg[125207][self.battleInfo.round]
+    if add then
+        info.aortext_scoreAdd.text = _G.GetLangPackValue(90033400041, string.format("%d", add[1 + posIndex] / 100)) .. "%"
+    else
+        info.aortext_scoreAdd.text = ""
+    end
+    info.aortext_score.text = _G.GetLangPackValue(90033400042) .. data.score
+    if self.effectList[posIndex] == nil then
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_zhangezhengfeng_duiwuchuji,
+            info.obj_effect,
+            function(trans)
+                if self:IsNil() then
+                    _G.DestroyObject(trans)
+                end
+                self.effectList[posIndex] = trans
+            end
+        )
+    else
+        info.obj_effect:SetActiveE(0)
+        info.obj_effect:SetActiveE(1)
+    end
+end
+
+function ActivityDispatchBattleView:OnClickPlayerBtn(_, _, posIndex)
+    ActivityDispatchModel:GetInstance():BattleClick(self.battleInfo.enemy[posIndex], function(msg)
+        self:InitView()
+    end)
+end
+
+function ActivityDispatchBattleView:ClearAllRoleModel()
+    for i = 1, PLAYER_COUNT do
+        --回收角色模型
+        ---@type RecordRankListView._obj_info1_GoTable
+        local temp = _G.GetAutoGoTable(self.go_table["obj_info" .. i])
+        local tempCount = temp.trans_role:GetChildCountE()
+        if tempCount > 0 then
+            _G.PoolsManager:GetInstance():Despawn(temp.trans_role:GetChildE(0), _G.ePoolType.Temporary)
+        end
+    end
+end
+
+---界面的销毁函数
+function ActivityDispatchBattleView:OnDestroy()
+    self:RemoveAllListener()
+end
+
+---按钮点击事件在这里派发
+function ActivityDispatchBattleView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_CloseView then
+        self:Close()
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ActivityDispatchView.Name)
+        if view == nil then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ActivityDispatchView.Name, self.activity)
+        end
+    elseif go == self.go_table.aorbtn_info then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 166)
+    elseif go == self.go_table.aorbtn_battleAll then
+        if _G.BattleManager:GetInstance():CheckInBattle() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(1080009)
+            return
+        end
+        if self.mpower == 0 then
+            _G.PopWindowManager:GetInstance():ShowAllTips(8207)
+        else
+            local stage, _ = ActivityDispatchModel:GetInstance():GetStateInfo()
+            if stage == 2 then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ActivityDispatchAllBattleView.Name, self.activity)
+            else
+                _G.PopWindowManager:GetInstance():ShowAllTips(8204)
+            end
+        end
+    elseif go == self.go_table.aorbtn_embattle then
+        ActivityDispatchModel:GetInstance():OpenAttackEmbattle()
+    end
+end
+
+return ActivityDispatchBattleView

@@ -1,0 +1,275 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Artifact.Model.ArtifactDrawModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/11/17
+-- Description: 神器抽卡数据类
+-----------------------------------------------------------------------
+local ArtifactNet = require("ArtifactNet")
+
+local base = _G.GameDataModelBase
+---@class ArtifactDrawModel : GameDataModelBase
+local ArtifactDrawModel = _G.BaseClass("ArtifactDrawModel", base)
+
+---@return ArtifactDrawModel ArtifactDrawModel
+function ArtifactDrawModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+local MaterialType = {
+    All = -1,
+    N = 1,
+    R = 2,
+    SR = 3
+}
+ArtifactDrawModel.MaterialType = MaterialType
+
+ArtifactDrawModel.MaterialEnum = {
+    [MaterialType.N] = 203100100,
+    --[MaterialType.R] = 203100200,
+    --[MaterialType.SR] = 203100300,
+    --2024/05/22 修改为默认只展示第三档, 且第三档使用第二档的货币, 之后可能还原
+    --交换第三档和第三档的id
+    [MaterialType.R] = 203100300,
+    [MaterialType.SR] = _G.ConfigManager.item_roller_cfg[10100].ticket[1]
+}
+
+ArtifactDrawModel.PoolEnum = {
+    [MaterialType.N] = 10100,
+    --[MaterialType.R] = 10200,
+    --[MaterialType.SR] = 10300
+    --2024/05/22 修改为默认只展示第三档, 且第三档使用第二档的货币, 之后可能还原
+    --交换第三档和第三档的id
+    [MaterialType.R] = 10300,
+    [MaterialType.SR] = 10200
+}
+
+---创建对象时,入口构造函数
+function ArtifactDrawModel:__init()
+    self.curFunctionOpenID = 145
+    self.free_count = self.free_count or 0
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+---从服务器拉取数据
+function ArtifactDrawModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---获取抽卡信息
+function ArtifactDrawModel:GetInfo()
+    ArtifactNet:GetInstance():DrawInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg artifact_draw.s2c_info
+function ArtifactDrawModel:ParseData(msg)
+    self.dayCount = 0
+    self.accCount = {}
+    if msg.day_count ~= nil then
+        self.dayCount = msg.day_count or 0
+    end
+    if msg.total_count ~= nil then
+        self.accCount = msg.total_count
+    end
+    if msg.diamond_times ~= nil then
+        self.diamond_times = msg.diamond_times
+    end
+    if msg.need_count ~= nil then
+        self.need_count = msg.need_count
+    end
+    if msg.wish_sids ~= nil then
+        self.wish_sids = msg.wish_sids
+    end
+    self.free_count = msg.free_count or 0
+    self.super.ParseData(self)
+end
+
+function ArtifactDrawModel:OnSixClockUpdate(endcall)
+    if self.curFunctionOpenID > 0 then
+        if not self:GetFunctionOpen() then
+            if endcall then
+                endcall(self.__cname)
+            end
+            return
+        end
+    end
+    self.initFunctionTag = true
+    self.OnSixUpdateTag = true
+    self.endCallback = endcall
+    self:GetDataFormServer()
+end
+
+---获取心愿单
+function ArtifactDrawModel:GetWishsids()
+    return self.wish_sids or {0, 0, 0}
+end
+
+---增加已使用魂玉召唤次数
+---@param num number 次数
+---@return number   当前次数
+function ArtifactDrawModel:AddDiamondTimes(num)
+    self.diamond_times = (self.diamond_times or 0) + num
+    return self.diamond_times
+end
+
+---获取已使用魂玉召唤次数
+---@return number
+function ArtifactDrawModel:GetDiamondTimes()
+    return self.diamond_times or 0
+end
+
+---获取本日召唤次数
+---@return number
+function ArtifactDrawModel:GetDayCount()
+    return self.dayCount or 0
+end
+
+---获取本日剩余免费召唤次数
+---@return number
+function ArtifactDrawModel:GetDayFreeCount()
+    return _G.ConfigManager.item_roller_cfg[10100].free_day - self.free_count
+end
+
+---获取魂玉召唤次数上限
+---@return number
+function ArtifactDrawModel:GetDiamondTotalTimes()
+    self.diamond_total_times = self.diamond_total_times or _G.ConfigManager.item_roller_cfg[10100].count_diamond
+    local num = self.diamond_total_times
+    local data =
+        require "PrivilegeManager":GetInstance():GetPrivilegeData({_G.PrivilegeType.LimitedTimePrivilege.ShopNumAdd, 2})
+    if data[1] then
+        num = data[1] + num
+    end
+    return num
+end
+
+---获取剩余魂玉召唤次数
+function ArtifactDrawModel:GetLastDiamondTimes()
+    return self:GetDiamondTotalTimes() - self:GetDiamondTimes()
+end
+
+---@param data number[]
+function ArtifactDrawModel:SetWish(data, callback)
+    local pbData = {wish_sids = data}
+    ArtifactNet:GetInstance():SetWish(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                self.wish_sids = {data[1]}
+                _G.Events:GetInstance():Broadcast(_G.ArtifacteDrawUpBattlePass.ArtifacteDrawWishRefresh)
+                if callback then
+                    callback(msg)
+                end
+            end
+        end
+    )
+end
+
+---抽卡
+---@param num number 抽奖次数
+---@param consume_type number 消耗类型（1:道具 2:魂玉）
+function ArtifactDrawModel:Draw(drawNum, consume_type, callback, freeBol)
+    local pbData = {draw_times = drawNum, consume_type = consume_type}
+    if self.dayCount + drawNum > _G.ConfigManager.item_roller_cfg[10100].limit_daily then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130102)
+        return
+    end
+    ArtifactNet:GetInstance():DrawExecute(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData({award = msg.award})
+                if msg.award.overflow then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(380104)
+                end
+                self.need_count = msg.need_count
+                self.dayCount = self.dayCount + drawNum
+                local sid
+                local num
+                if consume_type == 1 then
+                    sid = _G.ConfigManager.item_roller_cfg[10100].ticket[1]
+                    num = drawNum
+                else
+                    self:AddDiamondTimes(drawNum)
+                    sid, num = self:GetDiamondCurrencyByType(drawNum)
+                end
+                if freeBol then
+                    self.free_count = self.free_count + 1
+                else
+                    _G.StorageManager:GetInstance():ConsumeItem(sid, 0, num)
+                end
+                if callback then
+                    callback(msg)
+                end
+            end
+        end
+    )
+end
+
+---获取魂玉抽卡的sid和num
+---@param drawNum number 抽奖次数
+---@return number,number,number 消耗id，消耗值，折扣
+function ArtifactDrawModel:GetDiamondCurrencyByType(drawNum)
+    local sid
+    local num
+    sid = _G.ConfigManager.item_roller_cfg[10100].ticket_2[1]
+    local baseNum = _G.ConfigManager.item_roller_cfg[10100].ticket_2[2]
+    num = drawNum * baseNum
+    local data =
+        require "PrivilegeManager":GetInstance():GetPrivilegeData(
+        {_G.PrivilegeType.LimitedTimePrivilege.ConsumeReduce, 10100}
+    )
+    local discount = 1
+    --取消折扣
+    --[[    if data[1] then
+        discount = data[1] * 0.0001
+        num = num - num * discount
+    end]]
+    return sid, _G.math.ceil(num), 1 - discount
+end
+
+---刷新功能红点
+function ArtifactDrawModel:RefreshRedPoint(param)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.ArtifactDraw.id, param)
+end
+
+---检查材料是否足够十连
+function ArtifactDrawModel:CheckMaterial(type)
+    local checkNum = 10
+    local enough
+    if type == nil or type == MaterialType.All then
+        enough = _G.StorageManager:GetInstance():CheckItem(self.MaterialEnum[MaterialType.N], checkNum)
+        if enough then
+            return true
+        end
+        enough = _G.StorageManager:GetInstance():CheckItem(self.MaterialEnum[MaterialType.R], checkNum)
+        if enough then
+            return true
+        end
+        return _G.StorageManager:GetInstance():CheckItem(self.MaterialEnum[MaterialType.SR], checkNum)
+    elseif type == MaterialType.N then
+        return _G.StorageManager:GetInstance():CheckItem(self.MaterialEnum[MaterialType.N], checkNum)
+    elseif type == MaterialType.R then
+        return _G.StorageManager:GetInstance():CheckItem(self.MaterialEnum[MaterialType.R], checkNum)
+    elseif type == MaterialType.SR then
+        return _G.StorageManager:GetInstance():CheckItem(self.MaterialEnum[MaterialType.SR], checkNum)
+    end
+end
+
+---资源更新监听
+function ArtifactDrawModel:OnUpData(data)
+    self:RefreshRedPoint()
+end
+
+---销毁对象时,析构函数
+function ArtifactDrawModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+function ArtifactDrawModel:OnFunctionOpenCall(id)
+    base.OnFunctionOpenCall(self, id)
+    if id == self.curFunctionOpenID then
+        _G.FunctionManager:GetInstance():AddNewFunId(self.curFunctionOpenID)
+    end
+end
+
+return ArtifactDrawModel

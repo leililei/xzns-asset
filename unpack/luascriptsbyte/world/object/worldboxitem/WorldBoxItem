@@ -1,0 +1,349 @@
+-----------------------------------------------------------------------
+-- World.Object.WorldBoxItem.lua
+-- Created by csw
+-- DateTime: 2019/12/23 15:40
+-- Description: 宝箱
+-----------------------------------------------------------------------
+
+local boxType = {
+    normal = 1,
+    monster = 2,
+    boss = 3
+}
+local boxTypeIndex = 1
+local boxDropGoldIndex = 2
+local boxDropTagIndex = 3
+local base = require "WorldBaseItem"
+local ItemEvent = _G.WorldItemManager.ItemEvent
+---@class WorldBoxItem:WorldBaseItem	宝箱
+local WorldBoxItem = _G.BaseClass("WorldBoxItem", base)
+
+---类的构造函数
+function WorldBoxItem:__init(info, data)
+    if _G.string.IsNullOrEmpty(self.Cfg.ClickParams[boxTypeIndex]) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("宝箱未配置类型 sid = " .. self.Cfg.Sid)
+        end
+        self.mBoxType = boxType.normal
+    else
+        self.mBoxType = _G.tonumber(self.Cfg.ClickParams[boxTypeIndex])
+    end
+    if self.mBoxType > boxType.normal then --战斗宝箱
+        self.isInteracted =
+            _G.GlobalConditionManager.CheckCondition(
+            _G.GlobalConditionManager.ConditionType.monsterGroupAward,
+            self.Cfg.Params[1]
+        )
+    else
+        self.isInteracted = _G.WorldItemManager:GetInstance():GetInteractionBySid(self.Sid)
+    end
+end
+
+function WorldBoxItem:Dispose()
+    self.isInteracted = nil
+    self.highLight = nil
+end
+
+---加载资源完成
+function WorldBoxItem:OnLoadResObjComplete()
+    self:AddTriggerComponent(
+        function()
+            base.OnLoadResObjComplete(self)
+        end
+    )
+end
+
+function WorldBoxItem:OnGameObjShow()
+    if not self.ObjectMod then
+        return
+    end
+    if self.isInteracted then
+        self:CheckInteractionEndState()
+        if #self.Cfg.Action <= 1 then
+            return
+        end
+    else
+        self:CheckInitState()
+    end
+    if self.mBoxType > boxType.normal then
+        _G.WorldItemManager:GetInstance():RegiestWorldItemEvent(ItemEvent.enemyDispeared, self.OnEnemyDispeared, self)
+    end
+    base.OnGameObjShow(self)
+end
+
+function WorldBoxItem:OnGameObjHide()
+    if self.mBoxType > boxType.normal then
+        _G.WorldItemManager:GetInstance():UnRegiestWorldItemEvent(ItemEvent.enemyDispeared, self.OnEnemyDispeared, self)
+    end
+    base.OnGameObjHide(self)
+end
+
+function WorldBoxItem:OnEnemyDispeared(mgpID)
+    if mgpID == _G.tonumber(self.Cfg.Params[1]) then
+        _G.WorldItemManager:GetInstance():UnRegiestWorldItemEvent(ItemEvent.enemyDispeared, self.OnEnemyDispeared, self)
+        if not self.isInteracted then
+            self:OpenBox()
+        else
+            if self.mBoxType == boxType.boss then
+                local time = _G.ConfigManager.discrete_cfg[100215][1][1]
+                local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+                mainView:ShowExitSectionView(time)
+            end
+        end
+        local ChapterModel = require "ChapterModel":GetInstance()
+        local sectionSid = ChapterModel:GetCurExploreSection()
+        ChapterModel:SetSectionExplore(sectionSid)
+    end
+end
+
+function WorldBoxItem:OnExitWorld()
+    base.OnExitWorld(self)
+    if self.dropClass then
+        self.curAwardEffects = {}
+        self.dropClass:Close()
+        self:OnShowDropEnd()
+    end
+end
+-----物件被点击时的调用方法
+function WorldBoxItem:OnClick()
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    local radius = 0
+    local isArrival, isTooClose =
+        player:GotoPoint(
+        _G.Vector3.New(self.Transform:GetPosition()),
+        function()
+            self.NavStepMoveOverPosCheck(
+                player,
+                _G.Vector3.New(player.Transform:GetPosition()),
+                _G.Vector3.New(self.Transform:GetPosition()),
+                _G.handler(self, self.OpenBox)
+            )
+            --self:SetPlayerClickTargetNil()
+        end,
+        nil,
+        self.Cfg.ActionRadius,
+        true
+    )
+    if not isArrival and not isTooClose then
+        local fun
+        fun = function(param)
+            radius = radius + param
+            if not isArrival and not isTooClose then
+                local x, y, z = self.Transform:GetPosition()
+                local pos =
+                    player:GetClosestPointByTwoTarget(x, y, z, radius)
+                isArrival, isTooClose =
+                    player:GotoPoint(
+                    pos,
+                    function()
+                        self:OpenBox()
+                    end,
+                    nil,
+                    self.Cfg.ActionRadius,
+                    true
+                )
+            end
+            if isTooClose then
+                return
+            end
+            if isArrival or radius > self.Cfg.ActionRadius then
+                return
+            else
+                fun(0.1)
+            end
+        end
+        fun(0.1)
+    end
+end
+---获取显示标签的数据
+---@return boolean 是否显示标签
+function WorldBoxItem:GetShowTagData()
+    local show, pos = base.GetShowTagData(self)
+    if show then
+        show = not self.isInteracted
+    end
+    return show, pos
+end
+
+--region 触发器
+
+-----行为触发
+---@param isEnter boolean 是否是进入
+---@param tarInstId number 碰撞到的物体InstId
+---@param tarObj UnityEngine.GameObject 碰撞到的物体
+---@param luaObj WorldBaseItem 碰撞到的物体Lua对象
+function WorldBoxItem:NodeActionTriggerEvent(isEnter, tarInstId, tarObj, luaObj)
+    if self.isInteracted then
+        return
+    end
+    if not self:CheckPlayerClickTarget() then
+        return
+    end
+    self:SetPlayerClickTargetNil()
+    --判定是否主角触发
+    if tarInstId == _G.WorldManager:GetInstance():GetCurWorldPlayer().InstID then
+        if #self.Cfg.shader_type > 0 then
+            if self.ObjectMod then
+                local r = self.Cfg.shader_type[1] and self.Cfg.shader_type[1] or 255
+                local g = self.Cfg.shader_type[2] and self.Cfg.shader_type[2] or 255
+                local b = self.Cfg.shader_type[3] and self.Cfg.shader_type[3] or 255
+                self.World.CommonEff:SetSelectState(self.ObjectMod, isEnter, r, g, b)
+            end
+        end
+        if isEnter then
+            if self.Cfg.TriggerType == 1 then --靠近触发
+                self:OpenBox()
+            else
+                self:EnterBox()
+            end
+        else
+            _G.WorldItemManager:GetInstance():CloseInteractedView(_G.WorldItemType.Box, self.Transform)
+        end
+    end
+end
+--endregion
+
+--region 模板外的方法
+-----进入宝箱范围，触发显示
+function WorldBoxItem:EnterBox()
+    _G.WorldItemManager:GetInstance():OpenInteractedView(
+        _G.WorldItemType.Box,
+        _G.handler(self, self.OpenBox),
+        self.Transform,
+        self.Cfg.ActionTime
+    )
+end
+-----打开宝箱
+function WorldBoxItem:OpenBox()
+    if self.isInteracted then
+        return
+    end
+    if not _G.MainManager:GetInstance().isInMainView and self.mBoxType == boxType.normal then
+        return
+    end
+    if self.openingBox then
+        return
+    end
+    if not self:CheckLimitType() then
+        return
+    end
+    local WorldItemManagerIns = _G.WorldItemManager:GetInstance()
+    WorldItemManagerIns:CloseInteractedView(_G.WorldItemType.Box, self.Transform)
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    player:SetTransformLock(true)
+    player:SetClickTarget(self.Uid)
+    if self.mBoxType == boxType.normal then
+        WorldItemManagerIns:BroadcastWorldItemEvent(ItemEvent.interactionBoxStart)
+    end
+    if self.Cfg.ActionTime > 0 then
+        _G.TimerManager:GetInstance():GetTimer(self.Cfg.ActionTime, self.OnOpenBoxTimerCall, self, true):Start()
+    else
+        self:OnOpenBoxTimerCall()
+    end
+end
+
+function WorldBoxItem:OnOpenBoxTimerCall()
+    self.openingBox = true
+    local WorldItemManagerIns = _G.WorldItemManager:GetInstance()
+    if self.mBoxType == boxType.normal then
+        WorldItemManagerIns:InteractionBySid(
+            self.Sid,
+            function(success, data)
+                if success then
+                    self:OpenningBox(data)
+                else
+                    WorldItemManagerIns:BroadcastWorldItemEvent(ItemEvent.interactionBoxEnd)
+                end
+            end
+        )
+    else
+        self:OpenningBox(_G.ChapterRoomManager:GetInstance():GetCurEnemyBoxAward())
+    end
+end
+
+function WorldBoxItem:OnShowDropEnd()
+    self.dropClass = nil
+    self.curAwardItem = nil
+    self:SetPlayerClickTargetNil()
+end
+function WorldBoxItem:OpenningBox(data)
+    self.curAwardItem = data
+    --宝箱打开音效
+    require("AudioManager").PlayAudioByAudioCfgID(5001)
+    if #self.Cfg.default_interaction_plot > 0 then --摄像机抖动剧情
+        _G.AutomaticPlayStory.PlayStoryByID(self.Cfg.default_interaction_plot[1])
+    end
+    if self.Cfg.InteractionAction and self.Cfg.InteractionAction ~= "" then
+        _G.AnimatorPlayEndCallback.AddCallback(
+            _G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE(),
+            _G.handler(self, self.OnInteractionEnd)
+        )
+        self:PlayAnimByName(self.Cfg.InteractionAction, true)
+    else
+        self:OnInteractionEnd()
+    end
+end
+function WorldBoxItem:OnInteractionEnd()
+    self:CheckInteractionState(_G.handler(self, self.OnCheckInteractionStateCall))
+    require "CommonTipManager":GetInstance():OpenDropTip(self.curAwardItem)
+end
+function WorldBoxItem:OnCheckInteractionStateCall(effects)
+    if not _G.table.isEmptyOrNil(effects) then
+        local v3 = _G.Vector3.zero
+        local pos = nil
+        for key, value in pairs(effects) do
+            value:SetParentE(self.Transform:GetParent())
+            pos = _G.ConfigManager.ui_effect_cfg[key].Pos
+            v3.x = pos[1]
+            v3.y = pos[2]
+            v3.z = pos[3]
+            local x, y, z = self.Transform:GetLocalPosition()
+            value:SetLocalPosition(x + v3.x, y + v3.y, z + v3.z)
+        end
+    end
+    self.isInteracted = true
+    self.openingBox = false
+    _G.WorldManager:GetInstance():GetCurWorldPlayer():SetTransformLock(false)
+    ---宝箱打开，刷新描边
+    if self.ObjectMod then
+        self.World.CommonEff:SetSelectState(self.ObjectMod, false)
+    end
+    self:CheckInteractionEndState()
+    local WorldItemManagerIns = _G.WorldItemManager:GetInstance()
+    if self.curAwardItem and not _G.table.isEmptyOrNil(self.curAwardItem.award) then
+        if not self.Cfg.ClickParams[boxDropTagIndex] or _G.tonumber(self.Cfg.ClickParams[boxDropTagIndex]) == 1 then
+            self.dropClass = _G.require("CommonDropItemEffect").New()
+            local awards = _G.StorageManager:GetInstance():MergeAward(self.curAwardItem)
+            local goldNum =
+                self.Cfg.ClickParams[boxDropGoldIndex] and _G.tonumber(self.Cfg.ClickParams[boxDropGoldIndex]) or nil
+            self.dropClass:ShowByArray(awards, self.Transform, _G.handler(self, self.OnShowDropEnd), goldNum)
+        else
+            self:SetPlayerClickTargetNil()
+        end
+    else
+        if self.mBoxType == boxType.normal then
+            WorldItemManagerIns:BroadcastWorldItemEvent(ItemEvent.interactionBoxEnd)
+        end
+        self:SetPlayerClickTargetNil()
+    end
+    if self.mBoxType ~= boxType.monster then
+        local OnUClosedCall
+        OnUClosedCall = function(_, name)
+            if name == _G.ConfigManager.ui_cfg.CommonAwardView.Name then
+                if self.mBoxType == boxType.boss then
+                    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+                    local time = _G.ConfigManager.discrete_cfg[100215][1][1]
+                    mainView:ShowExitSectionView(time)
+                else
+                    WorldItemManagerIns:BroadcastWorldItemEvent(ItemEvent.interactionBoxEnd)
+                end
+                _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, OnUClosedCall, self)
+            end
+        end
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, OnUClosedCall, self)
+    end
+end
+--endregion
+
+--endregion
+return WorldBoxItem

@@ -1,0 +1,288 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.SpiritualDraw.Model.SpiritualDrawModel	(修改路径必须修正此项!)
+-- Created by zzy
+-- DateTime: 2025/03/17
+-- Description: 饰品/灵契/现在包装到底叫啥抽卡数据类
+-----------------------------------------------------------------------
+
+local SpiritualDrawNet = require("SpiritualDrawNet")
+---@class SpiritualDrawModel : GameDataModelBase
+local SpiritualDrawModel = _G.BaseClass("SpiritualDrawModel", _G.GameDataModelBase)
+
+local HOUR_OF_DAY = 24
+local SECOND_OF_HOUR = 3600
+local SECOND_OF_DAY = HOUR_OF_DAY * SECOND_OF_HOUR
+
+--所有灵契配置表
+local spiritual_cfg = _G.ConfigManager.spiritual_cfg
+local AState = require "ActivitySynManager".State
+---@return SpiritualDrawModel SpiritualDrawModel
+function SpiritualDrawModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SpiritualDrawModel:__init()
+    self.LocalCfg = {}
+    --饰品表
+    self.SpiritualCfg = {}
+    local wishItem = self:GetLocalCfg().wish_item
+    for _, v in pairs(wishItem) do
+        local data = {}
+        local cfg = spiritual_cfg[v]
+        data.sid = cfg.id
+        data.image = cfg.image_1
+        data.name = cfg.Name
+        data.cfg = cfg
+        data.order = cfg.Order
+        _G.table.insert(self.SpiritualCfg, data)
+    end
+    self.isOpenFunction = false
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.RefreshRedPoint, self)
+    --_G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+---资源更新监听
+function SpiritualDrawModel:RefreshRedPoint()
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SpiritualDrawTen.id)
+end
+
+---销毁对象时,析构函数
+function SpiritualDrawModel:Dispose()
+    --_G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.VIP, self.UpdateDrawRewardRed, self)
+    --_G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnDrawGodOpenCall, self)
+    if self.BtnCloseTimers then
+        self.BtnCloseTimers:Stop()
+        self.BtnCloseTimers = nil
+    end
+end
+
+---初始化数据
+function SpiritualDrawModel:GetDataFormServer(call)
+    -- 获取抽奖信息
+    self:GetSpiritualDrawCardInfo(call)
+    -- 饰品红点
+    --self:GengXingShuJu()
+    --倒计时
+    --self:SetBtnCloseCountdown()
+end
+
+---六点刷新
+function SpiritualDrawModel:OnSixClockUpdate(enccall)
+    self:Update()
+
+    --重置魂玉召唤次数
+    self.god_diamond_times = 0
+
+    _G.GameDataModelBase.OnSixClockUpdate(self, enccall)
+end
+
+---时间6刷新
+function SpiritualDrawModel:Update()
+    self:GetSpiritualDrawCardInfo(
+        function()
+            local SpiritualDrawView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.SpiritualDrawView.Name)
+            if SpiritualDrawView ~= nil then
+                --更新今日剩余招募次数
+                SpiritualDrawView.View:LoadLimitDrawNum()
+            end
+            --刷新礼包红点
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SpiritualDrawGiftPack.id)
+        end
+    )
+
+    local week = _G.TimeUtil.GetDateTime(_G.TimeUtil.GetServerUnixTime()).week
+    if week == 1 then
+        _G.PlayerPrefsManager.SetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "SpiritualGiftLastRefreshTime", 0)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SpiritualDrawGiftPack.id)
+    end
+end
+
+--region -------------------------------------------------- 网络回调 --------------------------------------------------
+
+---获取抽奖信息（getinfo
+function SpiritualDrawModel:GetSpiritualDrawCardInfoSuc(data, call)
+    self.isOpenFunction = true
+    --每日抽奖次数
+    self.day_times = data.day_count and data.day_count or 0
+    --当前保底累积次数
+    self.times = data.need_count and data.need_count or 0
+    --心愿灵契sid
+    self.wish_spiritual = data.wish_spiritual and data.wish_spiritual or 0
+    if data.free_count then
+        self.free_count = data.free_count
+    end
+    self.free_count = self.free_count or 0
+    if call ~= nil then
+        call()
+    end
+    self.super.ParseData(self)
+end
+
+--endregion -------------------------------------------------- 网络回调 end --------------------------------------------------
+
+--region -------------------------------------------------- 网络 --------------------------------------------------
+
+---获取抽奖信息/初始化and6点
+function SpiritualDrawModel:GetSpiritualDrawCardInfo(call)
+    SpiritualDrawNet:GetInstance():GetSpiritualDrawInfo(_G.handlerbind(self, self.GetSpiritualDrawCardInfoSuc, call))
+end
+
+---抽卡
+---@param num number @召唤次数
+function SpiritualDrawModel:DrawSpiritualCard(type, num, call, cancelCall, freeBol)
+    --没选饰品
+    if self.wish_spiritual == 0 then
+        --飘字
+        _G.PopWindowManager:GetInstance():ShowAllTips(130304)
+        if cancelCall then
+            cancelCall()
+        end
+        return
+    end
+
+    --抽卡上限
+    if self.day_times + num > self.LocalCfg.limit_daily then
+        _G.PopWindowManager:GetInstance():ShowAllTips(130303)
+        if cancelCall then
+            cancelCall()
+        end
+        return
+    end
+
+    local msg = {}
+    msg.draw_times = num
+    msg.type = type
+    SpiritualDrawNet:GetInstance():DrawSpiritual(msg,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+
+            --消耗招募券
+            local material = self.LocalCfg.ticket
+            if type == 1 then
+                _G.StorageManager:GetInstance():ConsumeItem(material[1], nil, material[2] * num)
+            elseif type == 2 then
+                material = self.LocalCfg.ticket_2
+                _G.StorageManager:GetInstance():ConsumeItem(material[1], nil, material[2] * num)
+            elseif type == 3 then
+                if freeBol then
+                    self.free_count = self.free_count + 1
+                else
+                    _G.StorageManager:GetInstance():ConsumeItem(material[1], nil, material[2] * num)
+                end
+            end
+            --解析奖励
+            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+            if data.award.overflow then 
+                _G.PopWindowManager:GetInstance():ShowAllTips(380104)
+            end
+            --招募次数更新
+            if data.need_count then
+                self.times = data.need_count
+            end
+            self.day_times = self.day_times + num
+
+            --[[    --红点
+                require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GodDraw.id)
+                --事件
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.Draw, 4}, num)]]
+
+            if call then
+                call(data)
+            end
+        end)
+end
+
+---选择心愿饰品
+function SpiritualDrawModel:SetWantedSpiritual(sid, call)
+    if sid ~= 0 and sid ~= nil then
+        local msg = {}
+        msg.wish_sid = sid
+
+        SpiritualDrawNet:GetInstance():SetSpiritualWish(
+            msg,
+            function(data)
+                if data.ack == 1 then
+                    self.wish_spiritual = sid
+                    if call then
+                        call()
+                    end
+                end
+            end)
+    end
+end
+
+--endregion -------------------------------------------------- 网络 end --------------------------------------------------
+
+--region -------------------------------------------------- 接口 --------------------------------------------------
+
+--- 获取每日抽奖次数
+function SpiritualDrawModel:GetDayDrawTimes()
+    return self.day_times or 0
+end
+
+---获取本日剩余免费召唤次数
+---@return number
+function SpiritualDrawModel:GetDayFreeCount()
+    return _G.ConfigManager.item_roller_cfg[30100].free_day - self.free_count
+end
+
+--- 获取当前保底累积次数
+function SpiritualDrawModel:GetDrawTimesExtracted()
+    return self.times or 0
+end
+
+--- 获取所有饰品->用于选择心愿饰品
+function SpiritualDrawModel:GetAllSpiritualInfo()
+    return self.SpiritualCfg or nil
+end
+
+--- 获取心愿饰品sid
+function SpiritualDrawModel:GetWantedSpiritualSid()
+    return self.wish_spiritual or 0
+end
+
+---获取卡池的消耗保底等本地配置
+---@return item_roller_cfg
+function SpiritualDrawModel:GetLocalCfg()
+    if not self.LocalCfg or _G.TableIsEmpty(self.LocalCfg) then
+        --local poolCfg = _G.ConfigManager.discrete_cfg[104314]        --看起来像是给池子的id
+        --if not poolCfg then
+        --    return nil
+        --end
+        self.LocalCfg = _G.ConfigManager.item_roller_cfg[30100]--poolCfg[1][1]]
+    end
+    return self.LocalCfg
+end
+
+---主界面中的按钮关闭
+function SpiritualDrawModel:SetBtnCloseCountdown()
+    if not _G.AppSetting.IsXzns then
+        local success = pcall(SpiritualDrawModel.CheckFirstRround)
+        if not success then
+            _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.SpiritualDraw)
+        else
+            _G.FunctionManager:GetInstance():OpenFunById(_G.MainFunctionItems.SpiritualDraw)
+        end
+    end
+end
+
+---检测主界面中显示，饰品召唤活动入口需与gm活动饰品探寻同步，gm活动开启时，活动入口开启，gm活动结束时入口关闭
+function SpiritualDrawModel.CheckFirstRround()
+    local data = require "ActivitySynManager":GetInstance():GetChildAcitivity(10043, 100314)
+    if data and data.curState == AState.Open then
+        return true
+    end
+    return false
+end
+
+--endregion -------------------------------------------------- 接口 end --------------------------------------------------
+
+--region -------------------------------------------------- 红点 --------------------------------------------------
+
+
+--endregion -------------------------------------------------- 红点 end --------------------------------------------------
+
+return SpiritualDrawModel

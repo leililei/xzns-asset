@@ -1,0 +1,1221 @@
+-----------------------------------------------------------------------
+-- G:.zhenhunjie.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.ActivitySyn.ActivitySynManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/08/01
+-- Description 动态活动管理类
+-----------------------------------------------------------------------
+local ActivitySynNet = require "ActivitySynNet"
+local ActivitySynTypeBase = require "ActivitySynTypeBase"
+local ActivitySynEnterManager = require "ActivitySynEnterManager"
+local TimeUtil = _G.TimeUtil
+local base = require "GameDataModelBase"
+---@class ActivitySynManager : Singleton	中文描述
+---@field mainBtnShowCfg table<number,{ time:number,all:boolean, subTypes:table<number,boolean>}>
+local ActivitySynManager = _G.BaseClass("ActivitySynManager", base)
+---活动状态枚举Close关闭 Open开启 Award领奖
+local ActivitySynState = {
+    ---关闭(不初始化对象，并且不展示页签或者按钮 (特殊需求，奖励领取之后隐藏页签或者按钮 将状态设置为关闭))
+    Close = 1,
+    ---预告(展示页签或者按钮)
+    Notice = 2,
+    ---开启(正常开启功能)
+    Open = 3,
+    ---结算(展示页签或者按钮，但是不能进入功能界面)
+    Settlement = 4,
+    ---特殊状态（用于策划需求冲突，还tm要用的情况，只用于前端特殊处理(比如结算期要求屏蔽入口，又tm要求显示入口)），用完记得手动把状态改回去
+    smch = 5
+}
+---活动类型 配置活动/GM活动
+local activityType = {
+    cfg = 1,
+    gm = 2
+}
+local enterBtnType = {
+    btn = 1,
+    page = 2
+}
+local needRefreshType = {
+    -- 10013,
+    -- 10022,
+    10028,
+    -- 10027,
+    -- 10014,
+    10007,
+    -- 10030,
+    -- 10020,
+    -- 10031,
+    -- 10034,
+    10002
+    -- 10003,
+}
+
+local UseConditionExtra = {
+    [127] = true
+}
+
+---需要优先初始化的活动类型(活动有父子关系, 必需先初始化父节点活动, 服务器发送是乱序的)
+local PriorityInitActivityType = {
+    [10031] = true,
+    [10028] = true,
+    [10023] = true,
+    [10012] = true,
+    [10004] = true,
+    [10029] = true,
+    [10043] = true,
+    [10044] = true,
+}
+
+ActivitySynManager.State = ActivitySynState
+ActivitySynManager.ActivityType = activityType
+ActivitySynManager.NeedRefreshType = needRefreshType
+
+---相同活动类型, 不同id模板的活动
+---@type (number[][])|{__cache:table<number,table<number,boolean>>}
+local SameActivityTemplateIds = {
+    { 10027, 10080 },
+}
+
+---是否为相同活动模板(存在同一活动, 不同模板id的情况)
+---@param activity activity.i_activity    @活动配置
+---@param activityId number     @活动id
+---@return boolean,boolean      @是否为相同活动模板,是否为id活动自身
+local function isSameActivityTemplate(activity, typeId)
+    local _id = activity.info.type
+    if _id == typeId then
+        return true, true
+    end
+
+    if not SameActivityTemplateIds.__cache then
+        --初始化模板缓存
+        SameActivityTemplateIds.__cache = {}
+        for i = 1, #SameActivityTemplateIds do
+            local ids = SameActivityTemplateIds[i]
+            local dict = {}
+            for _, v in ipairs(ids) do
+                dict[v] = true
+                SameActivityTemplateIds.__cache[v] = dict
+            end
+        end
+    end
+
+    local dict = SameActivityTemplateIds.__cache[typeId]
+    if not dict then
+        return false, false
+    end
+    return dict[_id], false
+end
+
+---@return ActivitySynManager ActivitySynManager
+function ActivitySynManager:GetInstance()
+    return _G.Singleton.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function ActivitySynManager:__init()
+    self.activityTable = {}
+    self.subActivityRedPointTb = {}
+    self.mainBtnShowCfg = {}
+    local cfg = _G.ConfigManager.discrete_cfg[132001]
+    if cfg then
+        for _, v in ipairs(cfg) do
+            local mainType = v[1]
+            local showCfg = self.mainBtnShowCfg[mainType]
+            if not showCfg then
+                showCfg = { time = 86400, all = true, subTypes = {} } --默认显示小于24h的活动倒计时
+                self.mainBtnShowCfg[mainType] = showCfg
+            end
+            for i = 2, #v do
+                local subType = v[i]
+                showCfg.subTypes[subType] = true
+                showCfg.all = false
+            end
+        end
+    end
+    ---子活动红点
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.activity.Cmd, self.OnActivityChanged, self)
+end
+
+---销毁对象时,析构函数
+function ActivitySynManager:Dispose()
+    for _, value in pairs(self.activityTable) do
+        value:Dispose()
+    end
+    self.activityTable = nil
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.activity.Cmd, self.OnActivityChanged, self)
+end
+
+--region 子类重写
+---从服务器拉取数据
+function ActivitySynManager:GetDataFormServer()
+    --TODO:初始化配置活动
+    self:InitConfig()
+end
+
+---解析数据
+---@param data table 服务器返回数据
+function ActivitySynManager:ParseData(data)
+    --TODO:解析服务器活动数据
+    self:InitServerActivity(data)
+    if self.needCheckConditionActivity or self.needCheckConditionGMActivity then
+        --TODO:开启条件检测
+        local enum = _G.ActiveTaskEnum.ConditionEnum
+        self.onCheckConditionType = { enum.AFK.IsPass, enum.Section.SectionPass }
+        _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.PlayAaction, self.OnAactionEvent, self)
+        _G.Events:GetInstance():AddListener(_G.ePlayerStatus.PlayerUpLevel, self.PlayerUpLevel, self)
+        _G.Events:GetInstance():AddListener(_G.eRechargeEvent.TotalCash, self.TotalCashEvent, self)
+        _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.VIP, self.TotalCashEvent, self)
+        _G.Events:GetInstance():AddListener(_G.FunctionOpenDailyCheckEvent.GuildTrain, self.GuildTrain, self)
+        _G.Events:GetInstance():AddListener(_G.FunctionOpenDailyCheckEvent.DailyActive, self.DailyActive, self)
+    end
+    base.ParseData(self)
+end
+
+---重连成功调用
+---@param endcall function 完成回调
+function ActivitySynManager:ReConnect(endcall)
+    if not self.activityIDArray then
+        if endcall then
+            endcall(self.__cname)
+        end
+        return
+    end
+    self.onReConnectCall = endcall
+    local index = 1
+    for id, _ in pairs(self.activityTable) do
+        --TODO:子类重连调用ReConnect
+        self.activityIDArray[index] = id
+        index = index + 1
+    end
+    for i = index + 1, #self.activityIDArray do
+        self.activityIDArray[i] = 0
+    end
+    self.activityReconnectIndex = 1
+    if #self.activityIDArray <= 0 then
+        if self.onReConnectCall then
+            self.onReConnectCall(self.__cname)
+            self.onReConnectCall = nil
+        end
+        return
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(self.activityIDArray, "活动要重连的id")
+    end
+
+    self.activityTable[self.activityIDArray[self.activityReconnectIndex]]:ReConnect(
+        _G.handlerbind(self, self.OnReConnectCall, "one", self.activityIDArray[self.activityReconnectIndex])
+    )
+end
+
+---初始化功能逻辑
+function ActivitySynManager:InitFunction()
+    --TODO:初始化活动红点
+    ActivitySynEnterManager:GetInstance():InitRedPoint()
+    for id, class in pairs(self.activityTable) do
+        if class.typeClass.LaterInitFunction then
+            class.typeClass:LaterInitFunction()
+        end
+    end
+    self:OpenStateChangeTimer()
+end
+
+--endregion
+
+--region 内部方法
+---初始化配置活动
+function ActivitySynManager:InitConfig()
+    local cfgs = _G.ConfigManager.activity_info_cfg
+    local state, t, condition
+    local ActivitySynCfgActivity = require "ActivitySynCfgActivity"
+    self.activityIDArray = {}
+    local ActivitySynEnterManagerIns = ActivitySynEnterManager:GetInstance()
+    for id, cfg in pairs(cfgs) do
+        state, t = self:CheckCfgActivityState(cfg)
+        --ZHJ-35950【拉新活动】功能优化导致新号无法进入游戏
+        --原先的condition_display字段不支持复合条件配置, 此处time为新加客户端逻辑通用条件判断
+        if t > 0 and (not cfg.time or #cfg.time == 0 or _G.GlobalConditionManager.CheckConditionArrays(cfg.time)) then
+            --TODO:判定条件是否满足
+            condition = UseConditionExtra[cfg.type_activity] and cfg.condition_extra or cfg.condition_display
+            if self:CheckConditionParams(condition, cfg.review) then --满足展示条件
+                local activity = self.activityTable[id]
+                if not activity then
+                    self.activityTable[id] = ActivitySynCfgActivity.New(id, cfg, state, t)
+                    self.activityIDArray[#self.activityIDArray + 1] = id
+                    if state ~= ActivitySynState.Close then
+                        ActivitySynEnterManagerIns:AddActivityBtn(self.activityTable[id])
+                    end
+                else
+                    activity:ChangeActivityData(nil, state, t)
+                    self.activityIDArray[#self.activityIDArray + 1] = id
+                end
+            else --不满足展示条件
+                if not self.needCheckConditionActivity then
+                    self.needCheckConditionActivity = { [id] = cfg.condition_display }
+                else
+                    self.needCheckConditionActivity[id] = cfg.condition_display
+                end
+            end
+        end
+    end
+    if #self.activityIDArray > 0 then
+        self.activityIndex = 1
+        self.activityTable[self.activityIDArray[self.activityIndex]]:InitData(
+            _G.handler(self, self.OnCfgActivityDataCall)
+        )
+    else
+        --TODO:拉取服务器活动数据
+        ActivitySynNet:GetInstance():InitAllActivity(_G.handler(self, self.ParseData))
+    end
+end
+
+---初始化配置数据回调
+function ActivitySynManager:OnCfgActivityDataCall()
+    --TODO:检测活动是否在领取完奖励后隐藏按钮
+    local activity = self.activityTable[self.activityIDArray[self.activityIndex]]
+    if activity.cfg.is_reveal == 1 then
+        if activity:GetActivityTypeCls():CheckActivityAwardDone() then
+            activity:ChangeState(ActivitySynState.Close)
+        end
+    end
+    self.activityIndex = self.activityIndex + 1
+    if self.activityIndex > #self.activityIDArray then
+        --TODO:拉取服务器活动数据
+        ActivitySynNet:GetInstance():InitAllActivity(_G.handler(self, self.ParseData))
+    else
+        self.activityTable[self.activityIDArray[self.activityIndex]]:InitData(
+            _G.handler(self, self.OnCfgActivityDataCall)
+        )
+    end
+end
+
+---重连成功后拉取数据回调
+function ActivitySynManager:OnReConnectCall(name, id)
+    if _G.AppSetting.DEBUG then
+        _G.Log(name .. ">>>>>>>" .. (id == nil and "" or id), "已重连完成id")
+    end
+    self.activityReconnectIndex = self.activityReconnectIndex + 1
+    if self.activityReconnectIndex > #self.activityIDArray or self.activityIDArray[self.activityReconnectIndex] == 0 then
+        if self.onReConnectCall then
+            self.onReConnectCall(self.__cname)
+            self.onReConnectCall = nil
+        end
+    else
+        self.activityTable[self.activityIDArray[self.activityReconnectIndex]]:ReConnect(
+            _G.handlerbind(self, self.OnReConnectCall, self.activityIDArray[self.activityReconnectIndex])
+        )
+    end
+end
+
+---初始化GM活动
+---@param msg table 活动列表
+function ActivitySynManager:InitServerActivity(msg)
+    if msg.ack ~= 1 or not msg.activity or #msg.activity <= 0 then
+        return
+    end
+    msg = msg.activity
+    -- 暂时把东西排个序 镇魂街ZHJ-30460 【主任务】【0329】涉及程序主单号ZHJ-30609【客户端】GM主任务活动添加容错  活动id 10031 10028 10023 10012
+    local ActivitySynGMActiZvity = require "ActivitySynGMActivity"
+    local ActivitySynEnterManagerIns = ActivitySynEnterManager:GetInstance()
+    local data
+    self.allActivityInfo = msg
+    for i = 1, #msg do
+        data = msg[i]
+        if _G.tonumber(data.info.name) then
+            data.info.name = _G.GetLangPackValue(_G.tonumber(data.info.name))
+        end
+        if _G.tonumber(data.info.title) then
+            data.info.title = _G.GetLangPackValue(_G.tonumber(data.info.title))
+        end
+        if _G.tonumber(data.info.description) then
+            data.info.description = _G.GetLangPackValue(_G.tonumber(data.info.description))
+        end
+        --优先初始化活动(活动有父子关系, 必需先初始化父节点活动)
+        if PriorityInitActivityType[data.info.type] then
+            self:initOneActivity(data, ActivitySynGMActiZvity, ActivitySynEnterManagerIns)
+        end
+    end
+    for i = 1, #msg do
+        data = msg[i]
+        --初始化剩下的活动
+        if not PriorityInitActivityType[data.info.type] then
+            self:initOneActivity(data, ActivitySynGMActiZvity, ActivitySynEnterManagerIns)
+        end
+    end
+
+    -- for i = 1, #msg do
+    --     id = msg[i].info.id
+    --     if self:CheckGMConditionPatams(msg[i].info) then --展示条件通过
+    --         state, t = self:CheckGMActivityState(msg[i].time)
+    --         activity = self.activityTable[id]
+    --         if t > 0 then
+    --             if activity then
+    --                 activity:ChangeActivityData(msg[i], state, t)
+    --                 activity.typeClass:HandleGMData(msg[i].self_info)
+    --             else
+    --                 activity = ActivitySynGMActiZvity.New(msg[i].info.id, msg[i], state, t)
+    --                 self.activityTable[msg[i].info.id] = activity
+    --                 if not activity:GetActivityTypeCls():CheckActivityAwardDone() then
+    --                     ActivitySynEnterManagerIns:AddActivityBtn(self.activityTable[msg[i].info.id])
+    --                 end
+    --             end
+    --         else
+    --             if activity then --活动关闭了
+    --                 ActivitySynEnterManagerIns:RemoveActivityBtn(activity)
+    --             end
+    --         end
+    --     else
+    --         if not self.needCheckConditionGMActivity then
+    --             self.needCheckConditionGMActivityList = {}
+    --             self.needCheckConditionGMActivity = {[id] = msg[i]}
+    --         else
+    --             self.needCheckConditionGMActivity[id] = msg[i]
+    --         end
+    --     end
+    -- end
+    --self:UpdateConditionActivity()
+end
+
+--返回所有活动信息
+function ActivitySynManager:GetAllActivityInfo()
+    return self.allActivityInfo or {}
+end
+
+function ActivitySynManager:initOneActivity(data, ActivitySynGMActiZvity, ActivitySynEnterManagerIns)
+    local state, t
+    local id = data.info.id
+    local activity
+    if self:CheckGMConditionPatams(data.info) then --展示条件通过
+        state, t = self:CheckGMActivityState(data.time)
+        activity = self.activityTable[id]
+        if t > 0 then
+            if state == ActivitySynState.Notice then
+                if not self.needCheckConditionGMActivity then
+                    self.needCheckConditionGMActivityList = {}
+                    self.needCheckConditionGMActivity = { [id] = data }
+                else
+                    self.needCheckConditionGMActivity[id] = data
+                end
+                _G.table.insert(self.needCheckConditionGMActivityList, id)
+            else
+                if activity then
+                    activity:ChangeActivityData(data, state, t)
+                    activity.typeClass:HandleGMData(data.self_info)
+                else
+                    activity = ActivitySynGMActiZvity.New(data.info.id, data, state, t)
+                    self.activityTable[data.info.id] = activity
+                    if not activity:GetActivityTypeCls():CheckActivityAwardDone() then
+                        ActivitySynEnterManagerIns:AddActivityBtn(self.activityTable[data.info.id])
+                    end
+                    --- 跨天拉数据时，会将之前提前显示，但是跨天后开启的活动一起获得
+                    --- 导致提前显示的活动拉了两遍数据
+                    if self.needCheckConditionGMActivityList and self.needCheckConditionGMActivity[data.info.id] then
+                        _G.table.removebyvalue(self.needCheckConditionGMActivityList, data.info.id)
+                        self.needCheckConditionGMActivity[data.info.id] = nil
+                    end
+                end
+            end
+        else
+            if activity then --活动关闭了
+                ActivitySynEnterManagerIns:RemoveActivityBtn(activity)
+            end
+        end
+    else
+        self.activityTable[id] = nil
+        if not self.needCheckConditionGMActivity then
+            self.needCheckConditionGMActivityList = {}
+            self.needCheckConditionGMActivity = { [id] = data }
+        else
+            self.needCheckConditionGMActivity[id] = data
+        end
+        _G.table.insert(self.needCheckConditionGMActivityList, id)
+    end
+end
+
+---检测GM活动状态
+---@param 变量名 变量类型 中文描述
+---@return 变量类型 中文描述
+function ActivitySynManager:CheckGMActivityState(data)
+    local t = TimeUtil.GetServerUnixTime()
+    local noticeTime = data.start_time
+    if data.show_time > 0 and t < data.start_time then --展示时间
+        return ActivitySynState.Notice, noticeTime - t
+    end
+    noticeTime = noticeTime + data.run_time
+    if t < noticeTime then --开启时间
+        return ActivitySynState.Open, noticeTime - t
+    end
+    noticeTime = noticeTime + data.get_time
+    if t < noticeTime then --结算时间
+        return ActivitySynState.Settlement, noticeTime - t
+    end
+    return ActivitySynState.Close, 0
+end
+
+---检测配置表活动状态
+---@param cfg activity_info_cfg 活动配置数据
+---@return ActivitySynState|number 活动状态|活动状态改变时间差
+function ActivitySynManager:CheckCfgActivityState(cfg)
+    local noticeTime = 0
+    if cfg.time_type == 1 then     --物理时间(绝对时间戳)
+        noticeTime = TimeUtil.TranslateTimeForStamp(cfg.time_open) - cfg.show_time
+    elseif cfg.time_type == 2 then ---服务器相对时间
+        noticeTime = _G.PlayerModel:GetInstance():GetServerOpenTime() + cfg.time_open[1] - cfg.show_time
+    end
+    local t = TimeUtil.GetServerUnixTime()
+    local times = cfg.time_interval == 0 and 1 or (cfg.num_cycle > 1 and cfg.num_cycle or 1)
+    for i = 1, times do
+        if t < noticeTime then --展示时间之前
+            return ActivitySynState.Close, noticeTime - t
+        end
+        noticeTime = noticeTime + cfg.show_time
+        if t < noticeTime then --展示时间
+            return ActivitySynState.Notice, noticeTime - t
+        end
+        noticeTime = noticeTime + cfg.time_duration
+        if t < noticeTime then --开启时间
+            return ActivitySynState.Open, noticeTime - t
+        end
+        noticeTime = noticeTime + cfg.end_time
+        if t < noticeTime then --结算时间
+            return ActivitySynState.Settlement, noticeTime - t
+        end
+        noticeTime = noticeTime + cfg.time_interval
+    end
+    return ActivitySynState.Close, 0
+end
+
+---检测限制条件
+---@param params table 限制条件{{type,param},{type,param}}
+---@param review number 提审模式下是否显示
+---@return boolean 是否满足显示条件
+function ActivitySynManager:CheckConditionParams(params, review)
+    if review and review == 1 and _G.AppSetting.IsArraigned then
+        ---提审模式下，review为1的活动不显示
+        return false
+    end
+    if _G.table.isEmptyOrNil(params) then
+        return true
+    end
+    if #params == 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("活动显示判定条件参数错误")
+        end
+        return true
+    end
+    if #params == 1 then
+        local cfg = _G.ConfigManager.function_open_cfg[params[1]]
+        return _G.GlobalConditionManager.CheckConditionByArray(cfg.condition_type)
+    end
+    return _G.GlobalConditionManager.CheckCondition(params[1], params[2])
+end
+
+---检测GM活动限制条件
+---@param params table 限制条件{{type=t,value=param, list = list},{type=t,value=param}}
+---@return boolean 是否满足显示条件
+function ActivitySynManager:CheckGMConditionPatams(params)
+    params = params.front
+    if not params then
+        return true
+    end
+    params = params.con
+    if not params then
+        return true
+    end
+    for i = 1, #params do
+        if not _G.GlobalConditionManager.CheckCondition(params[i].type, params[i].value, params[i].list) then
+            return false
+        end
+    end
+    return true
+end
+
+---开启活动计时器
+function ActivitySynManager:OpenStateChangeTimer()
+    if self.activityStateTimer ~= nil then
+        self.activityStateTimer:Stop()
+        self.activityStateTimer = nil
+    end
+    self.activityStateTimer = _G.TimerManager:GetInstance():GetTimer(1, self.OnActivityStateChangerTimerCall, self)
+    self.activityStateTimer:Start()
+end
+
+---检测条件监听方法
+function ActivitySynManager:OnAactionEvent(id)
+    local type = id[1]
+    if type == nil then
+        return
+    end
+    for i = 1, #self.onCheckConditionType do
+        if type == self.onCheckConditionType[i] then
+            self:UpdateConditionActivity()
+            break
+        end
+    end
+end
+
+---玩家升级监听方法
+function ActivitySynManager:PlayerUpLevel()
+    self:UpdateConditionActivity()
+end
+
+---充值监听
+function ActivitySynManager:TotalCashEvent()
+    self:UpdateConditionActivity()
+end
+
+---活跃度监听
+function ActivitySynManager:DailyActive()
+    self:UpdateConditionActivity()
+end
+
+---公会试炼监听
+function ActivitySynManager:GuildTrain()
+    self:UpdateConditionActivity()
+end
+
+ActivitySynManager.NoticeShowBtn = {
+    [10105] = true,
+    [10092] = true,
+}
+
+function ActivitySynManager:UpdateConditionActivity()
+    local ids, cfg
+    local ActivitySynEnterManagerIns = require("ActivitySynEnterManager"):GetInstance()
+    if self.needCheckConditionActivity then
+        local ActivitySynCfgActivity = require("ActivitySynCfgActivity")
+        for id, condition in pairs(self.needCheckConditionActivity) do
+            cfg = _G.ConfigManager.activity_info_cfg[id]
+            local state, t = self:CheckCfgActivityState(cfg)
+            if self:CheckConditionParams(condition, cfg.review) and state ~= ActivitySynState.Notice then
+                if not ids then
+                    ids = { id }
+                else
+                    ids[#ids + 1] = id
+                end
+                --TODO:检测活动开启时间
+
+                if t > 0 then
+                    self.activityTable[id] = ActivitySynCfgActivity.New(id, cfg, state, t)
+                    self.activityIDArray[#self.activityIDArray + 1] = id
+                    self.activityTable[id]:InitData(
+                        function()
+                            if state ~= ActivitySynState.Close then
+                                ActivitySynEnterManagerIns:AddActivityBtn(self.activityTable[id])
+                                --TODO:刷新红点
+                                local item = self.activityTable[id]:GetActivityTypeCls()
+                                local tree = item:GetRedPointTree()
+                                if not _G.table.isEmptyOrNil(tree) then
+                                    local param
+                                    local RedPointManagerIns = require("RedPointManager"):GetInstance()
+                                    for i = 1, #tree do
+                                        param = item:GetRedPointParams(i)
+                                        if param then
+                                            RedPointManagerIns:RefreshNodeByAllParams(item:GetRedpointIDByIndex(i))
+                                        else
+                                            RedPointManagerIns:RefreshNode(item:GetRedpointIDByIndex(i))
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    )
+                end
+            end
+        end
+        if ids then
+            for i = 1, #ids do
+                self.needCheckConditionActivity[ids[i]] = nil
+            end
+        end
+    end
+
+    ids = nil
+    if self.needCheckConditionGMActivity then
+        local ActivitySynGMActivity = require("ActivitySynGMActivity")
+        for k, v in ipairs(self.needCheckConditionGMActivityList) do
+            local id = v
+            local data = self.needCheckConditionGMActivity[v]
+            if data then
+                -- body
+                local state, t = self:CheckGMActivityState(data.time)
+                if self:CheckGMConditionPatams(data.info) and (state ~= ActivitySynState.Notice) then
+                    if not ids then
+                        ids = { id }
+                    else
+                        ids[#ids + 1] = id
+                    end
+                    if t > 0 then
+                        self.activityTable[id] = ActivitySynGMActivity.New(id, data, state, t)
+                        self.activityTable[id]:RefreshData()
+                        ---有些活动在达成某些条件才会显示一开始不会显示(降神礼遇需要消费达到某个条件再显示)
+                        if self.activityTable[id]:GetCurActivityState() ~= ActivitySynState.Close then
+                            ActivitySynEnterManagerIns:AddActivityBtn(self.activityTable[id])
+                        end
+                        --TODO:刷新红点
+                        local item = self.activityTable[id]:GetActivityTypeCls()
+                        local tree = item:GetRedPointTree()
+                        if not _G.table.isEmptyOrNil(tree) then
+                            local param
+                            local RedPointManagerIns = require("RedPointManager"):GetInstance()
+                            for i = 1, #tree do
+                                param = item:GetRedPointParams(i)
+                                if param then
+                                    RedPointManagerIns:RefreshNodeByAllParams(item:GetRedpointIDByIndex(i))
+                                else
+                                    RedPointManagerIns:RefreshNode(item:GetRedpointIDByIndex(i))
+                                end
+                            end
+                        end
+                        self:AddSubActivityRedPoint(item)
+                    end
+                end
+            end
+        end
+        if ids then
+            for i = 1, #ids do
+                self.needCheckConditionGMActivity[ids[i]] = nil
+                for index, value in ipairs(self.needCheckConditionGMActivityList) do
+                    if value == ids[i] then
+                        _G.table.remove(self.needCheckConditionGMActivityList, index)
+                        break
+                    end
+                end
+            end
+        end
+    end
+    self:ClearConditionCheckArray()
+end
+
+function ActivitySynManager:ClearConditionCheckArray()
+    if
+        _G.table.isEmptyOrNil(self.needCheckConditionGMActivity) and
+        _G.table.isEmptyOrNil(self.needCheckConditionActivity)
+    then
+        self.needCheckConditionActivity = nil
+        self.needCheckConditionGMActivityList = nil
+        self.needCheckConditionGMActivity = nil
+        self.onCheckConditionType = nil
+        _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.PlayAaction, self.OnAactionEvent, self)
+        _G.Events:GetInstance():RemoveListener(_G.ePlayerStatus.PlayerUpLevel, self.PlayerUpLevel, self)
+        _G.Events:GetInstance():RemoveListener(_G.eRechargeEvent.TotalCash, self.TotalCashEvent, self)
+        _G.Events:GetInstance():RemoveListener(_G.ePlayAactionEvent.VIP, self.TotalCashEvent, self)
+        _G.Events:GetInstance():RemoveListener(_G.FunctionOpenDailyCheckEvent.GuildTrain, self.GuildTrain, self)
+        _G.Events:GetInstance():RemoveListener(_G.FunctionOpenDailyCheckEvent.DailyActive, self.DailyActive, self)
+    end
+end
+
+---活动状态改变计时器回调
+function ActivitySynManager:OnActivityStateChangerTimerCall(elapsed)
+    local removeIDTab
+    local state, t
+    --修改状态调整的时间
+    for id, item in pairs(self.activityTable) do
+        item:UpdateStateTime(elapsed)
+        if item:GetChangeStateTime() <= 0 then
+            if item:GetActivityType() == activityType.cfg then
+                state, t = self:CheckCfgActivityState(item.cfg)
+            else
+                state, t = self:CheckGMActivityState(item.cfg.time)
+            end
+            if t <= 0 then
+                if not removeIDTab then
+                    removeIDTab = {}
+                end
+                removeIDTab[id] = true
+            end
+            --TODO：活动状态改变
+            item:ChangeActivityData(nil, state, t)
+        end
+    end
+    if removeIDTab then
+        --将关闭不会再开的活动移除列表
+        for id, _ in pairs(removeIDTab) do
+            self.activityTable[id]:Dispose()
+            self.activityTable[id] = nil
+        end
+    end
+end
+
+---服务器推送，GM活动数据修改
+--[[
+    message p2c_activity {
+        required uint32 activity_id = 1;
+        required uint32 state = 2;  //新的活动状态
+    }
+    0：活动关闭
+    1：活动开启
+    2：活动停止 在stop状态下不做处理，此状态用于领奖
+    3：活动预热(可以提前看到)
+]]
+---@param msg table 活动数据
+function ActivitySynManager:OnActivityChanged(msg)
+    if msg.state == 0 then --关闭活动
+        local item = self.activityTable[msg.activity_id]
+        if item then
+            item:ChangeActivityData(nil, ActivitySynState.Close, 0)
+            self.activityTable[msg.activity_id] = nil
+        else
+            if self.needCheckConditionGMActivity and self.needCheckConditionGMActivity[msg.activity_id] then
+                self.needCheckConditionGMActivity[msg.activity_id] = nil
+                self:ClearConditionCheckArray()
+            end
+        end
+    else
+        ActivitySynNet:GetInstance():InitActivity(msg.activity_id, _G.handler(self, self.OnActivityChangedCall))
+    end
+end
+
+---活动数据修改回调
+---@param msg table 活动数据
+---@param realActivityId boolean 真实活动id（针对如公平竞技场之类的活动）
+function ActivitySynManager:OnActivityChangedCall(msg, realActivityId)
+    if msg.ack ~= 1 then
+        return
+    end
+    msg = msg.activity[1]
+    local data = msg
+    if _G.tonumber(data.info.name) then
+        data.info.name = _G.GetLangPackValue(_G.tonumber(data.info.name))
+    end
+    if _G.tonumber(data.info.title) then
+        data.info.title = _G.GetLangPackValue(_G.tonumber(data.info.title))
+    end
+    if _G.tonumber(data.info.description) then
+        data.info.description = _G.GetLangPackValue(_G.tonumber(data.info.description))
+    end
+    local item = self.activityTable[msg.info.id]
+    local state, t
+    state, t = self:CheckGMActivityState(msg.time)
+    if self:CheckGMConditionPatams(msg.info) and state ~= ActivitySynState.Notice then
+        if not item then --不存在的活动
+            local ActivitySynGMActivity = require "ActivitySynGMActivity"
+            if t > 0 then
+                item = ActivitySynGMActivity.New(msg.info.id, msg, state, t, realActivityId)
+                self.activityTable[msg.info.id] = item
+                ---有些活动在达成某些条件才会显示一开始不会显示
+                if item:GetCurActivityState() ~= ActivitySynState.Close then
+                    ActivitySynEnterManager:GetInstance():AddActivityBtn(item)
+                end
+                --TODO:刷新红点
+                item = item:GetActivityTypeCls()
+                local tree = item:GetRedPointTree()
+                if not _G.table.isEmptyOrNil(tree) then
+                    local param
+                    local RedPointManagerIns = require("RedPointManager"):GetInstance()
+                    for i = 1, #tree do
+                        param = item:GetRedPointParams(i)
+                        if param then
+                            RedPointManagerIns:RefreshNodeByAllParams(item:GetRedpointIDByIndex(i))
+                        else
+                            RedPointManagerIns:RefreshNode(item:GetRedpointIDByIndex(i))
+                        end
+                    end
+                end
+                self:AddSubActivityRedPoint(item)
+            end
+        elseif item:GetActivityType() == activityType.gm then -- 目前只支持GM活动动态修改
+            item:ChangeActivityData(msg, state, t)
+        end
+    else
+        if not self.needCheckConditionGMActivity then
+            self.needCheckConditionGMActivityList = {}
+            self.needCheckConditionGMActivity = { [msg.info.id] = msg }
+        else
+            if _G.table.isEmptyOrNil(self.needCheckConditionGMActivity) then
+                if _G.table.isEmptyOrNil(self.needCheckConditionActivity) then
+                    --TODO:开启条件检测
+                    local enum = _G.ActiveTaskEnum.ConditionEnum
+                    self.onCheckConditionType = { enum.AFK.IsPass, enum.Section.SectionPass }
+                    _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.PlayAaction, self.OnAactionEvent, self)
+                    _G.Events:GetInstance():AddListener(_G.ePlayerStatus.PlayerUpLevel, self.PlayerUpLevel, self)
+                    _G.Events:GetInstance():AddListener(_G.eRechargeEvent.TotalCash, self.TotalCashEvent, self)
+                    _G.Events:GetInstance():AddListener(_G.ePlayAactionEvent.VIP, self.TotalCashEvent, self)
+                    _G.Events:GetInstance():AddListener(_G.FunctionOpenDailyCheckEvent.GuildTrain, self.GuildTrain, self)
+                    _G.Events:GetInstance():AddListener(_G.FunctionOpenDailyCheckEvent.DailyActive, self.DailyActive, self)
+                end
+            end
+            self.needCheckConditionGMActivity[msg.info.id] = msg
+        end
+    end
+end
+
+--endregion
+
+---添加子活动红点
+---@param activity ActivitySynTypeBase
+---@param sub_type number 二级壳子需要指定一级壳子的sub_type
+function ActivitySynManager:AddSubActivityRedPoint(activity, sub_type)
+    local ids = activity:GetOtherActivityRedPointIds()
+    ---活动类型
+    local type = activity.curActivityClass:GetTypeId()
+
+    ---功能类型
+    local maintypes = activity:GetOtherActivityRedPointMainType()
+
+    if type == 10067 and sub_type == nil then
+        --二级壳子，需要拿子壳子的subty
+        local subTypeLis = activity:GetAllChildSubType()
+        for _, v in pairs(subTypeLis) do
+            self:AddSubActivityRedPoint(activity, v)
+        end
+        ids = activity:GetDirectActivityRedPointIds()
+    end
+    ---子活动类型
+    sub_type = sub_type or activity.curActivityClass:GetJumpType()
+    local RedPointManager = require "RedPointManager":GetInstance()
+    if not _G.table.isEmptyOrNil(ids) then
+        if not self.subActivityRedPointTb[sub_type] then
+            self.subActivityRedPointTb[sub_type] = {}
+        end
+        self.subActivityRedPointTb[sub_type] = {}
+        local sub_activity = nil
+        for k, v in pairs(ids) do
+            local maintype = maintypes and maintypes[k] or nil
+            sub_activity = self:GetChildAcitivity(v, sub_type,maintype)
+            if
+                not sub_activity or
+                not RedPointManager:GetRedpointItem(sub_activity:GetActivityTypeCls():GetRedpointIDByIndex(1))
+            then
+                self.subActivityRedPointTb[sub_type][v] = activity.curActivityClass:GetActivityID()
+            else
+                RedPointManager:AddRedPointChild(
+                    activity:GetRedpointIDByIndex(1),
+                    sub_activity:GetActivityTypeCls():GetRedpointIDByIndex(1)
+                )
+            end
+        end
+    end
+    if self.subActivityRedPointTb[sub_type] and self.subActivityRedPointTb[sub_type][type] then
+        local parentActivity = self:GetActivityClass(self.subActivityRedPointTb[sub_type][type])
+        if
+            not parentActivity or
+            not RedPointManager:GetRedpointItem(parentActivity:GetActivityTypeCls():GetRedpointIDByIndex(1))
+        then
+            return
+        end
+        RedPointManager:AddRedPointChild(
+            parentActivity:GetActivityTypeCls():GetRedpointIDByIndex(1),
+            activity:GetRedpointIDByIndex(1)
+        )
+        self.subActivityRedPointTb[sub_type][type] = nil
+        if _G.table.isEmptyOrNil(self.subActivityRedPointTb[sub_type]) then
+            self.subActivityRedPointTb[sub_type] = nil
+        end
+    end
+end
+
+---添加假活动
+---@param msg activity.s2c_activity_info
+---@param realActivityId number 真实活动id
+function ActivitySynManager:AddVirtualActivity(msg, realActivityId)
+    self:OnActivityChangedCall(msg, realActivityId)
+end
+
+--region 对外接口
+---获取活动对象
+---@param id number 活动ID
+---@return ActivitySynBase 活动对象
+function ActivitySynManager:GetActivityClass(id)
+    if id then
+        local activity = self.activityTable[id]
+        if not activity then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("活动table异常 id=" .. id)
+            end
+        end
+        return self.activityTable[id]
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.LogError("id  = nil 检查参数合法性")
+    end
+    return nil
+end
+
+---获取主界面按钮倒计时
+---@param id number 活动ID
+---@return boolean,number 是否显示倒计时, 倒计时结束时间
+function ActivitySynManager:GetBtnCountDown(id)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("id  = nil 检查参数合法性")
+        end
+        return false, 0
+    end
+    local activity = self.activityTable[id]
+    if not activity or activity:GetCurActivityState() ~= ActivitySynState.Open then
+        return false, 0
+    end
+
+    --判断此类型是否显示
+    ---@type number,number
+    local mainType, subType = activity.GetMainType and activity:GetMainType() or activity:GetTypeId(), activity:GetJumpType()
+    local showCfg = self.mainBtnShowCfg[mainType]
+    if not showCfg or not showCfg.all and not showCfg.subTypes[subType] then
+        return false, 0
+    end
+    --判断剩余时长是否满足要求
+    local _, endTime = activity:GetActivityDeadLineByCondition(ActivitySynState.Close)
+    if endTime >= showCfg.time then
+        return false, 0
+    end
+    return true, _G.TimeUtil.GetServerUnixTime() + endTime
+end
+
+---获取活动是否开放
+---@param id number 活动ID
+---@return boolean 是否开放
+function ActivitySynManager:CheckActivityOpened(id)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("id  = nil 检查参数合法性")
+        end
+        return false
+    end
+    local item = self.activityTable[id]
+    if item then
+        return item:GetFunctionOpen()
+    end
+    return false
+end
+
+---检测进入额外条件是否满足
+---@param id number 活动ID
+---@return boolean 是否满足进入条件
+function ActivitySynManager:CheckActivityConditionExtra(id)
+    if not id then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("id  = nil 检查参数合法性")
+        end
+        return false
+    end
+    local item = self.activityTable[id]
+    if item then
+        return item:CheckConditionExtra()
+    end
+    return false
+end
+
+---创建活动类型实例化对象
+---@param id number 活动类型ID
+---@param activity ActivitySynBase 活动对象
+---@return ActivitySynTypeBase 活动类型类对象
+function ActivitySynManager:CreateActivitySynTypeCls(id, activity)
+    return ActivitySynTypeBase.Create(id, activity)
+end
+
+---跳转进活动
+---@param id number 活动类型
+---@param call function 跳转成功回调
+---@return boolean 跳转是否成功
+function ActivitySynManager:JumpActivity(id, call)
+    local activity = self.activityTable[id]
+    if activity and activity:GetCurActivityState() ~= ActivitySynState.Close then
+        if activity:EnterActivity(call) then
+            return true
+        else
+            --TODO:不满足活动进入条件
+            return false
+        end
+    end
+    --TODO:活动已关闭
+    return false
+end
+
+---获取某玩法的所有活动ID组
+---@param type number 玩法类型
+---@return table 活动ID组(可能为nil)
+function ActivitySynManager:GetAllActivityByType(type)
+    local actIDs
+    for id, activity in pairs(self.activityTable) do
+        if activity:GetCurActivityState() == ActivitySynState.Open then --只将正在开启的活动加入列表
+            if type == activity:GetTypeId() then
+                if not actIDs then
+                    actIDs = { id }
+                else
+                    actIDs[#actIDs + 1] = id
+                end
+            end
+        end
+    end
+    return actIDs
+end
+
+---获取谋玩法的所有活动数据
+---@param type number 玩法类型
+function ActivitySynManager:GetActivityByType(type)
+    local actList = {}
+    for _, activity in pairs(self.activityTable) do
+        if type == activity:GetTypeId() and activity:GetCurActivityState() == ActivitySynState.Open then
+            _G.table.insert(actList, activity)
+        end
+    end
+    return actList
+end
+
+--endregion
+---根据类型和子类型跳转打开GM活动
+function ActivitySynManager:JumpActivityByType(type, jumpId, isSingle, main_type)
+    local _activity = self:GetChildAcitivity(type, jumpId, main_type)
+    if _activity and _activity:GetCurActivityState() ~= ActivitySynState.Close then
+        --只将正在开启的活动加入列表
+        self:JumpActivity2(_activity, isSingle)
+    else
+        --提示活动已结束
+        --活动不存在或已关闭时, 是否显示跳转按钮???
+        _G.PopWindowManager:GetInstance():ShowAllTips(5300101)
+    end
+end
+
+---根据id跳转打开配置活动
+function ActivitySynManager:JumpActivityByCfg(id, isSingle)
+    self:JumpActivity2(self.activityTable[id], isSingle)
+end
+
+---内部方法内部方法内部方法内部方法内部方法内部方法
+function ActivitySynManager:JumpActivity2(activity, isSingle)
+    local positionCfg = _G.ConfigManager.activity_position_cfg
+    local t, p1, p2
+    if activity and activity:GetCurActivityState() ~= ActivitySynState.Close then
+        t, p1, p2 = activity:GetShowBtnType()
+        ---如果是独立按钮 直接走活动自己的入口
+        if t == enterBtnType.btn then
+            activity:EnterActivity()
+        else
+            ---如果是其他界面 根据配置索引进入
+            if p1 then
+                local cfg = positionCfg[p1]
+                if cfg ~= nil and cfg.views ~= nil then
+                    ActivitySynEnterManager:GetInstance():JumpActivity(
+                        cfg.views,
+                        p2,
+                        activity:GetActivityID(),
+                        isSingle
+                    )
+                end
+            end
+        end
+    end
+end
+
+---获取活动（若多期只会获取其中一个）
+function ActivitySynManager:GetActivityWithTypeId(typeId)
+    for _, v in pairs(self.activityTable) do
+        if v:GetTypeId() == typeId then
+            return v
+        end
+    end
+end
+
+---获得子活动
+---@param type number 活动类型
+---@param jumpID number 跳转ID
+---@return ActivitySynGMActivity 活动Table
+function ActivitySynManager:GetChildAcitivity(type, jumpId, main_type)
+    if not self.activityTable then
+        return nil
+    end
+    local sameTemplate
+    for _, v in pairs(self.activityTable) do
+        if v.cfg.info then
+            
+            if v.cfg.info.front.sub_type == jumpId then
+                local ok, isSelf = isSameActivityTemplate(v.cfg, type)
+                if ok and (not main_type or main_type <= 0 or main_type == v.cfg.info.front.main_type) then
+                    if isSelf then
+                        return v
+                    end
+                    sameTemplate = v --作为相同模板备选活动实例
+                end
+            end
+        else
+            if not jumpId and v.cfg.type_activity == type then
+                return v
+            end
+        end
+    end
+    return sameTemplate
+end
+
+---获取未开启的活动
+---@param type number 活动类型
+---@param jumpID number 跳转ID
+---@return activity.i_activity
+function ActivitySynManager:GetNotOpenAcitivity(type, jumpId, main_type)
+    if not self.needCheckConditionGMActivity then
+        return nil
+    end
+    local sameTemplate
+    for _, v in pairs(self.needCheckConditionGMActivity) do
+        if v.info then
+            if v.info.front.sub_type == jumpId then
+                local ok, isSelf = isSameActivityTemplate(v, type)
+                if ok and (not main_type or main_type <= 0 or main_type == v.info.front.main_type) then
+                    if isSelf then
+                        return v
+                    end
+                    sameTemplate = v --作为相同模板备选活动实例
+                end
+            end
+        end
+    end
+    return sameTemplate
+end
+
+---打开福利面板(加群有礼丶贵宾邀请)
+---@return void
+function ActivitySynManager:OpenCommunity()
+    self:InitCommunityActivity()
+
+    local list = self.communityActivity
+    if not list or #list <= 0 then
+        return
+    end
+    local activeId = 0
+    if list[#list]:GetActivityTypeCls():IsShowInFuliView() then
+        activeId = list[#list].activityID
+    end
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.FuliView.Name, list, nil, activeId)
+end
+
+---是否显示福利面板(加群有礼丶贵宾邀请)
+---@return boolean
+function ActivitySynManager:IsShowCommunity()
+    self:InitCommunityActivity()
+
+    local list = self.communityActivity
+    if not list or #list <= 0 then
+        return false
+    end
+    for _, activity in pairs(list) do
+        if activity:GetActivityTypeCls():IsShowInFuliView() then
+            return true
+        end
+    end
+    return false
+end
+
+---初始化福利面板数据
+---@private
+---@retrun void
+function ActivitySynManager:InitCommunityActivity()
+    if self.communityActivity then
+        return
+    end
+    ---福利面板数据
+    ---@type ActivitySynCfgActivity[]
+    self.communityActivity = {}
+    --1011801: 加群有利
+    --1011901: 贵宾好礼
+    for _, id in ipairs({ 1011901 }) do
+        local cfg = _G.ConfigManager.activity_info_cfg[id]
+        if cfg then
+            ---@type ActivitySynCfgActivity
+            local activity = require("ActivitySynCfgActivity").New(id, cfg, ActivitySynState.Open, 9999999)
+            --activity:InitData()
+            table.insert(self.communityActivity, activity)
+        end
+    end
+end
+
+return ActivitySynManager

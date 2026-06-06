@@ -1,0 +1,415 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DrawActivity.Model.DrawActivityModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2023/02/06
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "ThemeActivityBaseModel"
+---@class DrawActivityModel	:ThemeActivityBaseModel 灵域觅宝
+---@field cfgs activity_theme.i_draw_cfg[]
+---@field perSordLists activity_theme.i_draw_cfg[] 奖励排序后的表
+---@field perList number[] 奖励获取概率表
+local DrawActivityModel = _G.BaseClass("DrawActivityModel", base)
+
+---@return DrawActivityModel DrawActivityModel
+function DrawActivityModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function DrawActivityModel:__init()
+    --当前拥有的代币数量
+    self.CoinNum = 0
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.RefreshRedPoint, self)
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.theme_award_coin.Cmd, self.P2C_award_coin, self)
+end
+
+---后端主动推送的数据
+function DrawActivityModel:P2C_award_coin(data)
+    if _G.IsNil(data) then
+        return
+    end
+    self:AddCoinNum(data.coin_num)
+end
+
+---销毁对象时,析构函数
+function DrawActivityModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.RefreshRedPoint, self)
+end
+
+---初始化数据
+---@param msg activity_theme.i_draw
+function DrawActivityModel:InitData(msg)
+    self.info = msg
+    if not self.coinSid then
+        self.coinSid = require"ThemeActivityManager":GetInstance():GetCoinSid()
+    end
+    ---主题活动代币数量
+    self.CoinNum = 0
+    self:SetCoinNum(self.info.coin_num or 0)
+    self:InitDarwCfg()
+    self:InitMaxPools()
+    self:InitNormalPools()
+    --self:UpdateCanTakeBox()
+    --self:InitTimer()
+end
+
+---初始化许愿
+function DrawActivityModel:InitDarwCfg()
+    self.cfgs = {}
+    local maxPer = 0
+    self.perSordLists = {}
+    self.perList = {}
+    local insert = _G.table.insert
+    for _, v in pairs(self.info.cfg_list) do
+        self.cfgs[v.id] = v
+        maxPer = maxPer + v.weight
+        insert(self.perSordLists, v)
+    end
+    _G.SortList(
+        self.perSordLists,
+        function(data)
+            return -data.weight, data.id
+        end
+    )
+    for i = 1, #self.perSordLists do
+        self.perList[i] = _G.math.ceil(self.perSordLists[i].weight / maxPer * 10000) / 10000
+    end
+end
+
+---设置代币数量
+function DrawActivityModel:SetCoinNum(num)
+    self.CoinNum = num
+    self:DispatchUpdateEvent(num)
+    return self.CoinNum
+end
+---增加代币
+function DrawActivityModel:AddCoinNum(num)
+    self.CoinNum = self.CoinNum + num
+    self:DispatchUpdateEvent(num)
+    return self.CoinNum
+end
+---减少代币
+function DrawActivityModel:RedCoinNum(num)
+    self.CoinNum = self.CoinNum - num
+    self:DispatchUpdateEvent(num)
+    return self.CoinNum
+end
+
+---推送货币更新事件
+---@param change number 更新数量
+function DrawActivityModel:DispatchUpdateEvent(change)
+    if change == nil then
+        change = 0
+    end
+    local tmp = {}
+    if not self.coinSid then
+        self.coinSid = require "ThemeActivityManager":GetInstance():GetCoinSid()
+    end
+    _G.table.insert(tmp, self.coinSid)
+    _G.table.insert(tmp, change)
+    _G.table.insert(tmp, self.CoinNum)
+    _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, {{type = tmp}})
+end
+
+--返回主题活动代币数量
+function DrawActivityModel:GetCoinNum()
+    return self.CoinNum
+end
+
+---初始化保底奖池
+function DrawActivityModel:InitMaxPools()
+    self.maxPools = {}
+    for _, v in pairs(self.info.max_id_list) do
+        self.maxPools[v] = true
+    end
+end
+
+function DrawActivityModel:InitNormalPools()
+    local tb = {}
+    local insert = _G.table.insert
+    local tb2 = {}
+    local id
+    local count = #self.info.draw_id_list
+    for i = 1, count do
+        id = self.info.draw_id_list[i]
+        if self:CheckIsMaxItem(id) then
+            insert(tb, id)
+        else
+            insert(tb2, id)
+        end
+    end
+    self.info.draw_id_list = tb2
+    local count2 = #tb
+    if count >= 10 then
+        for i = 1, count2 do
+            insert(self.info.draw_id_list, 10 - count2 + 1, tb[i])
+        end
+    else
+        for i = 1, count2 do
+            insert(self.info.draw_id_list, tb[i])
+        end
+    end
+end
+
+---初始化倒计时
+function DrawActivityModel:InitTimer()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if not self.info.box_info then
+        return
+    end
+    local minOffset = 0
+    local offset = 0
+    local time = _G.TimeUtil.GetServerUnixTime()
+    for _, v in pairs(self.info.box_info) do
+        if not self.canTakeBox[v.box_id] then
+            offset = v.time + self:GetCfg(v.id).time - time
+            if minOffset < offset then
+                minOffset = offset
+            end
+        end
+    end
+    if minOffset <= 0 then
+        return
+    end
+    self.timer = _G.TimerManager:GetInstance():GetTimer(minOffset, self.TimerOver, self, true, false, true)
+    self.timer:Start()
+end
+
+---倒计时结束
+function DrawActivityModel:TimerOver()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self:UpdateCanTakeBox()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(self:GetRedPointId())
+    self:InitTimer()
+end
+
+---初始化可领取宝箱
+function DrawActivityModel:UpdateCanTakeBox()
+    self.canTakeBox = {}
+    if self.info.box_info then
+        local time = _G.TimeUtil.GetServerUnixTime()
+        local endTime = 0
+        for _, v in pairs(self.info.box_info) do
+            endTime = v.time + self:GetCfg(v.id).time
+            if time >= endTime then
+                self.canTakeBox[v.box_id] = true
+            end
+        end
+    end
+end
+
+---获取宝箱数据
+---@return activity_theme.i_box
+function DrawActivityModel:GetBoxData(index)
+    if not self.info.box_info then
+        return nil
+    end
+    return self.info.box_info[index]
+end
+
+---获取宝箱可领取时间
+function DrawActivityModel:GetBoxDurationTime(id)
+    if not self.cfgs[id] then
+        return 0
+    end
+    return self.cfgs[id].time
+end
+
+---许愿
+function DrawActivityModel:Draw(call)
+    if self.info.box_info and #self.info.box_info >= 5 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(770101)
+        return
+    end
+    if not self.coinSid then
+        self.coinSid = require "ThemeActivityManager":GetInstance():GetCoinSid()
+    end
+    if self.info.draw_cost > self:GetCoinNum() then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, self.coinSid)
+        return
+    end
+    local num = self:Draw_num()
+    require "DrawActivityNet":GetInstance():Draw(
+        {id = require "ThemeActivityManager":GetInstance():GetActivityID(), draw_num = num},
+        _G.handlerbind(self, self.DrawCall, call, num)
+    )
+end
+
+function DrawActivityModel:Draw_num()
+    local Draw_num = 1
+    local GetCoinNum = self:GetCoinNum()
+    local GetConsume = self:GetConsume()
+    if GetCoinNum > GetConsume then
+        -- local Draw_num = GetCoinNum / GetConsume
+        Draw_num = math.floor(GetCoinNum / GetConsume)
+        if Draw_num > 10 then
+            Draw_num = 10
+        end
+    end
+    return Draw_num
+end
+
+---抽卡回调
+---@param msg activity_theme.s2c_activity_theme_draw
+function DrawActivityModel:DrawCall(msg, call, num)
+    if msg.ack ~= 1 then
+        return
+    end
+    if not self.info.box_info then
+        self.info.box_info = {}
+    end
+    self.info.draw_times = self.info.draw_times + num
+    self:RedCoinNum(self.info.draw_cost * num)
+    --_G.StorageManager:GetInstance():ConsumeItem(105, 0, self.info.draw_cost[2])
+    --_G.table.insert(self.info.box_info, msg.box)+
+    self.info.draw_times = msg.draw_times
+    -- for key, value in pairs(msg.ids) do
+    --     if self:CheckIsMaxItem(value) then
+    --     end
+    -- end
+
+    -- self:GetBox(msg.box.box_id, call)
+    --self:InitTimer()
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    require "CommonTipManager".OpenCommonAwardView(msg, nil, true)
+    if call then
+        call()
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(self:GetRedPointId())
+end
+
+---领取宝箱
+function DrawActivityModel:GetBox(boxId, call)
+    if self.isGet then
+        return
+    end
+    self.isGet = true
+    require "DrawActivityNet":GetInstance():GetBox(
+        {
+            id = require "ThemeActivityManager":GetInstance():GetActivityID(),
+            box_id = boxId
+        },
+        _G.handlerbind(self, self.GetBoxCall, boxId, call)
+    )
+end
+
+---领取宝箱回调
+function DrawActivityModel:GetBoxCall(msg, boxId, call)
+    if msg.ack ~= 1 then
+        self.isGet = false
+        return
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    require "CommonTipManager".OpenCommonAwardView(msg)
+    -- for i, v in pairs(self.info.box_info) do
+    --     if v.box_id == boxId then
+    --         _G.table.remove(self.info.box_info, i)
+    --         break
+    --     end
+    -- end
+    --self.canTakeBox[boxId] = nil
+    if call then
+        call()
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(self:GetRedPointId())
+    self.isGet = false
+end
+
+---检测是否达到保底
+function DrawActivityModel:CheckIsKeep()
+    return self.info.draw_times == self.info.min_draw_times
+end
+
+---获取所有奖励信息
+---@return activity_theme.i_draw_cfg[]
+function DrawActivityModel:GetCfgs()
+    return self.cfgs or {}
+end
+
+---获取奖励信息
+function DrawActivityModel:GetCfg(id)
+    if not id then
+        return nil
+    end
+    return self.cfgs[id]
+end
+
+---获取当前奖池数据
+---@return activity_theme.i_draw_cfg
+function DrawActivityModel:GetCurListItem(index)
+    return self:GetCfg(self.info.draw_id_list[index])
+end
+
+---进入活动
+function DrawActivityModel:EnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DrawActivityView.Name)
+end
+
+---获取单次消耗
+function DrawActivityModel:GetConsume()
+    return self.info and self.info.draw_cost or 0
+end
+
+---获取许愿次数
+function DrawActivityModel:GetDrawNum()
+    return self.info and self.info.draw_times or 0
+end
+
+---检测是否为大奖
+function DrawActivityModel:CheckIsMaxItem(id)
+    return self.maxPools[id]
+end
+
+---获取保底次数
+function DrawActivityModel:GetKeepNum()
+    return self.info and self.info.min_draw_times or 0
+end
+
+---获取奖励概率
+function DrawActivityModel:GetPerData(index)
+    return self.perList[index] and self.perList[index] or 0
+end
+
+---获取概率表
+function DrawActivityModel:GetPerList()
+    return self.perSordLists or {}
+end
+
+function DrawActivityModel:InitRedTree()
+    self.redTree = {{1, "RedPointDrawActivity", {}}}
+end
+
+---检测红点
+function DrawActivityModel:CheckRedPoint()
+    if not self.info or not require "ThemeActivityManager":GetInstance():CheckThemeActivityIsOpen() then
+        return false
+    end
+    -- if _G.table.count(self.canTakeBox) > 0 then
+    --     return true
+    -- end
+    -- if self.info.box_info and _G.table.count(self.info.box_info) >= 5 then
+    --     return false
+    -- end
+    if self.info.draw_cost > self:GetCoinNum() then
+        return false
+    end
+    return true
+end
+
+---刷新红点
+function DrawActivityModel:RefreshRedPoint()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(self:GetRedPointId())
+end
+
+return DrawActivityModel

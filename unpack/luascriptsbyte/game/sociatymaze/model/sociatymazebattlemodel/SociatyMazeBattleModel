@@ -1,0 +1,907 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.SociatyMaze.Model.SociatyMazeBattleModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/11/26
+-- Description 天罡龙骑战主界面战斗模块
+-----------------------------------------------------------------------
+
+---@class SociatyMazeBattleModel : GameDataModelBase	中文描述
+---@field mapData table<number,guild_maze.s2c_maze_cell>        @地图格子数据
+---@field isPass boolean                                        @是否已通关迷宫
+---@field isGetPassAward boolean                                @是否已领取通关奖励
+local SociatyMazeBattleModel = _G.BaseClass("SociatyMazeBattleModel", _G.Singleton)
+
+---@type table<number,number> 难度语言表id
+local GradeLanguageIds = {
+    [1] = 90032700008, --简单
+    [2] = 90032700009, --普通
+    [3] = 90032700010, --困难
+    [4] = 90032700011, --地狱
+}
+
+---@return SociatyMazeBattleModel SociatyMazeBattleModel
+function SociatyMazeBattleModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SociatyMazeBattleModel:__init()
+    self.pointType = {
+        LeiMonster = 101,   --小怪-雷
+        FengMonster = 102,  --小怪-风
+        ShuiMonster = 103,  ---小怪-水
+        HuoMonster = 104,   --小怪-火
+        TuMonster = 105,    --小怪-土
+        ShenMonster = 106,  --小怪-神
+        SmallBoss = 107,    --小Boss
+        BigBoss = 108,      --大Boss
+        Goddess = 109,      --女神像
+        Gift = 110,         --藏宝阁
+        Box = 111,          --免费宝箱
+        Weaponry = 112,     ---兵器库
+        BrithPoint = 113,   ---出生点
+        EmptyPoint = 114,   ---空白点
+        BigPointEmpty = 115 ---大格子空白占位，方便后面做客户端表现，比如加特效
+    }
+    local mapSize = _G.ConfigManager.discrete_cfg[116110][1]
+    self.mapWidthPoint = mapSize[1]
+    self.mapHeightPoint = mapSize[2]
+    self.boxOpenList = {}
+end
+
+---解析玩家的暗影迷宫数据
+---@param roleInfo guild_maze.i_role_maze_info
+---@param isPass boolean
+function SociatyMazeBattleModel:ParseRoleInfo(roleInfo, isPass)
+    ---体力点
+    self.restore = roleInfo.restore or 0
+    ---今日已探索点
+    self.route = roleInfo.route or {}
+    ---已触发的宝箱格子
+    self.treasure = roleInfo.treasure or {}
+    ---已触发的女神像格子
+    self.goddess = roleInfo.goddess or {}
+    ---玩家的胜点(累计)
+    self.winPoint = roleInfo.win_point
+    self.isPass = isPass
+    self.isGetPassAward = roleInfo.pass_award and roleInfo.pass_award > 0
+    ---宝箱和女神像的历史次数
+    self.hisTimes = roleInfo.his_times
+    self:RefreshRestoreRedPoint()
+    self:RefreshPassAwardRedPoint()
+    self:RefreshRelicEquipRedPoint()
+    -- self:GetBoxList()
+end
+
+---订阅
+---@param type number 0订阅或1取消订阅
+function SociatyMazeBattleModel:Subscribe(type)
+    require("SociatyMazeNet"):GetInstance():Subscribe(
+        { subscribe_type = type },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+        end
+    )
+end
+
+---设置探索路径(客户端只记录战斗格子，其他格子没有需求就暂时不缓存)
+function SociatyMazeBattleModel:SetRoute(uid)
+    if not _G.table.indexof(self.route, uid) then
+        _G.table.insert(self.route, uid)
+    end
+end
+
+---今日是否已探索路径
+function SociatyMazeBattleModel:CheckRoute(uid)
+    return _G.table.indexof(self.route, uid)
+end
+
+---拉取地图数据
+function SociatyMazeBattleModel:GetMapInfo(callback)
+    self.isPass = false
+    require("SociatyMazeNet"):GetInstance():GetMapInfo(
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.mapData = {}
+            local mapPointData = {}
+            local smallBossData = {}
+            local bigBossData = {}
+            if msg.cells then
+                for _, v in pairs(msg.cells) do
+                    mapPointData[self:GetPointIndexByUid(v.uid)] = v
+                    if v.type == self.pointType.BigBoss then
+                        bigBossData = v
+                        self.isPass = v.status == 2 --已通关迷宫
+                    elseif v.type == self.pointType.SmallBoss then
+                        _G.table.insert(smallBossData, v)
+                    end
+                    self.mapData[v.uid] = v
+                end
+            end
+            --刷新通关奖励红点
+            if self.isPass then
+                self:RefreshPassAwardRedPoint()
+                self:RefreshRestoreRedPoint()
+            end
+            if callback then
+                callback(mapPointData, smallBossData, bigBossData)
+            end
+        end
+    )
+end
+
+function SociatyMazeBattleModel:ChangeBoxList(type, uid)
+    if not self.boxOpenList[type] then
+        self.boxOpenList[type] = {}
+    end
+
+    if _G.table.indexof(self.boxOpenList[type], uid) == false then
+        _G.table.insert(self.boxOpenList[type], uid)
+        if type == self.pointType.Box then
+           self:RefreshBoxRedPoint()
+        else
+            self:RefreshInfoRedPoint() 
+        end
+    end
+end
+
+function SociatyMazeBattleModel:RemoveBoxList(type, uid)
+    if not self.boxOpenList[type] then
+        return
+    end
+
+    self:ChangeHisTimes(type)
+    local index = _G.table.indexof(self.boxOpenList[type], uid)
+    if index then
+        _G.table.remove(self.boxOpenList[type], index)
+        if type == self.pointType.Box then
+           self:RefreshBoxRedPoint()
+        else
+            self:RefreshInfoRedPoint()
+        end
+    end
+end
+
+---修改格子状态
+function SociatyMazeBattleModel:ChangeStatus(uid, callback)
+    require("SociatyMazeNet"):GetInstance():ChangeStatus(
+        { uid = uid, status = 1 },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if self.mapData[uid] and (self.mapData[uid].type == self.pointType.Box or self.mapData[uid].type == self.pointType.Goddess) then
+                self:ChangeBoxList(self.mapData[uid].type, uid)
+            end
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---触发事件
+function SociatyMazeBattleModel:TriggerEvent(uid, type, callback)
+    require("SociatyMazeNet"):GetInstance():TriggerEvent(
+        { uid = uid },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if type == self.pointType.Goddess then
+                self:SetRestore(1)
+                _G.table.insert(self.goddess, uid)
+                _G.Events:GetInstance():Broadcast(_G.eSociatyMaze.SociatyMazeGoddess, uid)
+
+                self:RemoveBoxList(type, uid)
+            elseif type == self.pointType.Box then
+                _G.table.insert(self.treasure, uid)
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                _G.Events:GetInstance():Broadcast(_G.eSociatyMaze.SociatyMazeBox, uid)
+
+                self:RemoveBoxList(type, uid)
+            end
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---设置标记
+function SociatyMazeBattleModel:SetMarker(uid, flag, callback)
+    require("SociatyMazeNet"):GetInstance():SetMarker(
+        { uid = uid, flag = flag },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:SetMapData(uid, "flg", flag)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---获取宝箱列表
+function SociatyMazeBattleModel:GetBoxList(callback)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(264) then
+        return
+    end
+    require("SociatyMazeNet"):GetInstance():GetBoxList(
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.boxOpenList = {}
+            if msg.boxes then
+                for i, v in ipairs(msg.boxes) do
+                    if v.open == 0 then
+                        if not self.boxOpenList[v.cell.type] then
+                            self.boxOpenList[v.cell.type] = {}
+                        end
+                        _G.table.insert(self.boxOpenList[v.cell.type], v.cell.uid)
+                    end
+                end
+            end
+            self:RefreshBoxRedPoint()
+            self:RefreshInfoRedPoint()
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---获取地图数据
+---@param uid number
+---@return guild_maze.s2c_maze_cell
+function SociatyMazeBattleModel:GetMapData(uid)
+    if not self.mapData then
+        return nil
+    end
+    return self.mapData[uid]
+end
+
+---修改地图数据
+---@field uid number 格子uid
+function SociatyMazeBattleModel:SetMapData(uid, field, data)
+    if self.mapData[uid] then
+        self.mapData[uid][field] = data
+    end
+end
+
+---检查地图单元格是否已通关
+---@param uid number
+---@return boolean,boolean  (是否通关, 是否存在单元格实例)
+function SociatyMazeBattleModel:CheckMapDataPass(uid)
+    local d = self.mapData and self.mapData[uid]
+    if not d then
+        return false, false
+    end
+    --检查单元格是否已通关
+    if d.status == 2 then
+        return true, true
+    end
+    return false, true
+end
+
+---获取体力
+function SociatyMazeBattleModel:GetRestore()
+    return self.restore or 0
+end
+
+---修改体力
+function SociatyMazeBattleModel:SetRestore(num)
+    self.restore = self.restore + num
+    self:RefreshRestoreRedPoint()
+    if num < 0 then
+       self:RefreshInfoRedPoint() 
+    end
+    _G.Events:GetInstance():Broadcast(_G.eSociatyMaze.SociatyMazeRestoreChange, num)
+end
+
+---是否已领取宝箱奖励
+function SociatyMazeBattleModel:IsGetTreasure(uid)
+    return _G.table.indexof(self.treasure, uid) ~= false
+end
+
+---是否已领取女神像奖励
+function SociatyMazeBattleModel:IsGetGoddess(uid)
+    return _G.table.indexof(self.goddess, uid) ~= false
+end
+
+---最大体力数据
+function SociatyMazeBattleModel:GetMaxRestore()
+    return _G.ConfigManager.discrete_cfg[116103][1][1]
+end
+
+---获取地图大小
+function SociatyMazeBattleModel:GetMapSize()
+    return self.mapWidthPoint * self.mapHeightPoint
+end
+
+---将格子的uid反解成x,y
+function SociatyMazeBattleModel:GetPointXY(uid)
+    return _G.Mathf.Floor(uid / 100), uid % 100
+end
+
+---将格子的uid转换成一维数组的索引
+function SociatyMazeBattleModel:GetPointIndexByUid(uid)
+    local row, col = self:GetPointXY(uid)
+    return (self.mapWidthPoint - row) * self.mapHeightPoint + col
+end
+
+---将格子坐标(x,y)转换成一维数组索引
+function SociatyMazeBattleModel:GetPointIndexByXY(x, y)
+    return (self.mapWidthPoint - x) * self.mapHeightPoint + y
+end
+
+---是否有战斗难度设定
+---@param type number    地图格子类型
+---@return boolean
+function SociatyMazeBattleModel:HasGrade(type)
+    --101	小怪_雷
+    --102	小怪_风
+    --103	小怪_水
+    --104	小怪_火
+    --105	小怪_土
+    --106	小怪_神
+    --107	小BOSS
+    --108	大BOSS
+    return type >= 101 and type <= 108 or type == 112
+end
+
+---是否已通关迷宫
+---@return boolean
+function SociatyMazeBattleModel:IsPass()
+    return self.isPass
+end
+
+---是否已领取通关奖励
+---@return boolean
+function SociatyMazeBattleModel:IsGetPassAward()
+    return self.isGetPassAward
+end
+
+---修改历史记录
+function SociatyMazeBattleModel:ChangeHisTimes(type)
+    if self.hisTimes then
+        for i, v in pairs(self.hisTimes) do
+            if v.k == type then
+                self.hisTimes[i].v = v.v + 1
+                break
+            end
+        end
+    end
+end
+
+---宝箱和女神像是否达到上限
+function SociatyMazeBattleModel:IsGetLimited(type)
+    if self.hisTimes then
+        local max = 0
+        if type == self.pointType.Box then
+            max = _G.ConfigManager.discrete_cfg[116113][1][1]
+        elseif type == self.pointType.Goddess then
+            max = _G.ConfigManager.discrete_cfg[116117][1][1]
+        end
+        for _, v in pairs(self.hisTimes) do
+            if v.k == type then
+                return v.v >= max
+            end
+        end
+    end
+
+    return false
+end
+
+---当前是否满体力
+function SociatyMazeBattleModel:IsMaxRestore()
+    return self:GetRestore() >= self:GetMaxRestore()
+end
+
+function SociatyMazeBattleModel:GetBoxRedNum()
+    local boxList = self.boxOpenList[self.pointType.Box]
+    if not boxList then
+        return 0
+    end
+
+    if self:IsGetLimited(self.pointType.Box) then
+        return 0
+    end
+
+    return _G.table.count(boxList)
+end
+
+function SociatyMazeBattleModel:GetInfoAward()
+    if not self:IsGetLimited(self.pointType.Goddess) and not self:IsMaxRestore() then
+        local goddessList = self.boxOpenList[self.pointType.Goddess]
+        if goddessList and #goddessList > 0 then
+            return 1
+        end
+    end
+
+    local weaponryList = self.boxOpenList[self.pointType.Weaponry]
+    if weaponryList then
+        if weaponryList and #weaponryList > 0 then
+            return 1
+        end
+    end
+    return 0
+end
+
+---获取玩家胜点
+---@return boolean
+function SociatyMazeBattleModel:GetWinPoint()
+    return self.winPoint or 0
+end
+
+---增加玩家胜点
+---@param uid number 挑战的格子id
+---@param grade number  挑战的难度(非怪物挑战传0)
+---@return void
+function SociatyMazeBattleModel:AddWinPointFromCell(uid, grade)
+    local mapData = self:GetMapData(uid)
+    if not mapData then
+        return
+    end
+    --如果迷宫已通关, 不再获取胜点
+    if self.isPass and mapData.type ~= self.pointType.BigBoss then
+        return
+    end
+    local cfg = _G.ConfigManager.guild_gve_cfg[mapData.type]
+    self.winPoint = (self.winPoint or 0) + (self:HasGrade(mapData.type) and cfg.score[grade] or cfg.score[1] or 0)
+
+    if self.isPass then
+        self:RefreshPassAwardRedPoint()
+        self:RefreshRestoreRedPoint()
+    end
+end
+
+---体力红点
+function SociatyMazeBattleModel:CheckRestoreRedPoint()
+    if self.isPass then
+        return 0
+    end
+    if not self.restore then
+        return 0
+    end
+    return self.restore > 0 and 1 or 0
+end
+
+function SociatyMazeBattleModel:RefreshRelic(uid)
+    if self.boxOpenList[self.pointType.Weaponry] then
+        self:RemoveBoxList(self.pointType.Weaponry, uid)
+    end
+end
+
+---刷新体力红点
+function SociatyMazeBattleModel:RefreshRestoreRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyMazeRestore.id)
+end
+
+---刷新通关奖励红点
+function SociatyMazeBattleModel:RefreshPassAwardRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyMazePassAward.id)
+end
+
+---刷新宝箱红点
+function SociatyMazeBattleModel:RefreshBoxRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyMazeBox.id)
+end
+
+---刷新信息红点(女神像和遗物)
+function SociatyMazeBattleModel:RefreshInfoRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyMazeInfo.id)
+end
+
+---刷新可装备遗物红点
+function SociatyMazeBattleModel:RefreshRelicEquipRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SociatyMazeRelicEquip.id)
+end
+
+---检测是否有可领取的兵器库
+function SociatyMazeBattleModel:CheckWeaponryRedPoint(data)
+    if not data or data.type ~= self.pointType.Weaponry or data.status ~= 2 then
+        return 0
+    end
+
+    return require("SociatyMazeRelicManager"):GetInstance():CheckWeaponryRedPoint(data)
+end
+
+---玩家被踢数据或者功能结算
+function SociatyMazeBattleModel:OnBeKicked()
+    self.restore = 0
+    self.mapData = {}
+    self.route = {}
+    self.treasure = {}
+    self.winPoint = 0
+    self:RefreshRestoreRedPoint()
+    self:RefreshPassAwardRedPoint()
+    self:RefreshRelicEquipRedPoint()
+end
+
+---获取卡牌配置
+function SociatyMazeBattleModel:GetCardCfg(data, monsterId)
+    if not monsterId then
+        local config = _G.ConfigManager.guild_gve_cfg[data.type]
+        monsterId = config.monster_group and config.monster_group[data.monster_pool][1]
+    end
+    if monsterId then
+        local groupCfg = _G.ConfigManager.monster_group_cfg[monsterId]
+        local defenserSids = groupCfg and groupCfg.DefaultDefenserSids and groupCfg.DefaultDefenserSids[1]
+        if defenserSids then
+            local monsterCfg
+            if defenserSids[4] > 0 then
+                monsterCfg = _G.ConfigManager.monster_cfg[defenserSids[4]]
+            else
+                monsterCfg = _G.ConfigManager.monster_cfg[defenserSids[1]]
+            end
+            local cardConfig = _G.ConfigManager.card_cfg[monsterCfg.CardID]
+            return cardConfig
+        end
+    end
+    return nil
+end
+
+--region ===========================战斗逻辑===================================
+
+---获取挑战monster group id, 返回0表示地图缓存不存在
+---@param uid number 挑战的格子id
+---@param grade number  挑战的难度(非怪物挑战传0)
+---@return number
+function SociatyMazeBattleModel:GetFightMonsterGroupId(uid, grade)
+    local mapData = self:GetMapData(uid)
+    if not mapData then
+        return 0
+    end
+
+    local cfg = _G.ConfigManager.guild_gve_cfg[mapData.type]
+    return self:HasGrade(mapData.type) and
+        cfg.monster_group[mapData.monster_pool][grade] or
+        cfg.monster_group[1][1]
+end
+
+---获取挑战限定五行, 返回nil表示不作限制
+---@param uid number 挑战的格子id
+---@param grade number  挑战的难度(非怪物挑战传0)
+---@return CardElementType[]
+function SociatyMazeBattleModel:GetFightLockElements(uid, grade)
+    local mapData = self:GetMapData(uid)
+    if not mapData then
+        return nil
+    end
+    if not self:HasGrade(mapData.type) then
+        grade = 1
+    end
+
+    local cfg = _G.ConfigManager.guild_gve_cfg[mapData.type]
+    local removeElements = cfg.Elements[grade]
+    if not removeElements or #removeElements <= 0 then
+        return nil
+    end
+
+    local elements = {
+        _G.CardElementType.Thunder,
+        _G.CardElementType.Wind,
+        _G.CardElementType.Water,
+        _G.CardElementType.Fire,
+        _G.CardElementType.Earth,
+        _G.CardElementType.God,
+    }
+    for _, remove in pairs(removeElements) do
+        local index = _G.table.indexof(elements, remove)
+        if index and index >= 0 then
+            _G.table.remove(elements, index)
+        end
+    end
+    return elements
+end
+
+function SociatyMazeBattleModel:GetMonsterName(uid, grade)
+    uid = uid or self.id
+    local mapData = self:GetMapData(uid)
+    if not mapData then
+        return ""
+    end
+
+    local cfg = _G.ConfigManager.guild_gve_cfg[mapData.type]
+    ---@type string
+    local name
+    if self:HasGrade(mapData.type) then
+        local bossName
+        if mapData.type == self.pointType.SmallBoss or mapData.type == self.pointType.BigBoss then
+            local cardCfg = self:GetCardCfg(mapData)
+            bossName = _G.GetLangPackValue(cfg.name, _G.GetLangPackValue(cardCfg.Name))
+        else
+            bossName = _G.GetLangPackValue(cfg.name)
+        end
+        name = string.format(
+            "%s(%s)",
+            bossName,
+            _G.GetLangPackValue(grade and GradeLanguageIds[grade] or GradeLanguageIds[1])
+        )
+    else
+        name = _G.GetLangPackValue(cfg.name)
+    end
+    return name
+end
+
+---挑战当前关卡
+---@param uid number 挑战的格子id
+---@param grade number  挑战的难度(非怪物挑战传0)
+---@return void
+function SociatyMazeBattleModel:Fight(uid, grade)
+    if _G.MainManager:GetInstance():IsFighting(true) then
+        return
+    end
+    --检查地图单元格状态
+    local pass, exists = self:CheckMapDataPass(uid)
+    if pass or not exists then
+        _G.PopWindowManager:GetInstance():ShowAllTips(1010107)
+        self:ShowWindows()
+        return
+    end
+    self.id = uid
+    --获取monster id
+    local monsterGroupId = self:GetFightMonsterGroupId(uid, grade)
+    local autoFight = false
+    --进入布阵场景
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyMazeEmbattleView.Name,
+        _G.handler(self, self.ExitEmbattle),
+        function(_, _, skipBattle)
+            if skipBattle then
+                self:SkipFight(uid, grade, monsterGroupId)
+            else
+                self:EnterFight(uid, grade, monsterGroupId)
+            end
+        end,
+        uid,
+        grade,
+        autoFight
+    )
+end
+
+---进入战斗
+---@return void
+function SociatyMazeBattleModel:EnterFight(uid, grade, monsterGroupId)
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    --发起战斗请求
+    require("SociatyMazeNet"):GetInstance():Fight(
+        { uid = uid, difficulty = grade, monster_sid = monsterGroupId },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                _G.WorldManager:GetInstance():DespawnRoleParent()
+                self:ExitEmbattle()
+                return
+            end
+            if msg.winner and msg.winner[1] then
+                self:SetRestore(-1)
+                self:AddWinPointFromCell(uid, grade)
+                self:SetRoute(uid)
+            end
+            _G.BattleManager:GetInstance():SetArgData(msg.data)
+            _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.SociatyMaze, msg, uid, grade,
+                monsterGroupId)
+        end
+    )
+end
+
+---跳过战斗
+---@return void
+function SociatyMazeBattleModel:SkipFight(uid, grade, monsterGroupId)
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    --发起战斗请求
+    require("SociatyMazeNet"):GetInstance():Fight(
+        { uid = uid, difficulty = grade, monster_sid = monsterGroupId },
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                _G.WorldManager:GetInstance():DespawnRoleParent()
+                self:ExitEmbattle()
+                return
+            end
+            if msg.winner and msg.winner[1] then
+                self:SetRestore(-1)
+                self:AddWinPointFromCell(uid, grade)
+                self:SetRoute(uid)
+            end
+
+            ---@type BattleControllerSociatyMaze
+            local controller = _G.require(_G.BattleControllerType.SociatyMaze).New()
+            controller.id = uid
+            controller.grade = grade
+            controller.monsterId = monsterGroupId
+            controller.curFightState = 4 --设置战斗结束
+            controller.results = msg
+
+            _G.BattleManager:GetInstance():SetArgData(msg.data)
+            _G.BattleManager:GetInstance():SetBattleController(controller)
+            --显示结算界面
+            controller:FightResultFunc(nil)
+        end
+    )
+end
+
+---离开战斗
+---@return void
+function SociatyMazeBattleModel:ExitEmbattle()
+    self:ShowWindows()
+end
+
+---返回主页面(刷新)
+---@return void
+function SociatyMazeBattleModel:ReturnPanel(isWin, id)
+    if id == require("SettlementModel").FunctionEnum.Next or
+        id == require("SettlementModel").FunctionEnum.DevelopRole or
+        id == require("SettlementModel").FunctionEnum.DevelopEquip then
+        return
+    end
+    if isWin then
+        local mapData = self:GetMapData(self.id)
+        if mapData.type == self.pointType.Weaponry and mapData.status == 2 then
+            local msg = {}
+            msg.cell_uid = self.id
+            require "SociatyMazeNet":GetInstance():GetMementoList(
+                msg,
+                function(data)
+                    if data.ack ~= 1 then
+                        return
+                    end
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyMazeGetRelicView.Name,
+                        data.mementos, self.id)
+                end
+            )
+        end
+    end
+    self:ShowWindows()
+end
+
+---显示主界面
+---@return void
+function SociatyMazeBattleModel:ShowWindows()
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(true)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SociatyMainView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SociatyMazeMainView.Name)
+end
+
+---监听界面打开
+---@param name string 界面名称
+function SociatyMazeBattleModel:OnEmbattleViewOpened(name)
+    if name ~= _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        return
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    --隐藏主界面
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(false)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SociatyMainView.Name)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SociatyMazeMainView.Name)
+    --隐藏事件入口面板
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SociatyMazeBossInfoView.Name)
+end
+
+--endregion
+
+
+--region ===========================网络接口===================================
+
+---获取藏宝库信息
+---@param uid number
+---@param callback fun(msg:guild_maze.s2c_get_treasure_info):void
+function SociatyMazeBattleModel:GetGiftInfo(uid, callback)
+    require("SociatyMazeNet"):GetInstance():GetGiftInfo({ cell_uid = uid }, callback)
+end
+
+---购买藏宝库物品
+---@param uid number
+---@param index number 商品序号
+---@param callback fun(msg:public.s2c_common_ack):void
+function SociatyMazeBattleModel:BuyGift(uid, index, callback)
+    require("SociatyMazeNet"):GetInstance():BuyGift({ cell_uid = uid, index = index }, callback)
+end
+
+---获取通关奖励信息
+---@param callback fun(msg:guild_maze.s2c_get_award_log):void
+function SociatyMazeBattleModel:GetPassAwardInfo(callback)
+    require("SociatyMazeNet"):GetInstance():GetPassAwardInfo(
+        _G.handlerbind(self, self.OnGetPassAwardInfoCallback, callback)
+    )
+end
+
+---领取通关奖励
+---@param index number
+---@param callback fun(msg:public.s2c_common_ack):void
+function SociatyMazeBattleModel:GetPassAward(index, callback)
+    require("SociatyMazeNet"):GetInstance():GetPassAward(
+        { award_index = index },
+        _G.handlerbind(self, self.OnGetPassAwardCallback, callback)
+    )
+end
+
+---通关奖励信息回调
+function SociatyMazeBattleModel:OnGetPassAwardInfoCallback(msg, callback)
+    if msg and msg.ack == 1 and msg.award_logs then
+        local selfUid = _G.PlayerModel:GetInstance():GetPlayerUid()
+        for _, v in pairs(msg.award_logs) do
+            if v.uid == selfUid then
+                self.isGetPassAward = true
+                break
+            end
+        end
+    end
+    if callback then
+        callback(msg)
+    end
+end
+
+---领取通关奖励回调
+function SociatyMazeBattleModel:OnGetPassAwardCallback(msg, callback)
+    if msg and msg.ack == 1 then
+        self.isGetPassAward = true
+        --获取奖励
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        --刷新红点状态
+        self:RefreshPassAwardRedPoint()
+    end
+    if callback then
+        callback(msg)
+    end
+end
+
+--endregion
+
+
+--region ===========================服务器推送===================================
+
+---通关奖励领取状态推送
+---@param msg guild_maze.i_award_log
+function SociatyMazeBattleModel:OnPassAwardChange(msg)
+    _G.Events:GetInstance():Broadcast(_G.eSociatyMaze.SociatyMazePassAwardChange, msg)
+end
+
+---迷宫格子推送
+---@param cells guild_maze.s2c_maze_cell[]
+function SociatyMazeBattleModel:OnSociatyMazeChange(cells)
+    if not cells or not self.mapData then
+        return
+    end
+    for _, v in pairs(cells) do
+        self.mapData[v.uid] = v
+        --已通关迷宫
+        if v.type == self.pointType.BigBoss and v.status == 2 then
+            self.isPass = true
+            self:RefreshPassAwardRedPoint()
+            self:RefreshRestoreRedPoint()
+        end
+        if (v.type == self.pointType.Goddess or v.type == self.pointType.Weaponry or v.type == self.pointType.Box) and v.status == 0 then
+            self:ChangeBoxList(v.type, v.uid)
+        end
+    end
+    _G.Events:GetInstance():Broadcast(_G.eSociatyMaze.SociatyMazeChange, cells)
+end
+
+---MVP结算推送
+---@param msg guild_maze.i_guild_maze_member
+function SociatyMazeBattleModel:OnSociatyMazeMvp(msg)
+    --已通关迷宫
+    self.isPass = true
+    self:RefreshPassAwardRedPoint()
+    self:RefreshRestoreRedPoint()
+    require("SociatyMazeModel"):GetInstance():SetMvpData(msg)
+end
+
+--endregion
+
+---销毁对象时,析构函数
+function SociatyMazeBattleModel:Dispose()
+end
+
+return SociatyMazeBattleModel

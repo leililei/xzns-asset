@@ -1,0 +1,490 @@
+-----------------------------------------------------------------------
+-- D:\Project\Alpha\Client\Assets\Resources\LuaScripts\Game\Dialogue\Dialogue3DShow.lua
+-- Created by lsy
+-- DateTime: 2020/03/28
+-- Description 显示 对话角色 3D 模型的 2D RenderTexture 并提供播放 对话角色 动画的接口
+-- 生命周期Awake,Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+--local RenderTextureManager = require("RenderTextureManager")
+
+---@class Dialogue3DShow : Component	显示 对话角色 3D 模型的 2D RenderTexture 并提供播放 对话角色 动画的接口
+local Dialogue3DShow = _G.BaseClass("Dialogue3DShow", _G.Component)
+
+local CS = _G.CS
+local typeof = _G.typeof
+
+---创建对象时,入口构造函数
+---@param index number 角色站位编号
+function Dialogue3DShow:OnCreate(go_table, index)
+    self:SetNil()
+    self.Roleindex = index
+    self.Common_Title = nil
+    self.RoleTargetCamera = nil
+    -- 当前表情
+    self.PhizTran = nil
+
+    local DialogueView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DialogueView.Name)
+    self.phziCanvasRect = nil
+    if not _G.IsNil(DialogueView) then
+        local NormalLayerRect = DialogueView.View.gameObject:GetComponentE(typeof(CS.UnityEngine.RectTransform))
+        if not _G.IsNil(NormalLayerRect) then
+            self.phziCanvasRect = NormalLayerRect
+        end
+    end
+
+    if self.Common_Title == nil then
+        ---@type DialogueRootTranDic
+
+        local StoryManager = _G.StoryManager:GetInstance()
+        if StoryManager.isDialogueRootTranDicInit then
+            local DialogueRootTranDic = StoryManager.DialogueRootTranDic
+            ---@type DialoguePosDic
+            local PosTranDic = DialogueRootTranDic[self.Roleindex]
+
+            self.Common_Title = PosTranDic.Common_Title
+            ---@type RoleTargetCamera
+            self.RoleTargetCamera = PosTranDic.RoleTargetCamera
+        end
+    end
+end
+
+---销毁对象时,析构函数
+function Dialogue3DShow:OnDestroy()
+    self:delRole(_G.DialogueEnum.RoleShowType.direct)
+    --self:SetNil()
+end
+---在dialogueView的ondisable之前先执行 确保计时器置空
+function Dialogue3DShow:OnDisable()
+    self:SetNil()
+end
+---开始加载角色
+---@param path string 角色模型名称
+---@param scriptCfg dialogue_script_cfg_Item 角色模型名称
+---@param callback fun() 初始化完成回调
+function Dialogue3DShow:Init(path, scriptCfg, callback)
+    local RoleShowType = scriptCfg.ShowType
+    if not (RoleShowType >= _G.DialogueEnum.RoleShowType.direct) then
+        RoleShowType = _G.DialogueEnum.RoleShowType.direct
+    end
+    self:delRole(
+        RoleShowType,
+        function()
+            ---@type dialogue_script_cfg
+            self.scriptCfg = scriptCfg
+
+            self:LoadRole(
+                path,
+                RoleShowType,
+                function()
+                    callback()
+                end
+            )
+        end
+    )
+end
+
+---销毁角色
+---@param RoleShowType number 消失方式 1闪现 2滑动
+---@param callback fun() 初始化完成回调
+function Dialogue3DShow:delRole(RoleShowType, callback)
+    local function callFun()
+        if callback ~= nil then
+            callback()
+        end
+    end
+
+    if _G.IsNil(self.RoleTransf) then
+        callFun()
+        return
+    end
+
+    local function runFun()
+        self.totween_DelROleMove = nil
+        if _G.IsNil(self.RoleTransf) == false then
+            local TalkRoleTopRender = self.RoleTransf:GetComponentE(_G.typeof(_G.CS.TalkRoleTopRender))
+            if TalkRoleTopRender ~= nil then
+                _G.DestroyObject(TalkRoleTopRender)
+            end
+        end
+        if self.RoledataResRef ~= nil then
+            self.RoledataResRef:Release()
+            self.RoledataResRef = nil
+        end
+        _G.PoolsManager:GetInstance():Despawn(self.RoleTransf, _G.ePoolType.Temporary)
+        self:DelPhiz()
+        self.RoleTransf = nil
+        self.RoleGameObject = nil
+        callFun()
+    end
+
+    --- 直接
+    if RoleShowType == _G.DialogueEnum.RoleShowType.direct then
+        runFun()
+    elseif RoleShowType == _G.DialogueEnum.RoleShowType.slide then
+        -- 滑动
+
+        local tagerPos_x = 0
+        local movetime = _G.DialogueEnum.DoMoveTime
+        --- 两边角色 滑动
+        if self.Roleindex == _G.DialogueEnum.PosIndex.left then
+            tagerPos_x = _G.DialogueEnum.PosIndexV3_init_x.left
+        elseif self.Roleindex == _G.DialogueEnum.PosIndex.right then
+            tagerPos_x = _G.DialogueEnum.PosIndexV3_init_x.right
+        else
+            tagerPos_x = _G.DialogueEnum.PosIndexV3_init_x.mid
+            -- 中间直接
+            movetime = 0.01
+        end
+
+        self.totween_DelROleMove =
+            DOTween.To(
+            function()
+                return self.RoleTargetCamera.InScreenRate
+            end,
+            function(x)
+                self.RoleTargetCamera.InScreenRate = x
+            end,
+            tagerPos_x,
+            movetime
+        )
+        self.totween_DelROleMove.onComplete = _G.handler(self, runFun)
+    end
+end
+
+function Dialogue3DShow:LoadRole(path, RoleShowType, callback)
+    if _G.IsNil(self.RoleTargetCamera) or string.IsNullOrEmpty(path) then
+        if callback ~= nil then
+            callback()
+        end
+        return
+    end
+    local function callFun()
+        ---延迟几帧 确保  self.RoleTargetCamera:Init 初始化后 移动到了配置位置
+        self.LoadRoleTimer =
+            _G.TimerManager:GetInstance():GetTimer(2, self.LoadRoleTimerFunc, self, true, true, false, callback)
+        self.LoadRoleTimer:Start()
+    end
+
+    local function runFun(trans)
+        if _G.IsNil(trans) or _G.IsNil(self.RoleTargetCamera) then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("模型加载路径有误 path:" .. path)
+            end
+            return
+        end
+        local posx = 0
+
+        -- - 直接
+        if RoleShowType == _G.DialogueEnum.RoleShowType.direct then
+            if self.scriptCfg.DialogueShowType == _G.DialogueEnum.DialogueShowType.fight then
+                posx = _G.DialogueEnum.RotIndexV3_x.fightleft
+            elseif self.Roleindex == _G.DialogueEnum.PosIndex.left then
+                posx = _G.DialogueEnum.RotIndexV3_x.left
+            elseif self.Roleindex == _G.DialogueEnum.PosIndex.right then
+                posx = _G.DialogueEnum.RotIndexV3_x.right
+            else
+                posx = _G.DialogueEnum.RotIndexV3_x.mid
+            end
+            self.RoleTargetCamera:Init(self.RoleGameObject, posx, self.RoledataCfg)
+            callFun()
+        else
+            -- 滑动
+
+            local posx = 0
+            --- 两边角色 滑动
+            if self.Roleindex == _G.DialogueEnum.PosIndex.left then
+                self.RoleTargetCamera:Init(
+                    self.RoleGameObject,
+                    _G.DialogueEnum.PosIndexV3_init_x.left,
+                    self.RoledataCfg
+                )
+                posx = _G.DialogueEnum.RotIndexV3_x.left
+            elseif self.Roleindex == _G.DialogueEnum.PosIndex.right then
+                self.RoleTargetCamera:Init(
+                    self.RoleGameObject,
+                    _G.DialogueEnum.PosIndexV3_init_x.right,
+                    self.RoledataCfg
+                )
+                posx = _G.DialogueEnum.RotIndexV3_x.right
+            else
+                self.RoleTargetCamera:Init(self.RoleGameObject, _G.DialogueEnum.RotIndexV3_x.mid, self.RoledataCfg)
+                ---中间角色直接
+                callFun()
+                return
+            end
+
+            ---战斗单人对话  位置要不一样
+            if self.scriptCfg.DialogueShowType == _G.DialogueEnum.DialogueShowType.fight then
+                posx = _G.DialogueEnum.RotIndexV3_x.fightleft
+            end
+            self.totween_DelROleMove =
+                DOTween.To(
+                function()
+                    return self.RoleTargetCamera.InScreenRate
+                end,
+                function(x)
+                    self.RoleTargetCamera.InScreenRate = x
+                end,
+                posx,
+                _G.DialogueEnum.DoMoveTime
+            )
+            self.totween_DelROleMove:SetEase(_G.CS.DG.Tweening.Ease.OutExpo)
+            self.totween_DelROleMove.onComplete = _G.handler(self, callFun)
+        end
+    end
+
+    self.totween_DelROleMove = nil
+
+    local cfgPath = self:GetDataCfgPath(path)
+    _G.ResourcesManager:GetInstance():LoadScriptableObject(
+        cfgPath,
+        _G.handlerbind(self, self.LoadScriptableObjectCall, path, runFun),
+        self
+    )
+end
+
+function Dialogue3DShow:LoadRoleTimerFunc(callback)
+    if not _G.IsNil(self.RoleTransf) then
+        self.RolePoint = self.RoleTransf:GetComponentE(_G.typeof(_G.CS.RolePoint))
+
+        if self.Common_Title then
+            if self.RolePoint and not _G.IsNil(self.RolePoint.Point_Head) then
+                local x, y, z = self.RolePoint.Point_Head:GetPosition()
+                self.Common_Title:SetPosition(x, y, z)
+            end
+        end
+    end
+
+    if callback ~= nil then
+        callback()
+    end
+end
+
+function Dialogue3DShow:LoadScriptableObjectCall(dataCfg, resRef, path, runFun)
+    if self:IsDes() then
+        if resRef ~= nil then
+            resRef:Release()
+        end
+        return
+    end
+    ---@type dialogue_script_cfg
+    self.RoledataCfg = dataCfg
+    self.RoledataResRef = resRef
+
+    require("CardInfoManager").GetRole(
+        path,
+        _G.ePoolType.Temporary,
+        _G.StoryManager:GetInstance().InitPosRoot,
+        _G.RoleEffTypeEnum.Dialogue,
+        _G.handlerbind(self, self.SpawnRoleCall, runFun)
+    )
+end
+
+function Dialogue3DShow:SpawnRoleCall(tran, _, runFun)
+    if _G.IsNil(self.RoleTargetCamera) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 界面已销毁 ")
+        end
+        if self.RoledataResRef ~= nil then
+            self.RoledataResRef:Release()
+            self.RoledataResRef = nil
+        end
+        _G.DestroyObject(tran)
+        return
+    end
+    self:OnRoleLoaded(tran)
+    runFun(tran)
+end
+---角色模型加载完成
+---@param RoleTransff UnityEngine.Transform
+function Dialogue3DShow:OnRoleLoaded(RoleTransff)
+    if _G.IsNil(RoleTransff) then
+        return
+    end
+    -- if _G.SystemSettingManager:GetInstance():GetImageQuality() == _G.ImageQuality.High then
+    --     self.highLight = RoleTransff:RequireComponentE(typeof(_G.CS.HighlightableObject))
+    --     if self.highLight then
+    --         self.highLight:OccluderOn()
+    --     end
+    -- end
+    --local TalkRoleTopRender = RoleTransff:GetComponentE(_G.typeof(_G.CS.TalkRoleTopRender))
+    RoleTransff:AddComponentE(_G.typeof(_G.CS.TalkRoleTopRender))
+    self.RoleTransf = RoleTransff
+    self.RoleGameObject = RoleTransff.gameObject
+    self.AnimComponent = _G.RoleAnimatorController.GetOrCreateAnimatorController(self.RoleTransf)
+
+    -- ---更改shader参数,打开alpha通道
+    -- local list = self.RoleTransf:GetComponentsInChildren(typeof(_G.CS.UnityEngine.Renderer))
+    -- if not list then
+    --("RoleTransf Renderers nil. ")
+    --     return
+    -- end
+    -- -- print_table(list)
+    -- for i = 0, list.Length - 1, 1 do
+    --     if list[i].material:HasProperty("RTMODE") and not list[i].material:IsKeywordEnabled("RTMODE") then
+    --         list[i].material:EnableKeyword("RTMODE")
+    --     end
+    --     if list[i].material:HasProperty("_ColorMask") then
+    --         list[i].material:SetInt("_ColorMask", 15)
+    --     end
+    -- end
+
+    -- if not Image then
+    --     Image = self.transform:GetComponentE(typeof(CS.UnityEngine.UI.RawImage))
+    -- end
+    -- _G.RenderTextureManager:GetInstance():RenderToTexture(self.RoleTransf, Image, "")
+end
+
+--- 播放角色默认动画
+function Dialogue3DShow:MovePos(PosIndex, callback)
+    local tagerPos_x = 0
+    local movetime = _G.DialogueEnum.DoMoveTime
+    --- 两边角色 滑动
+    if PosIndex == _G.DialogueEnum.PosIndex.left then
+        tagerPos_x = _G.DialogueEnum.RotIndexV3_x.left
+    elseif PosIndex == _G.DialogueEnum.PosIndex.right then
+        tagerPos_x = _G.DialogueEnum.RotIndexV3_x.right
+    else
+        tagerPos_x = _G.DialogueEnum.RotIndexV3_x.mid
+        -- 中间直接
+        movetime = 0.01
+    end
+
+    self.totween_DelROleMove =
+        DOTween.To(
+        function()
+            return self.RoleTargetCamera.InScreenRate
+        end,
+        function(x)
+            self.RoleTargetCamera.InScreenRate = x
+        end,
+        tagerPos_x,
+        movetime
+    )
+    self.totween_DelROleMove.onComplete = callback
+end
+
+--- 播放角色动画
+---@param state DialogueEnum.PhizType 角色表情动作动画
+function Dialogue3DShow:PlayRolePhiz(PhizType)
+    if _G.IsNil(self.Common_Title) then
+        return
+    end
+    local PhizCfg = _G.DialogueEnum.PhizPrePath[PhizType]
+    if PhizCfg == nil then
+        return
+    end
+
+    local pos = _G.UIUtils.Get3DTo2DPos(self.phziCanvasRect, self.Common_Title.position)
+    pos = pos + _G.Vector3(PhizCfg.Pos[1] or 0, PhizCfg.Pos[2] or 0, PhizCfg.Pos[3] or 0)
+    _G.UIUtils.LoadEffectByCfg(
+        PhizCfg,
+        self.Common_Title,
+        -- self.gameObject,
+        function(tran)
+            self:DelPhiz()
+            self.PhizTran = tran
+            tran:SetParentE(self.gameObject:GetParent())
+            tran:SetLocalPosition(pos.x, pos.y, pos.z)
+        end,
+        nil,
+        3
+    )
+end
+
+function Dialogue3DShow:DelPhiz()
+    if not _G.IsNil(self.PhizTran) then
+        _G.GameObject.Destroy(self.PhizTran)
+        self.PhizTran = nil
+    end
+end
+
+--- 播放角色默认动画
+function Dialogue3DShow:PlayAnim(animName)
+    if string.IsNullOrEmpty(animName) then
+        return
+    end
+    if _G.IsNil(self.AnimComponent) == false then
+        local ishave = self.AnimComponent:isHaveAni(animName)
+        if ishave == true then
+            self.AnimComponent:Play(animName)
+            self.AnimComponent:Queue(animName, "idle_1")
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError(string.format("没有该动作:%s  该模型:%s ", animName, self.scriptCfg.Model))
+            end
+        end
+    end
+end
+
+--- 播放角色默认动画
+function Dialogue3DShow:PlayShake()
+    if not _G.IsNil(self.RoleTargetCamera) then
+        self.RoleTargetCamera:ActionShake(0.1)
+    end
+end
+
+---通过角色预制体路径 获取剧情配置路径
+---@type string path 角色预制体路径
+---@return string dataCfgPath
+function Dialogue3DShow:GetDataCfgPath(path)
+    --- 角色预制体路径 Roles/sr/caoyanbing/caoyanbing_01/prf_caoyanbing_01
+    --- 角色剧情配置路径 Story/Roles/sr/caoyanbing/caoyanbing_01/caoyanbing_01_story_cfg
+    local str = path
+    if string.IsNullOrEmpty(path) then
+        return ""
+    end
+    local strArr = string.split(str, "/")
+    strArr[#strArr] = string.sub(strArr[#strArr], 5)
+
+    local dataCfgPath = "Story"
+    for i = 1, #strArr do
+        dataCfgPath = dataCfgPath .. "/" .. strArr[i]
+    end
+    dataCfgPath = dataCfgPath .. "_story_cfg"
+
+    return dataCfgPath
+end
+
+---
+
+---当前脚本是否还存在  true不存在
+function Dialogue3DShow:IsDes()
+    return self.Roleindex == nil
+end
+function Dialogue3DShow:SetNil()
+    self.phziCanvasRect = nil
+    self.Common_Title = nil
+    self.RoleTargetCamera = nil
+    self.scriptCfg = nil
+    self.RolePoint = nil
+    self.Roleindex = nil
+    self.AnimComponent = nil
+    self.RoledataCfg = nil
+    if self.LoadRoleTimer ~= nil then
+        self.LoadRoleTimer:Stop()
+        self.LoadRoleTimer = nil
+    end
+    if self.totween_DelROleMove ~= nil then
+        self.totween_DelROleMove:Kill()
+        self.totween_DelROleMove = nil
+    end
+
+    if self.RoleTransf ~= nil then
+        _G.PoolsManager:GetInstance():Despawn(self.RoleTransf, _G.ePoolType.Temporary)
+        self.RoleTransf = nil
+        self.RoleGameObject = nil
+    end
+
+    if self.RoledataResRef ~= nil then
+        self.RoledataResRef:Release()
+        self.RoledataResRef = nil
+    end
+
+    if not _G.IsNil(self.PhizTran) then
+        _G.GameObject.Destroy(self.PhizTran)
+        self.PhizTran = nil
+    end
+end
+
+return Dialogue3DShow

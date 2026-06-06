@@ -1,0 +1,770 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha_ft.Client.Assets.Resources.LuaScripts.Game.SeasonTower.Model.SeasonTowerModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2023/04/13
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "SeasonBaseModel"
+---@class SeasonTowerModel : SeasonBaseModel
+---@field maxStage number 最高阶段
+---@field stage number 当前阶段
+---@field buffList season_tower.i_buff 当前阶段选择buff
+---@field curTowerId number 当前层数
+---@field monsterBuffList season_tower.i_buff 当前怪物buff
+---@field isBuy boolean 礼包是否购买
+---@field monsterList season_tower.i_monster[] 怪物信息
+---@field stageCfg season_tower_pools_cfg 阶段配置
+---@field storeCfg store_season_battle_cfg 礼包配置
+local SeasonTowerModel = _G.BaseClass("SeasonTowerModel", base)
+local FirstKey = "SeasonTowerModelKey"
+local NextStageKey = "SeasonTowerNextStage"
+---@return SeasonTowerModel SeasonTowerModel
+function SeasonTowerModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SeasonTowerModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.SeasonTower
+    self.maxStage = 1
+    self.stageEndTb = {}
+    for _, v in pairs(_G.ConfigManager.season_tower_cfg) do
+        if v.stage > self.maxStage then
+            self.maxStage = v.stage
+        end
+        if not self.stageEndTb[v.stage] then
+            self.stageEndTb[v.stage] = v.layer
+        elseif self.stageEndTb[v.stage] and self.stageEndTb[v.stage] < v.layer then
+            self.stageEndTb[v.stage] = v.layer
+        end
+    end
+    self.redPointId = _G.ConfigManager.redpoint_cfg.FirstTower.id
+    self.reviveParams = _G.ConfigManager.discrete_cfg[107601][1]
+    self.cycle = _G.ConfigManager.discrete_cfg[122004][1][1]
+end
+
+---销毁对象时,析构函数
+function SeasonTowerModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+
+--region 子类重写
+---从服务器拉取数据
+function SeasonTowerModel:GetDataFormServer()
+    require "SeasonTowerNet":GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---初始化信息
+---@param msg season_tower.s2c_season_tower_info
+function SeasonTowerModel:ParseData(msg)
+    if msg.ack ~= 1 then
+        base.ParseData(self)
+        return
+    end
+    self.stage = msg.info.stage
+    self.buffList = msg.info.buff_list
+    self.isBuy = msg.info.is_buy == 1
+    self.refreshTimes = msg.info.refresh_times
+    self.stageCfg = _G.ConfigManager.season_tower_pools_cfg[self:GetStage()]
+    self.isOverStage = msg.info.stage_pass
+    self.passTime = msg.info.pass_time
+    self:InitTowerInfo(msg.info.tower_info)
+    self:InitCardList(msg.info.card_info)
+    self:InitAwardList(msg.info.award)
+    self:UpdateTimer()
+    base.ParseData(self)
+end
+
+function SeasonTowerModel:UpdateTimer()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if not self.isOverStage then
+        return
+    end
+    local nextStageCfg = _G.ConfigManager.season_tower_pools_cfg[self.stage + 1]
+    if nextStageCfg then
+        local endTime = self:GetStartTime() + (nextStageCfg.time - 1) * 86400
+        if endTime > _G.TimeUtil.GetServerUnixTime() then
+            self.timer =
+                _G.TimerManager:GetInstance():GetTimer(
+                endTime - _G.TimeUtil.GetServerUnixTime(),
+                self.TimerOver,
+                self,
+                true,
+                false,
+                true
+            )
+            self.timer:Start()
+        else
+            require "RedPointManager":GetInstance():RefreshNode(self.redPointId, 2)
+        end
+    end
+end
+
+function SeasonTowerModel:TimerOver()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    require "RedPointManager":GetInstance():RefreshNode(self.redPointId, 2)
+end
+
+function SeasonTowerModel:InitFunction()
+    local seasonCfg = require "SeasonModel":GetInstance():GetCfg()
+    local id = _G.tonumber(seasonCfg.tower_pools[2][1])
+    self.storeCfg = _G.ConfigManager.store_season_battle_cfg[id]
+    self.towerMapFloor = {}
+    local startFloor = 0
+    for i = 1, #seasonCfg.tower_pools[1] do
+        ---@type season_tower_pools_cfg
+        local cfg = _G.ConfigManager.season_tower_pools_cfg[seasonCfg.tower_pools[1][i]]
+        for i = 1, #cfg.season_tower do
+            startFloor = startFloor + 1
+            self.towerMapFloor[cfg.season_tower[i]] = startFloor
+        end
+    end
+end
+
+---初始化卡牌
+---@param cardInfo fight.i_fight_card[]
+function SeasonTowerModel:InitCardList(cardInfo)
+    self.cardList = {}
+    if cardInfo then
+        for _, v in pairs(cardInfo) do
+            self.cardList[v.uid] = {hp = v.hp or 0, mp = v.mp or 0}
+        end
+    end
+end
+
+---初始化当前层的信息
+---@param tower season_tower.i_tower 当前层的信息
+function SeasonTowerModel:InitTowerInfo(tower)
+    self.curTowerId = tower.t_id
+    self.monsterBuffList = tower.buff
+    if not self.monsterBuffList.boss_buff then
+        self.monsterBuffList.boss_buff = {}
+    end
+    if not self.monsterBuffList.buff then
+        self.monsterBuffList.buff = {}
+    end
+    self.monsterPower = tower.tower_power
+    self.monsterList = {}
+    self.monsterPet = tower.pet or {}
+    if tower.monster_list then
+        for _, v in pairs(tower.monster_list) do
+            self.monsterList[v.index] = v
+            local id = v.m_id * 10 + v.index
+            for _, v2 in pairs(tower.card_info) do
+                if v2.uid == id then
+                    v.info = v2
+                    break
+                end
+            end
+        end
+    end
+    self.tempid = self.curTowerId > 0 and self.curTowerId or self:GetStageCfg().season_tower[1]
+    local cfg = _G.ConfigManager.season_tower_cfg[self.tempid]
+    self.passTowerCount = 0
+    if cfg then
+        self.passTowerCount = cfg.layer
+        if not self.isOverStage then
+            self.passTowerCount = self.passTowerCount - 1
+        end
+    end
+end
+
+---初始化奖励
+---@param award number[]
+function SeasonTowerModel:InitAwardList(award)
+    self.awardList = {}
+    if award then
+        for _, v in pairs(award) do
+            self.awardList[v] = true
+        end
+    end
+end
+
+---检测是否完成所有阶段
+function SeasonTowerModel:CheckIsAllStage()
+    return self.stage == self.maxStage and self.isOverStage
+end
+
+---检查是否可以开启下一阶段（时间另行判断）
+function SeasonTowerModel:CheckCanOpenNextStage()
+    return self.stage ~= self.maxStage and self.isOverStage
+end
+
+---获取怪物buff
+---@return season_tower.i_buff
+function SeasonTowerModel:GetMonsterBuff()
+    return self.monsterBuffList
+end
+
+---获取怪物
+function SeasonTowerModel:GetMonsterList()
+    return self.monsterList
+end
+
+---获取怪物战力
+function SeasonTowerModel:GetMonsterPower()
+    return self.monsterPower
+end
+
+---选择buff
+function SeasonTowerModel:ChooseBuff(call)
+    require "SeasonTowerNet":GetInstance():ChooseBuff(_G.handlerbind(self, self.ChooseBuffCall, call))
+    -- _G.PopWindowManager:GetInstance():ShowAllTips(
+    --     820303,
+    --     nil,
+    --     function()
+    --         local msg = {buff_info = {}}
+    --         msg.buff_info.boss_buff = bossBuff
+    --         msg.buff_info.buff = normalBuff
+    --         require "SeasonTowerNet":GetInstance():ChooseBuff(_G.handlerbind(self, self.ChooseBuffCall, call, msg))
+    --     end
+    -- )
+end
+
+---选择buff成功
+---@param msg season_tower.s2c_season_tower_choose_buff
+function SeasonTowerModel:ChooseBuffCall(msg, call, chooseData)
+    if msg.ack ~= 1 then
+        return
+    end
+    self:InitTowerInfo(msg.tower_info)
+    self.buffList = {buff = self.stageCfg.pools1, boss_buff = self.stageCfg.pools2}
+    if call then
+        call()
+    end
+    _G.Events:GetInstance():Broadcast(_G.eSeasonTower.SeasonTowerRefreshView)
+end
+
+---获取奖励
+function SeasonTowerModel:GetAward(call)
+    local msg = {}
+    msg.a_id = self:GetCanTakeAward()
+    if _G.table.isEmptyOrNil(msg.a_id) then
+        return
+    end
+    require "SeasonTowerNet":GetInstance():GetAward(msg, _G.handlerbind(self, self.GetAwardCall, msg.a_id, call))
+end
+
+---购买礼包
+function SeasonTowerModel:Buy(call)
+    if self.buyCall then
+        return
+    end
+    self.buyCall = call
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    local cfg = self:GetStoreCfg()
+    require("MallManager"):GetInstance():BuyActiveGift(cfg.price_id, nil, cfg.id)
+end
+
+function SeasonTowerModel:OnMallCashListener(data)
+    if self:GetStoreCfg().id == data.sid then
+        self.isBuy = true
+        if self.buyCall then
+            self.buyCall()
+            self.buyCall = nil
+        end
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        require "CommonTipManager".OpenCommonAwardView(data)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstTower.id, 1)
+        _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    end
+end
+
+---获取奖励成功
+function SeasonTowerModel:GetAwardCall(msg, ids, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    for _, v in pairs(ids) do
+        self.awardList[v] = true
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    require "CommonTipManager".OpenCommonAwardView(msg)
+    if call then
+        call()
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstTower.id, 1)
+end
+
+---获取可领取的奖励
+function SeasonTowerModel:GetCanTakeAward()
+    if not self.isBuy then
+        return {}
+    end
+    local tb = {}
+    ---@type store_season_battlecon_cfg
+    local cfg
+    for _, v in pairs(self.storeCfg.content) do
+        cfg = _G.ConfigManager.store_season_battlecon_cfg[v]
+        if cfg and self.passTowerCount >= cfg.conditions[2] and not self:CheckAwrdIsGet(v) then
+            _G.table.insert(tb, v)
+        end
+    end
+    return tb
+end
+
+---战斗
+function SeasonTowerModel:Fight()
+    if not require "SeasonManager".CheckSeasonIsOpen() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(620105)
+        return
+    end
+    local data = {}
+    data.power = 0
+    for i = 1, #self.monsterList do
+        local tb = {
+            sid = 0,
+            uid = 0,
+            level = 0,
+            star = 0
+        }
+        if self.monsterList[i].info and self.monsterList[i].info.hp and self.monsterList[i].info.hp > 0 then
+            tb = {
+                sid = self.monsterList[i].m_id,
+                uid = 0,
+                level = self.monsterList[i].lv,
+                star = self.monsterList[i].star
+            }
+        end
+        _G.table.insert(data, tb)
+    end
+    data.power = self:GetMonsterPower()
+    data.pet = self.monsterPet
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require "EmbattleController":GetInstance():OpenEmbattle(
+        _G.EmbattleType.SeasonTower,
+        _G.EmbattleSaveType.server,
+        true,
+        _G.EmbattleControllerItemType.seasonTower,
+        _G.handler(self, self.OnExitFight),
+        _G.handler(self, self.OnFight),
+        self.stageCfg.monster_group,
+        data
+    )
+end
+
+function SeasonTowerModel:ReEnterFight()
+    local data = {}
+    data.power = 0
+    for i = 1, #self.monsterList do
+        local tb = {
+            sid = 0,
+            uid = 0,
+            level = 0,
+            star = 0
+        }
+        if self.monsterList[i].info and self.monsterList[i].info.hp and self.monsterList[i].info.hp > 0 then
+            tb = {
+                sid = self.monsterList[i].m_id,
+                uid = 0,
+                level = self.monsterList[i].lv,
+                star = self.monsterList[i].star
+            }
+        end
+        _G.table.insert(data, tb)
+    end
+    data.power = self:GetMonsterPower()
+    data.pet = self.monsterPet
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require "EmbattleController":GetInstance():OpenEmbattle(
+            _G.EmbattleType.SeasonTower,
+            _G.EmbattleSaveType.server,
+            true,
+            _G.EmbattleControllerItemType.seasonTower,
+            _G.handler(self, self.OnExitFight),
+            _G.handler(self, self.OnFight),
+            self.stageCfg.monster_group,
+            data
+    )
+end
+
+---监听界面打开
+---@param name string 界面名称
+function SeasonTowerModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+        if _G.IsNil(view.curSceneTrans) then
+            view:SetInitSceneCall(
+                function()
+                    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SeasonView.Name)
+                    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SeasonTowerView.Name)
+                end
+            )
+        else
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SeasonView.Name)
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SeasonTowerView.Name)
+        end
+    end
+end
+
+---退出布阵
+function SeasonTowerModel:OnExitFight()
+    if not require "SeasonModel":GetInstance():CheckSeasonIsOpen() then
+        self:OnQuit()
+    else
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SeasonView.Name)
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SeasonTowerView.Name)
+    end
+end
+
+---进入战斗
+function SeasonTowerModel:OnFight()
+    local otherInfo = {}
+    local cfg = _G.ConfigManager.season_tower_cfg[self.tempid]
+    otherInfo.name = _G.GetLangPackValue(90023200002, cfg.layer)
+    otherInfo.sid = self.monsterList[1].m_id
+    otherInfo.selfName = _G.PlayerModel:GetInstance():GetName()
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.seasonTower, otherInfo)
+end
+
+---战斗胜利
+function SeasonTowerModel:FightWin(result)
+    if result then
+        self.passTowerCount = self.passTowerCount + 1
+        _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.SeasonTower}, 1)
+    end
+    if require "SeasonModel":GetInstance():CheckSeasonIsOpen() then
+        require "SeasonTowerNet":GetInstance():GetInfo(
+            function(msg)
+                self.isOverStage = msg.info.stage_pass
+                self.passTime = msg.info.pass_time
+                self:InitTowerInfo(msg.info.tower_info)
+                self:InitCardList(msg.info.card_info)
+                self:UpdateTimer()
+                require "RedPointManager":GetInstance():RefreshNode(self.redPointId, 1)
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTower.SeasonTowerRefreshView, result)
+            end
+        )
+    end
+end
+
+---检测是否当前阶段最后一关
+function SeasonTowerModel:ChekckStageEnd()
+    return self.curTowerId == self.stageEndTb[self.stage]
+end
+
+---获取心魔开启时间
+function SeasonTowerModel:GetStartTime()
+    local timeData = require "SeasonModel":GetInstance():GetTime()
+    if not timeData or not timeData.startTime then
+       return 0 
+    end
+    return timeData.startTime + self:GetCurPeriods() * self.cycle * 86400
+end
+
+---获取剩余时间
+function SeasonTowerModel:GetRTS()
+    local time = require "SeasonModel":GetInstance():GetTime()
+    return time.endTime - time.startTime
+end
+
+---获取结束时间
+function SeasonTowerModel:GetEndTime()
+    return require "SeasonModel":GetInstance():GetTime().endTime
+end
+
+---进入下个阶段
+function SeasonTowerModel:OnNextStage(call)
+    require "SeasonTowerNet":GetInstance():NextStage(_G.handlerbind(self, self.OnNextStageCall, call))
+end
+
+---进入下个阶段
+function SeasonTowerModel:OnNextStageCall(msg, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.stage = self.stage + 1
+    ---@type season_tower_pools_cfg
+    self.stageCfg = _G.ConfigManager.season_tower_pools_cfg[self.stage]
+    self.isOverStage = false
+    self.refreshTimes = 0
+    self.buffList = {}
+    self.curTowerId = 0
+    self.monsterList = {}
+    self.monsterPet = {}
+    self.monsterBuffList = { boss_buff = {}, buff = {} }
+    self.monsterPower = 0
+    if call then
+        call()
+    end
+    self:UpdateTimer()
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstTower.id, 2)
+end
+
+---复活卡牌
+function SeasonTowerModel:ReviveCard(call)
+    if
+        not _G.StorageManager:GetInstance():CheckItem(
+            _G.tonumber(self.reviveParams[1]),
+            _G.tonumber(self.reviveParams[2])
+        )
+     then
+        return
+    end
+    if _G.table.isEmptyOrNil(self.cardList) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(820104)
+        return
+    end
+    local isNeed = false
+    for _, v in pairs(self.cardList) do
+        if v.hp < 10000 then
+            isNeed = true
+            break
+        end
+    end
+    if not isNeed then
+        _G.PopWindowManager:GetInstance():ShowAllTips(820104)
+        return
+    end
+    require "SeasonTowerNet":GetInstance():ReviveCard(_G.handlerbind(self, self.ReviveCardCall, call))
+end
+
+---复活卡牌回调
+function SeasonTowerModel:ReviveCardCall(msg, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    for _, v in pairs(self.cardList) do
+        v.hp = 10000
+        v.mp = 1000
+    end
+    if call then
+        call()
+    end
+end
+
+---获取玩家buff
+function SeasonTowerModel:GetBuff()
+    if not self.buffList or not self.buffList.boss_buff then
+        self.buffList = {boss_buff = {}, buff = {}}
+    end
+    return self.buffList
+end
+
+---刷新buff
+function SeasonTowerModel:RefreshMonsterBuff(call)
+    local refesh = function()
+        require "SeasonTowerNet":GetInstance():RefreshMonsterBuff(
+            _G._G.handlerbind(self, self.RefreshMonsterBuffCall, call)
+        )
+    end
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OpenDialog, self)
+    self.tipsStr = ""
+    if self.refreshTimes >= self.stageCfg.frequency then
+        self.tipsStr = _G.LangUtil.GetLangPackValue(90036010108, self.stageCfg.expend[2])
+        local str = _G.LangUtil.GetLangPackValue(90036010101)
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            820302,
+            str,
+            function()
+                if not _G.StorageManager:GetInstance():CheckItemNew(self.stageCfg.expend[1], self.stageCfg.expend[2]) then
+                    return
+                end
+                refesh()
+            end
+        )
+    else
+        self.tipsStr =
+            _G.LangUtil.GetLangPackValue(
+            90036010107,
+            self.stageCfg.frequency - self.refreshTimes,
+            self.stageCfg.frequency
+        )
+        local str = _G.LangUtil.GetLangPackValue(90036010101)
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            820301,
+            str,
+            function()
+                refesh()
+            end
+        )
+    end
+end
+
+---打开二次弹窗
+function SeasonTowerModel:OpenDialog(name)
+    if name == _G.ConfigManager.ui_cfg.OptionDialogView.Name then
+        ---@type OptionDialogView
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.OptionDialogView.Name)
+        view:ShowDown({{content = self.tipsStr, sid = self.refreshTimes >= self.stageCfg.frequency and self.stageCfg.expend[1] or nil}})
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OpenDialog, self)
+    end
+end
+
+---刷新buff成功
+---@param msg season_tower.s2c_season_tower_refresh_buff
+function SeasonTowerModel:RefreshMonsterBuffCall(msg, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    if self.refreshTimes >= self.stageCfg.frequency then
+        _G.StorageManager:GetInstance():ConsumeItem(self.stageCfg.expend[1], nil, self.stageCfg.expend[2])
+    end
+    self.refreshTimes = self.refreshTimes + 1
+    self.monsterBuffList = msg.buff
+    if call then
+        call()
+    end
+end
+
+---当前阶段配置
+---@return season_tower_pools_cfg
+function SeasonTowerModel:GetStageCfg()
+    return self.stageCfg
+end
+
+---获取通关层数
+function SeasonTowerModel:GetPassTowerCount()
+    return self.passTowerCount or 0
+end
+
+---检测奖励是否领取
+function SeasonTowerModel:CheckAwrdIsGet(id)
+    return self.awardList[id]
+end
+
+---获取排行榜
+function SeasonTowerModel:GetRank(call)
+    require "SeasonTowerNet":GetInstance():GetRank(
+        function(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---当前层
+function SeasonTowerModel:GetCurTowerId()
+    return self.curTowerId == 0 and 100001 or self.curTowerId
+end
+
+---结算
+function SeasonTowerModel:OnSettlement()
+    self:OnQuit()
+end
+
+function SeasonTowerModel:GetHPMP(uid)
+    return self.cardList[uid] or {hp = 10000, mp = 0}
+end
+
+---退出功能
+function SeasonTowerModel:OnQuit()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if
+        _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.SeasonTowerView.Name) and
+            not _G.BattleManager:GetInstance():CheckInBattle()
+     then
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonTowerChooseBuffView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.CommonRankView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonTowerCardBagView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonTowerGiftView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonTowerTaskView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonTowerBuffView.Name)
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.OptionDialogView.Name)
+        local isExit, view = _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+        if isExit then
+            view.view:QuitEmbattle()
+        end
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonTowerView.Name)
+    end
+end
+
+---结束
+function SeasonTowerModel:OnSeasonEnd()
+    self:OnQuit()
+end
+
+function SeasonTowerModel:OpenView()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SeasonTowerView.Name)
+end
+
+---获取当前阶段
+function SeasonTowerModel:GetStage()
+    return self.stage == 0 and 1 or self.stage
+end
+
+---获取层级
+---@param id number season_tower_cfg id
+function SeasonTowerModel:GetFloor(id)
+    return self.towerMapFloor[id] or 0
+end
+
+---获取当前阶段最后一层
+function SeasonTowerModel:GetStageMaxFloor(stageId)
+    if not stageId then
+        stageId = self.stage
+    end
+    return self.stageEndTb[stageId]
+end
+
+function SeasonTowerModel:GetNextStageMaxFloor()
+    if self.stage >= self.maxStage then
+        return 0
+    end
+    return self.stageEndTb[self.stage + 1]
+end
+
+---检测红点
+function SeasonTowerModel:GetRedPoint(param)
+    if param == 1 then
+        if #self:GetCanTakeAward() > 0 then
+            return true
+        end
+        return false
+    elseif param == 2 then
+        if self.isOverStage then
+            local nextStageCfg = _G.ConfigManager.season_tower_pools_cfg[self.stage + 1]
+            if nextStageCfg then
+                local endTime = self:GetStartTime() + (nextStageCfg.time - 1) * 86400
+                return _G.TimeUtil.GetServerUnixTime() >= endTime
+            end
+        end
+    else
+        if
+            not _G.PlayerPrefsManager.HasKey(FirstKey) or
+                (self:GetStartTime() > 0 and _G.PlayerPrefsManager.GetString(FirstKey) ~= _G.tostring(self:GetStartTime()))
+         then
+            return true
+        end
+    end
+
+    return false
+end
+
+---设置首次登录
+function SeasonTowerModel:SetFirst()
+    _G.PlayerPrefsManager.SetString(FirstKey, _G.tostring(self:GetStartTime()))
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstTower.id, 0)
+end
+
+---获取礼包配置
+function SeasonTowerModel:GetStoreCfg()
+    if not self.storeCfg then
+        local seasonCfg = require "SeasonModel":GetInstance():GetCfg()
+        local id = _G.tonumber(seasonCfg.tower_pools[2][1])
+        self.storeCfg = _G.ConfigManager.store_season_battle_cfg[id]
+    end
+    return self.storeCfg
+end
+
+---获取当前期数, 从0开始计数（x天一期）
+function SeasonTowerModel:GetCurPeriods()
+    local curDay = require "SeasonModel":GetInstance().curDay
+    return (curDay - 1) // self.cycle
+end
+
+return SeasonTowerModel

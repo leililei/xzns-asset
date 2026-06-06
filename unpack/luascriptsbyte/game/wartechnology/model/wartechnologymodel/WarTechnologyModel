@@ -1,0 +1,1501 @@
+--------------------------------------------------------------------------
+-- D:.zhenhunjie.Client.Assets.Resources.LuaScripts.Game.WarTechnology.Model.WarTechnologyModel	(修改路径必须修正此项!)
+-- Created by cy
+-- DateTime: 2025/09/09
+-- Description 战争科技
+-----------------------------------------------------------------------
+local WarTechnologyNet = require("WarTechnologyNet")
+local ActiveTaskManager = require "ActiveTaskManager"
+local CardInfoManager = require("CardInfoManager")
+
+---@class WarTechnologyModel
+---@field technologyInfo table<number,table<number,number>> <篇章, <科技点sid,等级>>
+---@field buildInfo table<number,technology.i_build> 建筑信息
+---@field freeTimes number 今日已领取快速挂机免费次数
+---@field payTimes number 今日已领取快速挂机付费次数
+---@field awardTime number 上次领奖时间
+---@field freeMaxTimes number 今日快速挂机免费次数上限
+---@field freePayTimes number 今日快速挂机付费次数上限
+local WarTechnologyModel = _G.BaseClass("WarTechnologyModel", _G.GameDataModelBase)
+---@return WarTechnologyModel WarTechnologyModel
+function WarTechnologyModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---类的构造函数
+function WarTechnologyModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.WarTechnology
+    self.technologyInfo = {}
+    self.buildInfo = {}
+    self.freeMaxTimes = _G.ConfigManager.discrete_cfg[130003][1][1]
+    self.freePayTimes = _G.ConfigManager.discrete_cfg[130003][1][2]
+    self.awardRedTime = 3600 * 12
+    self.tasks = {}
+    self.dispathCards = {}
+    self.fastTime = 0
+    self.openTechnologyId = {}
+    ---任务完成 刷新界面
+    self.taskCompletedFun = _G.handler(self, self.TaskCompleted)
+
+    _G.Events:GetInstance():AddListener(_G.eCard.CardChangeStar, self.OnStarTaskUpdate, self)
+    _G.Events:GetInstance():AddListener(_G.eCard.CardPotential, self.OnAwakeTaskUpdate, self)
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.OnUpdataSelfCards, self)
+end
+
+---更新星级任务
+function WarTechnologyModel:OnStarTaskUpdate()
+    local isChange = false
+    for key, value in pairs(self.tasks) do
+        if value.taskEnumType == _G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceStarNum or value.taskEnumType == _G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceCurMaxStar then
+            value:CheckTaskTarget()
+            value:CheckTaskState()
+            isChange = true
+        end
+    end
+    if isChange == true then
+        for i = 1, 4 do
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.Technologytasks.id, i)
+        end
+    end
+end
+
+---更新觉醒任务
+function WarTechnologyModel:OnAwakeTaskUpdate()
+    local isChange = false
+    for key, value in pairs(self.tasks) do
+        if value.taskEnumType == _G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceAwakeNum or value.taskEnumType == _G.ActiveTaskEnum.ConditionEnum.WarTechnology.RaceAwakeMaxLevel then
+            value:CheckTaskTarget()
+            value:CheckTaskState()
+            isChange = true
+        end
+    end
+    if isChange == true then
+        for i = 1, 4 do
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.Technologytasks.id, i)
+        end
+    end
+end
+---刷新本地卡牌列表和红点
+function WarTechnologyModel:OnUpdataSelfCards()
+    self.cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Technologyvacancy.id)
+end
+
+function WarTechnologyModel:GetDataFormServer()
+    if  _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(302) then
+        WarTechnologyNet:GetInstance():GetInfo(_G.handlerbind(self, self.ParseData))
+    end
+end
+function WarTechnologyModel:OnSixClockUpdate(endcall)
+    if  _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(302) then
+        if endcall  then
+            endcall()
+        end
+    end
+end
+---获取挂机总时长
+function WarTechnologyModel:GetFastTime()
+    return self.fastTime
+end
+
+function WarTechnologyModel:GetAwardTime()
+    return self.awardTime
+end
+
+---
+---@protected
+function WarTechnologyModel:GetBuildInfo()
+    return self.buildInfo
+end
+
+function WarTechnologyModel:GetBuildInfoBySid(sid)
+    return self.buildInfo[sid]
+end
+
+function WarTechnologyModel:GetTechnologyInfo()
+    return self.technologyInfo
+end
+
+function WarTechnologyModel:GetTechnologyInfoBySid(sid)
+    return self.technologyInfo[sid]
+end
+
+---
+---@protected
+function WarTechnologyModel:GetFreeTimes()
+    return self.freeTimes
+end
+
+function WarTechnologyModel:GetPayTimes()
+    return self.payTimes
+end
+
+---
+---@protected
+function WarTechnologyModel:CheckBuildCard(sid)
+    local cards = {}
+    local cardList = self.buildInfo[sid].card_list
+    for i, v in ipairs(cardList) do
+        if self.cards[v] ~= nil then
+            _G.table.insert(cards, v)
+        end
+    end
+    if #cardList ~= #cards then
+        self.buildInfo[sid].card_list = cards
+    end
+end
+
+---
+---@protected
+function WarTechnologyModel:CheckTechnologyUnlock(sid)
+    local pre_section = _G.ConfigManager.technology_cfg[sid].pre_section
+    local isLock = false
+    for i, v in ipairs(pre_section) do
+        if self.technologyInfo[v[1]] == nil or self.technologyInfo[v[1]] < v[2] then
+            isLock = true
+            break
+        end
+    end
+    return isLock
+end
+---获取信息回调
+---@param msg technology.s2c_build_info
+function WarTechnologyModel:ParseData(msg)
+    for i = 1, 4 do
+        self.buildInfo[i] = {}
+        local cfg = _G.ConfigManager.technology_building_cfg[i]
+        self.buildInfo[i].build_sid = i
+        self.buildInfo[i].card_list = {}
+        self.buildInfo[i].cfg = cfg
+        self.buildInfo[i].building_count = 0
+        self.buildInfo[i].addValue = {}
+        self.buildInfo[i].addOrder = {}
+        self.buildInfo[i].build_lv = 1
+        self.buildInfo[i].build_task_num = 0
+        for k, v in ipairs(cfg.order_add) do
+            self.buildInfo[i].addValue[v[1]] = v[2]
+            _G.table.insert(self.buildInfo[i].addOrder, v[1])
+        end
+    end
+    --建筑信息
+    if msg.build_list then
+        for i, v in ipairs(msg.build_list) do
+            if v.card_list then
+                self.buildInfo[v.build_sid].card_list = v.card_list
+                for i, v in ipairs(v.card_list) do
+                    self.dispathCards[v] = true
+                end
+            end
+            if v.build_lv then
+                self.buildInfo[v.build_sid].build_lv = v.build_lv
+            end
+            if v.build_task_num then
+                self.buildInfo[v.build_sid].build_task_num = v.build_task_num
+            end
+        end
+    end
+    --科技信息
+    if msg.pos_info then
+        for k, v in ipairs(msg.pos_info) do
+            self.technologyInfo[v.key] = v.value
+        end
+    end
+    self.freeTimes = msg.free_times
+    self.awardTime = msg.award_time
+    self.payTimes = msg.times
+    self.finishTask = {}
+    if msg.finish then
+        for i, v in ipairs(msg.finish) do
+            self.finishTask[v] = true
+        end
+    end
+    self.canAwardTask = {}
+    if msg.can_award then
+        for i, v in ipairs(msg.can_award) do
+            self.canAwardTask[v] = true
+        end
+    end
+    self.cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    self:UpDataBuildLv()
+    self:SetUnLockLv()
+    --任务
+    self:ParseTaskDatas(msg)
+    self:InitFunction(msg.collector)
+    --self:ParseData()
+    self:SetTimeAwardTimer()
+    self:OnUpdataSelfCards()
+    self.super.ParseData(self)
+end
+
+---
+---@protected
+function WarTechnologyModel:SetTimeAwardTimer()
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    if self.awardTime ~= 0 and (curTime - self.awardTime) < self.awardRedTime then
+        if self.timer == nil then
+            local num = self.awardRedTime - (curTime - self.awardTime)
+            self.timer = _G.TimerManager:GetInstance():GetTimer(num, self.UpdataTimeAwardRed, self, true, false, true)
+            self.timer:Start()
+        end
+    else
+        if self.timer then
+            self.timer:Stop()
+            self.timer = nil
+        end
+    end
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Technologybenefits.id)
+end
+
+function WarTechnologyModel:UpdataTimeAwardRed()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Technologybenefits.id)
+end
+
+---挂机奖励红点
+function WarTechnologyModel:CheckTimeAwardRed()
+    if self.awardTime == nil then
+        return false
+    end
+    if self.awardTime == 0 then
+        return false
+    elseif (_G.TimeUtil.GetServerUnixTime() - self.awardTime) >= self.awardRedTime then
+        return true
+    end
+    return false
+end
+
+---科技升级红点
+function WarTechnologyModel:CheckUpLvRed()
+    local layerCfg = _G.ConfigManager.technology_layer_cfg
+    for k, v in pairs(layerCfg) do
+        local isUp = self:GetLayerUpLvRed(v.id)
+        if isUp == true then
+            return true
+        end
+    end
+    return false
+end
+
+---
+---@protected
+function WarTechnologyModel:OpenTechnologyId(id)
+    if _G.table.ContainsValue(self.openTechnologyId, id) == false then
+        _G.table.insert(self.openTechnologyId, id)
+        local index = _G.ConfigManager.technology_cfg[id].layer
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+            _G.ConfigManager.redpoint_cfg.Technologyupgrade.id, index)
+        _G.Events:GetInstance():Broadcast(_G.eWarTechnology.openIdChange, id)
+    end
+end
+function WarTechnologyModel:CloseTechnologyId(id)
+    if _G.table.ContainsValue(self.openTechnologyId, id) == true then
+        _G.table.removebyvalue(self.openTechnologyId, id)
+        local index = _G.ConfigManager.technology_cfg[id].layer
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Technologyupgrade.id, index)
+        _G.Events:GetInstance():Broadcast(_G.eWarTechnology.openIdChange, id)
+    end
+end
+
+---任务红点
+function WarTechnologyModel:CheckTaskRed(index)
+    local task = self:GetTaskListByBuildId(index)
+    for i, v in ipairs(task) do
+        if v.i_task.state == _G.TaskEnum.ETaskState.Submited then
+            local isGet = self:CheckIsGet(v.Cfg.id)
+            if isGet == nil then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function WarTechnologyModel:GetLayerUpLvRed(index)
+    local isLock = WarTechnologyModel:GetInstance():GetIsUnlock(index)
+    if isLock == false then
+        return false
+    end
+    local v = _G.ConfigManager.technology_layer_cfg[index]
+    for k2, v2 in ipairs(v.mission_extra) do
+        local isCostEnough = self:GetLayerPointUpLvRed(v2)
+        if isCostEnough == true then
+            return true
+        end
+    end
+    return false
+end
+
+---
+---@protected
+function WarTechnologyModel:GetLayerPointUpLvRed(sid)
+    if self:CheckTechnologyUnlock(sid) == false then
+        if _G.table.ContainsValue(self.openTechnologyId, sid) == false then
+            local isCostEnough = self:GetUpLvCostEnough(sid)
+            if isCostEnough == true then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---
+---@protected
+function WarTechnologyModel:GetUpLvCostEnough(id)
+    local cfg = _G.ConfigManager.technology_cfg
+    local lv = self.technologyInfo[id] ~= nil and self.technologyInfo[id] or 0
+    if lv == cfg[id].level then
+        return false
+    end
+    local cost = cfg[id].material
+    local data = cost[lv + 1]
+    if data == nil then
+        return false
+    end
+    local isUp = true
+    for i = 1, (#data) / 2 do
+        local itemSid = data[2 * (i - 1) + 1]
+        local num = data[2 * (i - 1) + 2]
+        local haveCount = _G.StorageManager:GetInstance():GetItemCountBySid(itemSid)
+        if haveCount < num then
+            isUp = false
+        end
+    end
+    if isUp == true then
+        local data2 = cfg[id].materials_elements[lv + 1]
+
+        local needNum = data2[2]
+        if needNum == 0 then
+            return true
+        end
+
+        local element = cfg[id].elements
+        local sid, count, data
+        local curNum = 0
+        for _, v in pairs(_G.ConfigManager.item_card_cfg) do
+            sid = v.id
+            if v.Elements == _G.CardElementType.Common or v.Elements == element then
+                count = _G.StorageManager:GetInstance():GetItemCountBySid(sid)
+                if count > 0 then
+                    curNum = curNum + count
+                    if curNum >= needNum then
+                        return true
+                    end
+                end
+            end
+        end
+        local cardList = CardInfoManager.GetDogFoodCards(element, data2[1])
+        if curNum + #cardList >= needNum then
+            return true
+        end
+    end
+    return false
+end
+
+---能否建筑升级
+function WarTechnologyModel:CheckIsBuildUp(index)
+    local maxLv = #_G.ConfigManager.technology_building_level_cfg
+    local build_lv = self.buildInfo[index].build_lv
+    if build_lv >= maxLv then
+        return false
+    end
+    local num = self.buildInfo[index].build_task_num
+    local lv = self:GetBuildLvByTaskNum(num)
+    if lv > build_lv then
+        return true
+    end
+    return false
+end
+
+---根据任务数量获取建筑等级
+function WarTechnologyModel:GetBuildLvByTaskNum(num)
+    local cfg = _G.ConfigManager.technology_building_level_cfg
+    local lv = 0
+    for i, v in ipairs(cfg) do
+        if num >= v.level then
+            lv = v.id
+        end
+    end
+    return lv
+end
+
+---空闲的上阵栏位红点
+function WarTechnologyModel:CheckUpCardRed(index)
+    if self.buildInfo == nil or table.count(self.buildInfo) == 0 then
+        return false
+    end
+
+    local num = self.buildInfo[index].lvCfg.building_count
+    if #self.buildInfo[index].card_list < num then
+        local cards = self:GetCards(index)
+        if #cards > #self.buildInfo[index].card_list then
+            return true
+        end
+    end
+    return false
+end
+
+---成就信息
+---@param data achieve.s2c_achieve_info 成就信息
+function WarTechnologyModel:ParseTaskDatas(data)
+    self.dataB = {}
+
+    for _, value in pairs(data.collector) do
+        local s = value.key[1]
+        self.dataB[s] = value.value
+    end
+end
+
+function WarTechnologyModel:InitFunction(collector)
+    if not _G.table.isEmptyOrNil(self.tasks) then
+        for i = 1, _G.table.count(self.tasks) do
+            self.tasks[i]:Dispose()
+            -- _G.table.remove(self.tasks, i)
+        end
+        self.tasks = {}
+    end
+
+    local cfgs = _G.ConfigManager.technology_building_cfg
+    local count = #cfgs
+    local temp = {}
+    for i = 1, count do
+        local count2 = #cfgs[i].mission_extra
+        for j = 1, count2 do
+            for k, v in ipairs(cfgs[i].mission_extra[j]) do
+                if k == #cfgs[i].mission_extra[j] then
+                    if _G.table.ContainsValue(temp, v) == false then
+                        _G.table.insert(temp, v)
+                    end
+                else
+                    if self.finishTask[v] == nil then
+                        if _G.table.ContainsValue(temp, v) == false then
+                            _G.table.insert(temp, v)
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    for i = 1, #temp do
+        self:SetServerInfo(temp[i])
+    end
+
+    if collector ~= nil then
+        -- body
+        for _, value in pairs(collector) do
+            _G.Events:GetInstance():Broadcast(_G.ePlayAactionEvent.PlayAactionCjWar, value.key, value.value, nil, true)
+        end
+    end
+end
+
+---获取任务列表
+function WarTechnologyModel:GetTaskListByBuildId(index)
+    local taskIds = {}
+    for i, v in ipairs(self.tasks) do
+        taskIds[v.sid] = i
+    end
+    local tasks = {}
+    local cfgs = _G.ConfigManager.technology_building_cfg
+    local taskList = cfgs[index].mission_extra
+    for i = 1, #taskList do
+        for k, v in ipairs(taskList[i]) do
+            if taskIds[v] ~= nil then
+                table.insert(tasks, self.tasks[taskIds[v]])
+                break
+            end
+        end
+    end
+    return tasks
+end
+
+---整理服务器数据
+---@param data achieve.s2c_achieve_info 成就信息
+---@param id number 成就id
+function WarTechnologyModel:SetServerInfo(id)
+    local task = {
+        sid = id,
+        state = self:GetTaskState(id),
+        target = {
+            [1] = 0
+        }
+    }
+    local CjTaskData = require("WarTechnologyTaskData").New(task, self.taskCompletedFun, _G.MarkTaskType.WarTechnology)
+    table.insert(self.tasks, CjTaskData)
+end
+
+function WarTechnologyModel:TaskCompleted(taskid)
+    self:UpdataView()
+end
+
+function WarTechnologyModel:UpdataView()
+    local view = self:GetView()
+    if view == nil then
+        return
+    end
+    view:UpdateView()
+end
+
+---@return ActiveTaskView
+function WarTechnologyModel:GetView()
+    if _G.IsNil(self.View) or _G.IsNil(self.View.gameObject) then
+        self.View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.WarTechnologyTaskView.Name)
+    end
+
+    return self.View
+end
+
+---获取任务状态
+function WarTechnologyModel:GetTaskState(sid)
+    if self.finishTask[sid] ~= nil then
+        return _G.TaskEnum.ETaskState.Submited
+    end
+    if self.canAwardTask[sid] ~= nil then
+        return _G.TaskEnum.ETaskState.Submited
+    end
+    return _G.TaskEnum.ETaskState.Claimed
+end
+
+---更新已有成就的任务数据列表
+function WarTechnologyModel:UpdateChengJiu(taskinfos)
+    if taskinfos == nil then
+        return
+    end
+    for key, value in pairs(taskinfos.collector) do
+        self:ShuZhiPanDuan(value.key[1], value.value)
+        _G.Events:GetInstance():Broadcast(_G.ePlayAactionEvent.PlayAactionCjWar, value.key, value.value, nil, true)
+    end
+    for i = 1, 4 do
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Technologytasks.id,
+            i)
+    end
+end
+
+function WarTechnologyModel:ShuZhiPanDuan(condition, num)
+    if self.dataB ~= nil and self.dataB[condition] then
+        if self.dataB[condition] < num then
+            self.dataB[condition] = num
+        end
+    end
+end
+
+function WarTechnologyModel:PanDuanZhi(index, ids, onFinishCallback)
+    if self.yijianlingqupanduan then
+        return
+    end
+    self.yijianlingqupanduan = true
+    local canGets = {}
+    local canGetsType = {}
+    local cfg = _G.ConfigManager.technology_building_cfg[index].mission_extra
+    for k, v in pairs(ids) do
+        local index = 0
+        local id = v.Cfg.id
+        for k2, v2 in ipairs(cfg) do
+            if _G.table.ContainsValue(v2, id) then
+                index = k2
+                break
+            end
+        end
+        local idList = self:YiJianLingQu(v, cfg[index])
+        canGetsType[index] = idList
+        for _, s in pairs(idList) do
+            _G.table.insert(canGets, s)
+        end
+    end
+    if _G.table.count(canGets) > 0 then
+        local pbData = { sids = {} }
+        for i, v in ipairs(canGets) do
+            if self.canAwardTask[v] == nil then
+                _G.table.insert(pbData.sids, v)
+            end
+        end
+        if #pbData.sids > 0 then
+            require("WarTechnologyNet"):GetInstance():FinishTask(pbData, function()
+                for i, v in ipairs(pbData.sids) do
+                    self.canAwardTask[v] = true
+                end
+                self:GetTaskAward(
+                    canGets,
+                    index,
+                    canGetsType,
+                    function(data)
+                        self.yijianlingqupanduan = false
+                        if onFinishCallback then
+                            onFinishCallback()
+                        end
+                    end
+                )
+            end)
+        else
+            self:GetTaskAward(
+                canGets,
+                index,
+                canGetsType,
+                function(data)
+                    self.yijianlingqupanduan = false
+                    if onFinishCallback then
+                        onFinishCallback()
+                    end
+                end
+            )
+        end
+    else
+        self.yijianlingqupanduan = false
+        if onFinishCallback then
+            onFinishCallback()
+        end
+    end
+end
+
+---一键领取循环判断服务器端
+function WarTechnologyModel:YiJianLingQu(data, ids)
+    local id = data.Cfg.id
+    local idList = {}
+    _G.table.insert(idList, id)
+
+    local index = 0
+    for i, v in ipairs(ids) do
+        if v == id then
+            index = i
+        end
+    end
+
+    if index == #ids then
+        return idList
+    end
+
+    local cfg
+    local mission_cfg = _G.ConfigManager.mission_extra_cfg
+    for i = 1, #ids - index do
+        cfg = mission_cfg[ids[index + i]]
+        local num = #cfg.condition[1]
+        local count = self:TiaoMuPanDuan(cfg.condition)
+        if count >= cfg.condition[1][num] then
+            _G.table.insert(idList, cfg.id)
+        else
+            if ActiveTaskManager:GetInstance():CheckTaskTarget(cfg.condition[1], data) then
+                _G.table.insert(idList, cfg.id)
+            else
+                return idList
+            end
+        end
+    end
+    return idList
+end
+
+function WarTechnologyModel:GetTaskAward(taskIds, index, canGetsType, call)
+    if taskIds ~= nil then
+        WarTechnologyNet:GetInstance():GetTaskAward(
+            { sid = taskIds },
+            function(data)
+                if data.sids == nil then
+                    return
+                end
+                for i, v in ipairs(data.sids) do
+                    self.finishTask[v] = true
+                end
+                --self:UpDataBuildLv()
+                for k, v in pairs(canGetsType) do
+                    self:UpdateMangerTasksNew(index, k, v)
+                end
+                --for i = 1, #data.sids do
+                --    self:UpdateMangerTasks(data.sids[i], index)
+                --end
+                if self.awardTime == 0 then
+                    for k, v in pairs(self.buildInfo) do
+                        if v.lvCfg.id > 1 then
+                            self.awardTime = _G.TimeUtil.GetServerUnixTime()
+                            break
+                        end
+                    end
+                end
+                local num = self.buildInfo[index].build_task_num or 0
+                self.buildInfo[index].build_task_num = num + #taskIds
+                require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.Technologytasks.id, index)
+                _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data)
+                _G.Events:GetInstance():Broadcast(_G.eWarTechnology.BuildUpCard)
+
+                if data.award and data.award.item and #data.award.item > 0 then
+                    local isClear = false
+                    local ids = _G.ConfigManager.ui_cfg.WarTechnologyView.resources
+                    for i, v in ipairs(data.award.item) do
+                        if _G.table.ContainsValue(ids, v.type[1]) then
+                            isClear = true
+                            break
+                        end
+                    end
+                    if isClear == true then
+                        self.openTechnologyId = {}
+                    end
+                    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                        .Technologyupgrade.id)
+                end
+                if call then
+                    call()
+                end
+            end
+        )
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("章节关卡id为空，成就领奖暂停")
+        end
+    end
+end
+
+function WarTechnologyModel:UpdateMangerTasksNew(index, k, sids)
+    local cfg = _G.ConfigManager.technology_building_cfg[index].mission_extra[k]
+    local re_sid = 0
+    local sid = sids[#sids]
+    local curSid = sids[1]
+    if curSid == cfg[#cfg] then
+        local cfg = _G.ConfigManager.mission_extra_cfg[curSid]
+        local task = {
+            sid = sid,
+            state = _G.TaskEnum.ETaskState.Completed,
+            target = { cfg.count }
+        }
+        self:UpdataTask(task)
+    else
+        for i = 1, #self.tasks do
+            if self.tasks[i].i_task.sid == curSid then
+                _G.table.remove(self.tasks, i)
+                break
+            end
+        end
+
+        for k2, v2 in ipairs(cfg) do
+            if v2 == sid then
+                re_sid = k2 == #cfg and sid or cfg[k2 + 1]
+                break
+            end
+        end
+
+        if re_sid > 0 then
+            local states
+            local cfg = _G.ConfigManager.mission_extra_cfg[re_sid]
+            if self.canAwardTask[re_sid] ~= nil then
+                states = _G.TaskEnum.ETaskState.Submited
+            else
+                states = _G.TaskEnum.ETaskState.Claimed
+            end
+            local task = {
+                sid = re_sid,
+                state = states,
+                target = { self:TiaoMuPanDuan(cfg.condition) }
+            }
+            local CjTaskData = require("WarTechnologyTaskData").New(task, self.taskCompletedFun,
+                _G.MarkTaskType.WarTechnology)
+            table.insert(self.tasks, CjTaskData)
+        end
+    end
+end
+
+---@param  task task.i_task
+function WarTechnologyModel:UpdataTask(task)
+    for i = 1, #self.tasks do
+        if self.tasks[i].i_task.sid == task.sid then
+            self.tasks[i]:UpdataData(task)
+        end
+    end
+end
+
+function WarTechnologyModel:TiaoMuPanDuan(condition)
+    local _ = #condition[1]
+    for key, value in pairs(self.dataB) do
+        if condition[1][1] == key then
+            return value
+        end
+    end
+    return 0
+end
+
+---检测奖励是否领取
+function WarTechnologyModel:CheckIsGet(sid)
+    return self.finishTask[sid]
+end
+
+---更新建筑登记信息
+function WarTechnologyModel:UpDataBuildLv()
+    for k, v in pairs(self.buildInfo) do
+        local num = 0
+        for k, v2 in ipairs(v.cfg.mission_extra) do
+            for k2, v3 in ipairs(v2) do
+                if self.finishTask[v3] ~= nil then
+                    num = num + 1
+                end
+            end
+        end
+        local cfgLv = _G.ConfigManager.technology_building_level_cfg
+        local lvCfg = cfgLv[v.build_lv]
+        for i = 1, #cfgLv do
+            --if num >= cfgLv[i].level then
+            --    lvCfg = cfgLv[i]
+            --end
+            v.building_count = v.building_count < cfgLv[i].building_count and cfgLv[i].building_count or v
+                .building_count
+        end
+        v.lvCfg = lvCfg
+        if v.build_oldlv then
+            v.oldcfg=cfgLv[v.build_oldlv]
+        end
+        v.num = num
+    end
+    self.fastTime = self:GetBuildAwardTime()
+end
+
+---
+---@protected
+function WarTechnologyModel:SetUnLockLv()
+    self.BuildUnLock = {}
+    for i, v in pairs(_G.ConfigManager.technology_building_level_cfg) do
+        if self.BuildUnLock[v.building_count] == nil then
+            self.BuildUnLock[v.building_count] = v
+        end
+    end
+end
+
+---
+---@protected
+function WarTechnologyModel:SetUnLockLvByIndex(index)
+    return self.BuildUnLock[index]
+end
+
+---获取下一个解锁栏位任务数量配置
+function WarTechnologyModel:GetNextBuildLv(id)
+    local cfgLv = _G.ConfigManager.technology_building_level_cfg
+    local num = #cfgLv
+    if id < num then
+        return cfgLv[id + 1]
+    end
+    return cfgLv[id]
+end
+
+---获取挂机总时间
+function WarTechnologyModel:GetBuildAwardTime()
+    local time = 0
+    for k, v in pairs(self.buildInfo) do
+        if v.lvCfg.building_time > time then
+            time = v.lvCfg.building_time
+        end
+    end
+    return time
+end
+
+---取得能上阵的卡牌
+---@return CardData[]
+function WarTechnologyModel:GetCards(index)
+    local type = self.buildInfo[index].addOrder
+    local elements = self.buildInfo[index].cfg.elements
+    local list = {}
+    self.cardsElements = {}
+    for _, v in pairs(self.cards) do
+        if require "CardInfoManager":GetInstance():CheckMultiMatchCOP(v.cfg.Elements_new, elements) and _G.table.ContainsValue(type, v.cfg.Order) then
+            _G.table.insert(list, v)
+        end
+    end
+    return list
+end
+
+function WarTechnologyModel:CardsSort(index, cards)
+    local list = {}
+    for i, v in ipairs(cards) do
+        local add = self:GetCardAdd(index, v.uid)
+        _G.table.insert(list, { uid = v.uid, add = add })
+    end
+    _G.table.sort(
+        list,
+        function(a, b)
+            if
+                (self:CheckIsDispatch(a.uid) == nil and self:CheckIsDispatch(b.uid) == nil) or
+                (self:CheckIsDispatch(a.uid) ~= nil and self:CheckIsDispatch(b.uid) ~= nil)
+            then
+                if a.add ~= b.add then
+                    return a.add > b.add
+                end
+                return a.uid > b.uid
+            else
+                return self:CheckIsDispatch(a.uid) ~= nil
+            end
+        end
+    )
+    local showCard = {}
+    for i, v in ipairs(list) do
+        _G.table.insert(showCard, self.cards[v.uid])
+    end
+    return showCard
+end
+
+function WarTechnologyModel:CardsSort2(index, cards)
+    local list = {}
+    for i, v in ipairs(cards) do
+        local add = self:GetCardAdd(index, v.uid)
+        _G.table.insert(list, { uid = v.uid, add = add })
+    end
+    _G.table.sort(
+        list,
+        function(a, b)
+            if a.add ~= b.add then
+                return a.add > b.add
+            end
+            return a.uid > b.uid
+        end
+    )
+    local showCard = {}
+    for i, v in ipairs(list) do
+        _G.table.insert(showCard, self.cards[v.uid])
+    end
+    return showCard
+end
+
+---检测卡牌是否被派遣
+function WarTechnologyModel:CheckIsDispatch(uid)
+    return self.dispathCards[uid]
+end
+
+---
+---@protected
+function WarTechnologyModel:GetCardData(uid)
+    return self.cards[uid]
+end
+
+---获取单个卡牌的倍率加成
+function WarTechnologyModel:GetCardAdd(index, uid)
+    local cardData = self.cards[uid]
+    if cardData == nil then
+        return 0
+    end
+    local add = 0
+    if _G.ConfigManager.card_star_cfg[require("CardInfoManager"):GetInstance():GetStarCfgId(cardData.cfg.Elements_new, cardData:GetStar())] ~= nil then
+        add = add +
+            _G.ConfigManager.card_star_cfg
+            [require("CardInfoManager"):GetInstance():GetStarCfgId(cardData.cfg.Elements_new, cardData:GetStar())]
+            .building_effect / 10000
+    end
+    if _G.ConfigManager.card_potential_cfg[cardData:GetPotential()] ~= nil then
+        add = add + _G.ConfigManager.card_potential_cfg[cardData:GetPotential()].building_effect / 10000
+    end
+    local multiple = self.buildInfo[index].addValue[cardData.cfg.Order] / 10000
+    return add * multiple
+end
+
+---检测是否有更高收益的卡牌上阵
+function WarTechnologyModel:CheckDispathAllRefresh()
+    local cards = {}
+    for i = 1, 4 do
+        cards[i] = {}
+        local cardList = _G.table.toArray(self:GetCards(i))
+        cardList = self:CardsSort2(i, cardList)
+        local num = self.buildInfo[i].lvCfg.building_count
+        for k, v in ipairs(cardList) do
+            if #cards[i] < num then
+                _G.table.insert(cards[i], v.uid)
+            else
+                break
+            end
+        end
+    end
+    local isDispacth = false
+    for i, v in ipairs(self.buildInfo) do
+        self:CheckBuildCard(i)
+        local cur = self:GetBuildAddCardByIdList(v.card_list, i)
+        local pre = self:GetBuildAddCardByIdList(cards[i], i)
+        if cur ~= pre then
+            isDispacth = true
+            break
+        end
+    end
+    return isDispacth, cards
+end
+
+---
+---@protected
+function WarTechnologyModel:DispathAll(call)
+    local isDispacth, cards = self:CheckDispathAllRefresh()
+    if isDispacth == true then
+        --一键派遣
+        local pbData = {}
+        for i = 1, 4 do
+            local data = {}
+            data.build_sid = i
+            data.card_list = cards[i]
+            _G.table.insert(pbData, data)
+        end
+        self:BuildUpCard(pbData, call)
+    else
+        --提示
+        _G.PopWindowManager:GetInstance():ShowAllTips(1080301)
+    end
+end
+
+---获取快速挂机奖励
+function WarTechnologyModel:GetFastAwardInfo()
+    local fastTime = _G.ConfigManager.discrete_cfg[130002][1][1]
+    local items = {}
+    for k, v in pairs(self.buildInfo) do
+        local add = self:GetBuildAddTotleById(k)
+        _G.table.insert(items, { v.cfg.drop_item, math.floor(fastTime / 60) * add })
+    end
+    return items
+end
+
+---
+---@protected
+function WarTechnologyModel:GetBuildAddTotleById(id)
+    local data = self.buildInfo[id]
+    local add = data.lvCfg.building_effect / 10000
+    --for k2, v2 in ipairs(data.card_list) do
+    --    add = add + self:GetCardAdd(id, v2)
+    --end
+    return add + self:GetBuildAddCardByIdList(data.card_list, id)
+end
+
+---
+---@protected
+function WarTechnologyModel:GetBuildAddCardByIdList(list, id)
+    local add = 0
+    for k2, v2 in ipairs(list) do
+        add = add + self:GetCardAdd(id, v2)
+    end
+    return add
+end
+
+---领取建筑挂机奖励
+function WarTechnologyModel:GetBuildAward(call)
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    WarTechnologyNet:GetInstance():GetBuildAward({ time = curTime }, function(msg)
+        if msg.ack == 1 then
+            self.awardTime = curTime
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            self:SetTimeAwardTimer()
+            _G.Events:GetInstance():Broadcast(_G.eWarTechnology.TimeAwardGet)
+
+            if msg.award and msg.award.item and #msg.award.item > 0 then
+                local isClear = false
+                local ids = _G.ConfigManager.ui_cfg.WarTechnologyView.resources
+                for i, v in ipairs(msg.award.item) do
+                    if _G.table.ContainsValue(ids, v.type[1]) then
+                        isClear = true
+                        break
+                    end
+                end
+                if isClear == true then
+                    self.openTechnologyId = {}
+                end
+                require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg
+                    .Technologyupgrade.id)
+            end
+            if call then
+                call()
+            end
+        end
+    end)
+end
+
+---领取建筑快速挂机奖励
+function WarTechnologyModel:GetAllBuildReward(call)
+    local type = 1
+    if self.freeTimes >= self.freeMaxTimes then
+        type = 2
+    end
+    WarTechnologyNet:GetInstance():GetAllBuildReward({ type = type }, function(msg)
+        if msg.ack == 1 then
+            if type == 1 then
+                self.freeTimes = self.freeTimes + 1
+            else
+                self.payTimes = self.payTimes + 1
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if call then
+                call()
+            end
+        end
+    end)
+end
+
+---建筑上阵卡牌
+function WarTechnologyModel:BuildUpCard(data, call)
+    WarTechnologyNet:GetInstance():BuildUpCard({ up_list = data }, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        local indexs = {}
+        for i, v in ipairs(data) do
+            for i, v2 in ipairs(self.buildInfo[v.build_sid].card_list) do
+                self.dispathCards[v2] = nil
+            end
+            _G.table.insert(indexs, v.build_sid)
+        end
+        for i, v in ipairs(data) do
+            for i, v2 in ipairs(v.card_list) do
+                self.dispathCards[v2] = true
+            end
+        end
+        for i, v in ipairs(data) do
+            self.buildInfo[v.build_sid].card_list = _G.DeepCopy(v.card_list)
+        end
+        if self.awardTime == 0 then
+            self.awardTime = _G.TimeUtil.GetServerUnixTime()
+        end
+        if call then
+            call()
+        end
+        _G.Events:GetInstance():Broadcast(_G.eWarTechnology.BuildUpCard, indexs)
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Technologyvacancy
+            .id)
+    end)
+end
+
+---建筑升级
+function WarTechnologyModel:SetBuildUpLv(sid, call)
+    WarTechnologyNet:GetInstance():BuildUpLv({ build_sid = sid }, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        local lv = self:GetBuildLvByTaskNum(self.buildInfo[sid].build_task_num)
+        self.buildInfo[sid].build_oldlv=self.buildInfo[sid].build_lv
+        self.buildInfo[sid].build_lv = lv
+        self:UpDataBuildLv()
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Technologyvacancy
+            .id)
+        if call then
+            call()
+        end
+    end)
+end
+
+---科技点升级
+function WarTechnologyModel:SetPosUpLv(sid, call, uids, sidArgs)
+    local lv = self.technologyInfo[sid] ~= nil and self.technologyInfo[sid] or 0
+    WarTechnologyNet:GetInstance():PosUpLv({ sid = sid, lv = lv + 1, card_uid = uids, item = sidArgs }, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.technologyInfo[sid] = lv + 1
+        local data = _G.ConfigManager.technology_cfg[sid].material[lv + 1]
+        if data then
+            for i = 1, (#data) / 2 do
+                local itemSid = data[2 * (i - 1) + 1]
+                local num = data[2 * (i - 1) + 2]
+                _G.StorageManager:GetInstance():ConsumeItem(itemSid, nil, num)
+            end
+        end
+        local cfg = _G.ConfigManager.technology_layer_cfg
+        --_G.Events:GetInstance():Broadcast(_G.eWarTechnology.PosUpLv, sid)
+        --local next_section = _G.ConfigManager.technology_cfg[sid].next_section
+        --if #next_section > 0 then
+        --    for i, v in ipairs(next_section) do
+        --        _G.Events:GetInstance():Broadcast(_G.eWarTechnology.PosUpLv, v)
+        --    end
+        --end
+        local layerNum = #cfg
+        local index = _G.ConfigManager.technology_cfg[sid].layer
+        local num = index == layerNum and 1 or 2
+        for i = 1, num do
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.Technologyupgrade.id, index + i - 1)
+        end
+        local technologyCfg = _G.ConfigManager.technology_cfg
+        local elements = technologyCfg[sid].elements
+        for i, v in ipairs(cfg[index].mission_extra) do
+            if technologyCfg[v].elements == elements then
+                _G.Events:GetInstance():Broadcast(_G.eWarTechnology.PosUpLv, v)
+            end
+        end
+        _G.Events:GetInstance():Broadcast(_G.eWarTechnology.PosUpLvChange, _G.ConfigManager.technology_cfg[sid].layer)
+        if call then
+            call()
+        end
+    end)
+end
+
+---
+---@protected
+function WarTechnologyModel:GetTechnologyAllLv()
+    local lv = 0
+    for i, v in pairs(self.technologyInfo) do
+        lv = lv + v
+    end
+    return lv
+end
+
+---获取科技总等级
+function WarTechnologyModel:GetTechnologyTotleLv(sid)
+    local cfg = _G.ConfigManager.technology_layer_cfg[sid].mission_extra
+    local cfg2 = _G.ConfigManager.technology_cfg
+    local totle = 0
+    local max = 0
+    for i, v in ipairs(cfg) do
+        local lv = self.technologyInfo[v] ~= nil and self.technologyInfo[v] or 0
+        totle = totle + lv
+        max = max + cfg2[v].level
+    end
+    return totle, max
+end
+
+---判断科技层数是否解锁
+function WarTechnologyModel:GetIsUnlock(sid)
+    local cfg = _G.ConfigManager.technology_layer_cfg[sid].unlock
+    if #cfg == 0 then
+        return true
+    end
+    local lv = self:GetTechnologyTotleLv(cfg[1])
+    return lv >= cfg[2]
+end
+
+function WarTechnologyModel:GetTotleAttribute2()
+    local attributeTotle = {}
+    local technologyCfg = _G.ConfigManager.technology_cfg
+    self.cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    self.cardsElements = {}
+    for _, v in pairs(self.cards) do
+        for i = 1, #v.cfg.Elements_new do
+            if self.cardsElements[v.cfg.Elements_new[i]] == nil then
+                self.cardsElements[v.cfg.Elements_new[i]] = true
+            end
+        end
+    end
+
+    for k, v in pairs(self.technologyInfo) do
+        local value = technologyCfg[k]
+        --if value.pointtype ~= 3 then
+        local lv = v
+        if lv ~= nil and lv > 0 then
+            --全体属性加成
+            local base_att = value.base_att
+            local data = base_att[lv]
+            if data then
+                if attributeTotle[1] == nil then
+                    attributeTotle[1] = {}
+                end
+                local attribute = attributeTotle[1]
+                if attribute[data[1]] == nil then
+                    attribute[data[1]] = {}
+                end
+                if attribute[data[1]][data[2]] == nil then
+                    attribute[data[1]][data[2]] = 0
+                end
+                attribute[data[1]][data[2]] = attribute[data[1]][data[2]] + tonumber(data[3])
+                --种族属性加成
+                local base_att2 = value.base_att2
+                if self.cardsElements[value.elements] then
+                    local data2 = base_att2[lv]
+                    if attributeTotle[value.elements + 1] == nil then
+                        attributeTotle[value.elements + 1] = {}
+                    end
+                    local attribute = attributeTotle[value.elements + 1]
+                    if attribute[data2[1]] == nil then
+                        attribute[data2[1]] = {}
+                    end
+                    if attribute[data2[1]][data2[2]] == nil then
+                        attribute[data2[1]][data2[2]] = 0
+                    end
+                    attribute[data2[1]][data2[2]] = attribute[data2[1]][data2[2]] + tonumber(data2[3])
+                end
+            end
+        end
+        --end
+    end
+    local listTotle = {}
+    for index, value in pairs(attributeTotle) do
+        local list = {}
+        for k, v in pairs(value) do
+            for k2, v2 in pairs(v) do
+                _G.table.insert(list, { k, k2, v2 })
+            end
+        end
+        listTotle[index] = list
+    end
+    return listTotle
+end
+
+function WarTechnologyModel:GetTotleAttributeGlobal()
+    local attribute = {}
+    local technologyCfg = _G.ConfigManager.technology_cfg
+
+    for k, v in pairs(self.technologyInfo) do
+        local value = technologyCfg[k]
+        local lv = v
+        if lv ~= nil and lv > 0 then
+            --全体属性加成
+            local base_att = value.base_att
+            local data = base_att[lv]
+            if data then
+                if attribute[data[1]] == nil then
+                    attribute[data[1]] = {}
+                end
+                if attribute[data[1]][data[2]] == nil then
+                    attribute[data[1]][data[2]] = 0
+                end
+                attribute[data[1]][data[2]] = attribute[data[1]][data[2]] + tonumber(data[3])
+            end
+        end
+    end
+    local list = {}
+    for k, v in pairs(attribute) do
+        for k2, v2 in pairs(v) do
+            _G.table.insert(list, { k, k2, v2 })
+        end
+    end
+    return list
+end
+
+---
+---@protected
+function WarTechnologyModel:GetTotleAttribute(elements)
+    local attribute = {}
+    local technologyCfg = _G.ConfigManager.technology_cfg
+
+    for k, v in pairs(self.technologyInfo) do
+        local value = technologyCfg[k]
+        local lv = v
+        if lv ~= nil and lv > 0 then
+            --种族属性加成
+            local base_att2 = value.base_att2
+            if elements == value.elements then
+                local data2 = base_att2[lv]
+                if attribute[data2[1]] == nil then
+                    attribute[data2[1]] = {}
+                end
+                if attribute[data2[1]][data2[2]] == nil then
+                    attribute[data2[1]][data2[2]] = 0
+                end
+                attribute[data2[1]][data2[2]] = attribute[data2[1]][data2[2]] + tonumber(data2[3])
+            end
+        end
+    end
+    local list = {}
+    for k, v in pairs(attribute) do
+        for k2, v2 in pairs(v) do
+            _G.table.insert(list, { k, k2, v2 })
+        end
+    end
+    return list
+end
+
+---
+---@protected
+function WarTechnologyModel:GetSkillAttInfoByIndex(index)
+    local technologyCfg = _G.ConfigManager.technology_cfg
+    local value = _G.ConfigManager.technology_layer_cfg[index]
+    local attribute2 = {}
+    for i, v in ipairs(value.mission_extra) do
+        local isLock = self:GetIsUnlock(index)
+        if isLock == true then
+            local cfg = technologyCfg[v]
+            if cfg.pointtype == 3 then
+                local lv = self.technologyInfo[v]
+                if lv ~= nil then
+                    if attribute2[cfg.elements] == nil then
+                        attribute2[cfg.elements] = {}
+                    end
+                    attribute2[cfg.elements] = { att = cfg.base_att2[lv], active = self.technologyInfo[v] ~= nil }
+                end
+            end
+        end
+    end
+    return attribute2
+end
+
+---获取属性
+function WarTechnologyModel:GetAllAttribute(Elements)
+    Elements = require "CardInfoManager":GetInstance():GetElementsMulti(Elements)
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    local attributeglobal = AttributeClassManager:GetAttribtueClass()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute)
+        return attribute, changeAttrTypes
+    end
+    local tonumber = _G.tonumber
+    local name, value, aType
+
+    local attTable = self:GetTotleAttribute(Elements[1])
+
+    for _, v in pairs(attTable) do
+        value = tonumber(v[3])
+        name = v[1]
+        aType = v[2] == "1" and _G.AttCountType.other or tonumber(v[2])
+        attribute:AddValueByName(name, AttributeClassManager:GetValueWithName(name, value, aType), false, aType)
+    end
+
+    local attTableglobal = self:GetTotleAttributeGlobal()
+
+    for _, v in pairs(attTableglobal) do
+        value = tonumber(v[3])
+        name = v[1]
+        aType = v[2] == "1" and _G.AttCountType.other or tonumber(v[2])
+        attributeglobal:AddValueByName(name, AttributeClassManager:GetValueWithName(name, value, aType), false, aType)
+    end
+
+    ---全局数据只算一次，加到默认种族上
+    _G.AttributeClassManager:GetInstance():AddAttribute(attribute, attributeglobal)
+
+    local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute)
+
+    local changeAttrTypes_new = changeAttrTypes
+    local attribute_new = attribute
+    ---多种族在默认种族基础叠加
+    if #Elements > 1 then
+        for i = 2, #Elements do
+            local attribute2 = AttributeClassManager:GetAttribtueClass()
+            attTable = self:GetTotleAttribute(Elements[i])
+
+            for _, v in pairs(attTable) do
+                value = tonumber(v[3])
+                name = v[1]
+                aType = v[2] == "1" and _G.AttCountType.other or tonumber(v[2])
+                attribute2:AddValueByName(name, AttributeClassManager:GetValueWithName(name, value, aType), false, aType)
+            end
+
+            attribute_new = _G.AttributeClassManager:GetInstance():AddAttributeByNew(attribute_new,
+                attribute2)
+
+            local changeAttrTypes2 = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute2)
+            changeAttrTypes_new = _G.AttributeClassManager:GetInstance():AddAttributeByNew(changeAttrTypes_new,
+                changeAttrTypes2)
+        end
+    end
+
+    return attribute, changeAttrTypes
+end
+
+---
+---@protected
+function WarTechnologyModel:SetBuildingEffectNum(num)
+    local str = string.format("%.1f", num)
+    local integerPart, fractionalPart = math.modf(str)
+    if fractionalPart == 0 then
+        str = integerPart
+    end
+    return str
+end
+
+---获取战斗是否跳过
+function WarTechnologyModel:GetAutoChoose()
+    return _G.PlayerPrefsManager.GetInt("WarTechnologyAutoChoose", 0)
+end
+
+---设置战斗是否自动战斗
+function WarTechnologyModel:SetAutoChoose(isSkip)
+    local value = isSkip and 1 or 0
+    _G.PlayerPrefsManager.SetInt("WarTechnologyAutoChoose", value)
+end
+
+---类的析构函数
+function WarTechnologyModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eCard.CardChangeStar, self.OnStarTaskUpdate, self)
+    _G.Events:GetInstance():RemoveListener(_G.eCard.CardPotential, self.OnAwakeTaskUpdate, self)
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.OnUpdataSelfCards, self)
+end
+
+return WarTechnologyModel

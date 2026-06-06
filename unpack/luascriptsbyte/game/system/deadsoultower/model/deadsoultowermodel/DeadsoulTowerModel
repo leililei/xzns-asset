@@ -1,0 +1,800 @@
+-----------------------------------------------------------------------
+-- Created by szs on 20. 四月 2021 20:35
+--
+-- @Description 死魂岛数据类
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+local base = _G.GameDataModelBase
+local DeadsoulTowerNet = require("DeadsoulTowerNet")
+
+---@class DeadsoulTowerModel : GameDataModelBase
+---@field GetInstance fun():DeadsoulTowerModel
+---@field TowerProps number[] 五行
+---@field MianTower number 主塔
+---@field SystemId number 功能id
+---@field LandFloor number 主塔当前层数
+---@field PracticeFloor number[][] 试炼所属类型完成层数, 今日已挑战层数
+---@field CurTowerSid number 当前塔ID
+---@field CurTowerType number 当前塔所属
+---@field TowerMonster number[] 怪物组
+---@field CurWeek number 当前周(五行塔开放后使用)
+---@field curTowerType_max number 当前塔的最大层数
+local DeadsoulTowerModel = _G.BaseClass("DeadsoulTowerModel", base)
+
+--region -------------静态变量-------------
+
+--endregion
+---@param curQuickPass number 当前快速挑战的次数
+function DeadsoulTowerModel:__init()
+    self.endCallback = nil
+    self.curFunctionOpenID = 22
+    self.TowerProps = {
+        none = 0,
+        lei = 1,
+        feng = 2,
+        shui = 3,
+        huo = 4,
+        tu = 5
+    }
+
+    self.MianTower = 9
+    self.SystemId = 0
+
+    self.LandFloor = 0
+    self.PracticeFloor = {}
+    self.CurWeek = 0
+    for i = 1, 5 do
+        self.PracticeFloor[i] = {
+            name = _G.table.keyof(self.TowerProps, i),
+            high_floor = 0,
+            pass_num = 0
+        }
+    end
+    self.CurTowerType = self.MianTower
+    self.extra_reaward_jiange = 5
+    self.enemy_lists = {}
+    self.target_list = {}
+    self.award_list = {}
+    self.curQuickPass = 0
+    self.CurTowerSid = 0
+    self.curTowerType_max = 0
+    self.IsOpenWx = false
+end
+
+---跨天刷新
+function DeadsoulTowerModel:OnSixClockUpdate(endcall)
+    if _G.AppSetting.DEBUG then
+        _G.Log(DeadsoulTowerModel:GetInstance().PracticeFloor, "跨天刷新五行数据")
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.DeadsoulMain) then
+        if endcall then
+            endcall()
+        end
+        return
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DeadSoulDailyReward.id)
+    if DeadsoulTowerModel:GetInstance().IsOpenWx then
+        --更改下日期
+        local now = _G.TimeUtil.GetServerUnixTime() - _G.TimeUtil.GAME_DAY_TIME
+        local tb = _G.TimeUtil.GetDateTime(now)
+        local curWeek = tb.week == 0 and 7 or tb.week
+        DeadsoulTowerModel:GetInstance().CurWeek = curWeek
+
+        --刷新界面数据
+        ---@type DeadsoulTowerView
+        local window1 = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DeadsoulTowerView.Name)
+        if window1 and window1.gameObject:GetActiveSelf() == 1 then
+            --window1:Show()
+            window1:UpdateFightFloor()
+            window1:StartTower()
+        end
+        ---@type DeadsoulView
+        local window2 = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DeadsoulView.Name)
+        if window2 and window2.PropType ~= DeadsoulTowerModel:GetInstance().MianTower and window2.gameObject:GetActiveSelf() == 1 then
+            --检查当前是否开启此塔
+            local isOpen = false
+            local cfg = _G.ConfigManager.discrete_cfg[101802]
+            if cfg then
+                isOpen = cfg[window2.PropType] and _G.table.indexof(cfg[window2.PropType], curWeek)
+            end
+            if isOpen then
+                window1:UpdateFightFloor()
+            else
+                window2:Close()
+            end
+        end
+    end
+    base.OnSixClockUpdate(self, endcall)
+end
+
+function DeadsoulTowerModel:InitFunction()
+    local isTrue, _ = self:CheckFunctionIsUnlock(_G.FunctionID.DeadsoulMain)
+    if isTrue then
+        self:InitAwardDatas()
+    end
+    self:CacheMainTowerTask()
+    --刷新 死魂塔 五行塔开启刷新 红点
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DeadsoulMain.id)
+end
+
+function DeadsoulTowerModel:CacheMainTowerTask()
+    self.TowerTaskList = {}
+    for k, v in pairs(_G.ConfigManager.mission_cfg) do
+        if v.condition[1][1] == 40 then
+            if not self.TowerTaskList[v.condition[1][2]] then
+                self.TowerTaskList[v.condition[1][2]] = {}
+            end
+            _G.table.insert(self.TowerTaskList[v.condition[1][2]], {v.id, v.condition[1][3]})
+            if not _G.table.isEmptyOrNil(self.TowerTaskList[v.condition[1][2]]) then
+                _G.SortList(
+                    self.TowerTaskList[v.condition[1][2]],
+                    function(a)
+                        return -a[2]
+                    end
+                )
+            end
+        end
+    end
+end
+
+---结算使用
+---找到最接近的任务
+function DeadsoulTowerModel:GetSidTaskCom(sid)
+    local missionCfg
+    if _G.table.isEmptyOrNil(self.TowerTaskList) and not sid then
+        return nil
+    else
+        local tower = _G.ConfigManager.tower_cfg[sid].tower
+        local _condition = sid - 10000 * tower
+        if not _G.table.isEmptyOrNil(self.TowerTaskList[tower]) then
+            for k, v in pairs(self.TowerTaskList[tower]) do
+                if _condition <= v[2] then
+                    return v[1]
+                end
+            end
+        end
+    end
+end
+
+---初始化下 主塔信息
+function DeadsoulTowerModel:InitTowerInfo(type)
+    local TowerInfo = {}
+    local cfg = _G.ConfigManager.tower_cfg
+    for _, v in pairs(cfg) do
+        if v.tower == type then
+            TowerInfo[v.layer] = v
+        end
+    end
+    return TowerInfo
+end
+
+---得到当前塔的 最大层数
+---@param maxtowerinfo table 最大层的信息
+function DeadsoulTowerModel:SetMaxCurrentTower(maxtowerinfo)
+    self.curTowerType_max_info = maxtowerinfo
+end
+
+---获取当前选择塔（类型：五行，主）的最大层数
+function DeadsoulTowerModel:GetMaxCurrentTower()
+    return self.curTowerType_max_info
+end
+
+---打开死魂岛
+function DeadsoulTowerModel:GetDataFormServer(_)
+    local isTrue, _ = self:CheckFunctionIsUnlock(_G.FunctionID.DeadsoulMain)
+    if isTrue then
+        DeadsoulTowerModel:GetInstance().SystemId = 201
+        ---获取主塔信息
+        ---@param msg dead_soul.s2c_dead_soul_island
+        DeadsoulTowerNet:GetInstance():DeadSoulIsland(
+            nil,
+            function(msg)
+                DeadsoulTowerModel:GetInstance().LandFloor = msg.high_floor
+                -- local unlockFloor = _G.ConfigManager.discrete_cfg[102301][1][1]
+                DeadsoulTowerModel:GetInstance().target_list = msg.target_list
+                DeadsoulTowerModel:GetInstance().award_list = msg.award_list
+                DeadsoulTowerModel:GetInstance().buy_store_id = msg.buy_store_id or {}
+                self.isDailyReward = msg.day_award
+                self.lastMaxFid = msg.last_max_fid
+                local towerStore = _G.ConfigManager.tower_store_cfg
+                local cashCfg = _G.ConfigManager.store_extra_cfg
+                local diamondCfg = _G.ConfigManager.store_exchange_cfg
+                local towerCfg = _G.ConfigManager.tower_cfg
+                local giftDataList = {}
+                local insert = _G.table.insert
+                for k, v in pairs(towerStore) do
+                    local data = {}
+                    data.layer = towerCfg[v.tower].layer
+                    data.award = {}
+                    if v.rmb and v.rmb ~= 0 then
+                        local giftdata = cashCfg[v.rmb]
+                        data.sid = v.rmb
+                        data.award = giftdata.goods
+                        data.price_id = giftdata.price_id
+                        data.original_id = giftdata.original_id
+                        data.buyType = 1
+                    end
+                    if v.diamond and v.diamond ~= 0 then
+                        local giftdata = diamondCfg[v.diamond]
+                        data.sid = v.diamond
+                        data.award = giftdata.goods
+                        data.price_id = giftdata.price
+                        data.original_id = giftdata.original
+                        data.buyType = 2
+                    end
+                    data.id = v.id
+                    data.nextLayer = 9999
+                    local lastdata = giftDataList[#giftDataList]
+                    if lastdata then
+                        lastdata.nextLayer = data.layer
+                    end
+                    insert(giftDataList, data)
+                end
+                _G.SortList(
+                    giftDataList,
+                    function(a)
+                        return -a.id
+                    end
+                )
+                DeadsoulTowerModel:GetInstance().giftDataList = giftDataList
+                ---主塔层级达到开试炼的条件
+                local isFinishFloor = msg.high_floor
+                if isFinishFloor > 0 then
+                    isFinishFloor = _G.ConfigManager.tower_cfg[isFinishFloor].layer
+                end
+                _G.Events:GetInstance():Broadcast(
+                    _G.ePlayAactionEvent.PlayAaction,
+                    {
+                        _G.ActiveTaskEnum.ConditionEnum.Section.DeadsoulFoor
+                    },
+                    1
+                )
+                --查看是否解锁了 五行试炼塔
+                local unlockFloor = _G.ConfigManager.discrete_cfg[102301][1][1]
+                if
+                    isFinishFloor >= unlockFloor and
+                        _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Deadsoul)
+                 then
+                    DeadsoulTowerModel:GetInstance().IsOpenWx = true
+                    DeadsoulTowerNet:GetInstance():DeadSoulPractice(
+                        nil,
+                        function(msg)
+                            for i = 1, #msg.open_tower do
+                                ---@type dead_soul.tower_info
+                                local towerInfo = msg.open_tower[i]
+                                local pfr = self.PracticeFloor[towerInfo.type]
+                                pfr.high_floor = towerInfo.high_floor
+                                pfr.pass_num = towerInfo.pass_num
+                                pfr.award_list = towerInfo.award_list
+                            end
+                            self.super.ParseData(self)
+                        end
+                    )
+                else
+                    DeadsoulTowerModel:GetInstance().IsOpenWx = false
+                    self.super.ParseData(self)
+                end
+                --刷新红点信息
+                --require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DeadsoulMain.id)
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DeadsoulPack.id)
+                require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DeadSoulDailyReward.id)
+            end
+        )
+    else
+        self.super.ParseData(self)
+    end
+end
+
+function DeadsoulTowerModel:ReConnect(endcall)
+    if self.mallCall then
+        self.buy_store_id[1] = self.curBuyId
+        self.mallCall()
+        self.mallCall = nil
+        self.sendBuy = false
+    end
+    self.super.ReConnect(self, endcall)
+end
+
+---判断功能是否解锁
+---@param sid number function_open_cfg 表Id
+function DeadsoulTowerModel:CheckFunctionIsUnlock(sid)
+    local cfg = _G.ConfigManager.function_open_cfg[sid]
+    if _G.GlobalConditionManager.CheckConditionByArray(cfg.condition_type) then
+        return true
+    end
+    return false
+    --, cfg.condition_params
+end
+
+---进入副本
+---@param sid number 挑战的id
+---@param type number tower_cfg.tower 所属塔
+function DeadsoulTowerModel:EnterSection(sid, type)
+    self.CurTowerSid = sid
+    self.CurTowerType = type
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("选择爬塔的类型：" .. self.CurTowerType)
+    end
+    local cfg = _G.ConfigManager.tower_cfg
+    self.TowerMonster = {cfg[sid].monster}
+    _G.DeadsoulTowerManager:GetInstance():EnterEmbattle(false)
+end
+
+--死魂塔目标层数 102301
+function DeadsoulTowerModel:GetDeadTowerFunForecast()
+    local Layer = _G.ConfigManager.discrete_cfg[102301][1][1]
+    if self.CurTowerType == 9 then
+        local curLayer = self.CurTowerSid - self.CurTowerType * 10000
+        if curLayer <= Layer then
+            local forecast = {}
+            forecast.progress = "(" .. curLayer .. "/" .. Layer .. ")"
+            forecast.desc = _G.LangUtil.GetLangPackValue(90028010119, Layer)
+            forecast.finish = curLayer >= Layer
+            return forecast
+        end
+    end
+    return nil
+end
+
+---检测星期是否对上
+---@param propType number 五行类型
+function DeadsoulTowerModel:CheckWeek(propType)
+    local isOk = false
+    local param = _G.ConfigManager.discrete_cfg[101802]
+    local weeks = param[propType]
+    for i = 1, #weeks do
+        if weeks[i] == self.CurWeek then
+            isOk = true
+            break
+        end
+    end
+
+    return isOk
+end
+
+---检测是否挑战(红点)
+function DeadsoulTowerModel:CheckIsChallenge()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.DeadsoulMain) then
+        return true
+    end
+    if not DeadsoulTowerModel:GetInstance().LandFloor then
+        return false
+    end
+    return DeadsoulTowerModel:GetInstance().LandFloor > 0
+end
+
+--初始化奖励数据
+function DeadsoulTowerModel:InitAwardDatas()
+    self.AwardDatas = {}
+    local Tower_cfg = _G.ConfigManager.tower_cfg
+    local cfg = {}
+    for key, value in pairs(Tower_cfg) do
+        if not _G.table.isEmptyOrNil(value.reward_first) then
+            _G.table.insert(cfg, value)
+        end
+    end
+    _G.table.sort(
+        cfg,
+        function(a, b)
+            if a.tower < b.tower then
+                return true
+            elseif a.tower == b.tower and a.layer < b.layer then
+                return true
+            end
+            return false
+        end
+    )
+    local ChapterRewardData = require "DeadSoulRewardData"
+    local count = #cfg
+    for i = 1, count do
+        self.AwardDatas[i] = ChapterRewardData.New()
+        self.AwardDatas[i]:Parse(cfg[i])
+    end
+end
+
+---更新奖励数据
+function DeadsoulTowerModel:UpdateAwardDatas()
+    if not self.AwardDatas then
+        return
+    end
+    for _, v in pairs(self.AwardDatas) do
+        v.isGet = false
+        v.CanTake = false
+        v:UpdateCanTake()
+    end
+end
+
+function DeadsoulTowerModel:GetId()
+    return self.LandFloor
+end
+
+---获取当前层数
+function DeadsoulTowerModel:GetCurLayer()
+    return self:Getlayer(self.LandFloor)
+end
+
+---获取层数
+---@param id number 查询id/nil当前
+function DeadsoulTowerModel:Getlayer(id)
+    local layer = 0
+    local tid
+    if id == nil then
+        tid = self.LandFloor
+    else
+        tid = id
+    end
+    if tid > 0 then
+        local cfg = _G.ConfigManager.tower_cfg[tid]
+        if cfg then
+            layer = cfg.layer
+        end
+    end
+    return layer
+end
+
+---检测接口, 死魂塔 任务，塔的类型，（9-主塔；1-雷；2-风；3-水；4-火；5-土；10-所有塔都达到指定层；11-所有五行塔都达到指定层）
+---@param type number 10 全部塔，11 全部的 五行塔
+---@param param number 目标值
+---@return  返回 最小的塔的层数
+function DeadsoulTowerModel:CheckDeadsoulTask(type, param)
+    local layer = 0
+    local towertable = {}
+    local cfg = _G.ConfigManager.tower_cfg
+
+    local sid = 0
+
+    --region --------------------------------------主塔--------
+
+    ---- 10    9 要考虑主塔
+    if type == 10 or type == 9 then
+        sid = self.LandFloor
+        if sid == 0 then
+            layer = 0
+        else
+            layer = cfg[sid].layer
+        end
+        _G.table.insert(towertable, layer)
+    end
+
+    --region --------------------------------------五行塔--------
+
+    if type == 11 or type == 10 then
+        ---所有五行塔
+        for key, value in pairs(self.PracticeFloor) do
+            sid = value.high_floor
+            if sid == 0 then
+                layer = 0
+            else
+                layer = cfg[sid].layer
+            end
+            _G.table.insert(towertable, layer)
+        end
+    elseif type < 6 then
+        ---指定 五行塔
+        local value = self.PracticeFloor[type]
+        sid = value.high_floor
+        if sid == 0 then
+            layer = 0
+        else
+            layer = cfg[sid].layer
+        end
+        _G.table.insert(towertable, layer)
+    end
+
+    --endregion------------------------------------五行塔--------
+    _G.table.sort(
+        towertable,
+        function(a, b)
+            return a < b
+        end
+    )
+    layer = towertable[1]
+    return layer
+end
+
+--region 对外接口 检测红点
+---检测目标奖励
+function DeadsoulTowerModel:CheckRedPointTowerTargetAward()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return false
+    end
+    local target_list = DeadsoulTowerModel:GetInstance().target_list
+    local tower_five_cfg = _G.ConfigManager.tower_five_cfg
+    local maxCount = #tower_five_cfg
+    local id = 1
+    if table.isEmptyOrNil(target_list) then
+        id = 1
+    else
+        _G.table.sort(
+            target_list,
+            function(a, b)
+                return a > b
+            end
+        )
+        id = target_list[1]
+        id = id + 1
+        if id > maxCount then
+            return false
+        end
+    end
+    local tower = tower_five_cfg[id].tower
+    local number = 0
+    local pra = DeadsoulTowerModel:GetInstance().PracticeFloor
+    for i = 1, #tower do
+        if tower[i] <= pra[i].high_floor then
+            number = number + 1
+        end
+    end
+    if number < 5 then
+        return false
+    end
+    return true
+end
+
+---检测额外奖励
+function DeadsoulTowerModel:CheckRedpointTowerExtraAward(param)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return false
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(23) then
+        return false
+    end
+    ---判断是主塔 还是 五行塔
+    local exraAward = {}
+    local flag = false
+    if param == 9 then
+        exraAward = {}
+        exraAward = DeadsoulTowerModel:GetInstance().award_list
+        flag = true
+    else
+        ---检测时间是否有开启的五行塔，五行塔中是否有奖励
+        local now = _G.CS.YoukiaCore.TimeKit.GetNowUnixTime() - _G.TimeUtil.GAME_DAY_TIME
+        local tb = _G.TimeUtil.GetDateTime(now)
+        local pra = DeadsoulTowerModel:GetInstance().PracticeFloor
+        local param1 = _G.ConfigManager.discrete_cfg[101802]
+        local week = tb.week
+        if week == 0 then
+            week = 7
+        end
+        ---查看五行塔是否 又可领取的
+        local param2 = param1[param]
+        for i = 1, #param2 do
+            if param2[i] == week then
+                exraAward = {}
+                exraAward = pra[param].award_list
+                flag = true
+                break
+            end
+        end
+    end
+    ---查看是否有奖励可以领取
+    if flag and (not _G.table.isEmptyOrNil(exraAward)) then
+        return true
+    end
+    return false
+end
+
+---检测礼包
+function DeadsoulTowerModel:CheckRedPointGift()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return false
+    end
+    if self.giftDataList == nil then
+        return false
+    end
+    local layer = _G.PlayerPrefsManager.GetInt("DeadSoulGift")
+    if layer == nil then
+        layer = 0
+    end
+    local landId = self.LandFloor
+    local nLandFloor = landId ~= 0 and _G.ConfigManager.tower_cfg[landId].layer or 0
+    local maxLayer = self.buy_store_id and self.buy_store_id[1] or 0
+    for i, v in pairs(self.giftDataList) do
+        if v.id > maxLayer then
+            if v.layer <= nLandFloor then
+                if layer < v.layer then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+    -- local maxLayer = self:GetGiftMaxLayer()
+    -- if layer == nil then
+    --     layer = 0
+    -- end
+    -- if maxLayer > layer then
+    --     return true
+    -- else
+    --     return false
+    -- end
+end
+
+---每日礼包红点
+function DeadsoulTowerModel:CheckRedPointDailyReward()
+    -- if self:GetId() == 0 then
+    --     return false
+    if not self:CheckIsDailyReward() then
+        return true
+    end
+    return false
+end
+
+---获取礼包最大层级数
+function DeadsoulTowerModel:GetGiftMaxLayer()
+    local curLayer = self:Getlayer()
+    local maxLayer = 0
+    for _, v in pairs(self.giftDataList) do
+        if curLayer >= v.layer then
+            maxLayer = v.layer
+        end
+    end
+    return maxLayer
+end
+
+--endregion
+
+---获取当前塔sid
+---@return number
+function DeadsoulTowerModel:GetCurTowerSid()
+    return self.CurTowerSid
+end
+
+---获取通关录像
+---@param call function
+---@param tower_sid number
+function DeadsoulTowerModel:GetRecommend(call, tower_sid)
+    require "DeadsoulTowerNet":GetInstance():GetRecommend(
+        {sid = tower_sid},
+        function(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---购买礼包
+function DeadsoulTowerModel:BuyGift(data, callback)
+    if data.buyType == 1 then
+        _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+        self.mallCall = callback
+        self.curBuyId = data.id
+        self.sendBuy = true
+        require "MallManager":GetInstance():BuyActiveGift(data.price_id, nil, data.sid)
+    elseif data.buyType == 2 then
+        local pbData = {}
+        pbData.buy_store_id = data.id
+        DeadsoulTowerNet:GetInstance():BuyGift(
+            pbData,
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.StorageManager:GetInstance():ConsumeItem(12, 0, data.price_id)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg, callback)
+                self.buy_store_id[1] = data.id
+            end
+        )
+    end
+end
+
+---充值回调
+function DeadsoulTowerModel:OnMallCashListener(data)
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    self.buy_store_id[1] = self.curBuyId
+    if self.mallCall then
+        self.mallCall()
+        self.mallCall = nil
+    end
+    self.sendBuy = false
+end
+
+function DeadsoulTowerModel:DeadSoulStrategy(call)
+    local Getlayer = self:Getlayer()
+
+    if Getlayer <= 0 then
+        return
+    end
+    Getlayer = self.CurTowerType * 10000 + Getlayer + 1
+
+    require "DeadsoulTowerNet":GetInstance():GetRecommend(
+        {sid = Getlayer},
+        function(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---领取每日礼包
+function DeadsoulTowerModel:GetDailyReward(call)
+    DeadsoulTowerNet:GetInstance():GetDailyReward(function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        self.isDailyReward = 1
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.DeadSoulDailyReward.id)
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        if call then
+            call()
+        end
+    end)
+end
+
+---领取所有奖励
+---@param type number 爬塔类型
+---@param callback function 回调
+function DeadsoulTowerModel:GetAllAward(type, callback)
+    local temp = {}
+    local datas = self.AwardDatas
+    if datas then
+        for _, v in ipairs(datas) do
+            if v.CanTake and v.cfg.tower == type then
+                _G.table.insert(temp, v.sid)
+            end
+        end
+    end
+    if _G.table.isEmptyOrNil(temp) then
+        return
+    end
+    _G.DeadsoulTowerManager:GetInstance():DeadSoulAward(type, temp, function(msg)
+        for _, value in pairs(self.AwardDatas) do
+            if _G.table.indexof(temp, value.sid) then
+                value.isGet = true
+                value.CanTake = false
+            end
+        end
+        if callback then
+            callback(msg)
+        end
+    end)
+end
+
+---每日礼包是否已领取
+function DeadsoulTowerModel:CheckIsDailyReward()
+    return self.isDailyReward == 1
+end
+
+---获取昨日最高层数
+function DeadsoulTowerModel:GetLastDayMaxLayer()
+    local layer = 0
+    if self.lastMaxFid == 0 then
+        return 0
+    else
+        local cfg = _G.ConfigManager.tower_cfg[self.lastMaxFid]
+        if cfg then
+            layer = cfg.layer
+        end
+    end
+    return layer
+end
+
+---可领取的index 方便跳转
+function DeadsoulTowerModel:GetHaveGetIndex()
+    local maxGift = self.buy_store_id and self.buy_store_id[1] or 0
+    
+    return maxGift 
+end
+
+---检测是否所有礼包购买完
+function DeadsoulTowerModel:CheckAllGitfSoldOut()
+    local maxLayer = self.buy_store_id and self.buy_store_id[1] or 0
+    for i, v in pairs(self.giftDataList) do
+        if v.id > maxLayer then
+            return false
+        end
+    end
+    return true
+end
+
+function DeadsoulTowerModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+return DeadsoulTowerModel

@@ -1,0 +1,448 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.WorldBoss.Model.WorldBossModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/09/18
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local WorldBossNet = require "WorldBossNet"
+local WorldBossCardData = require "WorldBossCardData"
+local WorldBossData = require "WorldBossData"
+---@class WorldBossModel : Singleton	中文描述
+---@field wordData world_boss.s2c_get_info
+---@field curDiffculty number 当前难度
+---@field bossCfg boss_cfg 当前难度配置表
+---@field rankData rank.i_boss_rank[]
+---@field playerRank rank.s2c_get_rank_num
+---@field checkIsPutResult table<sid,boolean>
+---@field BossDatas WorldBossData[]
+local WorldBossModel = _G.BaseClass("WorldBossModel", _G.GameDataModelBase)
+
+---@return WorldBossModel WorldBossModel
+function WorldBossModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function WorldBossModel:__init()
+    self.checkIsPutResult = {}
+    self.curFunctionOpenID = 4
+    self.curDiffculty = 0
+    ---@type system_cfg
+    self.systemCfg = _G.ConfigManager.system_cfg[204]
+    self.maxFightNum = self.systemCfg.count_reset
+end
+
+---销毁对象时,析构函数
+function WorldBossModel:Dispose()
+    self.checkIsPutResult = nil
+end
+
+function WorldBossModel:GetDataFormServer()
+    self:GetWorldBossData()
+end
+
+---获取世界boss信息
+function WorldBossModel:GetWorldBossData(callback)
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        WorldBossNet:GetInstance():GetWorldBossInfo(_G.handlerbind(self, self.GetWorldBossDataCall, callback))
+    end
+    self:ParseData()
+end
+
+---获取世界boss信息回调
+---@param msg world_boss.s2c_get_info
+function WorldBossModel:GetWorldBossDataCall(msg, callback)
+    self.wordData = msg
+    self:InitBossData()
+    if callback then
+        callback()
+    end
+    _G.Events:GetInstance():Broadcast("WorldBossModelRresh")
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.WorldBoss.id)
+end
+---初始化放置
+function WorldBossModel:InitCheckIsPutResult()
+    if self.wordData.up_sids then
+        for _, v in pairs(self.wordData.up_sids) do
+            self.checkIsPutResult[v] = true
+        end
+    end
+end
+
+---获取排行榜回调
+---@param msg rank.s2c_rank_world_boss
+function WorldBossModel:GetRankCall(msg, callback)
+    --self.rankData = msg.rankers
+    self.rankData = msg.rank
+    require "DungonesModel":GetInstance().rank_all_player = {}
+    require "DungonesModel":GetInstance():SetRankAllPlayer(msg.rank, 10)
+end
+
+---获取玩家自身排名名词
+---@param msg rank.s2c_get_rank_num
+function WorldBossModel:GetPlayerNum(msg, callback)
+    self.playerRank = msg
+    if self.playerRank.value < self.wordData.score then
+        self.playerRank.value = self.wordData.score
+    end
+    if callback then
+        callback()
+    end
+end
+
+---获取当前挑战的难度
+function WorldBossModel:GetCurDiffculty()
+    return self.curDiffculty
+end
+---检测挑战模式是否全部通关
+function WorldBossModel:CheckChangllengeIsPass()
+    return self.curDiffculty == #_G.ConfigManager.boss_cfg
+end
+
+---获取剩余讨伐次数
+function WorldBossModel:GetCrusadeNum()
+    if nil == self.wordData then
+        return 0
+    end
+    return self.maxFightNum - self.wordData.fight_num
+end
+---检测是否为首次挑战
+function WorldBossModel:CheckIsFirst()
+    if nil == self.wordData then
+        return true
+    end
+    return self.wordData.fight_num == 0
+end
+
+---检测是否上过阵
+function WorldBossModel:CheckIsPut(sid)
+    return self.checkIsPutResult[sid]
+end
+
+---获取卡牌数据
+function WorldBossModel:GetCardData()
+    local card = _G.DeepCopy(_G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card))
+    self.CardDatas = {[_G.CardElementType.None] = {}}
+    local put = {}
+    for i = 1, 3 do
+        local grounp = require "EmbattleModel":GetInstance():GetEmbattleData(60 + i)
+        if grounp then
+            local count = #grounp
+            for j = 1, count do
+                if grounp[j] > 0 then
+                    put[grounp[j]] = {grounp = i, pos = j}
+                end
+            end
+        end
+    end
+    local putCards = {}
+    for _, v in pairs(card) do
+        local data = WorldBossCardData.New()
+        data:Parse(v)
+        if put[v.uid] then
+            if not putCards[put[v.uid].grounp] then
+                putCards[put[v.uid].grounp] = {}
+            end
+            putCards[put[v.uid].grounp][put[v.uid].pos] = data
+        end
+        _G.table.insert(self.CardDatas[_G.CardElementType.None], data)
+        if not self.CardDatas[data.element] then
+            self.CardDatas[data.element] = {}
+        end
+        _G.table.insert(self.CardDatas[data.element], data)
+    end
+    self:SortAllCard(self.CardDatas)
+    return self.CardDatas, putCards
+end
+---排序所有
+function WorldBossModel:SortAllCard()
+    for _, v in pairs(self.CardDatas) do
+        self:SortCard(v)
+    end
+end
+---卡牌排序
+function WorldBossModel:SortCard(tb)
+    _G.table.sort(
+        tb,
+        function(a, b)
+            if (a.isPut and b.isPut) or (not a.isPut and not b.isPut) then
+                if a.power == b.power then
+                    if a.cardData.Grade == b.cardData.Grade then
+                        if a.star == b.star then
+                            return a.sid > b.sid
+                        else
+                            return a.star > b.star
+                        end
+                    else
+                        return a.cardData.Grade > b.cardData.Grade
+                    end
+                else
+                    return a.power > b.power
+                end
+            else
+                return a.isPut
+            end
+        end
+    )
+end
+---初始化Boss数据
+function WorldBossModel:InitBossData()
+    self.BossDatas = {}
+    self.curDiffculty = 0
+    local cfgs = _G.ConfigManager.boss_cfg
+    for i, v in ipairs(cfgs) do
+        self.BossDatas[i] = WorldBossData.New()
+        self.BossDatas[i]:Parse(cfgs[i])
+        if not self.BossDatas[i].isLock then
+            self.curDiffculty = i
+        end
+    end
+    self.bossCfg = _G.ConfigManager.boss_cfg[self.curDiffculty == 0 and 1 or self.curDiffculty]
+end
+
+---更新Boss数据
+function WorldBossModel:UpdateBossData()
+    self.curDiffculty = 0
+    local count = #self.BossDatas
+    for i = 1, count do
+        self.BossDatas[i]:UpdateLock()
+        if not self.BossDatas[i].isLock then
+            self.curDiffculty = i
+        end
+    end
+    self.bossCfg = _G.ConfigManager.boss_cfg[self.curDiffculty == 0 and 1 or self.curDiffculty]
+end
+
+---添加已上阵卡牌
+---@param cards WorldBossCardData[]
+function WorldBossModel:AddUids(cards)
+    local count = #cards
+    if not self.wordData.up_sids then
+        self.wordData.up_sids = {}
+    end
+    for i = 1, count do
+        if cards[i].uid > 0 then
+            _G.table.insert(self.wordData.up_sids, cards[i].sid)
+            self.checkIsPutResult[cards[i].sid] = true
+        end
+    end
+end
+
+---获取一键上阵的卡牌
+---@param HCards WorldBossCardData[] 寄灵人的卡
+---@param HCards WorldBossCardData[]  守护灵的卡
+function WorldBossModel:GetAutoCard()
+    ---TOO 找到所有符合要求的卡
+    local Cards = {}
+    local newHCards = self:ChooseCard(self.CardDatas[0])
+
+    local count = #newHCards
+    local isPut = {}
+    if count > 0 then
+        for i = 1, self.curDiffculty * 5 do
+            for _, v in pairs(newHCards) do
+                if not isPut[v.sid] then
+                    _G.table.insert(Cards, v)
+                    isPut[v.sid] = true
+                    break
+                end
+            end
+        end
+    end
+
+    return Cards
+end
+---选择卡牌
+---@param Cards WorldBossCardData[]
+function WorldBossModel:ChooseCard(Cards)
+    local tb =
+        _G.table.chooseToArray(
+        Cards,
+        function(k, v)
+            return v.canChoose
+        end
+    )
+    _G.table.sort(
+        tb,
+        function(a, b)
+            if (a.isCurElement and b.isCurElement) or (not a.isCurElement and not b.isCurElement) then
+                if (a.isCurPro and b.isCurPro) or (not a.isCurPro and not b.isCurPro) then
+                    return a.power > b.power
+                else
+                    return a.isCurPro
+                end
+            else
+                return a.isCurElement
+            end
+        end
+    )
+    return tb
+end
+
+---找出符合要求的卡牌
+function WorldBossModel:GetNeedCard(cards, filed)
+    local tb = {}
+    local count = #cards
+    local index = 1
+    for i = 1, count do
+        if cards[i][filed] then
+            tb[index] = cards[i]
+            index = index + 1
+        end
+    end
+    return tb
+end
+
+function WorldBossModel:CrusadeFight(cards)
+    self:UpdateTimes()
+    _G.Events:GetInstance():Broadcast("WorldBossUpdate")
+end
+
+---更新排行榜
+function WorldBossModel:UpdateRank(callback)
+    --WorldBossNet:GetInstance():GetRank({page = 1}, _G.handler(self, self.GetRankCall))
+    require "LingRankNet":GetInstance():GetRankAllInfos({type = 10}, _G.handler(self, self.GetRankCall))
+    WorldBossNet:GetInstance():GetPlayerRank(_G.handlerbind(self, self.GetPlayerNum, callback))
+end
+function WorldBossModel:UpdateTimes()
+    -- require("SystemEntranceModel"):GetInstance():SetTimes(204, self:GetCrusadeNum(), self.bossCfg.num_challenges)
+end
+function WorldBossModel:FightWin(atk_dps)
+    if not self.wordData.score or self.wordData.score <= atk_dps then
+        self.wordData.score = atk_dps
+    end
+    self.wordData.fight_num = self.wordData.fight_num + 1
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.WorldBoss.id, 0)
+    _G.Events:GetInstance():Broadcast("WorldBossModelRresh")
+end
+
+---获取最高积分
+function WorldBossModel:GetMaxScore()
+    return self.wordData.score
+end
+
+---获取讨伐数据
+function WorldBossModel:GetCursadeDatas()
+    return self.CursadeDatas
+end
+---获取Boss数据
+function WorldBossModel:GetBossData(index)
+    return self.BossDatas[index]
+end
+---获取其他使用
+function WorldBossModel:GetOtherUseCombineSkill(index)
+    local tb = {}
+    local index2 = 1
+    for i = 1, 3 do
+        if i ~= index then
+            local data = require "EmbattleModel":GetInstance():GetSkillIndex(60 + i)
+            tb[index2] = data
+            index2 = index2 + 1
+        end
+    end
+    local skills = {}
+    local data
+    for i = 1, #tb do
+        data = tb[i]
+        for j = 1, #data do
+            if data[j] > 0 then
+                skills[data[j]] = true
+            end
+        end
+    end
+    return skills
+end
+
+function WorldBossModel:GetCombineSkillState()
+    return self.combinePosState
+end
+
+function WorldBossModel:UpdateCombineSkillState()
+    self.combinePosState = {false, false, false}
+    local EmbattleModelIns = require("EmbattleModel"):GetInstance()
+    for i = 1, #self.combinePosState do
+        self.combinePosState[i] = EmbattleModelIns:CheckSkillPosUnLock(i)
+    end
+end
+
+function WorldBossModel:CheckRedPoint(id)
+    if id == 0 then
+        return self:CheckIsFirst()
+    end
+end
+---获取出战阵容id
+function WorldBossModel:GetEmbattleSid()
+    local tb = {}
+    for i = 1, 3 do
+        if self.BossDatas[i].isLock then
+            break
+        end
+        tb[i] = 60 + i
+    end
+    return tb
+end
+---获取敌人数据
+function WorldBossModel:GetEmbattleEnemyData()
+    local insert = _G.table.insert
+    local data = {}
+    ---@type monster_group_cfg
+    local cfg
+    ---@type monster_cfg
+    local cfg2
+    for i = 1, 3 do
+        if self.BossDatas[i].isLock then
+            break
+        end
+        data[i] = {}
+        ---@type monster_group_cfg
+        cfg = _G.ConfigManager.monster_group_cfg[self.BossDatas[i].cfg.monster_group]
+
+        for j = 1, #cfg.DefaultDefenserSids[1] do
+            local temp = {
+                sid = 0,
+                level = 0,
+                star = 0,
+                soulLink_lv = 0,
+                power = 0
+            }
+            if cfg.DefaultDefenserSids[1][j] > 0 then
+                cfg2 = _G.ConfigManager.monster_cfg[cfg.DefaultDefenserSids[1][j]]
+                temp.sid = cfg2.CardID
+                temp.level = cfg2.Level
+                temp.star = cfg2.Stars
+                temp.power = cfg2.Power
+            end
+            insert(data[i], temp)
+        end
+    end
+    return data
+end
+
+function WorldBossModel:GetEmbattleEnemyId()
+    local insert = _G.table.insert
+    local data = {}
+    ---@type monster_group_cfg
+    local cfg
+    ---@type monster_cfg
+    local cfg2
+    for i = 1, 3 do
+        if self.BossDatas[i].isLock then
+            break
+        end
+        data[i] = self.BossDatas[i].cfg.monster_group
+    end
+    return data
+end
+---获取上阵卡牌
+function WorldBossModel:GetEmbattleCards()
+    local cards = {}
+    for i = 1, 3 do
+        if self.BossDatas[i].isLock then
+            break
+        end
+        _G.table.insertto(cards, require "EmbattleModel":GetInstance():GetEmbattleData(60 + i))
+    end
+    return cards
+end
+
+return WorldBossModel

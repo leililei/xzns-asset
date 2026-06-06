@@ -1,0 +1,1102 @@
+-------------------------------------------------------
+-- Description:     世界管理器
+-- Author:          csw
+-- Create Date:     2019/11/29
+-------------------------------------------------------
+require "WorldItemData"
+require "AIManager"
+-- require "WorldItemEvent"
+local WorldNet = require "WorldNet"
+--region定义说明
+---@class WorldManager : Singleton 世界场景管理类
+---@field public CurrentWorld BaseWorld 当前世界场景
+---@field public curSceneSid number 当前世界场景sid
+---@field public lastSceneSid number 上一个世界场景sid
+---@field public LoadedCallBack function 完成加载后的回调
+---@field public Running boolean 是否加载中
+---@field public DoorSid number 下个场景的传送门sid
+local WorldManager = _G.BaseClass("WorldManager", _G.Singleton)
+_G.WorldManager = WorldManager
+WorldManager.OtherPlayerActionType = {
+    action = 1,
+    role = 2,
+    title = 3,
+    name = 4,
+    effect = 5,
+    hell = 6
+}
+WorldManager.AnimNames = {
+    MOVE = "run_1",
+    IDLE = "idle_1",
+    Stand = "stand_1",
+    WALK = "walk_1"
+}
+--endregion
+
+require "NetPushHandler"
+
+---@return WorldManager WorldManager
+function WorldManager:GetInstance()
+    return self.super.GetInstance(self)
+end
+function WorldManager:__init()
+    self.CurrentWorld = nil
+    self.CurSceneType = nil
+    self.curSceneSid = 0
+    self.lastSceneSid = 0
+    self.LoadedCallBack = nil
+    self.Running = false
+    --缓存世界场景
+    self.cacheWorld = {}
+    self.curSceneRes = ""
+    self.curSceneParent = nil
+    self.curItemParent = nil
+    self.roleParent = nil
+    self.mainSceneSid = 300
+end
+function WorldManager:Dispose()
+    self.CurrentWorld = nil
+    self.CurSceneType = nil
+    self.curSceneSid = nil
+    self.lastSceneSid = nil
+    self.LoadedCallBack = nil
+    self.Running = nil
+    --缓存世界场景
+    self.cacheWorld = nil
+    self.curSceneRes = nil
+    self.curSceneParent = nil
+    self.curItemParent = nil
+    if not _G.IsNil(self.roleParent) then
+        self.roleParent:DestroyObject()
+    end
+    self.roleParent = nil
+    if not _G.IsNil(self.curSceneResTrans) then
+        self.curSceneResTrans:DestroyObject()
+    end
+    self.curSceneResTrans = nil
+    self.mainSceneSid = nil
+end
+
+--region 对外接口
+-----获取当前世界对象
+---@return BaseWorld 当前世界对象
+function WorldManager:GetCurWorld()
+    return self.CurrentWorld
+end
+---对比当前世界类型
+---@type SceneType 世界类型 _G.SceneType.Section
+---@return boolean 和当前世界场景类型是否一致
+function WorldManager:CheckSceneType(SceneType)
+    if _G.IsNil(self.CurrentWorld) then
+        return false
+    end
+    return self.CurrentWorld.Cfg.Scene_Type == SceneType
+end
+
+---对比当前场景的类型
+---新增的一个函数，将类型赋值改到更前面，保证世界物体使用判定时更准确
+function WorldManager:CheckCurSceneType(SceneType)
+    if nil == self.CurSceneType then
+        return false
+    end
+    return self.CurSceneType == SceneType
+end
+---获取当前世界场景是否显示
+---@return boolean 是否显示
+function WorldManager:GetCurWorldShow()
+    if self.CurrentWorld then
+        local cfg = _G.ConfigManager.scene_cfg[self.CurrentWorld.Sid]
+        if cfg.WorldType == _G.WorldType.MainWorld then
+            return _G.UIManager:GetInstance():IsActiveWindow(cfg.Res)
+        else
+            return self.CurrentWorld.GameObject:GetActiveSelf() == 1
+        end
+    end
+    return false
+end
+-----获取主角
+---@return WorldPlayerItem 主角
+function WorldManager:GetCurWorldPlayer()
+    return self.CurrentWorld and self.CurrentWorld.WorldPlayer or nil
+end
+-----获取当前场景Sid
+---@return number 当前场景sid
+function WorldManager:GetCurWorldSid()
+    return self.curSceneSid or 0
+end
+-----获取上一个场景sid
+---@return number 上一个场景sid
+function WorldManager:GetLastWorldSid()
+    return self.lastSceneSid
+end
+-----获取场景GameObject
+---@param name string 场景预设名
+---@return UnityEngine.Transform 场景实例
+function WorldManager:GetSceneGameObj(name)
+    local trans
+    if not _G.IsNil(self.curSceneParent) then
+        trans = self.curSceneParent:FindE(name)
+    end
+    if _G.IsNil(trans) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到场景资源 name = " .. name, "WorldManager:GetSceneGameObj")
+        end
+    end
+    return trans
+end
+-----回收场景GameObject
+---@param trans UnityEngine.Transform 场景实例
+function WorldManager:PutSceneGameObj(trans)
+    if not _G.IsNil(trans) then
+        trans:SetParentE(self.curSceneParent)
+        trans:SetActiveE(0)
+    end
+end
+-----获取物件Transform
+---@param name string 物件预设名
+---@return UnityEngine.Transform 物件实例
+function WorldManager:GetItemGameObj(name)
+    local trans
+    if not _G.string.IsNullOrEmpty(name) and not _G.IsNil(self.curItemParent) then
+        trans = self.curItemParent:FindE(name)
+    end
+    return trans
+end
+-----获取角色Transform
+---@param name string 角色预设名
+---@return UnityEngine.Transform 角色实例
+function WorldManager:GetRoleGameObj(name)
+    local trans
+    if not _G.string.IsNullOrEmpty(name) and not _G.IsNil(self.roleParent) then
+        trans = self.roleParent:FindE(name)
+    end
+    return trans
+end
+---获取物件父节点
+---@return Transform 物件父节点
+function WorldManager:GetItemParent()
+    return self.curItemParent
+end
+---获取角色父节点
+---@return 变量类型 中文描述
+function WorldManager:GetRoleParent()
+    if _G.IsNil(self.roleParent) then
+        self.roleParent = _G.GameObject("roleParent")
+    end
+    return self.roleParent
+end
+---回收角色
+function WorldManager:DespawnRoleParent()
+    if self.roleParent then
+        for i = self.roleParent:GetChildCountE() - 1, 0, -1 do
+            _G.PoolsManager:GetInstance():Despawn(self.roleParent:GetChildE(i), _G.ePoolType.World)
+        end
+    end
+end
+function WorldManager:DestoryRoleParent()
+    if self.roleParent then
+        for i = self.roleParent:GetChildCountE() - 1, 0, -1 do
+            self.roleParent:GetChildE(i):DestroyObject()
+        end
+    end
+end
+-----回收物件Transform
+---@param trans UnityEngine.Transform 物件实例
+function WorldManager:PutItemGameObj(trans)
+    if not _G.IsNil(trans) then
+        trans:SetParentE(self.curItemParent)
+    end
+end
+---进入世界场景
+---@param sid number 世界Sid
+---@param callback function 打开场景prefab后的回调
+---@param doorSid number 下个场景的传送门sid
+---@param doneCall function 关闭加载界面后的回调
+---@param cacheSids table 需要缓存的场景sid数组
+---@param immediately boolean 是否立即切换(不用镜头移动)
+function WorldManager:EnterWorld(sid, callback, doorSid, doneCall, cacheSids, immediately)
+    if self.Running then
+        return
+    end
+    -- 防止重复加载同一场景
+    if self.curSceneSid and self.curSceneSid == sid then
+        if callback then
+            callback()
+        end
+        return
+    end
+    self.enterImmediately = immediately
+    -- if self.curSceneSid ~= nil and self.curSceneSid > 0 then
+    --     local cfg = _G.ConfigManager.scene_cfg
+    --     if cfg[self.curSceneSid] ~= nil and cfg[self.curSceneSid].Scene_Type == _G.SceneType.MainWorld then
+    -- _G.PlayerModel:GetInstance():WritePosRecord(
+    --     self.curSceneSid,
+    --     self:GetCurWorldPlayer().Transform:GetPosition()
+    -- )
+    --     end
+    -- end
+    self.lastSceneSid = self.curSceneSid
+    if immediately then
+        self:HideLastScene()
+    end
+    self.curSceneSid = sid
+    self.LoadedCallBack = callback
+    self.DoneCallback = doneCall
+    self.cacheSids = cacheSids or {sid}
+    self.Running = true
+    --切场景把角色位置重置
+    _G.PlayerModel:GetInstance():ResetPos()
+    _G.Events:GetInstance():Broadcast(_G.eScene.EnterWorldStart)
+    self.DoorSid = doorSid
+    self.stopCoProgress = _G.coroutine.start(_G.handler(self, self.CoProgressSwitchWorld))
+end
+---隐藏显示当前场景
+---@param visible boolean
+function WorldManager:SetCurrentWorldVisible(visible)
+    if not _G.AppSetting.IsloadScence and self.CurrentWorld then
+        self:SetBaseViewVisible(visible)
+        return
+    end
+    if _G.AppSetting.DEBUG then
+        _G.Log("WorldManager:SetCurrentWorldVisible")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(visible, "是否显示主城")
+    end
+
+    if self.CurrentWorld then
+        if visible then
+            self:LoadScenceStory(
+                function()
+                    self.CurrentWorld:Visible(visible)
+                    self:SetBaseViewVisible(visible)
+                end
+            )
+        else
+            self.CurrentWorld:Visible(visible)
+            self:SetBaseViewVisible(visible)
+        end
+    end
+end
+---设置基础界面(主界面)的显隐
+---@param visible boolean 是否可见
+function WorldManager:SetBaseViewVisible(visible)
+    if visible then
+        ---HUDView常驻显示 不隐藏
+        -- _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.HUDView.Name)
+        if self.CurrentWorld.Sid == 701 or self.CurrentWorld.Sid == 702 or self.CurrentWorld.Sid == 703 then
+            ---对于公会场景进行特殊处理
+            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.DungonesRuningView.Name)
+        elseif self.CurrentWorld.Sid == 600 then
+            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SociatyMainView.Name)
+        elseif self.CurrentWorld.Sid == 801 then ---恶灵入侵场景中 进行的跳转
+            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name)
+        else
+            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        end
+    else
+        ---HUDView常驻显示 不隐藏
+        -- _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.HUDView.Name)
+        if self.CurrentWorld.Sid == 701 or self.CurrentWorld.Sid == 702 or self.CurrentWorld.Sid == 703 then
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.DungonesRuningView.Name)
+        elseif self.CurrentWorld.Sid == 600 then
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SociatyMainView.Name)
+        elseif self.CurrentWorld.Sid == 801 then ---恶灵入侵场景中 进行的跳转
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name)
+        else
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        end
+    end
+end
+---登录时进入场景
+---@param callback function 初始化完成回调
+function WorldManager:LoginEnterScene(callback)
+    self.onLoginEnterSceneCall = callback
+    -- local sid, line
+    -- local PlayerModelIns = _G.PlayerModel:GetInstance()
+    -- sid = PlayerModelIns:GetCurCitySid()
+    -- line = PlayerModelIns:GetServerLine()
+    self:OnLoginEnterScene({map_id = self.mainSceneSid, line = 1})
+end
+---切换场景
+---@param toSceneSid number 目标场景sid
+---@param callback function 切换完成回调(参数boolean 是否切换成功)
+---@param toDoorSid number 目标传送门sid
+function WorldManager:SwitchScene(toSceneSid, callback, toDoorSid)
+    local swithFunc = function()
+        _G.PlayerModel:GetInstance():SetCurCitySid(toSceneSid)
+        _G.WorldManager:GetInstance():EnterWorld(
+            toSceneSid,
+            function()
+                _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+                if callback then
+                    callback(true)
+                end
+            end,
+            toDoorSid
+        )
+    end
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        local pos = 0
+        if toDoorSid then
+            local cfg = _G.require(_G.ConfigManager.scene_cfg[toSceneSid].TiledResLua)
+            local doors = cfg.WorldItemDatas.Door
+            if doors and #doors > 0 then
+                for i = 1, #doors do
+                    if doors[i].Sid == toDoorSid then
+                        pos =
+                            _G.WorldUtils.PosToPoint(
+                            {x = doors[i].InitPoint[1].p_x, z = doors[i].InitPoint[1].p_z},
+                            cfg.BaseInfo
+                        )
+                        break
+                    end
+                end
+            end
+        end
+        WorldNet:GetInstance():SwitchScene(
+            toSceneSid,
+            pos,
+            function(msg)
+                if msg.ack == 1 then
+                    self.otherPlayerInfo = msg.users
+                    swithFunc()
+                else
+                    if callback then
+                        callback(false)
+                    end
+                end
+            end
+        )
+    else
+        swithFunc()
+    end
+end
+---重新进入场景
+---@param callback function 进入回调
+function WorldManager:ReEnterScene(callback)
+    self.onReEnterSceneCall = callback
+    local sid, line
+    local PlayerModelIns = _G.PlayerModel:GetInstance()
+    sid = PlayerModelIns:GetCurCitySid()
+    line = PlayerModelIns:GetServerLine()
+    WorldNet:GetInstance():EnterScene(_G.handler(self, self.OnReEnterSceneCall), sid, line)
+end
+--endregion
+
+--region 协程加载场景
+-----加载主界面
+function WorldManager:CoLoadView()
+    local uimanager = _G.UIManager:GetInstance()
+    local open, view, name
+    local SociatyManager = require("SociatyManager"):GetInstance()
+    ---公会的特殊处理一下
+    if self.curSceneSid == SociatyManager.ScenceId then
+        SociatyManager:AndGoSociaty()
+        name = _G.ConfigManager.ui_cfg.SociatyMainView.Name
+    else
+        name = _G.ConfigManager.ui_cfg.MainView.Name
+    end
+    open, view = uimanager:IsLoadedWindow(name)
+    if not open then
+        view = uimanager:OpenWindow(name)
+        while _G.IsNil(view.gameObject) do
+            _G.coroutine.waitforendofframe()
+        end
+    end
+    open, view = uimanager:IsLoadedWindow(_G.ConfigManager.ui_cfg.HUDView.Name)
+    if not open then
+        view = uimanager:OpenWindow(_G.ConfigManager.ui_cfg.HUDView.Name)
+        while _G.IsNil(view.gameObject) do
+            _G.coroutine.waitforendofframe()
+        end
+    end
+    open, view = uimanager:IsLoadedWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+    if not open then
+        view = uimanager:OpenWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+        while _G.IsNil(view.gameObject) do
+            _G.coroutine.waitforendofframe()
+        end
+    end
+    uimanager:HideWindow(_G.ConfigManager.ui_cfg.ShadowView.Name)
+
+    open, view = uimanager:IsLoadedWindow(_G.ConfigManager.ui_cfg.ShadowTopView.Name)
+    if not open then
+        view = uimanager:OpenWindow(_G.ConfigManager.ui_cfg.ShadowTopView.Name)
+        while _G.IsNil(view.gameObject) do
+            _G.coroutine.waitforendofframe()
+        end
+    end
+    uimanager:HideWindow(_G.ConfigManager.ui_cfg.ShadowTopView.Name)
+end
+-----加载当前场景的系列场景资源和物件资源
+function WorldManager:CoLoadScenes()
+    local isCache = false
+    local cfg = _G.ConfigManager.scene_cfg[self.curSceneSid]
+    self.curSceneRes = cfg.Res
+    if cfg.Scene_Type == _G.SceneType.MainWorld then
+        local window = _G.UIManager:GetInstance():OpenWindow(cfg.Res)
+        while _G.IsNil(window.View.gameObject) do
+            _G.coroutine.waitforendofframe()
+        end
+        window.View.gameObject:SetSiblingIndexE(0)
+        _G.UIManager:GetInstance():ChangeCanvasOrder(cfg.Res, 0)
+        self.curSceneResTrans = window.View
+    else
+        if _G.AppSetting.IsloadScence then
+            _G.PoolsManager:GetInstance():Spawn(
+                cfg.Res,
+                _G.ePoolType.World,
+                nil,
+                function(trans)
+                    self.curSceneResTrans = trans
+                    self.curSceneParent = trans:FindE("scene")
+                    self.curItemParent = trans:FindE("obj")
+                    if _G.IsNil(self.roleParent) then
+                        self.roleParent = _G.GameObject("roleParent")
+                    end
+                    local num = self.curSceneParent:GetChildCountE()
+                    if num > 0 then
+                        for i = 1, num do
+                            local childScene = self.curSceneParent:GetChildE(i - 1)
+                            local walk = childScene:FindE("Static/walk")
+                            if walk then
+                                local walkBC = walk:GetComponentE(typeof(CS.UnityEngine.BoxCollider))
+                                if IsNil(walkBC) then
+                                    walk:AddComponentE(typeof(CS.UnityEngine.BoxCollider))
+                                end
+                            end
+                        end
+                    end
+                    self.curSceneParent:SetChildrenActiveNumber(0)
+                    trans:SetActiveE(0)
+                    isCache = true
+                end
+            )
+            while not isCache do
+                _G.coroutine.waitforendofframe()
+            end
+        end
+    end
+end
+-----缓存同系列的场景
+function WorldManager:CoCacheWorlds()
+    local sid
+    if not _G.AppSetting.IsloadScence then
+        sid = self.mainSceneSid
+        if not self.cacheWorld[sid] and self:CheckSceneSameRes(sid) then --已经缓存的 和不同类型的场景不缓存
+            local world = self:CreateWorldBySid(sid)
+            self.cacheWorld[sid] = world
+            while not world.IsInitOver do
+                _G.coroutine.waitforendofframe()
+            end
+        end
+        return
+    end
+    if self.cacheSids or #self.cacheSids > 0 then
+        for i = 1, #self.cacheSids do
+            sid = self.cacheSids[i]
+            if not self.cacheWorld[sid] and self:CheckSceneSameRes(sid) then --已经缓存的 和不同类型的场景不缓存
+                local world = self:CreateWorldBySid(sid)
+                self.cacheWorld[sid] = world
+                while not world.IsInitOver do
+                    _G.coroutine.waitforendofframe()
+                end
+            end
+        end
+    end
+    self.cacheSids = nil
+end
+-----缓存同系列场景中的物件
+function WorldManager:CoCacheSceneItems()
+    if not _G.AppSetting.IsloadScence then
+        return
+    end
+    local items = {}
+    for _, world in pairs(self.cacheWorld) do
+        local data = world:GetItemsData()
+        for sid, num in pairs(data) do
+            local cfg = _G.ConfigManager.object_world_cfg[sid]
+            if not _G.string.IsNullOrEmpty(cfg.Res) then
+                if not items[cfg.Res] then
+                    items[cfg.Res] = num
+                elseif items[cfg.Res] < num then
+                    items[cfg.Res] = num
+                end
+            end
+        end
+    end
+    local loadDone = false
+    local Instantiate = function(name, num)
+        for i = 1, num do
+            local obj = _G.InstantiateObject(self:GetItemGameObj(name), self.curItemParent)
+            obj:SetName(name)
+        end
+        loadDone = true
+    end
+    local index = 0
+    local count = 0
+    local spawn = function(path, num)
+        local callback = function()
+            index = index + 1
+            if index >= count then
+                loadDone = true
+            end
+        end
+        for i = 1, num do
+            _G.PoolsManager:GetInstance():Preload(path, callback, _G.ePoolType.World)
+        end
+    end
+    if _G.table.isEmptyOrNil(items) then
+        loadDone = true
+    else
+        for res, num in pairs(items) do
+            if _G.string.find(res, "/") then
+                count = count + num
+                spawn(res, num)
+            else
+                Instantiate(res, num - 1)
+            end
+        end
+    end
+    while not loadDone do
+        _G.coroutine.waitforendofframe()
+    end
+end
+-----缓存主角
+function WorldManager:CoPlayer()
+    if not _G.AppSetting.IsloadScence then
+        return
+    end
+    local res = {}
+    local sid = _G.PlayerModel:GetInstance():GetRoleSid()
+    _G.table.insert(res, require "CardCommentManager":GetInstance():GetCfgs(sid).ModelPathLow)
+    local index = 1
+    local doneCall
+    doneCall = function()
+        index = index + 1
+        if index <= #res then
+            _G.PoolsManager:GetInstance():Preload(res[index], doneCall, _G.ePoolType.World)
+        end
+    end
+    _G.PoolsManager:GetInstance():Preload(res[index], doneCall, _G.ePoolType.World)
+    while index <= #res do
+        _G.coroutine.yield()
+    end
+end
+---开始协程加载世界场景
+function WorldManager:CoProgressSwitchWorld()
+    local isCache = self:CheckSceneSameRes(self.curSceneSid) and (self.cacheWorld[self.curSceneSid] and true or false)
+    if not isCache then --优先打开loading界面
+        local loading_window = _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+        while (_G.IsNil(loading_window.View)) do
+            _G.coroutine.yield()
+        end
+        -- 等待loading 加载完成
+        while (_G.IsNil(loading_window.View.gameObject)) do
+            _G.coroutine.yield()
+        end
+    end
+    --关闭除loading界面和常驻界面以外的所有界面
+    _G.UIManager:GetInstance():SwitchSceneCloseWindows()
+    if self.CurrentWorld then
+        self.CurrentWorld:LeaveWorld()
+        if
+            self.CurrentWorld.Cfg.WorldType == _G.WorldType.MainWorld or
+                self.CurrentWorld.Cfg.WorldType == _G.WorldType.SingleWorld or
+                self.CurrentWorld.Cfg.SceneName == _G.ConfigManager.scene_cfg[self.curSceneSid].SceneName
+         then
+            self.CurrentWorld:DespawnWorld()
+        end
+    end
+    _G.PoolsManager:GetInstance():ClearPoolAll(_G.ePoolType.Temporary)
+    if not isCache then --加载场景资源
+        _G.coroutine.waitforendofframe()
+        --清理缓存
+        self:ClearCache()
+        _G.coroutine.waitforendofframe()
+        _G.TimerManager:GetInstance():GetTimer(1, _G.CollectGarbageLua, self, true):Start()
+        self:CoLoadScenes()
+        self:CoCacheWorlds()
+        self:CoCacheSceneItems()
+    -- self:CoPlayer()
+    end
+    self.CurrentWorld = self.cacheWorld[self.curSceneSid]
+    local done = false
+    if _G.AppSetting.IsloadScence then
+        if self.CurrentWorld.Sid == 801 then
+            done = true
+        else
+            self.CurrentWorld:InitOtherPlayer(
+                function()
+                    done = true
+                end,
+                self.otherPlayerInfo
+            )
+        end
+    else
+        done = true
+    end
+
+    while not done do
+        _G.coroutine.waitforendofframe()
+    end
+    if _G.AppSetting.IsloadScence then
+        _G.WorldItemManager:GetInstance():OnLoadObjectComplete()
+        self.CurrentWorld:EnterWorld(self.enterImmediately)
+        self.enterImmediately = nil
+        -- self:SetPlayerPosition()
+        if not isCache then
+            self:CoLoadView()
+        end
+    else
+        self:CoLoadView()
+    end
+
+    -- if self.CurrentWorld.Cfg.Scene_Type == _G.SceneType.MainWorld then --主城 缓存挂机资源
+    --     require("AfkBattleManager"):GetInstance():CoCacheAfkRes()
+    -- end
+    _G.coroutine.waitforendofframe()
+    if self.CurrentWorld and self.CurrentWorld.Cfg.audio > 0 then
+        _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, self.CurrentWorld.Cfg.audio)
+    end
+    _G.TimerManager:GetInstance():GetTimer(0.5, self.HideLastScene, self, true):Start()
+    self:OnComplete()
+end
+---添加其他的玩家信息
+---@param msg scene.i_scene_user
+function WorldManager:AddOtherInfo(msg)
+    if not self.otherPlayerInfo then
+        self.otherPlayerInfo = {}
+    end
+    _G.table.insert(self.otherPlayerInfo, msg)
+end
+---移除其他玩家信息
+---@param msg scene.i_scene_user
+function WorldManager:RemoveOtherInfo(msg)
+    if not self.otherPlayerInfo then
+        self.otherPlayerInfo = {}
+    end
+    for i, v in pairs(self.otherPlayerInfo) do
+        if v.role_uid == msg.role_uid then
+            self:AddOfflinePlayerInfo(v)
+            _G.table.remove(self.otherPlayerInfo, i)
+            break
+        end
+    end
+end
+---增加离线玩家数据
+---@param msg scene.i_scene_user
+function WorldManager:AddOfflinePlayerInfo(msg)
+    if not self.offlinePlayerInfo then
+        self.offlinePlayerInfo = {}
+    end
+    self.offlinePlayerInfo[#self.offlinePlayerInfo + 1] = msg
+end
+---获取离线玩家数据
+---@return scene.i_scene_user[]
+function WorldManager:GetOfflinePlayerInfo()
+    if not self.offlinePlayerInfo then
+        self.offlinePlayerInfo = {}
+    end
+    return self.offlinePlayerInfo
+end
+
+--用于在上线的时候还没有初始化好场景，就来了添加了角色的情况
+function WorldManager:RemoveOfflinePlayer(uid)
+    if self.offlinePlayerInfo then
+        for key, value in pairs(self.offlinePlayerInfo) do
+            if value.role_uid == uid then
+                _G.table.remove(self.offlinePlayerInfo, key)
+                break
+            end
+        end
+    end
+    --todo 这里还要把这个角色加入到真实角色玩家中去
+end
+
+----用于在上线的时候还没有初始化好场景，就来了删除角色的情况
+function WorldManager:AddOfflinePlayer(uid)
+    --todo这里需要添加当前玩家数据到self.offlinePlayerInfo 里面 还要删除真实玩家的table
+end
+
+---设置玩家自身位置
+function WorldManager:SetPlayerPosition()
+    if self.DoorSid and self.DoorSid > 0 then --传送点
+        _G.Events:GetInstance():Broadcast(_G.eScene.PassDoor, self.DoorSid)
+    else --记录的上一次位置
+        local pos = _G.PlayerModel:GetInstance():GetPosRecord(self.curSceneSid)
+        self:GetCurWorldPlayer():SetInitPosition(pos)
+    end
+end
+function WorldManager:HideLastScene()
+    -- if
+    --     self.lastSceneSid and self.lastSceneSid > 0 and self.cacheWorld[self.lastSceneSid] and
+    --         self.cacheWorld[self.lastSceneSid].Cfg.WorldType == _G.WorldType.SimpleWorld
+    --  then
+    --     self.cacheWorld[self.lastSceneSid]:DespawnWorld()
+    -- end
+end
+--endregion
+
+--region 缓存世界场景
+-----清理缓存
+function WorldManager:ClearCache()
+    self.curSceneParent = nil
+    self.curItemParent = nil
+    self.curSceneRes = ""
+    self.CurrentWorld = nil
+    self.CurSceneType = nil
+    for key, value in pairs(self.cacheWorld) do
+        if key ~= self.curSceneSid then
+            value:Dispose()
+        end
+    end
+    self.cacheWorld = {}
+    _G.PoolsManager:GetInstance():ClearPoolAll(_G.ePoolType.World)
+    if not _G.IsNil(self.curSceneResTrans) then
+        self.curSceneResTrans:DestroyObject()
+    end
+    self.curSceneResTrans = nil
+    self.curSceneParent = nil
+    self.curItemParent = nil
+    if not _G.IsNil(self.roleParent) then
+        self.roleParent:DisposeChildren()
+    end
+end
+
+---通过sid创建世界对象
+---@param sid number 世界Sid
+---@return BaseWorld | MainWorld | SimpleWorld 世界Class
+function WorldManager:CreateWorldBySid(sid)
+    local worldType = _G.ConfigManager.scene_cfg[sid].WorldType
+    self.CurSceneType = _G.ConfigManager.scene_cfg[sid].Scene_Type
+    if (worldType == _G.WorldType.MainWorld) then
+        -- return require("MainWorld").New(sid)
+        return require("Main2DWorld").New(sid)
+    elseif (worldType == _G.WorldType.SimpleWorld) then
+        return require("SimpleWorld").New(sid)
+    elseif (worldType == _G.WorldType.SingleWorld) then
+        return require("SingleWorld").New(sid)
+    else
+        return require("BaseWorld").New(sid)
+    end
+end
+--endregion
+
+--region 内部方法
+---登录后进入场景回调
+---@param 变量名 变量类型 中文描述
+function WorldManager:OnLoginEnterScene(msg)
+    _G.GameNetTipsManager:GetInstance().isSendEnterScence = true
+    self.otherPlayerInfo = {}
+    self.offlinePlayerInfo = {}
+    local model = _G.PlayerModel:GetInstance()
+    model:SetCurCitySid(msg.map_id)
+    model:SetServerLine(msg.line)
+    if
+        not self.curSceneSid or self.curSceneSid == 0 or self.curSceneSid == 299 or self.curSceneSid == 801 or
+            _G.ConfigManager.scene_cfg[self.curSceneSid].WorldType == _G.WorldType.SimpleWorld or
+            --副本中不切场景
+            msg.map_id == self.curSceneSid
+     then
+        require("ServerLineManager"):GetInstance():InitData(self.onLoginEnterSceneCall)
+    else --服务器和本地所在场景不一致，以服务器为准
+        if self.curSceneSid == 600 then
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SociatyMainView.View)
+        end
+        self:EnterWorld(
+            msg.map_id,
+            function()
+                if self.curSceneSid ~= 600 then
+                    require("ServerLineManager"):GetInstance():InitData(self.onLoginEnterSceneCall)
+                else
+                    self.onLoginEnterSceneCall()
+                end
+
+                _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+            end
+        )
+    end
+end
+---重新进入当前场景回调
+---@param msg table 进入场景回调
+function WorldManager:OnReEnterSceneCall(msg)
+    if msg.ack ~= 1 then
+        if self.onReEnterSceneCall then
+            self.onReEnterSceneCall(false)
+            self.onReEnterSceneCall = nil
+        end
+        return
+    end
+    _G.GameNetTipsManager:GetInstance().isSendEnterScence = true
+    local model = _G.PlayerModel:GetInstance()
+    model:SetCurCitySid(msg.map_id)
+    model:SetServerLine(msg.line)
+    if not self.curSceneSid or self.curSceneSid == 0 or msg.map_id == self.curSceneSid then
+        self:GetCurWorld():ClearOtherPlayer()
+        self:GetCurWorld():InitOtherPlayer(
+            function()
+                if self.onReEnterSceneCall then
+                    self.onReEnterSceneCall(true)
+                    self.onReEnterSceneCall = nil
+                end
+            end,
+            msg.users
+        )
+    else --服务器和本地所在场景不一致，以服务器为准
+        self:EnterWorld(
+            msg.map_id,
+            function()
+                self:GetCurWorld():ClearOtherPlayer()
+                self:GetCurWorld():InitOtherPlayer(
+                    function()
+                        if self.onReEnterSceneCall then
+                            self.onReEnterSceneCall(true)
+                            self.onReEnterSceneCall = nil
+                        end
+                    end,
+                    msg.users
+                )
+            end
+        )
+    end
+end
+---退出当前场景
+function WorldManager:ExitCurrentWorld()
+    if self.CurrentWorld and self.CurrentWorld.WorldPlayer then
+        self.CurrentWorld.WorldPlayer:ForceMoveInterrupt()
+        _G.Events:GetInstance():Broadcast(_G.eScene.ExitWorld)
+    end
+    self.curSceneSid = 0
+end
+-----检测场景资源是否是同类型资源
+---@param sid number 场景sid
+---@return boolean 是否是同类型资源
+function WorldManager:CheckSceneSameRes(sid)
+    if _G.string.IsNullOrEmpty(self.curSceneRes) then
+        return false
+    end
+    local cfg = _G.ConfigManager.scene_cfg[sid]
+    if cfg.Res == self.curSceneRes then
+        return true
+    end
+    return false
+end
+-----场景加载完成
+function WorldManager:OnComplete()
+    --判断 是否要播放 场景剧情  再显示UI
+    if not _G.IsNil(self.CurrentWorld) then
+        self:OnLoadOneceJoinStory()
+    else
+        self:InitWorldOver()
+    end
+end
+
+---加载第一次进入剧情
+function WorldManager:OnLoadOneceJoinStory(call)
+    self:LoadScenceStory(
+        function()
+            self:InitWorldOver()
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+----检测加载剧情
+function WorldManager:LoadScenceStory(call)
+    -- self:OnLoadJoinStory()
+    self:OnLoadAfterAwardStoryID()
+    self:OnLoadChapterAfterStoryID()
+    _G.StoryManager:GetInstance():SetNowPassSectionID(nil)
+    if call then
+        call()
+    end
+end
+
+--region --------------------------------------afk 关卡完成剧情--------
+
+--- 检测 afk 关卡完成剧情
+---@return number nil/剧情id
+function WorldManager:CheckAfkAfterAwardStoryID()
+    local preCfg = require("AfkModel"):GetInstance():GetPreviousSectionCfg()
+    if preCfg ~= nil then
+        local AfterAwardStoryID = preCfg.AfterAwardStoryID
+        if AfterAwardStoryID > 0 and _G.StoryUtilities.HasStoryIDSavedUID(AfterAwardStoryID) == false then
+            return AfterAwardStoryID
+        end
+    end
+    return nil
+end
+---加载 AFK 完成关卡剧情
+function WorldManager:OnLoadAfterAwardStoryID()
+    local storyId = self:CheckAfkAfterAwardStoryID()
+    if storyId ~= nil and self.CurrentWorld.Cfg.Scene_Type == _G.SceneType.MainWorld then
+        -- 镇魂街ZHJ-24609 alpha_ft BUG合集ZHJ-20830
+        --【放置副本】在章节结束时，有低概率出现循环播放剧情
+        local hasQueueStoryID =
+            _G.MainManager:GetInstance():HasMainFunQueueByStoryID(_G.MainViewShowOrder.AfterAwardStoryID, storyId)
+        ---同剧情id不添加了
+        if not hasQueueStoryID then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.AutomaticPlayStory.PlayStoryByID(storyId, MainOpenViewFunItem.CallFun)
+            end
+            MainOpenViewFunItem.StoryID = storyId
+            _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.AfterAwardStoryID)
+        end
+        return
+    end
+end
+
+--endregion------------------------------------afk 关卡完成剧情--------
+
+--region --------------------------------------剧本关卡完成剧情--------
+
+--- 检测 剧本关卡完成剧情
+---@return number nil/剧情id
+function WorldManager:CheckChapterAfterStoryID()
+    local nowScetionId = _G.StoryManager:GetInstance():GetNowPassSectionID()
+    if nowScetionId ~= nil then
+        local storyID = nil
+        local cfg = _G.ConfigManager.main_section_cfg[nowScetionId]
+        if cfg and cfg.dialogue_after ~= 0 then
+            storyID = cfg.dialogue_after
+        end
+        if storyID ~= nil then
+            return storyID
+        end
+    end
+    return nil
+end
+
+---加载 AFK 完成关卡剧情
+function WorldManager:OnLoadChapterAfterStoryID()
+    local storyId = self:CheckChapterAfterStoryID()
+    if storyId ~= nil and self.CurrentWorld.Cfg.Scene_Type == _G.SceneType.MainWorld then
+        -- 镇魂街ZHJ-24609 alpha_ft BUG合集ZHJ-20830
+        --【放置副本】在章节结束时，有低概率出现循环播放剧情
+        local hasQueueStoryID =
+            _G.MainManager:GetInstance():HasMainFunQueueByStoryID(_G.MainViewShowOrder.ChapterAfterStoryID, storyId)
+        ---同剧情id不添加了
+        if not hasQueueStoryID then
+            ---@type MainOpenViewFunItem
+            local MainOpenViewFunItem = {}
+            MainOpenViewFunItem.OpenViewFun = function()
+                _G.AutomaticPlayStory.PlayStoryByID(storyId, MainOpenViewFunItem.CallFun)
+            end
+            MainOpenViewFunItem.StoryID = storyId
+            _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.ChapterAfterStoryID)
+        end
+        return
+    end
+end
+
+--endregion------------------------------------剧本关卡完成剧情--------
+
+---加载第一次进入主城剧情
+function WorldManager:OnLoadJoinStory()
+    local storyArr = self.CurrentWorld.Cfg.city_story
+    if _G.type(storyArr) == "table" then
+        local storyId = storyArr[1]
+        if storyId then
+            ---如果配置了检测条件
+            local _t = storyArr[2]
+            local _v = storyArr[3]
+
+            local isJoin1 = _G.StoryUtilities.HasStoryIDSavedUID(storyId)
+            if storyId > 0 and isJoin1 == false and self.CurrentWorld.Cfg.Scene_Type == _G.SceneType.MainWorld then
+                if _t == nil or (_t and _G.GlobalConditionManager.CheckCondition(_t, _v) == false) then
+                    -- 镇魂街ZHJ-24609 alpha_ft BUG合集ZHJ-20830
+                    --【放置副本】在章节结束时，有低概率出现循环播放剧情
+                    local hasQueueStoryID =
+                        _G.MainManager:GetInstance():HasMainFunQueueByStoryID(
+                        _G.MainViewShowOrder.OneMainScence,
+                        storyId
+                    )
+                    ---同剧情id不添加了
+                    if not hasQueueStoryID then
+                        ---@type MainOpenViewFunItem
+                        local MainOpenViewFunItem = {}
+                        MainOpenViewFunItem.OpenViewFun = function()
+                            _G.AutomaticPlayStory.PlayStoryByID(storyId, MainOpenViewFunItem.CallFun)
+                        end
+                        MainOpenViewFunItem.StoryID = storyId
+                        _G.MainManager:GetInstance():AddMainFunQueue(
+                            MainOpenViewFunItem,
+                            _G.MainViewShowOrder.OneMainScence
+                        )
+                    end
+                    return
+                end
+            end
+        end
+    end
+end
+
+---世界加载显示 全部完成
+function WorldManager:InitWorldOver()
+    self:ShowView()
+    self:OnMainViewOpened()
+end
+---展示界面
+function WorldManager:ShowView()
+    local uimanager = _G.UIManager:GetInstance()
+    local active, wind = uimanager:IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    if wind then
+        if not active then
+            uimanager:ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        end
+        wind.View:UpdateView()
+    end
+    active, wind = uimanager:IsActiveWindow(_G.ConfigManager.ui_cfg.HUDView.Name)
+    if not active then
+        uimanager:ShowWindow(_G.ConfigManager.ui_cfg.HUDView.Name)
+    end
+end
+---主界面加载完成
+function WorldManager:OnMainViewOpened()
+    if self.Running == false then
+        return
+    end
+    self.Running = false
+    if self.stopCoProgress then
+        _G.coroutine.stopwaiting(self.stopCoProgress)
+        self.stopCoProgress = nil
+    end
+    _G.Events:GetInstance():Broadcast(_G.eScene.EnterWorldOver)
+    if self.LoadedCallBack ~= nil then
+        self.LoadedCallBack()
+        self.LoadedCallBack = nil
+    else
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+        if self.DoneCallback then
+            self.DoneCallback()
+            self.DoneCallback = nil
+        end
+    end
+end
+--endregion
+
+-----获取当前场景的EnvironmentSetting实例对象(全局方法)
+---@return FrameWork.Environment.EnvironmentSetting EnvironmentSetting实例
+function _G.GetCurrentEnvironmentSetting()
+    local CurrentWorld = WorldManager:GetInstance():GetCurWorld()
+    if CurrentWorld then
+        if CurrentWorld.WorldSetting then
+            local res = CurrentWorld.WorldSetting.environmentSetting
+            return res
+        end
+        return
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.LogError("CurrentWorld EnvironmentSetting is nil")
+    end
+end
+
+return WorldManager

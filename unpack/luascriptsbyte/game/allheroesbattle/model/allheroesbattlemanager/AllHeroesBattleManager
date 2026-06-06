@@ -1,0 +1,1074 @@
+-----------------------------------------------------------------------
+-- G:.zhenhunjie.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.AllHeroesBattle.Model.AllHeroesBattleManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/07/02
+-- Description 群英会武数据管理类
+-----------------------------------------------------------------------
+local base = require "SeasonBaseModel"
+local AllHeroesBattleNet = require "AllHeroesBattleNet"
+--挂机收益上限值
+local MaxAwardCount = 10000
+local extra
+--挑战门票道具id
+local ticketItemID
+--门票通用兑换ID
+local exchangeTicketID
+
+---@field GetInstance fun():AllHeroesBattleManager
+---@class AllHeroesBattleManager : SeasonBaseModel	中文描述
+local AllHeroesBattleManager = _G.BaseClass("AllHeroesBattleManager", base)
+
+---创建对象时,入口构造函数
+function AllHeroesBattleManager:__init()
+    self.curFunctionOpenID = 72
+    self.redPointId = _G.ConfigManager.redpoint_cfg.AllHeroesBattle.id
+    local discrete_cfg = _G.ConfigManager.discrete_cfg
+    MaxAwardCount = discrete_cfg[105501][1][1]
+    ticketItemID = discrete_cfg[105506][1][1]
+    exchangeTicketID = discrete_cfg[105507][1][1]
+    extra = discrete_cfg[105725][1]
+    self.cycle = _G.ConfigManager.discrete_cfg[116122][1][1]
+    self.functionOpenTag = false
+    self.awardCount = 0
+    self.fightNums = discrete_cfg[105502][1][1]
+    self.awardTimeStamp = 0
+    local EventsIns = _G.Events:GetInstance()
+    EventsIns:AddListener(_G.ConfigManager.net_map.pvp_attacked.Cmd, self.OnReportNew, self)
+    EventsIns:AddListener(_G.eSeason.SeasonOver, self.OnSeasonStateClosed, self)
+end
+
+---销毁对象时,析构函数
+function AllHeroesBattleManager:Dispose()
+    self:StopTipsTimer()
+    self.reports = nil
+    self.functionOpenTag = nil
+    self.calculateAwardCount = nil
+    self.awardCount = nil
+    self.curPosID = nil
+    self.fightNums = nil
+    self.awardTimeStamp = nil
+    self.playSuccessEffectTag = nil
+    local EventsIns = _G.Events:GetInstance()
+    EventsIns:RemoveListener(_G.ConfigManager.net_map.pvp_attacked.Cmd, self.OnReportNew, self)
+    EventsIns:RemoveListener(_G.eSeason.SeasonOver, self.OnSeasonStateClosed, self)
+end
+
+--region 子类重写
+---获取模块功能是否开放
+---@return boolean 是否开放
+function AllHeroesBattleManager:GetFunctionOpen()
+    return base.GetFunctionOpen(self)
+end
+
+---从服务器拉取数据
+function AllHeroesBattleManager:GetDataFormServer()
+    self:HandleCfg()
+    AllHeroesBattleNet:GetInstance():Init(_G.handler(self, self.ParseData))
+end
+
+---进入结算期（关闭界面）
+
+function AllHeroesBattleManager:OnSettlement()
+    --TODO:赛季关闭处理，关闭界面，退出布阵，战斗结束后返回主城
+    self.functionOpenTag = false
+    self:StopTipsTimer()
+    if self.openEmbattleTag then --在布阵界面
+        --TODO:功能关闭提示
+        require("EmbattleController"):GetInstance():CloseEmbattle()
+    end
+    local UIManagerIns = _G.UIManager:GetInstance()
+    local ui_cfg = _G.ConfigManager.ui_cfg
+    UIManagerIns:CloseWindow(ui_cfg.AllHeroesBattleRoomView.Name)
+    UIManagerIns:CloseWindow(ui_cfg.AllHeroesBattleView.Name)
+    UIManagerIns:CloseWindow(ui_cfg.AllHeroesBattleReportView.Name)
+end
+
+---解析数据
+---@param data table 服务器返回数据
+function AllHeroesBattleManager:ParseData(data)
+    self:OnInitData(data)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleLogin.id)
+    base.ParseData(self)
+end
+
+function AllHeroesBattleManager:InitFunction()
+    if self.tipsTimer then --已经开启了跑马灯计时器
+        return
+    end
+    local discrete_cfg = _G.ConfigManager.discrete_cfg
+    ---群英会武跑马灯
+    ---@type number 循环间隔时间, 开始延迟等待时间
+    local tipsTime, startTipsTime
+    if discrete_cfg[105714] and discrete_cfg[105715] then
+        tipsTime = discrete_cfg[105714][1][1]
+        startTipsTime = _G.TimeUtil.GetSecondsOfDay() - discrete_cfg[105715][1][1] * 3600
+    end
+    if tipsTime and startTipsTime and tipsTime > 0 then
+        self.tipsTime = tipsTime
+        if startTipsTime < 0 then
+            while startTipsTime < 0 do
+                startTipsTime = startTipsTime + self.tipsTime
+            end
+        else
+            while startTipsTime > 0 do
+                startTipsTime = startTipsTime - self.tipsTime
+            end
+            startTipsTime = 0 - startTipsTime
+        end
+
+        if startTipsTime == 0 then
+            self:HandleTips()
+        else
+            self.tipsTimer = _G.TimerManager:GetInstance():GetTimer(startTipsTime, self.HandleTips, self, true)
+            self.tipsTimer:Start()
+        end
+    else
+        self:StopTipsTimer()
+        self.tipsTime = nil
+    end
+end
+
+--endregion
+function AllHeroesBattleManager:HandleCfg()
+    if self.rooms then
+        return
+    end
+    local cfgsPvp = _G.ConfigManager.activity_pvp_cfg
+    local cfgsRoom = _G.ConfigManager.activity_pvp_room_cfg
+    local roomids = self:GetRoomIds()
+    self.rooms = {false, false, false, false, false}
+    local dic
+
+    for k, room in ipairs(roomids) do
+        local cfgs = cfgsRoom[room]
+        for k2, v in ipairs(cfgs.pos) do
+            local cfg = cfgsPvp[v]
+            dic =
+                self.rooms[cfg.room] or
+                {
+                    id = cfg.room,
+                    normal = 0,
+                    specail = 0,
+                    pos = {},
+                    center = 0,
+                    image = cfgs.room_picture,
+                    name = cfgs.name,
+                    open_condition = cfgs.open_condition,
+                }
+            dic.pos[#dic.pos + 1] = cfg.id
+            if cfg.type_pos == 0 then
+                dic.normal = cfg.efficiency
+            else
+                dic.specail = cfg.efficiency
+                dic.center = cfg.id
+            end
+            self.rooms[cfg.room] = dic
+        end
+    end
+    local sort = _G.table.sort
+    for i = 1, #self.rooms do
+        sort(self.rooms[i].pos)
+    end
+end
+
+---获取任务list
+function AllHeroesBattleManager:GetTaskList()
+    local roomids = self:GetRoomIds()
+    local cfgsRoom = _G.ConfigManager.activity_pvp_room_cfg
+    local taskList = {}
+    local taskFinishList = {}
+    local jumpIndex = 0
+
+    local count = #roomids
+    for i = 1, count do
+        local room = roomids[count - i + 1]
+        local cfg = cfgsRoom[room]
+        local state1 = self:GetTaskStateByStarAndType(cfg.id, 0)
+        local state2 = self:GetTaskStateByStarAndType(cfg.id, 1)
+
+        if state2 == 2 then
+            _G.table.insert(
+                taskFinishList,
+                {sid = cfg.id, type = 1, reward = cfg.reward_pos_1, des = cfg.reward_desc[2], open_condition = cfg.open_condition}
+            )
+        else
+            _G.table.insert(taskList, {sid = cfg.id, type = 1, reward = cfg.reward_pos_1, des = cfg.reward_desc[2], open_condition = cfg.open_condition})
+            if state2 == 1 and jumpIndex == 0 then
+                jumpIndex = #taskList
+            end
+        end
+
+        if state1 == 2 then
+            _G.table.insert(
+                taskFinishList,
+                {sid = cfg.id, type = 0, reward = cfg.reward_pos_0, des = cfg.reward_desc[1], open_condition = cfg.open_condition}
+            )
+        else
+            _G.table.insert(taskList, {sid = cfg.id, type = 0, reward = cfg.reward_pos_0, des = cfg.reward_desc[1], open_condition = cfg.open_condition})
+            if state1 == 1 and jumpIndex == 0 then
+                jumpIndex = #taskList
+            end
+        end
+    end
+
+    for k, v in ipairs(taskFinishList) do
+        _G.table.insert(taskList, v)
+    end
+    return taskList, jumpIndex
+end
+
+---获取房间id列表
+---@return number[]
+function AllHeroesBattleManager:GetRoomIds()
+    local sid = require "SeasonModel":GetInstance():GetCurSeasonId() == 1 and 105728 or 105729
+    return _G.ConfigManager.discrete_cfg[sid][1]
+end
+
+---获取任务状态
+---@param star number
+---@param type number
+---@return number 0:不可领取 1：可领取 2：已领取
+function AllHeroesBattleManager:GetTaskStateByStarAndType(star, type)
+    local state = 0
+    if self.taskAwardData[star] and self.taskAwardData[star][type] then
+        state = 2
+    elseif (self.max_star > star) or (self.max_star == star and self.max_type >= type) then
+        state = 1
+    end
+    return state
+end
+
+---打开对应房间界面
+function AllHeroesBattleManager:OpenBattleView()
+    local id = _G.ConfigManager.activity_pvp_cfg[self.curPosID].room
+    local name = _G.ConfigManager.ui_cfg.AllHeroesBattleView.Name
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(name)
+    id = id == _G.table.count(self.rooms) and id or id + 1
+    view:OpenRoom(id)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.AllHeroesBattleTaskView.Name)
+end
+
+---处理跑马灯信息
+function AllHeroesBattleManager:HandleTips()
+    --TODO:跑马灯提示
+    _G.PopWindowManager:GetInstance():ShowAllTips(440212)
+    self:StopTipsTimer()
+    if not self.functionOpenTag then
+        return
+    end
+    self.tipsTimer = _G.TimerManager:GetInstance():GetTimer(self.tipsTime, self.HandleTips, self, true)
+    self.tipsTimer:Start()
+end
+
+function AllHeroesBattleManager:StopTipsTimer()
+    if self.tipsTimer then
+        self.tipsTimer:Stop()
+        self.tipsTimer = nil
+    end
+end
+
+--region 数据解析
+--[[
+  required uint32 sid=1;//所在房间点位sid
+  required uint32 fight_num=2;//剩余免费战斗次数
+  required uint32 time=3;//挂机开始时间戳
+  required uint32 reward = 4;//截至该时间戳已积攒奖励数量
+]]
+function AllHeroesBattleManager:OnInitData(data)
+    self.functionOpenTag = true
+    self.curPosID = (data.sid and data.sid > 0) and data.sid or self.rooms[1].center
+    self.fightNums = data.fight_num or 0
+    -- require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleChallenge.id)
+    self.awardTimeStamp = data.time
+    self.awardCount = data.reward
+    self.calculateAwardCount = 0
+    self.max_star = data.max_star
+    self.max_type = data.max_type
+    self.taskAwardData = {}
+    if data.room_award then
+        for k, v in ipairs(data.room_award) do
+            if not self.taskAwardData[v.k] then
+                self.taskAwardData[v.k] = {}
+            end
+            self.taskAwardData[v.k][v.v] = true
+        end
+    end
+    self:InitRepoetNewTag(data.attacked)
+    if self.onPosChangeCall then
+        self.onPosChangeCall()
+    end
+    if self.onInfoDataCall then
+        self.onInfoDataCall()
+    end
+    --刷新红点状态
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleReport.id)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleTask.id) --任务奖励
+end
+
+---获取是否离线被攻击
+function AllHeroesBattleManager:InitRepoetNewTag(attacked)
+    if not require "SeasonModel":GetInstance():CheckSeasonIsOpen() then
+        self.reportNewTag = false
+        return
+    end
+    ---只有被从中心点掉出或者从房间中掉出
+    if attacked then
+        if self.reportNewTag then
+            return
+        end
+        local num = _G.PlayerPrefsManager.GetInt(_G.AllHeroBattle.AllHeroReporTagKey, 0)
+        self.reportNewTag = num > 0
+        if not self.reportNewTag then
+            self.reportNewTag = self:CheckIsLose()
+        end
+    else
+        local time = _G.PlayerPrefsManager.GetString(_G.AllHeroBattle.AllHeroFightTimeKey)
+        local seasonTime = "" .. require "SeasonModel":GetInstance():GetTime().startTime
+        if _G.string.IsNullOrEmpty(time) or time == seasonTime then
+            local num = _G.PlayerPrefsManager.GetInt(_G.AllHeroBattle.AllHeroReporTagKey, 0)
+            self.reportNewTag = num > 0
+        else
+            _G.PlayerPrefsManager.SetString(_G.AllHeroBattle.AllHeroFightTimeKey, seasonTime)
+            if self.reportNewTag == nil then
+                self.reportNewTag = false
+                _G.PlayerPrefsManager.DeleteKey(_G.AllHeroBattle.AllHeroReportKey)
+                _G.PlayerPrefsManager.DeleteKey(_G.AllHeroBattle.AllHeroReporTagKey)
+            end
+        end
+    end
+end
+
+---检测是否掉段吗
+function AllHeroesBattleManager:CheckIsLose()
+    if _G.PlayerPrefsManager.HasKey(_G.AllHeroBattle.AllHeroReportKey) then
+        ---@type activity_pvp_cfg
+        local cfg2 = _G.ConfigManager.activity_pvp_cfg[self.curPosID]
+        local num = _G.PlayerPrefsManager.GetInt(_G.AllHeroBattle.AllHeroReportKey, 0)
+        if num > 0 and num ~= self.curPosID then
+            ---@type activity_pvp_cfg
+            local cfg = _G.ConfigManager.activity_pvp_cfg[num]
+            if cfg then
+                if cfg.room == cfg2.room then
+                    return num == self.rooms[cfg2.room].center
+                elseif cfg2.room < cfg.room then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+--[[
+  required uint32 ack = 1;
+  repeated i_room rooms=2;
+]]
+function AllHeroesBattleManager:OnRoomData(data)
+    if self.onRoomDataCall then
+        if data.ack ~= 1 then --数据获取出错
+            self.onRoomDataCall(false)
+        else
+            data = data.rooms
+            if data[1].sid == 0 then --一星房间不给位置，按照顺序默认位置 自己在第9位 对应中心位置
+                local pos = self.rooms[self.curChooseRoomID].pos
+                for i = 1, #data do
+                    data[i].sid = pos[i]
+                end
+            end
+            self.onRoomDataCall(true, data)
+        end
+        self.onRoomDataCall = nil
+    end
+end
+
+--[[
+  required string name_attack=1;//进攻玩家名字
+  required string name_defense=2;//防守玩家名字
+  required uint32 type = 3;//防守玩家类型 1，玩家，2，机器人
+  required uint32 sid=4;//点位sid
+]]
+function AllHeroesBattleManager:OnBattleInfoCall(data)
+    if self.onBattleInfoCall then
+        if _G.table.isEmptyOrNil(data.fights) then
+            self.onBattleInfoCall(false)
+        else
+            self.onBattleInfoCall(true, data.fights)
+        end
+        self.onBattleInfoCall = nil
+    end
+end
+
+--[[
+  optional uint32 sid = 1;//卡牌sid
+  optional uint32 level = 2;//等级
+  optional uint32 star = 3;//星级
+  optional uint32 index = 4;//站位
+]]
+function AllHeroesBattleManager:OnEmbattleDataCall(data)
+    if data.ack ~= 1 then
+        return
+    end
+    self.attackEmbattle = true
+    local edata = {}
+    for i = 1, #data.team do
+        edata[data.team[i].index] = data.team[i]
+        edata[data.team[i].index].uid = data.team[i].sid
+        edata[data.team[i].index].soulLink_IsActivate = data.team[i].soul_state
+        edata[data.team[i].index].soulLink_lv = data.team[i].soul_lv
+        edata[data.team[i].index].open_inborn = data.team[i].born_skill_num
+        edata[data.team[i].index].index = nil
+    end
+    edata.power = self.curChallengePower or 0
+    self.openEmbattleTag = true
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require("EmbattleController"):GetInstance():OpenEmbattle(
+        _G.EmbattleType.AllHeroesBattle,
+        _G.EmbattleSaveType.server,
+        nil,
+        _G.EmbattleControllerItemType.allHeroesAttack,
+        _G.handler(self, self.ExitEmbattle),
+        _G.handler(self, self.EnterFight),
+        _G.ConfigManager.activity_pvp_cfg[self.curChallengePosID].battle_scene,
+        edata,
+        self.curChallengeUid,
+        self.curChallengePosID
+    )
+end
+
+--[[
+  required uint64 uid = 1;//战报uid
+  required uint64 target_uid = 2;//对手uid
+  required uint32 target_type = 3;//对手类型,1 玩家,2 机器人
+  required string target_role_name = 4;//对手角色名
+  required uint32 target_style = 5;//对手头像
+  required uint32 frame = 6;//对手头像框
+  required uint32 target_power = 7;//对手战斗力
+  required uint32 target_level =8;//对手等级
+  repeated uint32 winner = 9;//胜负，0 胜利 | 1 失败
+  required uint32 time = 10;//时间
+  required uint32 report_type = 11;//战报类型 0 攻击， 1 防御
+  required uint64 playback_uid = 12;//战斗回放uid
+  repeated uint32 sids = 13;//进攻前双方位置 前 自己 后 对方
+]]
+function AllHeroesBattleManager:OnReportCall(data)
+    if data.ack ~= 1 then
+        self.onReportCall(false)
+        return
+    end
+    self.reports = data.reports
+    if self.onReportCall then
+        self.onReportCall(true, self.reports)
+    end
+end
+
+--[[
+    public.s2c_common_ack
+]]
+function AllHeroesBattleManager:OnGetAwardCall(data)
+    if data.ack ~= 1 then
+        return
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    require("CommonTipManager"):GetInstance():OpenDropTip(data)
+    self.awardCount = 0
+    self.calculateAwardCount = 0
+    self.awardTimeStamp = _G.TimeUtil.GetServerUnixTime()
+    if self.onGetAwardCall then
+        self.onGetAwardCall(true)
+        self.onGetAwardCall = nil
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleBox.id)
+    _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.AllHeroesBattle_Award}, 1)
+end
+
+--endregion
+
+--region 内部方法
+---计算奖励
+---@return number|number 奖励数量|下一次刷新奖励的间隔时间
+function AllHeroesBattleManager:CalculateAward()
+    if self.awardTimeStamp == 0 then
+        return 0
+    end
+    if self.calculateAwardCount >= MaxAwardCount then --达到上限
+        self.calculateAwardCount = MaxAwardCount
+        return self.calculateAwardCount
+    end
+    self.calculateAwardCount = _G.ConfigManager.activity_pvp_cfg[self.curPosID].efficiency
+    self.calculateAwardCount =
+        self.awardCount +
+        _G.Mathf.RoundToInt(self.calculateAwardCount * (_G.TimeUtil.GetServerUnixTime() - self.awardTimeStamp) / 3600)
+    if self.calculateAwardCount > MaxAwardCount then
+        self.calculateAwardCount = MaxAwardCount
+    end
+    return self.calculateAwardCount
+end
+
+---退出布阵
+function AllHeroesBattleManager:ExitEmbattle()
+    self.openEmbattleTag = false
+    self.playSuccessEffectTag = false
+    if self.attackEmbattle then
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.AllHeroesBattleRoomView.Name)
+    else
+        --require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleEmbattle.id)
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.AllHeroesBattleView.Name)
+    end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatView.Name)
+end
+
+---进入战斗
+function AllHeroesBattleManager:EnterFight()
+    self.openEmbattleTag = false
+    local skip =
+        _G.PlayerPrefsManager.GetInt(_G.tostring(_G.PlayerModel:GetInstance().role_uid) .. "SkipBattle" .. 4) or 0
+    if skip == 1 then
+        AllHeroesBattleNet:GetInstance():Challenge(
+            self.curChallengePosID,
+            self.curChallengeUid,
+            _G.handler(self, self.TiaoGuo)
+        )
+    else
+        --双方对战名称
+        local leftName = _G.PlayerModel:GetInstance():GetName()
+        local rightName = self.curChallengePlayer and self.curChallengePlayer.name or ""
+        _G.BattleManager:GetInstance():EnterFight(
+            _G.BattleControllerType.AllHeroesBattle,
+            self.curChallengePosID,
+            self.curChallengeUid,
+            _G.handler(self, self.OnChallengeCall),
+            _G.handler(self, self.OnEnterFight),
+            leftName,
+            rightName
+        )
+    end
+    --require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleEmbattle.id)
+end
+
+function AllHeroesBattleManager:TiaoGuo(_data)
+    self:OnEnterFight(_data)
+    if _data.ack == 1 then
+        _G.WorldManager:GetInstance():DespawnRoleParent()
+        _G.StorageManager:GetInstance():ReceiveAwardData(_data)
+        local result = _data.winner or false
+
+        --双方对战名称
+        local leftName = _G.PlayerModel:GetInstance():GetName()
+        local rightName = self.curChallengePlayer and self.curChallengePlayer.name or ""
+
+        self.curBattleController = _G.require(_G.BattleControllerType.AllHeroesBattle).New()
+        self.curBattleController.leftName = leftName
+        self.curBattleController.rightName = rightName
+        self.curBattleController.fightArg = _data.fight_arg
+        self.curBattleController:StartSettlement(
+            _G.SettlementModel.SettlementType.AllHeroesBattle,
+            result,
+            true,
+            function()
+                self:UpdateInitData(_G.handlerbind(self, self.OnChallengeCall, true))
+            end,
+            nil, --_G.BattleManager:GetInstance():GetStatisticsRecord(_data.fight_arg)
+            _data.fight_arg,
+            self.report_uid,
+            self.curChallengePlayer
+        )
+        _G.BattleManager:GetInstance():DestroyBattle()
+        _G.BattleManager:GetInstance():SetArgData(_data.fight_arg)
+        _G.BattleManager:GetInstance():SetBattleController( self.curBattleController)
+        _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, {_G.SeasonTaskID.AllHeroesBattle_Fight}, 1)
+    end
+end
+
+function AllHeroesBattleManager:OnChallengeCall(success)
+    if not success then --战斗验证不通过
+        self.playSuccessEffectTag = false
+        self:GetRoomPlayerData(
+            self.curChooseRoomID,
+            function(success, data)
+                local UIManagerIns = _G.UIManager:GetInstance()
+                local name = _G.ConfigManager.ui_cfg.AllHeroesBattleRoomView.Name
+                UIManagerIns:ShowWindow(name)
+                local view = UIManagerIns:GetWindowCtrl(name)
+                view:OnRoomDataCall(success, data)
+                _G.WorldManager:GetInstance():DestoryRoleParent()
+            end
+        )
+    else
+        self.reports = nil
+        -- require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleChallenge.id)
+        if self.fightNums <= 0 then --免费次数用完，消耗道具
+            _G.StorageManager:GetInstance():ConsumeItem(ticketItemID, 0, 1)
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.AllHeroesBattleRoomView.Name)
+            if view then
+                view:RefreshView()
+            end
+        end
+    end
+end
+
+---战斗开始消息回调
+---@param msg pvp.s2c_pvp_fight
+function AllHeroesBattleManager:OnEnterFight(msg)
+    if msg.ack ~= 1 then
+        return
+    end
+    ---战斗战报id(点战斗立即回调), 后续分享需要
+    self.report_uid = msg.report_uid
+    ---战斗战报数据
+    self.fight_arg = msg.fight_arg
+end
+
+---购买挑战次数回调
+function AllHeroesBattleManager:OnBuyTicketCall()
+    if self.onBuyTicketCall then
+        self.onBuyTicketCall()
+        self.onBuyTicketCall = nil
+    end
+end
+
+function AllHeroesBattleManager:OnEmbattleViewOpened(name)
+    local ui_cfg = _G.ConfigManager.ui_cfg
+    if name == ui_cfg.EmbattleView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+        if self.attackEmbattle then
+            _G.UIManager:GetInstance():HideWindow(ui_cfg.AllHeroesBattleRoomView.Name)
+        else
+            _G.UIManager:GetInstance():HideWindow(ui_cfg.AllHeroesBattleView.Name)
+        end
+        ---@type EmbattleNewView
+        local embattleView = _G.UIManager:GetInstance():GetWindowCtrl(ui_cfg.EmbattleView.Name)
+        if embattleView then
+            local rightName = self.curChallengePlayer and self.curChallengePlayer.name or ""
+            embattleView:SetVsDescription(
+                _G.PlayerModel:GetInstance():GetName(),
+                rightName
+            )
+        end
+    end
+end
+
+---赛季关闭时的监听
+function AllHeroesBattleManager:OnSeasonStateClosed()
+    --TODO:赛季关闭处理，关闭界面，退出布阵，战斗结束后返回主城
+    self.functionOpenTag = false
+    self:StopTipsTimer()
+    if self.openEmbattleTag then --在布阵界面
+        --TODO:功能关闭提示
+        require("EmbattleController"):GetInstance():CloseEmbattle()
+    end
+    local UIManagerIns = _G.UIManager:GetInstance()
+    local ui_cfg = _G.ConfigManager.ui_cfg
+    UIManagerIns:CloseWindow(ui_cfg.AllHeroesBattleRoomView.Name)
+    UIManagerIns:CloseWindow(ui_cfg.AllHeroesBattleView.Name)
+    UIManagerIns:CloseWindow(ui_cfg.AllHeroesBattleReportView.Name)
+end
+
+--endregion
+
+--region 对外接口
+---获取房间基础数据
+---@param id number 房间ID
+---@return table 房间基础数据
+function AllHeroesBattleManager:GetRoomBaseData(id)
+    return self.rooms[id]
+end
+
+---获取房间玩家数据
+---@param id number 房间ID
+---@param callback function 获取回调
+function AllHeroesBattleManager:GetRoomPlayerData(id, callback)
+    self.curChooseRoomID = id
+    self.onRoomDataCall = callback
+    AllHeroesBattleNet:GetInstance():GetEnemy(id, _G.handler(self, self.OnRoomData))
+end
+
+---获取战斗公告信息
+---@param callback function 获取回调
+function AllHeroesBattleManager:GetBattleInfo(callback)
+    self.onBattleInfoCall = callback
+    AllHeroesBattleNet:GetInstance():GetBattleInfo(_G.handler(self, self.OnBattleInfoCall))
+end
+
+---获取奖励数量以及下次刷新时间
+---@return number|number 当前量|下次刷新时间
+function AllHeroesBattleManager:GetAwardInfo()
+    return self:CalculateAward()
+end
+
+---获取最大储存量
+---@return number 最大容量
+function AllHeroesBattleManager:GetAwardMaxCount()
+    return MaxAwardCount
+end
+
+---获取挂机奖励
+---@param callback function 领取回调
+function AllHeroesBattleManager:GetAward(callback)
+    if self.calculateAwardCount <= 0 then
+        return
+    end
+    self.onGetAwardCall = callback
+    AllHeroesBattleNet:GetInstance():GetAward(_G.handler(self, self.OnGetAwardCall))
+end
+
+---打开防守布阵
+function AllHeroesBattleManager:OpenDefenceEmbattle()
+    self.attackEmbattle = false
+    self.openEmbattleTag = true
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require("EmbattleController"):GetInstance():OpenEmbattle(
+        _G.EmbattleType.AllHeroesBattle,
+        _G.EmbattleSaveType.server,
+        nil,
+        _G.EmbattleControllerItemType.arenaDefence,
+        _G.handler(self, self.ExitEmbattle),
+        _G.handler(self, self.ExitEmbattle),
+        _G.ConfigManager.activity_pvp_cfg[self.curPosID].battle_scene
+    )
+end
+
+---挑战玩家
+---@param id number 位置ID
+---@param uid number 挑战的玩家UID
+function AllHeroesBattleManager:Challenge(roomid, player)
+    if player.role_uid == _G.PlayerModel:GetInstance():GetPlayerUid() then --点自己没反应
+        return
+    end
+    if roomid == 1 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(620106)
+        if player.type == 1 then --玩家就弹出信息界面
+            _G.SystemSettingManager:GetInstance():OpenView(player.role_uid)
+        end
+        return
+    end
+    if self:GetFightTimes() <= 0 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            620103,
+            nil,
+            function()
+                local view =
+                    _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.AllHeroesBattleRoomView.Name)
+                self:BuyFightTimes(_G.handler(view, view.OnBuyFightTimes))
+            end
+        )
+        return
+    end
+    self.curChallengePosID = player.sid
+    self.curChallengeUid = player.role_uid
+    self.curChallengePower = player.power
+    self.curChallengePlayer = player
+    local cfgs = _G.ConfigManager.activity_pvp_cfg
+    local ecfg = cfgs[self.curChallengePosID]
+    local mcfg = cfgs[self.curPosID]
+    if ecfg.room - mcfg.room > 1 then --不能越级挑战
+        _G.PopWindowManager:GetInstance():ShowAllTips(630110)
+    elseif ecfg.room < mcfg.room or (ecfg.room == mcfg.room and ecfg.type_pos <= mcfg.type_pos) then --挑战同等位置或者底位置的玩家提示
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            620102,
+            nil,
+            function()
+                AllHeroesBattleNet:GetInstance():GetEnemyEmbattleData(
+                    player.role_uid,
+                    _G.handler(self, self.OnEmbattleDataCall)
+                )
+            end
+        )
+    else
+        self.playSuccessEffectTag = true
+        AllHeroesBattleNet:GetInstance():GetEnemyEmbattleData(
+            player.role_uid,
+            _G.handler(self, self.OnEmbattleDataCall)
+        )
+    end
+end
+
+---获取挑战次数
+---@return number 挑战次数
+function AllHeroesBattleManager:GetFightTimes()
+    return self.fightNums + _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.Prop, ticketItemID)
+end
+
+---购买挑战次数
+---@param callback function 购买回调
+function AllHeroesBattleManager:BuyFightTimes(callback)
+    self.onBuyTicketCall = callback
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ItemBuyView.Name,
+        exchangeTicketID,
+        _G.handler(self, self.OnBuyTicketCall)
+    )
+end
+
+---获取战报
+---@param callback function 战报回调
+function AllHeroesBattleManager:GetReport(callback)
+    if self.reports then
+        callback(true, self.reports)
+        return
+    end
+    self.onReportCall = callback
+    AllHeroesBattleNet:GetInstance():GetBattleReport(_G.handler(self, self.OnReportCall))
+end
+
+---领取通关奖励
+---@param callback function 战报回调
+function AllHeroesBattleManager:GetTaskAward(list, callback)
+    AllHeroesBattleNet:GetInstance():GetTaskAward(
+        {list = list},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+
+            for _, v in pairs(list) do
+                if not self.taskAwardData[v.room_star] then
+                    self.taskAwardData[v.room_star] = {}
+                end
+                self.taskAwardData[v.room_star][v.room_type] = true 
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(
+                _G.ConfigManager.redpoint_cfg.AllHeroesBattleTask.id
+            )
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---获取当前所在位置
+---@return number 当前所在位置ID
+function AllHeroesBattleManager:GetCurPosID()
+    return self.curPosID
+end
+
+---获取当前所在房间
+---@return number 当前所在房间ID
+function AllHeroesBattleManager:GetCurRoomID()
+    return _G.ConfigManager.activity_pvp_cfg[self.curPosID].room
+end
+
+---获取当前所在房间
+---@return number 当前选择的房间ID
+function AllHeroesBattleManager:GetCurChooseRoomID()
+    return (self.curChooseRoomID and self.curChooseRoomID > 0) and self.curChooseRoomID or self:GetCurRoomID()
+end
+
+---获取倒计时
+---@return number 剩余时间
+function AllHeroesBattleManager:GetEndTime()
+    return _G.TimeUtil.GetSixClockTimer()
+end
+
+---获取是否有新战报
+---@return boolean 是否有新战报
+function AllHeroesBattleManager:GetNewReport()
+    return self.reportNewTag or false
+end
+
+---新战报状态置空
+function AllHeroesBattleManager:SetNewReportNil()
+    if self.reportNewTag then
+        self.reportNewTag = false
+        _G.PlayerPrefsManager.SetInt(_G.AllHeroBattle.AllHeroReportKey, self.curPosID)
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleReport.id)
+        _G.PlayerPrefsManager.SetInt(_G.AllHeroBattle.AllHeroReporTagKey, 0)
+    end
+end
+
+function AllHeroesBattleManager:OnReportNew()
+    self.reports = nil
+    AllHeroesBattleNet:GetInstance():Init(_G.handler(self, self.OnReportNewCall))
+end
+
+---获取新战报
+function AllHeroesBattleManager:OnReportNewCall(data)
+    self:OnInitData(data)
+    if not data.attacked then
+        self.reportNewTag = self:CheckIsLose()
+    end
+    _G.PlayerPrefsManager.SetInt(_G.AllHeroBattle.AllHeroReportKey, data.sid)
+    _G.PlayerPrefsManager.SetInt(_G.AllHeroBattle.AllHeroReporTagKey, self.reportNewTag and 1 or 0)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleReport.id)
+end
+
+---回放战报
+---@param uid number 战报uid
+---@param callback function 回放回调
+function AllHeroesBattleManager:ReplayReport(uid, callback)
+    AllHeroesBattleNet:GetInstance():ReportPlayBack(uid, callback)
+end
+
+---监听位置改变
+---@param callback function 监听方法
+function AllHeroesBattleManager:RegiestPosChangeCall(callback)
+    self.onPosChangeCall = callback
+end
+
+---打开主界面
+function AllHeroesBattleManager:OpenMainView(hideCall, showCall)
+    self.onMainViewCloseCall = showCall
+    if self.awardTimeStamp == 0 then
+        AllHeroesBattleNet:GetInstance():Init(
+            function(data)
+                if data.ack and data.ack ~= 1 then
+                    self.functionOpenTag = false
+                    self:StopTipsTimer()
+                    return
+                end
+                self:OnInitData(data)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AllHeroesBattleView.Name, hideCall, showCall)
+            end
+        )
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.AllHeroesBattleView.Name, hideCall, showCall)
+    end
+end
+
+---更新基础数据
+---@param callback function 更新回调
+function AllHeroesBattleManager:UpdateInitData(call)
+    AllHeroesBattleNet:GetInstance():Init(
+        function(data)
+            if data.ack and data.ack ~= 1 then
+                self.functionOpenTag = false
+                self:StopTipsTimer()
+                call()
+                return
+            end
+            self:OnInitData(data)
+            _G.PlayerPrefsManager.SetInt(_G.AllHeroBattle.AllHeroReportKey, data.sid)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+function AllHeroesBattleManager:SetPlaySuccessEffectTag(play)
+    self.playSuccessEffectTag = play
+end
+
+function AllHeroesBattleManager:GetPlaySuccessEffectTag()
+    return self.playSuccessEffectTag
+end
+
+---获取功能是否开放
+---@return boolean 功能是否开放
+function AllHeroesBattleManager:GetFunctionOpened()
+    return self.functionOpenTag
+end
+
+function AllHeroesBattleManager:RegiestInfoDataCall(call)
+    self.onInfoDataCall = call
+end
+
+function AllHeroesBattleManager:GetMainViewCloseCall()
+    return self.onMainViewCloseCall
+end
+
+local allHeroesFirstLoginKey = "AllHeroesLoginFirstDay"
+---检测是否是当天首次登录
+---@return boolean 是否首次登录
+function AllHeroesBattleManager:CheckLoginFirstByDay()
+    if not self.arenaLoginFirst then
+        self.arenaLoginFirst = _G.PlayerPrefsManager.GetInt(allHeroesFirstLoginKey, 0)
+    end
+    if self.arenaLoginFirst == 0 then
+        return true
+    end
+    local startTime = require "SeasonModel":GetInstance():GetTime() and require "SeasonModel":GetInstance():GetTime().startTime or 0
+    if startTime ~= self.arenaLoginFirst then
+        self.arenaLoginFirst = 0
+        return true
+    end
+    return false
+end
+
+function AllHeroesBattleManager:SetArenaLoginFirstByDay()
+    if self.arenaLoginFirst == 0 then
+        self.arenaLoginFirst = require "SeasonModel":GetInstance():GetTime() and require "SeasonModel":GetInstance():GetTime().startTime or 1
+        _G.PlayerPrefsManager.SetInt(allHeroesFirstLoginKey, self.arenaLoginFirst)
+        --TODO:刷新登录红点
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleLogin.id)
+    end
+end
+
+---获取当前奖励产出
+---@return 变量类型 中文描述
+function AllHeroesBattleManager:GetCurAwardEfficiency()
+    if self.awardTimeStamp == 0 then
+        return 0
+    end
+    return _G.ConfigManager.activity_pvp_cfg[self:GetCurPosID()].efficiency
+end
+
+function AllHeroesBattleManager:OpenView(hideFun, openFun, ...)
+    require("AllHeroesBattleManager"):GetInstance():OpenMainView(hideFun, openFun)
+end
+
+--endregion
+---设置入口额外图标
+function AllHeroesBattleManager:SetExtraBtn()
+    local data = _G.StorageManager:GetInstance():GetStorageItemData(extra[1])
+    --local data = _G.StorageManager:GetInstance():GetItemDataByID(uid, extra[1])
+    local max = self:GetAwardMaxCount() * extra[2]
+    if self:GetAwardInfo() * 10000 >= max then
+        return 1, data.Icon, _G.handler(self, self.ExtraOnclick)
+    end
+    return 0
+end
+
+---变换入口额外图标
+function AllHeroesBattleManager:ChangeExtraBtn()
+    return 0
+end
+
+function AllHeroesBattleManager:ExtraOnclick(callback)
+    self:GetAward(callback)
+end
+
+---检测是否存在任务红点
+---@return boolean
+function AllHeroesBattleManager:CheckRedpointTask()
+    ---尚未初始化完成
+    if not self.taskAwardData then
+        return false
+    end
+
+    local cfgsRoom = _G.ConfigManager.activity_pvp_room_cfg
+
+    local roomids = self:GetRoomIds()
+    local count = #roomids
+    for i = 1, count do
+        local cfg = cfgsRoom[roomids[count - i + 1]]
+        --当前存在可领取的奖励
+        if self:GetTaskStateByStarAndType(cfg.id, 0) == 1 or self:GetTaskStateByStarAndType(cfg.id, 1) == 1 then
+            return true
+        end
+    end
+    return false
+end
+
+--获取计算房间开启的初始时间（第一赛季用功能开启时间，之后的赛季用赛季开始时间）
+function AllHeroesBattleManager:GetRoomFirstTime()
+    local model = require "SeasonModel":GetInstance()
+    local seasonStartTime = model:GetTime() and model:GetTime().startTime or 0
+    local functionOpenTime = _G.PlayerModel:GetInstance().open_time + (_G.ConfigManager.function_open_cfg[_G.FunctionID.AllHeroesBattle].condition_type[2][2] - 1) * 86400
+    if seasonStartTime and seasonStartTime > functionOpenTime then
+        local periods = self:GetCurPeriods()
+        return seasonStartTime + periods * self.cycle * 86400 
+    else 
+        return functionOpenTime
+    end
+end
+
+---获取当前期数（1赛季4期）
+function AllHeroesBattleManager:GetCurPeriods()
+    local curDay = require "SeasonModel":GetInstance().curDay
+    return (curDay - 1) // self.cycle
+end
+
+return AllHeroesBattleManager

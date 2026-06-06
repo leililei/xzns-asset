@@ -1,0 +1,987 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Battle.BattleController.BattleControllerAfkChallenge	(修改路径必须修正此项!)
+-- Created by zl
+-- DateTime: 2021/03/01
+-- Description: 放置战斗控制
+-----------------------------------------------------------------------
+local TrackingPointModel = require("TrackingPointModel")
+local base = require "BattleControllerBase"
+---@class BattleControllerAfkChallenge : BattleControllerBase 中文描述
+local BattleControllerAfkChallenge = _G.BaseClass("BattleControllerAfkChallenge", base)
+local afk_cfg = _G.ConfigManager.afk_cfg
+local ShowType = {
+    Loaded = 1,
+    ShowEnd = 2
+}
+
+local SpeedFunctionOpenID = 30
+local AutoFightFunctionOpenID = 31
+local SkipBattleFunctionOpenID = 156
+
+local discreteID = {
+    MaxAfkTime = 101103,
+    ResultIntervalTime = 101104,
+    RewardConsume = 101106,
+    MaxRewardTime = 101107,
+    FailShowBtn = 100106,
+    AutoNextId = 100217,
+    SkipBattleTime = 100129,
+    SkipBattle = 100130,
+    TeachMonsterGroup = 100241
+}
+
+---类的构造函数
+function BattleControllerAfkChallenge:__init()
+    self.retainPool = nil
+end
+
+---类的析构函数
+function BattleControllerAfkChallenge:Dispose()
+    self.scene = nil
+    self.FightResultData = nil
+    self.mgCfg = nil
+end
+
+--region 子类重写方法
+---处理传参
+---@param sid number 房间sid
+function BattleControllerAfkChallenge:OnHandleParams(scene, leftName, rightName)
+    self.scene = scene
+    self.leftName = leftName
+    self.rightName = rightName
+end
+
+-----检测是否可以进入战斗
+---@param callback function 检测后的回调(参数bool)
+function BattleControllerAfkChallenge:CheckFight(call)
+    local AfkModelIns = require("AfkModel"):GetInstance()
+    local port = AfkModelIns:FightBegin(
+        self.scene,
+        function(data)
+            if data.ack ~= 1 then
+                self:ExitLoading()
+                call(false, data.ack)
+            else
+                self.mgCfg = _G.ConfigManager.monster_group_cfg[data.fight_arg.sid]
+                require "AfkBattleManager":GetInstance():SetCurFightArg(data.fight_arg, data.fight_arg.sid)
+                call(true)
+            end
+        end
+    )
+    _G.BattleManager:GetInstance():AddLuaNetEvent(port)
+end
+
+---战斗验证不通过
+---@param msg string 错误信息
+function BattleControllerAfkChallenge:OnCheckFail(msg)
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.AfkEmbattleView.Name)
+    require("AfkBattleManager"):GetInstance():SetFighting(false)
+    require("AfkBattleManager"):GetInstance():EnterEmbattle()
+end
+
+---加载战斗(协程加载)
+function BattleControllerAfkChallenge:OnLoadFight()
+    local ePoolType = _G.ePoolType
+    local BattleManagerIns = _G.BattleManager:GetInstance()
+    BattleManagerIns:SetPoolName(
+        ePoolType.Static,
+        ePoolType.World,
+        ePoolType.World,
+        ePoolType.Default,
+        ePoolType.Default
+    )
+    self.State = nil
+    local uiManager = _G.UIManager:GetInstance()
+    local ui_cfg = _G.ConfigManager.ui_cfg
+    local battleView = uiManager:OpenWindow(ui_cfg.BattleView.Name).View
+    -- 等待 战斗窗口 加载完成
+    while (_G.IsNil(battleView.gameObject)) do
+        _G.coroutine.waitforendofframe()
+    end
+    battleView:Hide()
+    local AfkModel = require("AfkModel"):GetInstance()
+    local curSid = AfkModel:GetCurSection()
+    local cfg = afk_cfg[curSid]
+    local str = string.format("%d-%d", cfg.chapter, cfg.section)
+    BattleManagerIns:initAttackSids(
+        nil,
+        _G.EBattleType.AfkChallenge,
+        true,
+        0,
+        0,
+        nil,
+        str,
+        nil,
+        self.leftName,
+        self.rightName
+    )
+    while BattleManagerIns.Progress < 1 do
+        _G.coroutine.waitforendofframe()
+    end
+    local FunctionManagerIns = _G.FunctionManager:GetInstance()
+    if _G.AppSetting.IsAlipay then
+        local conditions = _G.ConfigManager.discrete_cfg[126101]
+        battleView:SetSpeedBtnActive(_G.GlobalConditionManager.CheckCondition(conditions[1][2],conditions[1][3]))
+    else
+        battleView:SetSpeedBtnActive(FunctionManagerIns:CheckFunctionIsUnlock(SpeedFunctionOpenID))
+    end
+    battleView:SetAutoBtnActive(FunctionManagerIns:CheckFunctionIsUnlock(AutoFightFunctionOpenID))
+    battleView:SetSettingBtnActive(true)
+    uiManager:CloseWindow(ui_cfg.EmbattleView.Name)
+    uiManager:CloseWindow(ui_cfg.AfkEmbattleView.Name)
+    --_G.WorldManager:GetInstance():SetCurrentWorldVisible(false, true)
+    _G.coroutine.waitforendofframe()
+    battleView:SetCanvasGroupTrue()
+end
+
+---战斗开始
+function BattleControllerAfkChallenge:OnStart()
+    local model = require("AfkModel"):GetInstance()
+    self.State = ShowType.Loaded
+    model:SetCurMonsterID(self.scene)
+    --对于1-6关卡, 启用特殊剧情
+    if model:GetCurSection() == 101006 then
+        _G.BattleManager:GetInstance():CreateStory(101006)
+    end
+
+    if self:DisplayStopSettingsBtns() then
+        _G.BattleManager:GetInstance():SetPauseBtnState(1, 1, 1)
+    else
+        _G.BattleManager:GetInstance():SetPauseBtnState(0, 0, 1)
+    end
+    self:OnBossShowEndDurationTimeEnd(self.State)
+end
+
+function BattleControllerAfkChallenge:FightOverBeforePlayDeathAni(tab)
+    local showEffect = true
+    if not _G.MainManager:GetInstance():IsToggledAfkWindow(true) or
+        not require("AfkBattleManager"):GetInstance():IsShowFighting() then
+        showEffect = false
+    end
+    base.FightOverBeforePlayDeathAni(self, tab, showEffect)
+end
+
+---战斗结束，死亡动画播放之前
+---@param tab table 战斗数据
+---@param call function 完成回调
+function BattleControllerAfkChallenge:OnFightOverBeforePlayDeathAni(tab, call)
+    self.FightResultData = {}
+    self.FightResultData.statistics = true
+    self.FightResultData.iSWin = tab.winner[1] or tab.skip
+    local AfkModelIns = require("AfkModel"):GetInstance()
+    if #AfkModelIns:GetSceneID() > 1 then
+        require "AfkBattleManager":GetInstance():SetLastFightCmd(tab.cmd)
+    end
+    if tab.winner[1] or tab.skip then
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            tab,
+            function(_data)
+                if _data.md5_error == "1" then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                elseif _data.md5_error == "2" then
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                end
+                self.FightResultData.iSWin = _data and _data.winner and _data.winner[1]
+                AfkModelIns:SetCurFailTime(_data.fail_time or 0)
+                if #AfkModelIns:GetSceneID() == 1 then
+                    --ZHJH-1604【放置推图】失败时，低概率弹出旧版的弹窗
+                    --ZHJH-2891【战斗】战斗服异常时，失败界面是旧的UI界面
+                    --单队关卡失败时, 直接弹出结算面板而非小结算面板
+                    self.FightResultData.pass = true
+                end
+                self:HandleFightWin(call, _data)
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, { _G.SeasonTaskID.Akf }, 1)
+            end
+        )
+    else
+        ---发送失败结算显示敌方阵容详情
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            tab,
+            function(_data)
+                if _data.md5_error == "1" then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                elseif _data.md5_error == "2" then
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                end
+                AfkModelIns:SetCurFailTime(_data.fail_time or 0)
+                self.FightResultData.btnDisplay = true
+                if #AfkModelIns:GetSceneID() == 1 then
+                    self.FightResultData.pass = true
+                end
+                call()
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, { _G.SeasonTaskID.Akf }, 1)
+
+                if _data.winner[1] == false then
+                    --local AfkModel = require("AfkModel"):GetInstance()
+                    --local curSid = AfkModel:GetCurSection()
+
+                    require "PopUpGiftBagModel":GetInstance():IsPlaceFailed()
+                    --curSid)
+                end
+            end
+        )
+    end
+end
+
+---处理战斗失败
+function BattleControllerAfkChallenge:HandleFightFail()
+    require "FriendHelpModel":GetInstance():OpenNpc(nil, nil, 1)
+    --TODO:直接退回布阵
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    base.OnSettlementEndCall(self, false, require("SettlementModel").FunctionEnum.ReEmbattle)
+end
+
+---处理多场战斗胜利
+function BattleControllerAfkChallenge:HandleFightV()
+    --TODO:直接退回布阵
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    -- ZHJ-18655【客户端】多队布阵-提示&自动下一关优化
+    local AfkBattleManagerIns = require "AfkBattleManager":GetInstance()
+    local autofight = AfkBattleManagerIns:GetAutoFight()
+    local autoNext = _G.PlayerPrefsManager.GetInt("AutoNextToggleData") == 1 and true or false
+    if autofight or autoNext then
+        base.OnSettlementEndCall(self, false, require("SettlementModel").FunctionEnum.Next)
+    else
+        base.OnSettlementEndCall(self, false, require("SettlementModel").FunctionEnum.ReEmbattle)
+    end
+end
+
+---处理战斗胜利
+---@param 变量名 变量类型 中文描述
+function BattleControllerAfkChallenge:HandleFightWin(call, _data)
+    local AfkModelIns = require("AfkModel"):GetInstance()
+    local AfkBattleManagerIns = require("AfkBattleManager"):GetInstance()
+    if _data.ack == 1 then
+        local isWin = _data.winner and _data.winner[1]
+        self.FightResultData.iSWin = isWin
+        if isWin then
+            --以服务器战斗结果为准
+            if #AfkModelIns:GetSceneID() > 1 then
+                AfkBattleManagerIns:SetCurStatisticsData(_G.BattleManager:GetInstance():GetStatistics(), self.scene)
+            end
+            AfkModelIns:SetMonsterPass()
+            if AfkModelIns:CheckCurChallengeIsPass() then
+                --通关
+                self.FightResultData.pass = true
+                if 101001 == AfkModelIns:GetCurSection() then
+                    _G.SDKManager:GetInstance():GameStepInfo(-70004)
+                    _G.SDKManager:GetInstance():MiniGameTrack(require("SDKDef").DotMsg.ShuShu.first_level_pass)
+                end
+                require("AfkNet"):GetInstance():ChallengeSuc(
+                    { sid = AfkModelIns:GetCurSection() },
+                    function(data)
+                        if data.ack == 1 then
+                            AfkModelIns:SetAfkTime(data.time)
+                            AfkModelIns:SetCurFailTime(0)
+                            _G.PlayerPrefsManager.DeleteKey("MonsterShowiView")
+                            local autonextDisplay = false
+                            --region VIP 特权 自动推图
+                            local f_flag = false
+                            local data1 = require "PrivilegeManager":GetInstance():GetPrivilegeData(
+                                { _G.PrivilegeType.VIP.unlockFunction }
+                            )
+                            if data1 and data1[1] then
+                                local count = 1
+                                local check_type = type(data1[1])
+                                if check_type == "number" then
+                                    -- 检测是不是数值类型
+                                    count = 1
+                                else
+                                    count = 2
+                                end
+                                for i = 1, #data1 do
+                                    local fun_id = 0
+                                    if count < 2 then
+                                        fun_id = data1[i]
+                                    else
+                                        fun_id = data1[i][2]
+                                    end
+                                    if fun_id == 69 then
+                                        f_flag = true
+                                    end
+                                end
+                            end
+                            --endregion
+                            if AfkModelIns:CheckAutoNextDisplay() or f_flag then
+                                autonextDisplay = true
+                            end
+                            if not autonextDisplay then
+                                if _G.AppSetting.IsArraigned then
+                                    self.FightResultData.bottomTip = _G.GetLangPackValue(90000001253)
+                                else
+                                    self.FightResultData.bottomTip = _G.GetLangPackValue(90000000911)
+                                end
+                            end
+                            self.FightResultData.funcForecast = self:GetAfkForecast()
+                            AfkModelIns:SetLastSection(AfkModelIns:GetCurSection())
+                            AfkModelIns:SetCurPage()
+                            AfkModelIns:SetHasShowTips(true)
+                            local curafkchapterid = AfkModelIns:GetCurAfkChapter()
+                            self.FightResultData.lastChapterID = curafkchapterid
+                            AfkModelIns:UnlockSection()
+                            _G.Events:GetInstance():Broadcast(
+                                _G.ePlayAactionEvent.PlayAaction,
+                                {
+                                    _G.ActiveTaskEnum.ConditionEnum.AFK.IsPass,
+                                    AfkModelIns:GetLastSection()
+                                },
+                                1
+                            )
+                            ---当前大章节结束判断红点宝箱
+                            self:JinDuBaoXiangPanDuan()
+                            require("RedPointManager"):GetInstance():RefreshNode(
+                                _G.ConfigManager.redpoint_cfg.FirstGather.id
+                            )
+                            _G.Events:GetInstance():Broadcast(_G.eAFKAactionEnum.AfkSectionPass)
+                            self.FightResultData.task = self:GetBattleTask()
+                            local ChapterAwardBoxGet = AfkModelIns:CheckNewChapterAwardIsGet()
+                            self.FightResultData.afktips = AfkModelIns:ComputeTarget()
+                            _G.Events:GetInstance():Broadcast(_G.eAfkEvents.Pass)
+                            _G.StorageManager:GetInstance():ReceiveAwardData(data)
+                            local storyid = _G.WorldManager:GetInstance():CheckAfkAfterAwardStoryID()
+                            --检查下一关布阵是否存在空阵容(仅当MainView afk未选中时)
+                            local nextEmbattleOk = true
+                            if not self:IsShowFighting() then
+                                ---@type EmbattleModel
+                                local embattleModel = require("EmbattleModel"):GetInstance()
+                                local embattleIds = require("AfkBattleManager"):GetInstance():GetCurEmbattleID()
+                                for _, embattleId in pairs(embattleIds) do
+                                    if not embattleModel:CheckEmbattleData(embattleId) then
+                                        nextEmbattleOk = false
+                                        autonextDisplay = false
+                                        break
+                                    end
+                                end
+                            end
+                            if
+                            autonextDisplay ~= false and storyid == nil and
+                                _G.FunctionManager:GetInstance():AfkIsBack() == false and
+                                not ChapterAwardBoxGet
+                            then
+                                self.FightResultData.autonextDisplay = autonextDisplay
+                            end
+                            self.FightResultData.showTwoBtn = true
+                            self.FightResultData.btnDisplay = true
+                            local preCfg = AfkModelIns:GetPreviousSectionCfg()
+                            if
+                            _G.FunctionManager:GetInstance():AfkIsBack() or not nextEmbattleOk or
+                                (preCfg and preCfg.AfterBattleButton == 1) or
+                                not AfkModelIns:CheckNextSectionCondition()
+                            then
+                                --显示"返回"而不显示"下一关"
+                                self.FightResultData.back = true
+                                ---显示返回按钮时，不再显示自动挑战
+                                self.FightResultData.autonextDisplay = false
+                                self.FightResultData.emptyNotBack = true
+                            end
+                            self.FightResultData.AwardData = _G.StorageManager:GetInstance():MergeAward(data)
+                            local cfg = _G.ConfigManager.discrete_cfg[100143]
+                            if cfg and cfg[1][1] == AfkModelIns.LastSid then
+                                self.FightResultData.MvpCardSid = cfg[1][2]
+                            end
+                            require("AfkBattleManager"):GetInstance():InitCurEmbattleSids()
+                            _G.PopWindowManager:GetInstance():CardAwardTipView()
+                            _G.PopWindowManager:GetInstance():AddInitialPopQuene()
+
+                            _G.Events:GetInstance():Broadcast(_G.eEscapeRoomChallenge.AfkPass)
+                        else
+                            self.FightResultData.pass = false
+                            self.FightResultData.iSWin = false
+                            AfkModelIns:ResetPass()
+                            --通关数据异常, 清除一下记录数据防止卡死
+                            AfkBattleManagerIns:ClearStatisticsData()
+                        end
+                        call()
+                    end
+                )
+            else
+                --下一组怪
+                -- self:HandleFightFail()
+                self.FightResultData.btnDisplay = false
+                call()
+            end
+        else
+            -- self:HandleFightFail()
+            if #AfkModelIns:GetSceneID() == 1 then
+                self.FightResultData.btnDisplay = true
+            else
+                self.FightResultData.btnDisplay = false
+            end
+            call()
+        end
+    else
+        --服务器返回错误 按失败处理
+        -- self:HandleFightFail()
+        self.FightResultData.iSWin = false
+        self.FightResultData.btnDisplay = false
+        call()
+    end
+end
+
+--判断当前ID是否满足进度宝箱
+function BattleControllerAfkChallenge:JinDuBaoXiangPanDuan()
+    local id = 253010001
+    local itemData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Prop, id)
+    if itemData ~= nil then
+        local NowGetNum = itemData.progress or 0
+        if NowGetNum > 0 then
+            ---红点显示 道具
+            require("RedPointManager"):GetInstance():RefreshNode(
+                _G.ConfigManager.redpoint_cfg.BackpackItem.id,
+                253010001
+            )
+        end
+    end
+end
+
+---函数功能注释
+---@param call function 结算回调(SettlementItemBase子对象,结算参数)
+function BattleControllerAfkChallenge:OnSettlement(call)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    --- 只有胜利 才播放战后剧情
+    if self.FightResultData.iSWin == true then
+        self:CreateResultEff(
+            function()
+                local cfg = require("AfkModel"):GetInstance():GetPreviousSectionCfg()
+                if
+                cfg and cfg.AfterBattleStoryID > 0 and
+                    _G.StoryUtilities.HasStoryIDSavedUID(cfg.AfterBattleStoryID) == false
+                then
+                    _G.AutomaticPlayStory.PlayStoryByID(
+                        cfg.AfterBattleStoryID,
+                        function()
+                            call(_G.SettlementModel.SettlementType.afkChallenge, self.FightResultData)
+                            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+                        end
+                    )
+                else
+                    call(_G.SettlementModel.SettlementType.afkChallenge, self.FightResultData)
+                    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+                end
+            end
+        )
+    else
+        self:CreateResultEff(
+            function()
+                call(_G.SettlementModel.SettlementType.afkChallenge, self.FightResultData)
+                _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+            end
+        )
+    end
+end
+
+---@return task i_task
+function BattleControllerAfkChallenge:GetBattleTask()
+    local task = {}
+    if
+    _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.ActiveTask) or
+        _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Achievement)
+    then
+        local taskid = require "AfkModel":GetInstance():GetSidTaskCom()
+        local _i_task
+        if taskid then
+            _i_task = require "ActiveTaskManager":GetInstance():GetTaskByTaskid(taskid)
+        end
+        if _i_task then
+            task.desc = _G.LangUtil.GetLangPackValue(_G.ConfigManager.mission_cfg[_i_task.i_task.sid].desc)
+            task.finish = _i_task.i_task.state == 5
+            task.progress = _i_task.i_task.state == 5 and "(1/1)" or "(0/1)"
+        end
+        return task
+    end
+end
+
+function BattleControllerAfkChallenge:GetAfkForecast()
+    local forecast = {}
+    local sid = require "AfkModel":GetInstance():GetCurSection()
+    local afkOpenArr = _G.FunctionManager:GetInstance():GetAfkFuncOpenArr()
+    if afkOpenArr then
+        for k, v in pairs(afkOpenArr) do
+            if
+            sid <= v[1] and #v[2] > 0 and --- ZHJ-17634【客户端】功能预告提前解锁优化VIP提前解锁功能后，对应的功能预告不再提示，返回按钮若已提前开放则不再显示；
+                not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(v[3])
+            then
+                forecast.finish = sid == v[1]
+                forecast.desc = _G.LangUtil.GetLangPackValue(v[2][1])
+                if #v[2] > 1 then
+                    forecast.item = v[2][2]
+                end
+                forecast.progress = "(" .. afk_cfg[sid].number .. "/" .. afk_cfg[v[1]].number .. ")"
+                break
+            end
+        end
+    end
+
+    return forecast
+end
+
+---战斗结束播放特效
+function BattleControllerAfkChallenge:CreateResultEff(call)
+    if #require("AfkModel"):GetInstance():GetSceneID() > 1 then
+        if call then
+            call()
+        end
+        return
+    end
+    if call then
+        call()
+    end
+
+    --是否显示战斗界面
+    -- if self:IsShowFighting() then
+    --     --展示战斗结束特效
+    --     local eff = _G.ConfigManager.ui_effect_cfg.BattleFail
+    --     if self.FightResultData.iSWin then
+    --         eff = _G.ConfigManager.ui_effect_cfg.BattleVictory
+    --     end
+    --     _G.UIUtils.LoadEffectByCfg(eff, _G.UIManager:GetInstance():GetUILayerTrans("TopLayer"), nil, call)
+    -- else
+    --     if call then
+    --         call()
+    --     end
+    -- end
+end
+
+---重新布阵
+function BattleControllerAfkChallenge:OnReEmbattle()
+    --战斗失败, 重新挑战
+    _G.UIManager:GetInstance():SwitchSceneCloseWindows()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    _G.MainManager:GetInstance():ShowAfkWindow()
+
+    require("AfkBattleManager"):GetInstance():EnterEmbattle()
+end
+
+--结算并返回
+function BattleControllerAfkChallenge:OnSettlementBack()
+    if not _G.MainManager:GetInstance():IsToggledAfkWindow(true) then
+        --返回afk界面
+        _G.UIManager:GetInstance():SwitchSceneCloseWindows()
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+        _G.MainManager:GetInstance():ShowAfkWindow()
+    end
+
+    --下一关有boss来袭告警
+    local afkId = require("AfkModel"):GetInstance():GetCurSection()
+    local afkCfg = _G.ConfigManager.afk_cfg[afkId]
+    if afkCfg and afkCfg.BossCome == 1 then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MonsterTipView.Name)
+    end
+end
+
+---结算完直接退出
+---@param result boolean 是否胜利
+function BattleControllerAfkChallenge:OnSettlementEnd(result)
+    local afkModel = require "AfkModel":GetInstance()
+    local afkManager = require("AfkBattleManager"):GetInstance()
+
+    if not self.FightResultData.pass then
+        if _G.MainManager:GetInstance():IsToggledAfkWindow(true) then
+            --当前选中冒险选项卡, 走原始的布阵相关逻辑
+            afkModel:SetCurPage()
+            afkManager:SetFighting(false)
+            if result then
+                self:HandleFightV()
+            else
+                self:HandleFightFail()
+            end
+        elseif result and afkManager:CheckCurrentEmbattleValid() then
+            --战斗胜利且满足布阵要求, 直接进入下一场战斗
+            afkModel:SetCurPage() --设置当前小关卡通关
+            --更新布阵数据(多场战斗)
+            afkManager:UpdateNextEmbattle(function(ok)
+                if ok then
+                    afkManager:SetFighting(false)
+                    afkManager:NextFight()
+                else
+                    afkManager:ExitFight()
+                end
+            end)
+        else
+            --战斗失败或不满足布阵要求, 直接退出战斗
+            afkManager:ExitFight()
+        end
+        return
+    end
+    afkManager:ExitFight()
+    if result then
+        local storyId = _G.WorldManager:GetInstance():CheckAfkAfterAwardStoryID()
+        local isHaveFunOpenView = _G.FunctionManager:GetInstance():IsHaveFunOpenView()
+        local ShowViewCall
+        ShowViewCall = function()
+            if not (storyId or isHaveFunOpenView) and afkModel:GetCurSection() > 101003 then
+                _G.MainManager:GetInstance():ShowEfficientChanged()
+                afkModel:SetHasShowTips(false)
+            end
+            _G.MainManager:GetInstance():RefreshAfkBoxTip()
+        end
+        -- local FunItem = {}
+        -- FunItem.checkFun = function()
+        --     return true
+        -- end
+        -- FunItem.OpenViewFun = function()
+        --     local data = require "AfkModel":GetInstance().CurChapterEndAward
+        --     _G.UIManager:GetInstance():OpenWindow(
+        --         _G.ConfigManager.ui_cfg.ChapterAwardView.Name,
+        --         data[1],
+        --         function()
+        --         end
+        --     )
+        -- end
+        local tempFun = function()
+            _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+            if _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name) then
+                ShowViewCall()
+            end
+        end
+        -- if AfkModel:GetHaveNewChapterAward() then
+        --     _G.MainManager:GetInstance():AddMainFunQueue(FunItem, _G.MainViewShowOrder.ChapterAward)
+        -- end
+        tempFun()
+    else
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+    end
+    TrackingPointModel:GetInstance():CloseAFKEmBattleViewTracking()
+end
+
+---挑战下一关
+function BattleControllerAfkChallenge:OnChallengeNext()
+    local afkModel = require("AfkModel"):GetInstance()
+    local sectionID = afkModel:GetSceneID()
+    local curSid = afkModel:GetCurSection()
+    if #sectionID > 0 then
+        if afk_cfg[curSid].next_section > 0 then
+            if afkModel:CheckNextSectionCondition(true) then
+                self.retainPool = true
+                local afkManager = require("AfkBattleManager"):GetInstance()
+                local nextE = afkModel:GetSceneID()
+                if nextE and #nextE > 1 then
+                    --更新布阵数据(多场战斗)
+                    afkManager:UpdateNextEmbattle(function(ok)
+                        if ok then
+                            afkManager:NextFight()
+                        elseif _G.MainManager:GetInstance():IsToggledAfkWindow(true) then
+                            afkManager:EnterEmbattle(true)
+                        else
+                            afkManager:ExitFight()    
+                        end
+                    end)
+                elseif afkManager:CheckCurrentEmbattleValid() then
+                    afkManager:NextFight()
+                else
+                    afkManager:EnterEmbattle(false)
+                end
+            else
+                _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+            end
+        else
+            _G.PopWindowManager:GetInstance():ShowAllTips(210108)
+            _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+        end
+    end
+    _G.FunctionManager:GetInstance():DoFunctionAction(_G.FunctionTouchType.Afk)
+end
+
+---继续战斗
+function BattleControllerAfkChallenge:OnChallengeContinue()
+    require("AfkBattleManager"):GetInstance():EnterEmbattle()
+    _G.FunctionManager:GetInstance():DoFunctionAction(_G.FunctionTouchType.Afk)
+end
+
+---退出到主城
+---@param call function 退出到主城时的回调
+function BattleControllerAfkChallenge:QuitToMainWorld(call)
+    call()
+end
+
+---手动停止战斗
+function BattleControllerAfkChallenge:OnEndFight()
+    self:FightExit()
+    if #_G.require("AfkModel"):GetInstance():GetSceneID() > 1 then
+        self:HandleFightFail()
+    else
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+        _G.MainManager:GetInstance():ShowEfficientChangedByCondition()
+        require("AfkBattleManager"):GetInstance():ExitFight()
+    end
+end
+
+---重新开始战斗
+function BattleControllerAfkChallenge:OnReFight()
+    self:FightExit()
+
+    require("AfkBattleManager"):GetInstance():EnterEmbattle()
+end
+
+---战斗退出
+function BattleControllerAfkChallenge:FightExit()
+    base.FightExit(self)
+    --战斗结束, 销毁RoleParent缓存(缓存布阵丶战斗相关节点)
+    _G.WorldManager:GetInstance():DespawnRoleParent()
+    --战斗逻辑处理
+    _G.BattleManager:GetInstance():SetCineAndVisualCam(false)
+    _G.BattleManager:GetInstance():SetSceneObjActive(false)
+
+    require("AfkBattleManager"):GetInstance():SetFighting(false)
+    _G.MainManager:GetInstance():RefreshAfkWindow()
+    _G.MainManager:GetInstance():RefreshAfkToggleEffect()
+    _G.PopWindowManager:GetInstance():CheckPopQunue()
+end
+
+---获取是否保留池里面的资源
+---@return boolean 是否保留
+function BattleControllerAfkChallenge:GetRetainpool()
+    return self.retainPool
+end
+
+---获取怪物组ID
+---@return number 怪物组ID
+function BattleControllerAfkChallenge:GetMonsterGroupID()
+    return self.scene
+end
+
+--endregion
+
+---afk第一章不开启重新战斗、自动设置
+function BattleControllerAfkChallenge:DisplayStopSettingsBtns()
+    if require("AfkModel"):GetInstance():GetCurSection() < 102001 then
+        return false
+    else
+        return true
+    end
+end
+
+--战前剧情
+function BattleControllerAfkChallenge:OnBossShowEndDurationTimeEnd(state)
+    if state == ShowType.Loaded then
+        _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.LoadingView.Name)
+    end
+    self.State = nil
+    _G.BattleManager:GetInstance():SetBattlePause(true)
+    _G.BattleManager:GetInstance():SetBattleStart()
+    local afkSid = require("AfkModel"):GetInstance():GetCurSection()
+    local cfg = afk_cfg[afkSid]
+    local FrontBattleStoryID = cfg.FrontBattleStoryID
+    if FrontBattleStoryID > 0 and _G.StoryUtilities.HasStoryIDSavedUID(FrontBattleStoryID) == false then
+        _G.AutomaticPlayStory.PlayStoryByID(FrontBattleStoryID, _G.handler(self, self.OnPlayBattleFrontStoryEnd))
+    else
+        self:OnPlayBattleFrontStoryEnd()
+    end
+end
+
+---加载战斗
+function BattleControllerAfkChallenge:LoadFight()
+    _G.Log("协程结束  LoadFight     " .. self.__cname)
+    local world = _G.ePoolType.World
+    _G.BattleManager:GetInstance():SetPoolName(world, world, world, world, world)
+    self.isMonsherShow = false
+    local monsterGroupId = self:GetMonsterGroupID()
+    local value = _G.PlayerPrefsManager.GetTable("MonsterShowiView")
+    local notShow = false
+    if value then
+        for i = 1, #value do
+            if value[i] == monsterGroupId then
+                notShow = true
+            end
+        end
+    end
+    --判断是否显示战斗界面
+    if self:IsShowFighting() then
+        local afkModel = require("AfkModel"):GetInstance()
+        --ZHJH-758【客户端】视频添加(首次进入游戏丶首次进入1-6)
+        local next
+        if not notShow and afkModel:GetCurSection() == 101006 then
+            if _G.AppSetting.IsXzns then
+                next = _G.handler(self, self.StartFightNew)
+            else
+                next = function()
+                    _G.UIUtils.PlayVideo(_G.ConfigManager.video_cfg.hlnfln, _G.handler(self, self.StartFightNew))
+                end
+            end
+        else
+            next = _G.handler(self, self.StartFightNew)
+        end
+        --展示"战斗开始"特效和"MonsterShow"效果
+        local mgIds = afkModel:GetSceneID()
+        local index = nil
+        if #mgIds > 1 then
+            index = 1
+            for _, mgId in pairs(mgIds) do
+                if afkModel:CheckMonsterIsPass(mgId) then
+                    index = index + 1
+                end
+            end
+        end
+        _G.GlobalInterface.OpenMonsterShow(next, self:GetMonsterGroupID(), notShow, index)
+    else
+        --直接开始调用StartFightNew
+        self.isMonsherShow = true
+    end
+    --延时一帧的目的是为了保证布阵场景和战斗角色都放入传递到战斗的节点下
+    _G.coroutine.waitforendofframe()
+    --调用init方法c#战斗开始加载资源了
+    self:OnLoadFight()
+    self:StartFightNew()
+    local mcfg = _G.ConfigManager.monster_group_cfg[monsterGroupId]
+    _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, mcfg.audio)
+end
+
+---战前剧情完成后 开始战斗
+function BattleControllerAfkChallenge:OnPlayBattleFrontStoryEnd()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.BattleView.Name)
+    _G.BattleManager:GetInstance():ShowBattleTeam()
+
+    if _G.ConfigManager.discrete_cfg[discreteID.SkipBattle][1][1] == 1 then
+        local showSkip = false
+        local curSid = require("AfkModel"):GetInstance():GetCurSection()
+        local cfg = afk_cfg[curSid]
+        if
+        cfg.type_section == 1 and cfg.FrontBuzhenStoryID == 0 and cfg.FrontBattleStoryID == 0 and
+            cfg.AfterBattleStoryID == 0 and
+            cfg.AfterAwardStoryID == 0
+        then
+            local teachMonsterGroups = _G.ConfigManager.discrete_cfg[discreteID.SkipBattle][1]
+            local isTeach = false
+            for k, v in pairs(teachMonsterGroups) do
+                if v == self.mgCfg.id then
+                    isTeach = true
+                    break
+                end
+            end
+            if not isTeach then
+                -- local isUnlock = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(SkipBattleFunctionOpenID)
+                -- if not isUnlock then
+
+                --     local cfg = _G.ConfigManager.function_open_cfg[SkipBattleFunctionOpenID]
+                --     if cfg then
+                --         local battleView =
+                --             _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.BattleView.Name)
+                --         if battleView then
+                --             battleView:SetLockSkipBtnShow(cfg.is_display)
+                --         end
+                --         showSkip = true
+                --     end
+                -- else
+                --     local skipDisableTime = _G.ConfigManager.discrete_cfg[discreteID.SkipBattleTime][1][1]
+                --     _G.BattleManager:GetInstance():ShowSkipBattleBtn(true, skipDisableTime)
+                --     showSkip = true
+                -- end
+                local battleView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.BattleView.Name)
+                if battleView then
+                    local unlockCfg
+                    if _G.AppSetting.IsAlipay then
+                        -- 达到VIP4 或者 通关第5章后解锁
+                        unlockCfg = _G.ConfigManager.discrete_cfg[126102]
+                    else
+                        -- 达到VIP7 或者 通关第八章后解锁
+                        unlockCfg = _G.ConfigManager.discrete_cfg[120008]
+                    end
+                    local isUnlock = false
+                    if unlockCfg then
+                        for i = 1, #unlockCfg do
+                            isUnlock = _G.GlobalConditionManager.CheckCondition(_G.table.unpack(unlockCfg[i]))
+                            if isUnlock then
+                                break
+                            end
+                        end
+                    end
+                    battleView:SetLockSkipBtnShow(isUnlock)
+                    if not isUnlock then
+                        if _G.AppSetting.IsAlipay then
+                            battleView:SetLockSkipBtnSystemTip(3709)
+                        else
+                            if _G.AppSetting.IsArraigned then
+                                battleView:SetLockSkipBtnSystemTip(3706)
+                            else
+                                battleView:SetLockSkipBtnSystemTip(3704)
+                            end
+                        end
+                    else
+                        local skipDisableTime = _G.ConfigManager.discrete_cfg[discreteID.SkipBattleTime][1][1]
+                        _G.BattleManager:GetInstance():ShowSkipBattleBtn(true, skipDisableTime)
+                    end
+                    showSkip = true
+                end
+            end
+        end
+        if not showSkip then
+            local battleView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.BattleView.Name)
+            if battleView then
+                --(策划)只要未解锁, 则固定显示解锁条件, 否则才显示"需要亲历亲为"
+                local unlockCfg = _G.ConfigManager.discrete_cfg[120008]
+                local isUnlock = false
+                if unlockCfg then
+                    for i = 1, #unlockCfg do
+                        isUnlock = _G.GlobalConditionManager.CheckCondition(_G.table.unpack(unlockCfg[i]))
+                        if isUnlock then
+                            break
+                        end
+                    end
+                end
+                battleView:SetLockSkipBtnShow(false)
+                local tipId
+                if _G.AppSetting.IsAlipay then
+                    tipId = 3709
+                else
+                    if _G.AppSetting.IsArraigned then
+                        tipId = 3706
+                    else
+                        tipId = 3704
+                    end
+                end
+                battleView:SetLockSkipBtnSystemTip(isUnlock and 220104 or tipId)
+            end
+        end
+    end
+end
+
+---进入回放战斗
+---@param index number 回放场次索引
+---@param notInBattle boolean 当前是否在战斗场景
+function BattleControllerAfkChallenge:EnterRecordFight(index, notInBattle, sid, leftName, rightName)
+    self.curSid = sid
+    self.leftName = leftName or self.leftName
+    self.rightName = rightName or self.rightName
+    base.EnterRecordFight(self, index, notInBattle)
+end
+
+---region 战斗回放功放
+---子类重写是否显示战斗回放按钮
+function BattleControllerAfkChallenge:CheckShowRecordBattle()
+    return true
+end
+
+---加载战斗(协程加载)
+function BattleControllerAfkChallenge:OnLoadRecordFight(index)
+    local AfkModel = require("AfkModel"):GetInstance()
+    local curSid = self.curSid or AfkModel:GetLastSection()
+    local cfg = afk_cfg[curSid]
+    local str = string.format("%d-%d", cfg.chapter, cfg.section)
+    _G.BattleManager:GetInstance():initAttackSids(
+        nil,
+        _G.EBattleType.AfkChallenge,
+        true,
+        1,
+        0,
+        nil,
+        str,
+        nil,
+        self.leftName,
+        self.rightName
+    )
+    local monsterGroupId = cfg.monster_group[1]
+    local mcfg = _G.ConfigManager.monster_group_cfg[monsterGroupId]
+    _G.AudioManager.PlayAudio(_G.AudioType.PlayMusic, mcfg.audio)
+end
+
+function BattleControllerAfkChallenge:IsShowFighting()
+    if not _G.MainManager:GetInstance():IsToggledAfkWindow(true) or
+        not require("AfkBattleManager"):GetInstance():IsShowFighting() then
+        return false
+    end
+    return true
+end
+
+return BattleControllerAfkChallenge

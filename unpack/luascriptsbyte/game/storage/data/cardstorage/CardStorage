@@ -1,0 +1,579 @@
+-----------------------------------------------------------------------
+-- UI.Storage.Data.CardStorage.lua
+-- Created by csw
+-- Description 卡牌仓库
+-----------------------------------------------------------------------
+local base = require "BaseStorage"
+local CardData = require "CardData"
+---@class CardStorage:BaseStorage	卡牌仓库
+local CardStorage = _G.BaseClass("CardStorage", base)
+
+local table = _G.table
+
+function CardStorage:__init()
+    self.sidTable = {}
+    self.starTable = {}
+    self.decoration_use_count = 0
+    self.decoration_suit_count = 0
+    self.DSuit_list = {}
+    self.decoration_suit_lists = {}
+    self.allList = {}
+    self.cardTypeList = {}
+    _G.Events:GetInstance():AddListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.UpdateCapacity, self)
+end
+function CardStorage:Dispose()
+    self.sidTable = nil
+    _G.Events:GetInstance():RemoveListener(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege, self.UpdateCapacity, self)
+end
+
+function CardStorage:Init()
+    self.isU = true
+end
+
+---仓库数据解析(类重写数据解析)
+---@param msg storage.CardStorage 物品PB数据
+function CardStorage:ParseInit(msg)
+    --赋值当前仓库的扩展次数
+    if msg.times ~= nil then
+        for key, value in pairs(msg.times) do
+            if value.type == _G.StorageType.Card then
+                self.capacity_times = value.times
+            end
+        end
+    else
+        self.capacity_times = 0
+    end
+    self.capacity = self.cfg.Capacity + self.capacity_times * self.cfg.extension
+
+    local props = msg.card
+    if props ~= nil then
+        for _, value in pairs(props) do
+            self:AddItemByData(value)
+        end
+    end
+end
+
+---重连进来
+function CardStorage:ParseReconnectInit(msg)
+    local props = msg.card
+    if props ~= nil then
+        local IllustrationModel = require "IllustrationModel":GetInstance()
+        for _, value in pairs(props) do
+            if nil == self:GetItemByKey(value.uid) then
+                self:AddItemByData(value)
+                IllustrationModel:JieSuoHunJiangNew(value.sid)
+            end
+        end
+    end
+end
+
+---解析单条奖励
+---@param data prop.CardProp 单条卡牌数据
+function CardStorage:ParseSingle(data)
+    local uid = data[2]
+    local sid = data[1]
+    self:AddItemByData(data)
+    local card = self.list[uid]
+    if data[3] ~= 0 then
+        if card.type == _G.CardType.Normal then
+            card:SetLevel(require("CardResonanceModel"):GetInstance():GetMinLevel())
+        end
+        card:upStarCardAward(data[3])
+    end
+    card:InitMutuallyData()
+
+    if self.sidTable[sid] and #self.sidTable[sid] <= 1 then
+        card.isNew = true
+    end
+    _G.Events:GetInstance():Broadcast(_G.eCardStorage.AddCardData,card)
+    return card
+end
+
+---初始化交互数据
+function CardStorage:InitMutuallyData()
+    for _, card in pairs(self.list) do
+        card:InitMutuallyData()
+        --计算卡牌穿戴饰品的数量
+        self:CalulateDecorationCount(card)
+        self:CalulateDecoration_suit_Count(card)
+    end
+    self:InitGetDecoration_suitCount()
+    require("EquipmentModel"):GetInstance():InitGradeCountDic()
+
+    _G.StorageManager:GetInstance():GetServerCardPower()
+end
+
+---新增物品
+---@param data table 动态参数
+---@return number|BaseItemData 返回添加的对象ID(0 为失败)|数据对象
+function CardStorage:AddItem(data)
+    local card = _G.CardData.New()
+    card:Parse(data)
+    if not self.sidTable[card.sid] then
+        self.sidTable[card.sid] = {}
+    end
+    table.insert(self.sidTable[card.sid], card.uid)
+    self:UpdateStarCount(nil, card.star)
+    -- if card.star >= 11 then
+    --     self:XingJiPanDuan()
+    -- end
+    return card.uid, card
+end
+
+---刷新红点
+---@param add table 新增id数组
+---@param rem table 移除id数组
+---@param change table 改变id数组
+---@param type CardChangeType 以什么操作改变
+function CardStorage:RefreshRedPoint(add, rem, change, type)
+    local CardInfoManager = require("CardInfoManager"):GetInstance()
+    local RedPointManagerIns = require("RedPointManager"):GetInstance()
+    local isAdd = not _G.table.isEmptyOrNil(add)
+    local isRem = not _G.table.isEmptyOrNil(rem)
+    local isChange = not _G.table.isEmptyOrNil(change)
+    if isAdd or isRem then
+        if isAdd then
+            for uid, sid in pairs(add) do
+                CardInfoManager:RedPointItemCardDevelop_Add(uid)
+                CardInfoManager:RedPointItemCardDevelopAllUpstar_Add(uid)
+            end
+        end
+
+        if isRem then
+            for uid, sid in pairs(rem) do
+                CardInfoManager:RedPointItemCardDevelop_Remove(uid)
+                CardInfoManager:RedPointItemCardDevelopAllUpstar_Remove(uid)
+            end
+        end
+
+        CardInfoManager:BindCardRedPointSounl(add, rem)
+        CardInfoManager:BindCardRedPointDecoration(add, rem)
+        CardInfoManager:BindCardRedPointCarving(add, rem)
+        CardInfoManager:BindCardRedPointFetter(add, rem)
+        CardInfoManager:BindCardRedPointEquiment(add, rem)
+        require("CardResonanceModel"):GetInstance():AddOrRemoveCard(add, rem)
+        require("CardInheritModel"):GetInstance():AddOrRemoveCard(add, rem)
+        require "RoleTeamModel":GetInstance():AddOrRemove(add, rem)
+        require("CampsiteModel"):GetInstance():AddorRemoveOrChange(add, rem)
+        require("TalentModel"):GetInstance():AddOrRemoveOrChange(add, rem)
+        require("SeasonHeroGiftPackModel"):GetInstance():AddOrRemoveCard(add, rem)
+    end
+    if isChange then
+        if type == _G.CardChangeType.UpLevel then
+            ---升级才加处理的红点
+            -- require("CardResonanceModel"):GetInstance():AddOrRemoveCard(nil, nil, change)
+            -- CardInfoManager:BindCardRedPointEquiment(nil, nil, change)
+        elseif type == _G.CardChangeType.UpStar then
+            ---升星才加处理的红点
+            CardInfoManager:BindCardRedPointDecoration(nil, nil, change)
+            CardInfoManager:BindCardRedPointCarving(nil, nil, change)
+            CardInfoManager:BindCardRedPointFetter(nil, nil, change)
+            require("CampsiteModel"):GetInstance():AddorRemoveOrChange(nil, nil, change)
+            require("TalentModel"):GetInstance():AddOrRemoveOrChange(nil, nil, change)
+        else
+            require("CardResonanceModel"):GetInstance():AddOrRemoveCard(nil, nil, change)
+            CardInfoManager:BindCardRedPointDecoration(nil, nil, change)
+            CardInfoManager:BindCardRedPointCarving(nil, nil, change)
+            CardInfoManager:BindCardRedPointFetter(nil, nil, change)
+            require("CampsiteModel"):GetInstance():AddorRemoveOrChange(nil, nil, change)
+            require("TalentModel"):GetInstance():AddOrRemoveOrChange(nil, nil, change)
+            CardInfoManager:BindCardRedPointEquiment(nil, nil, change)
+        end
+        CardInfoManager:BindCardRedPointSounl(nil, nil, change)
+    end
+
+    CardInfoManager:RedPointItemCard_UpdataAll()
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.Playtreeprofessional.id)
+    RedPointManagerIns:RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SpiritualPage.id)
+    --RedPointManagerIns:RefreshNode(_G.ConfigManager.redpoint_cfg.AllHeroesBattleEmbattle.id)
+end
+---计算道具数量
+---@param sid number sid
+---@return number 相同SID的装备数量
+function CardStorage:CalulateItemCount(sid)
+    return self.sidTable[sid] and #self.sidTable[sid] or 0
+end
+--region 饰品 数量检测
+---计算卡牌饰品数量
+function CardStorage:CalulateDecorationCount(card)
+    local count = card:GetDecorationCount()
+    self.decoration_use_count = self.decoration_use_count + count
+end
+---获得 饰品穿戴的数量
+function CardStorage:GetDecorationUseCount()
+    return self.decoration_use_count
+end
+---设置 饰品穿戴的数量
+function CardStorage:SetDecorationUseCount(num)
+    self.decoration_use_count = num
+end
+---计算饰品套装的数量
+---@field decoration_suit_lists table key = 套装id value = { uid = 卡牌的uid}
+function CardStorage:CalulateDecoration_suit_Count(card)
+    local suit_id, uid = card:GetDecorationSuitID()
+    if suit_id == 0 then
+        return
+    end
+    if _G.table.isEmptyOrNil(self.decoration_suit_lists[suit_id]) then
+        self.decoration_suit_lists[suit_id] = {}
+    end
+    _G.table.insert(self.decoration_suit_lists[suit_id], uid)
+end
+---（对外接口初始化 计算一次饰品套装数量，后面直接调用...2直接获得不同套装数量）获得饰品套装的数量
+function CardStorage:InitGetDecoration_suitCount()
+    local count = 0
+    if _G.table.isEmptyOrNil(self.decoration_suit_lists) then
+        count = 0
+    else
+        local suit = {}
+        --去掉重复的 套装id
+        for key, value in pairs(self.decoration_suit_lists) do
+            if _G.table.isEmptyOrNil(suit[key]) then
+                suit[key] = {}
+            end
+            suit[key] = 1
+        end
+        if _G.table.isEmptyOrNil(suit) then
+            count = 0
+        else
+            count = _G.table.count(suit)
+        end
+        self.DSuit_list = suit
+    end
+    self.decoration_suit_count = count
+    return count
+end
+---获得套装数量
+function CardStorage:GetSuit_count_noSame()
+    return self.decoration_suit_count
+end
+
+---对外接口 设置 套装的数量
+---@param isUpOrDown number 0 交换 1 穿戴 2 卸下
+---@param carduid number 卡牌uid
+function CardStorage:SetDecorationSuitCount(isUpOrDown, carduid, other_card_uid)
+    if isUpOrDown == 1 then
+        local suitsID, _ = self.list[carduid]:GetDecorationSuitID()
+        self:UpDecoration(suitsID, carduid, suitsID == 0 and 0 or 4)
+    elseif isUpOrDown == 2 then
+        self:DownDecoartion(carduid)
+    else
+        self:ReplaceDecoration(carduid, other_card_uid)
+    end
+end
+---卡牌穿戴 穿戴饰品()
+function CardStorage:UpDecoration(suitID, carduid, number)
+    --没有合成 套装
+    if number < 4 then
+        return
+    end
+    if _G.table.isEmptyOrNil(self.decoration_suit_lists[suitID]) then
+        self.decoration_suit_lists[suitID] = {}
+    end
+    _G.table.insert(self.decoration_suit_lists[suitID], carduid)
+    local flag = false
+    if _G.table.isEmptyOrNil(self.DSuit_list) then
+        flag = true
+    else
+        if self.DSuit_list[suitID] then
+            self.DSuit_list[suitID] = 1
+        else
+            flag = true
+        end
+    end
+    if flag then
+        self.DSuit_list[suitID] = {}
+        self.DSuit_list[suitID] = 1
+        self.decoration_suit_count = self.decoration_suit_count + 1
+    end
+end
+---卡牌卸下饰品
+function CardStorage:DownDecoartion(carduid)
+    local flag = false
+    local suitID, uid_index = 0, 0
+    for key, value in pairs(self.decoration_suit_lists) do
+        local uids = value
+        for ku, vu in pairs(uids) do
+            if vu == carduid then
+                flag = true
+                uid_index = ku
+                break
+            end
+        end
+        if flag then
+            suitID = key
+            break
+        end
+    end
+    if not flag then
+        return
+    end
+    local suits = self.decoration_suit_lists[suitID]
+    if #suits > 1 then
+    else
+        self.DSuit_list[suitID] = nil
+        self.decoration_suit_count = self.decoration_suit_count - 1
+    end
+    _G.table.remove(suits, uid_index)
+end
+---卡牌交换饰品
+function CardStorage:ReplaceDecoration(carduid, other_card_uid)
+    local suitsID, _ = self.list[carduid]:GetDecorationSuitID()
+    if suitsID == 0 then
+        self:DownDecoartion(carduid)
+    else
+        self:UpDecoration(suitsID, carduid, 4)
+    end
+    if other_card_uid == 0 then
+        return
+    end
+    suitsID, _ = self.list[carduid]:GetDecorationSuitID()
+    if suitsID == 0 then
+        self:DownDecoartion(other_card_uid)
+    else
+        self:UpDecoration(suitsID, other_card_uid, 4)
+    end
+end
+---设置 饰品套装的数量
+---@field decoration_suit_lists table key = 套装id uid = 卡牌的uid
+---@param suitID number 套装id
+---@param uid number 卡牌uid
+---@param number number 套装数量(是否能合成套装)
+---@param isUpOrDown number 卸下或者 0 = 替换 是装备 1 = 装备 2 = 卸下
+function CardStorage:SetDecoration_suitCount(suitID, uid, number, isUpOrDown)
+    --没有合成 套装
+    if isUpOrDown == 1 and number < 4 then
+        return
+    elseif isUpOrDown == 0 and number < 4 then
+    end
+    if _G.table.isEmptyOrNil(self.decoration_suit_lists[suitID]) then
+        if isUpOrDown == 2 then
+            return
+        else
+            self.decoration_suit_lists[suitID] = {}
+        end
+    else
+        local suit_uids = self.decoration_suit_lists[suitID]
+        local numb = #suit_uids
+        if isUpOrDown == 2 then
+            for key, value in pairs(suit_uids) do
+                if numb == 1 and value == uid then
+                    self.decoration_suit_lists[suitID] = {}
+                else
+                    if value == uid then
+                        key = {}
+                    end
+                end
+            end
+        end
+    end
+    _G.table.insert(self.decoration_suit_lists[suitID], uid)
+    local count = 0
+    local suit = {}
+    --去掉重复的 套装id
+    for key, value in pairs(self.decoration_suit_lists) do
+        if _G.table.isEmptyOrNil(suit[key]) then
+            suit[key] = 0
+        end
+        if not _G.table.isEmptyOrNil(value) then
+        end
+
+        suit[key] = 1
+    end
+    count = _G.table.count(suit)
+    self.decoration_suit_count = count
+end
+--endregion
+---仓库扩容次数增加
+---@param times number 扩容次数
+function CardStorage:AddCapacityTimes(times)
+    self.capacity_times = self.capacity_times + times
+    self.capacity =
+        self.cfg.Capacity + self.capacity_times * self.cfg.extension +
+        require "HellRoadModel":GetInstance():GetNumber({_G.PrivilegeType.Bag.HeroCount, 201})
+end
+
+function CardStorage:GetRedPointFreshData(uid)
+    return {uid, self.list[uid].sid}
+end
+--region 对外接口
+
+---获取同一张卡牌组
+---@param sid number 卡牌sid
+---@return table|CardData 卡牌数组
+function CardStorage:GetCardsBySid(sid)
+    local cards = {}
+    if self.sidTable[sid] then
+        for i = 1, #self.sidTable[sid] do
+            table.insert(cards, self.list[self.sidTable[sid][i]])
+        end
+    end
+    return cards
+end
+---获取所有的卡牌sid数组
+---@return table 卡牌sid数组
+function CardStorage:GetAllCardSids()
+    return table.keys(self.sidTable)
+end
+
+---改变数量
+---@param sidoruid number 物品Sid或者uid
+---@param num number 数量
+---@param fact boolean 是否是实际数量
+function CardStorage:ChangeCount(sidoruid, num, fact)
+    local item = self:GetItemByKey(sidoruid)
+    if item ~= nil then
+        local count = item:GetCount()
+        item:ChangeCount(num, fact)
+        num = item:GetCount()
+        self:UpdateStarCount(item:GetStar())
+        if num == 0 then
+            -- _G.Events:GetInstance():Broadcast(
+            --     _G.ePlayAactionEvent.PlayAaction,
+            --     {_G.ActiveTaskEnum.ConditionEnum.CardLevel.assignCountAssignStar, item.star},
+            --     -1
+            -- )
+            local data = self:GetRedPointFreshData(sidoruid)
+            self:RemoveItem(sidoruid)
+            self:OnRefreshRedPoint(nil, {data})
+        else
+            if num ~= count then
+                self:OnRefreshRedPoint(nil, nil, {self:GetRedPointFreshData(sidoruid)})
+            end
+        end
+    -- if item.star >= 11 then
+    --     self:XingJiPanDuan()
+    -- end
+    end
+end
+
+function CardStorage:UpdateCapacity()
+    self.capacity =
+        self.cfg.Capacity + self.capacity_times * self.cfg.extension +
+        require "HellRoadModel":GetInstance():GetNumber({_G.PrivilegeType.Bag.HeroCount, 201})
+end
+---更新卡牌星级统计
+function CardStorage:UpdateStarCount(s_star, e_star)
+    if (s_star and e_star) and s_star == e_star then
+        return
+    end
+    if s_star then
+        self.starTable[s_star] = self.starTable[s_star] - 1
+    end
+
+    if e_star then
+        if not self.starTable[e_star] then
+            self.starTable[e_star] = 0
+        end
+        self.starTable[e_star] = self.starTable[e_star] + 1
+    end
+
+    if s_star then
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {_G.ActiveTaskEnum.ConditionEnum.CardLevel.assignCountAssignStar, s_star},
+            self:GetCardStarDy(s_star),
+            nil,
+            true
+        )
+    end
+
+    if e_star then
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {_G.ActiveTaskEnum.ConditionEnum.CardLevel.assignCountAssignStar, e_star},
+            self:GetCardStarDy(e_star),
+            nil,
+            true
+        )
+        require "PopUpGiftBagModel":GetInstance():IsCardStarSure(e_star)
+    end
+end
+
+---获取超过当前星级的卡数量
+function CardStorage:GetCardStarDy(curStar)
+    local cnum = 0
+    for star, num in pairs(self.starTable) do
+        if star >= curStar then
+            cnum = cnum + num
+        end
+    end
+    return cnum
+end
+
+---移除卡牌
+---@param 卡牌uid
+function CardStorage:RemoveItem(uid)
+    local carddata = self.list[uid]
+    if carddata then
+        local index = require "FriendHelpModel":GetInstance():GetBorrowIndex(carddata.uid)
+        if index then
+            require "FriendHelpModel":GetInstance():SetBorrowCard({uid = carddata.uid, type = 2, index = index})
+        end
+        self:RemoveOtherTypeCard(uid, carddata.type)
+    end
+
+    self.super.RemoveItem(self, uid)
+    _G.Events:GetInstance():Broadcast(_G.eCardStorage.RemoveCardData,carddata)
+end
+---获取对应星级的卡牌数
+function CardStorage:GetCardStarCount(star)
+    return self.starTable[star] or 0
+end
+---添加其他类型的卡牌
+---@param cardData CardData
+function CardStorage:AddSingleOtherTypeCard(cardData)
+    if not self.otherTypeCardList then
+        self.otherTypeCardList = {}
+        self.otherTypeCardList[_G.CardType.Normal] = self.list
+    end
+    if not self.otherTypeCardList[cardData.type] then
+        self.otherTypeCardList[cardData.type] = {}
+    end
+    _G.table.insert(self.otherTypeCardList[cardData.type], cardData)
+end
+---添加其他类型的卡牌
+function CardStorage:AddOtherTypeCard(cardData)
+    if not self.cardTypeList[cardData.type] then
+        self.cardTypeList[cardData.type] = {}
+    end
+    _G.table.insert(self.cardTypeList[cardData.type], cardData)
+    self.allList[cardData.uid] = cardData
+end
+
+---移除其他类型的卡牌
+---@param uid number 卡牌uid
+function CardStorage:RemoveOtherTypeCard(uid, type)
+    if not self.cardTypeList[type] then
+        return
+    end
+    self.cardTypeList[type][uid] = nil
+    self.allList[uid] = nil
+end
+---获取所有item
+function CardStorage:GetAllItems(type)
+    if type then
+        return self.cardTypeList[type] or {}
+    else
+        return self.allList
+    end
+end
+---@param data prop.i_card
+function CardStorage:AddItemByData(data)
+    local uid = data.uid or data[2]
+    local _, item = self.super.AddItemByData(self, data)
+    self.allList[uid] = item
+    if not self.cardTypeList[item.type] then
+        self.cardTypeList[item.type] = {}
+    end
+    self.cardTypeList[item.type][item.uid] = item
+    --621
+end
+
+function CardStorage:GetItemByKey(key)
+    return self.allList[key]
+end
+
+--endregion
+
+return CardStorage

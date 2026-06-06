@@ -1,0 +1,398 @@
+--------------------------------------------------------------------------
+-- Created by 此处填写你的名字
+-- DateTime: 2020/09/21
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+require "CardUpStarView_cardItemLits"
+require "CardInfoNet"
+---@class CardUpStarView : UIBaseView	中文描述
+---@field public go_table CardUpStarView_GoTable GoTable
+---@field public mItemCountPerRow int 每行 item个数
+---@field public nowKey_Row int 刷新前的行数 looplist2刷新判断 相同RefreshAllShownItem  不同SetListItemCount
+local CardUpStarView = _G.BaseClass("CardUpStarView", _G.UIBaseView)
+--_G.CardUpStarView = CardUpStarView
+CardUpStarView.mItemCountPerRow = nil
+CardUpStarView.nowKey_Row = nil
+CardUpStarView.mCardInfoView = nil
+CardUpStarView.selectItems = nil
+
+local function LoadRoleScene(view, rolepath, callback)
+    view:RoleRecycle()
+    _G.PoolsManager:GetInstance():Spawn(
+        rolepath,
+        _G.ePoolType.Temporary,
+        nil,
+        function(trans)
+            trans:SetLocalPosition(0, 0, 0)
+            trans:SetLocalEulerAngles(0, 0, 0)
+            --设置  缩放
+            local Scale = view.mCardData.cfg.Size or 1
+            trans:SetLocalScale(Scale, Scale, Scale)
+            view.roleTrans = trans
+
+            if callback then
+                callback(trans)
+            end
+        end
+    )
+end
+
+local CS = _G.CS
+local typeof = _G.typeof
+function CardUpStarView:Awake()
+    self.mCardInfoView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.CardInfoView.Name).View
+    self.go_upStarOverTips = _G.GetAutoGoTable(self.go_table.obj_upStarOverTips, _G.handler(self, self.OnClickBtn))
+    self.playable_director = self.gameObject:GetComponentE(typeof(CS.UnityEngine.Playables.PlayableDirector))
+
+    ---@type CardData
+    self.mCardData = self.mCardInfoView.CardData
+    self.mCardInfoManager = require("CardInfoManager"):GetInstance()
+    self.mItemCountPerRow = 6
+    self.nowKey_Row = 0
+
+    self.selectItems = {}
+    self.mCard_starInfo = {}
+    local card_star_cfgId = require("CardInfoManager"):GetInstance():GetStarCfgId(self.mCardData.cfg.Elements_new, self.mCardData.star)
+    local card_starInfo = _G.ConfigManager.card_star_cfg[card_star_cfgId]
+    if card_starInfo ~= nil then
+        self.mCard_starInfo = card_starInfo
+        for i = 1, #card_starInfo.materials do
+            local selectData = {
+                --脚本
+                mLua = nil,
+                --需要的五行
+                elements = card_starInfo.materials[i][1],
+                --需要的星级
+                star = card_starInfo.materials[i][2]
+            }
+            local obj_select = self.go_table.obj_select:GetChildE(i - 1)
+
+            _G.GameUtil.SetActiveByCondition(obj_select, true)
+            local selectobj = obj_select:FindE("$_obj_BaseItemView")
+            selectData.mLua = self:AddComponent(selectobj, _G.CardUpStarView_carditem.New())
+            _G.GameUtil.SetActiveByCondition(selectobj, false)
+            table.insert(self.selectItems, selectData)
+        end
+    end
+
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+
+    self.obj_role = self:AddComponent(self.go_table.obj_role, _G.CardBagView_cardItem.New())
+    self.obj_role:SetName(self.mCardInfoView.CardData.uid)
+    self.obj_role:Init(self.mCardInfoView.CardData, nil, false)
+
+    self.go_table.looplist2_list:InitListView(0, _G.handler(self, self.RefreshRenItem))
+    --按钮点击对应的方法
+    self.clickFunction = {
+        --界面关闭
+        ["@_aorbtn_CloseView"] = self.CloseView,
+        ["@_aorbtn_close"] = self.CloseView,
+        ["@_aorbtn_Done"] = self.OnClick_UpStar,
+        ["nilFnc"] = function(self, go)
+            if _G.AppSetting.DEBUG then
+                _G.Log("未设置点击事件", "<color=red>" .. ">>>" .. go:GetName() .. "</color>")
+            end
+        end
+    }
+end
+
+---界面的入口函数
+function CardUpStarView:OnCreate()
+    ---选中的item对象{ carduid=SelectIndex , }
+    self.SelectObjs = {}
+    ---选中的item对象 的lua脚本    选中 无限滚动后当前选中对象会变    设置未选中函数
+    -- { SelectIndex=fun , }
+    self.SelectObjLua = {}
+
+    self.StorageCard = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+
+    self:RefreshAllItem()
+
+    self.go_table.aortext_Coin.text = self.mCard_starInfo.num_coin
+
+    ---隐藏 升星成功界面
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_upStarOverTips, false)
+end
+
+function CardUpStarView:OnEnable()
+    ---@type UnityEngine.RectTransform
+    local rect = self.gameObject:GetComponentE(typeof(CS.UnityEngine.RectTransform))
+    if not _G.IsNil(rect) then
+        self.gameObject:SetLocalScale(0.5, 0.5, 0.5)
+        rect:DOScale(1, 1, 1, 0.2)
+    end
+end
+
+function CardUpStarView:RefreshAllItem()
+    self.itemTransDic = {}
+
+    ---@type CardData[]
+    local mSort = require("CardInfoManager"):GetInstance():GetSortStarLvSid(self.StorageCard)
+    for key_i, value_i in pairs(mSort) do
+        ---与当前卡相同 排除
+        if self.mCardInfoView.CardData.uid == value_i.uid then
+            --五行不同 排除
+        elseif not require "CardInfoManager":GetInstance():CheckMultiMatchCOP(self.mCardInfoView.CardData.cfg.Elements_new ,value_i.cfg.Elements_new) then
+            --星级不同 排除
+        elseif self.selectItems[1].star ~= value_i.star then
+        else
+            table.insert(self.itemTransDic, value_i)
+        end
+    end
+
+    local sumCount = #self.itemTransDic
+    --count1 is the total row count
+    local count1 = math.ceil(sumCount / self.mItemCountPerRow)
+    ---最少显示3行  好看 zzm策划说的
+    if count1 < 3 then
+        count1 = 3
+    end
+    local isRefresh = false
+    --如果大于0 且与上次相等则调用刷新
+    if count1 > 0 and count1 == self.nowKey_Row then
+        isRefresh = true
+    end
+    self.nowKey_Row = count1
+
+    self.go_table.looplist2_list:SetListItemCount(count1, true)
+    if isRefresh then
+        self.go_table.looplist2_list:RefreshAllShownItem()
+    end
+end
+
+--初始化聊天iitem
+---@param index int 该数据的索引   0起始
+function CardUpStarView:RefreshRenItem(listView2, index)
+    if index < 0 then
+        return
+    end
+    local t_index = index + 1
+    local t_nowitemTransDic = self.itemTransDic
+
+    local item = listView2:NewListViewItem("$_obj_BaseItemList")
+    if GuideManager:GetInstance().IsGuideing then
+        item.name = t_index
+    end
+    local tCardUpStarView_cardItemLits = self:GetComponent(item, _G.CardUpStarView_cardItemLits)
+    if tCardUpStarView_cardItemLits == nil then
+        tCardUpStarView_cardItemLits = self:AddComponent(item, _G.CardUpStarView_cardItemLits.New())
+    end
+
+    for i = 1, self.mItemCountPerRow do
+        local itemindex = index * self.mItemCountPerRow + i
+        local params = t_nowitemTransDic[itemindex]
+        tCardUpStarView_cardItemLits.mCarditemList[i]:Init(params, itemindex)
+    end
+
+    return item
+end
+
+---按钮点击事件在这里派发
+function CardUpStarView:CloseView(go, isOn)
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_effect, false)
+
+    self.mCardInfoView:SetRoleShow(true)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.CardInfoView.Name)
+
+    --- 刷新一次 防止解锁等有变化 影响 cardbagview或 cardinfoview
+    require("CardInfoManager"):GetInstance():Updata_CardViewUpdataFun()
+    self:Close()
+end
+
+function CardUpStarView:OnClick_UpStar(go, isOn)
+    local len = #self.selectItems
+    if len <= 0 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(170103)
+        return
+    end
+
+    local consume_cards = {}
+    for i = 1, len do
+        if self.selectItems[i].mLua.CardData == nil then
+            _G.PopWindowManager:GetInstance():ShowAllTips(170102)
+            return
+        end
+        table.insert(consume_cards, self.selectItems[i].mLua.CardData.uid)
+    end
+
+    ---@type PropData
+    local tMoney = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.ResProp, _G.ResPropID.Coin)
+
+    if tMoney == nil or tMoney.count < self.mCard_starInfo.num_coin then
+        _G.PopWindowManager:GetInstance():ShowAllTips(90023030301)
+        return
+    end
+
+    require("CardInfoManager").CardStartDestroy(
+        consume_cards,
+        function()
+            ---@type card.c2s_card_up_star
+            local pbdata = {}
+            pbdata.consume_cards = consume_cards
+            pbdata.uid = self.mCardInfoView.CardData.uid
+
+            require("CardInfoNet"):GetInstance():UpStar(
+                pbdata,
+                function(data)
+                    if data.ack ~= 1 then
+                        --_G.GameUtil.NetAckShowTips(data.ack)
+                        return
+                    end
+                    -- if data
+                    for index, carduid in ipairs(consume_cards) do
+                        _G.StorageManager:GetInstance():DelCard(carduid)
+                    end
+                    _G.StorageManager:GetInstance():ConsumeItem(_G.ResPropID.Coin, 0, self.mCard_starInfo.num_coin)
+                    self.mCardData:upStarCardAward()
+                    self.mCardData:CalcNowSumProp()
+                    self:ShowUpStarOver()
+                    require("CardInheritModel"):GetInstance():CheckInheritBuffLock(true)
+                    --刷新红点形象
+                    require "RedPointManager":GetInstance():RefreshNode(
+                        _G.ConfigManager.redpoint_cfg.PlayerRole.id,
+                        self.mCardData.sid
+                    )
+                    _G.Events:GetInstance():Broadcast(
+                        _G.eCard.CardUpStar,
+                        self.mCardData:GetStar(),
+                        self.mCardData.sid,
+                        self.mCardData.uid
+                    )
+                    _G.Events:GetInstance():Broadcast(
+                        _G.ChatViewEvents.ChatViewLevel,
+                        self.mCardData,
+                        self.mCardData:GetStar()
+                    )
+                    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.CardPotential.id)
+                end
+            )
+        end
+    )
+end
+
+function CardUpStarView:ShowUpStarOver()
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.CardUpStarView.Name)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.CardInfoView.Name)
+
+    --隐藏 主要界面 只显示升星结果界面
+    for i = 0, 3 do
+        local nowtf = self.gameObject:GetChildE(i)
+        if nowtf ~= nil then
+            nowtf:SetActiveE(0)
+        end
+    end
+    --备份 当前摄像机位置 ( 升星动画的时候 要角色居中)
+    local maincamera = _G.GraphicsManager.Instance.CurrentVisualCamera
+
+    --播放升星特效
+    UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.ef_jueseshengxing,
+        _G.UIManager:GetInstance():GetUILayerTrans(_G.UILayers.NormalLayer.Name),
+        nil,
+        function()
+            _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.CardUpStarView.Name)
+
+            ---设置升星结果数据
+            self.mCardInfoManager:Star_byParent(self.go_upStarOverTips.obj_starParent1, self.mCardData.star - 1)
+            self.mCardInfoManager:Star_byParent(self.go_upStarOverTips.obj_starParent2, self.mCardData.star)
+            self.mCardInfoManager:ShowUpStarPropUpdata(
+                self.mCardData,
+                self.mCardData.star - 1,
+                self.go_upStarOverTips.obj_starProp
+            )
+
+            local nextSkill = self.mCardInfoManager:GetUpStarSkill(self.mCardData, self.mCardData.star)
+            local skillCfg = _G.ConfigManager.card_skills_cfg[nextSkill[2]]
+            if not _G.IsNil(skillCfg) then
+                local icon = skillCfg.icon
+                self.go_upStarOverTips.aorrawimage_SkillIcon.Alpha = 0
+                self.go_upStarOverTips.aorrawimage_SkillIcon:LoadImage(skillCfg.icon)
+
+                self.go_upStarOverTips.aortext_skillLv.text = skillCfg.level
+                self.go_upStarOverTips.aortext_SkillName.text = _G.LangUtil.GetLangPackValue(skillCfg.name)
+            else
+                _G.GameUtil.SetActiveByCondition(self.go_upStarOverTips.obj_Skill, false)
+            end
+
+            -- _G.GameUtil.SetActiveByCondition(self.go_upStarOverTips, true)
+            _G.GameUtil.SetActiveByCondition(self.go_upStarOverTips.obj_info, false)
+            ---@type card_cfg
+            local card_cfg = _G.ConfigManager.card_cfg[self.mCardData.sid]
+            ---@type AorRawImage
+            local aorrawimage_Role = self.go_upStarOverTips.aorrawimage_Role
+            aorrawimage_Role.Alpha = 0
+
+            if card_cfg ~= nil and not _G.string.IsNullOrEmpty(card_cfg.Portrait) then
+                aorrawimage_Role:LoadImage(
+                    card_cfg.Portrait,
+                    function()
+                        aorrawimage_Role:SetNativeSize()
+                        local x = card_cfg.pos_portrait[1] or 0
+                        local y = card_cfg.pos_portrait[2] or 0
+                        local z = card_cfg.pos_portrait[3] or 0
+
+                        aorrawimage_Role:SetLocalPosition(x, y, z)
+
+                        _G.GameUtil.SetActiveByCondition(self.go_upStarOverTips.obj_info, true)
+                        ---隐藏 角色模型 只取背景当背景
+                        self.mCardInfoView:SetRoleShow(false)
+
+                        _G.GameUtil.SetActiveByCondition(self.go_table.obj_effect, true)
+                        self.playable_director:Play()
+
+                        --- 角色立绘 动画   程序实现  因为要动态最终大小
+                        aorrawimage_Role.Alpha = 0
+                        aorrawimage_Role:DOFade(1, 0.2)
+                        aorrawimage_Role.rectTransform:SetLocalScaleXYZ(
+                            aorrawimage_Role.rectTransform:GetLocalScale() * 1.2
+                        )
+                        local size = card_cfg.size2 or 1
+                        aorrawimage_Role.rectTransform:SetLocalScaleXYZ(1.2)
+                        local dotween = aorrawimage_Role.rectTransform:DOScale(size, size, size, 0.2)
+                        dotween.onComplete = function()
+                            require("CardInfoManager"):GetInstance():RoleBreathe(aorrawimage_Role, true)
+                        end
+
+                        _G.DelayDo(
+                            1.3,
+                            function()
+                                self.mCardInfoManager:StarEf_byParent(
+                                    self.go_upStarOverTips.obj_starParent1,
+                                    self.mCardData.star - 1
+                                )
+                                self.mCardInfoManager:StarEf_byParent(
+                                    self.go_upStarOverTips.obj_starParent2,
+                                    self.mCardData.star
+                                )
+                            end
+                        )
+                    end
+                )
+            else
+            end
+        end
+    )
+end
+
+function CardUpStarView:RoleRecycle()
+    if not _G.IsNil(self.roleTrans) then
+        self.roleTrans.layer = _G.LayerMask.NameToLayer("Role")
+        local children = self.roleTrans:GetComponentsInChildren(typeof(_G.CS.UnityEngine.Transform))
+        for i = 1, children.Length do
+            children[i - 1].layer = _G.LayerMask.NameToLayer("UI")
+        end
+        _G.PoolsManager:GetInstance():Despawn(self.roleTrans, _G.ePoolType.Temporary)
+        self.roleTrans = nil
+    end
+end
+
+function CardUpStarView:OnClickBtn(go, isOn)
+    local name = go:GetName()
+    if self.clickFunction[name] then
+        self.clickFunction[name](self, go, isOn)
+    else
+        self.clickFunction["nilFnc"](self, go)
+    end
+end
+
+return CardUpStarView

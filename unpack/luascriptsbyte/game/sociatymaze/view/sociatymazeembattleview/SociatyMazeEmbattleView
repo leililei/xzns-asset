@@ -1,0 +1,167 @@
+---@class SociatyMazeEmbattleView : UIBaseView	公会-暗影迷宫布阵
+---@field go_table SociatyMazeEmbattleView_GoTable
+---@field onExitCall fun():void         @退出战斗回调
+---@field onBattleCall fun():void       @开始战斗回调
+---@field autoFight boolean             @是否自动开始战斗
+---@field isBeKicked boolean            @是否已被踢出公会
+local SociatyMazeEmbattleView = _G.BaseClass("SociatyMazeEmbattleView", _G.UIBaseView)
+
+function SociatyMazeEmbattleView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self:AddListener(_G.eSociatyEvent.BeKicked, self.OnBeKicked)
+    self:AddListener(_G.eSociatyMaze.SociatyMazeSettle, self.OnBeKicked)
+    self.Anim = self.go_table.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Animator))
+end
+
+---界面的入口函数
+function SociatyMazeEmbattleView:OnCreate(exitCall, battleCall, uid, grade, autoFight)
+    --如果没有公会, 关闭窗口
+    if not require("SociatyManager"):GetInstance():HasSociaty() then
+        self:Close()
+        if exitCall then
+            exitCall()
+        end
+        return
+    end
+
+    self.onExitCall = exitCall
+    self.onBattleCall = battleCall
+    self.uid = uid
+    self.grade = grade
+    self.autoFight = autoFight
+    self:AddListener(_G.eBattleState.RecordStart, self.Hide)
+    self:AddListener(_G.eBattleState.RecordEnd, self.Show)
+    _G.TrackingPointModel:GetInstance():SetWindowStartTime(self.viewName, true)
+
+    self:OpenEmbattleView()
+end
+
+function SociatyMazeEmbattleView:OnDestroy()
+    self.maxsid = nil
+    self.onExitCall = nil
+    self.onBattleCall = nil
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+end
+
+---监听被踢出公会
+---@return void
+function SociatyMazeEmbattleView:OnBeKicked()
+    self.isBeKicked = true
+    --需要等待布阵加载完成再退出
+    if not self.embattleView then
+        return
+    end
+    self.embattleView:Close()
+    self:OnExitCall()
+end
+
+---打开布阵页面
+---@return void
+function SociatyMazeEmbattleView:OpenEmbattleView()
+    if self.autoFight then
+        --判定队伍是否有布阵角色，如果没有则不会自动进入战斗
+        if not require("EmbattleModel"):GetInstance():CheckBattle(_G.EmbattleType.afk2) then
+            self.autoFight = nil
+        end
+        --判断关卡是否已通关
+        local pass, exists = require("SociatyMazeBattleModel"):GetInstance():CheckMapDataPass(self.uid)
+        if pass or not exists then
+            self.autoFight = nil
+        end
+    end
+
+    local model = require("SociatyMazeBattleModel"):GetInstance()
+    --获取monster id
+    local monsterGroupId = model:GetFightMonsterGroupId(self.uid, self.grade)
+    if monsterGroupId <= 0 then
+        self:OnExitCall()
+        return
+    end
+    --获取五行限定信息
+    ---@type number[]
+    local elements = model:GetFightLockElements(self.uid, self.grade)
+
+    --计算布阵id, 根据guild_gve_cfg.id区分队伍, 即使时不同难度有不同的禁用类型(限定五行角色时才使用)
+    local embattleType, saveType = _G.EmbattleType.sociatyMaze, _G.EmbattleSaveType.server 
+    local mapData = model:GetMapData(self.uid)
+    if elements and mapData and model:HasGrade(mapData.type) then
+        embattleType = embattleType * 10000 + mapData.type
+        saveType = _G.EmbattleSaveType.localfile
+    end
+
+    --进入战斗
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    require("EmbattleController"):GetInstance():OpenEmbattle(
+        embattleType,
+        saveType,
+        false,
+        _G.EmbattleControllerItemType.sociatyMaze,
+        _G.handler(self, self.OnExitCall),
+        _G.handler(self, self.OnBattleCall),
+        monsterGroupId,
+        elements
+    )
+end
+
+---退出战斗回调
+---@return void
+function SociatyMazeEmbattleView:OnExitCall()
+    _G.TrackingPointModel:GetInstance():CloseActTracking(self.viewName)
+    self:Close()
+    if self.onExitCall then
+        self.onExitCall()
+        self.onExitCall = nil
+    end
+end
+
+---进入战斗回调
+---@return void
+function SociatyMazeEmbattleView:OnBattleCall(...)
+    _G.TrackingPointModel:GetInstance():CloseActTracking(self.viewName)
+    self:Close()
+    if self.onBattleCall then
+        self.onBattleCall(...)
+        self.onBattleCall = nil
+    end
+end
+
+---监听界面打开
+---@param name string 界面名称
+function SociatyMazeEmbattleView:OnEmbattleViewOpened(name)
+    if name ~= _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        return
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    self.embattleView = _G.UIManager:GetInstance():GetWindowCtrl(name)
+    self.embattleView:SetVsDescription(
+        _G.PlayerModel:GetInstance():GetName(),
+        require("SociatyMazeBattleModel"):GetInstance():GetMonsterName(self.uid, self.grade)
+    )
+
+    _G.UIManager:GetInstance():ChangeCanvasOrder(
+        name,
+        self.gameObject:RequireComponentE(_G.typeof(_G.CS.UnityEngine.Canvas)).sortingOrder
+    )
+    self.embattleView.transform:SetParentE(self.go_table.trans_view)
+    self.embattleView:SetInitDoneCall(
+        function()
+            --如果没有公会, 关闭窗口
+            if self.isBeKicked or not require("SociatyManager"):GetInstance():HasSociaty() then
+                self:OnBeKicked()
+                return
+            end
+        end
+    )
+    self.embattleView:SetEffLoadCall()
+    --自动开始战斗
+    if self.autoFight then
+        self.embattleView:SetAutoBattle()
+    end
+end
+
+---UI交互事件回调
+---@return void
+function SociatyMazeEmbattleView:OnClickBtn(go)
+end
+
+return SociatyMazeEmbattleView

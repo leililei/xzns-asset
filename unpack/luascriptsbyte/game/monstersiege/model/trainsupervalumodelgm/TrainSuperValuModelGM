@@ -1,0 +1,738 @@
+local base = require "ActivitySynTypeBase"
+local ActivitySynManager = require "ActivitySynManager"
+---@class TrainSuperValuModelGM :ActivitySynTypeBase 超值礼包 (恶灵入侵)
+local TrainSuperValuModelGM = _G.BaseClass("TrainSuperValuModelGM", base)
+
+local coinSubList = {
+    [100051] = 104, --竞猜币
+    [100052] = 101, --恶灵入侵
+    [100053] = 103, --公平竞技场
+    [100054] = 106, --限时招募
+    [10029] = 109,  --限时招募
+    [100312] = 115, --灵兽起源招募
+    [100155] = 124  --联动招募
+}
+
+local buyAudioID = 2013
+---类的构造函数
+---@param activity ActivitySynGMActivity
+function TrainSuperValuModelGM:__init(activity)
+    self.FirstLogin = false
+    activity:AddStateChanged(self.OnActivityStateChanged, self)
+end
+
+function TrainSuperValuModelGM:OnActivityStateChanged(state)
+    if state == ActivitySynManager.State.Close then
+        self:UpdateRedpoint()
+        if self.coinType == 0 then
+            --刷新主城上方界面按钮
+            _G.MainManager:GetInstance():SetForShowGodSpecialGift(false)
+            _G.FunctionManager:GetInstance():CloseFunById(_G.MainFunctionItems.GodSpecialGift)
+        end
+    end
+end
+
+---类的析构函数
+function TrainSuperValuModelGM:Dispose()
+end
+
+---获取数据
+function TrainSuperValuModelGM:OnHandleGMData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+
+function TrainSuperValuModelGM:ParseData(data)
+    self:SetSelfData(data)
+    base.ParseData(self)
+end
+
+function TrainSuperValuModelGM:SetSelfData(info)
+    self.type_num = 2 --GM（同一个界面，2 = 是GM 1 = 配置）
+    local subType = self.curActivityClass:GetJumpType()
+    self.coinId = 101
+    if subType and coinSubList[subType] then
+        self.coinId = coinSubList[subType]
+    end
+    --self.type = info.cash_gift.type ---公平竞技场类型
+    --self.coinId = self.type and 103 or 101
+    if info == nil or info.cash_gift == nil then
+        if _G.AppSetting.DEBUG then
+            _G.Log("配置信息为空", "恶灵入侵")
+        end
+        return
+    end
+    local cfg
+    self.infocfg = info.cash_gift.gifts or {}
+    for _, v in pairs(self.infocfg) do
+        if _G.tonumber(v.name) then
+            v.name = _G.LangUtil.GetLangPackValue(_G.tonumber(v.name))
+        end
+    end
+    --self.times = info.times or {} --{sid,num} --礼包购买次数
+    self.times_buy = {}
+    if info.cash_gift.times ~= nil then
+        for i = 1, #info.cash_gift.times do
+            local buy = info.cash_gift.times[i]
+            -- if self.times_buy[buy.k] == nil then
+            --     self.times_buy[buy.k] = 0
+            -- end
+            self.times_buy[buy.k] = buy.v
+        end
+    end
+    self.LiHuiPath = (info.cash_gift.pos ~= nil and info.cash_gift.pos ~= "") and string.trim(info.cash_gift.pos) or nil
+    if info.cash_gift.dev then
+        local pos = {}
+        local scale = 1
+        local dev = string.split(info.cash_gift.dev, "#")
+        for _, v in pairs(dev) do
+            if string.contains(v, "|") then
+                scale = string.split(v, "|")[2]
+                table.insert(pos, tonumber(string.split(v, "|")[1]))
+            else
+                table.insert(pos, tonumber(v))
+            end
+        end
+        self.LiHuiPos = pos
+        self.LihuiScale = tonumber(scale)
+    end
+end
+
+---
+---@protected
+function TrainSuperValuModelGM:CheckState()
+    if self.coinType == 9 and self:CheckSoldout() then
+        self.curActivityClass:ChangeState(ActivitySynManager.State.Close)
+    end
+
+    if self.coinType == 9 and not self:CheckSoldout() then
+        ---@type MainOpenViewFunItem
+        local MainOpenViewFunItem = {}
+        MainOpenViewFunItem.OpenViewFun = function()
+            local windowName = _G.ConfigManager.ui_cfg.PushSkinGiftView.Name
+            local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.PushSkinGiftView.Name)
+            if window then
+                window.View:UpdateView(self.curActivityClass, 2)
+            else
+                _G.UIManager:GetInstance():OpenWindow(windowName, self.curActivityClass, 2)
+            end
+        end
+        _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.GiftPackGroup)
+    end
+end
+
+function TrainSuperValuModelGM:InitFunction()
+    self:InitModelData()
+    self:InitDynamicData()
+    self:CheckState()
+    local nowtime = _G.TimeUtil.GetServerUnixTime()
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "SuperValuGift_time"
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+        local login_time = _G.CS.WechatGameCore.PlayerPrefs.GetInt(key)
+        if _G.TimeUtil.CheckTheSameDay(login_time, nowtime) then
+        else
+            --检测是否 还有未充值的
+            if self:CheckOtherConditionExtra() then
+                _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, nowtime)
+                local key2 = tostring(_G.PlayerModel:GetInstance().role_uid) .. "SuperValuGift"
+                _G.CS.WechatGameCore.PlayerPrefs.SetInt(key2, 1)
+            end
+        end
+    else
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, nowtime)
+        local key1 = tostring(_G.PlayerModel:GetInstance().role_uid) .. "SuperValuGift"
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key1, 1)
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+    local View
+    if self.coinType == 4 then
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.DrawUpPackView.Name)
+    elseif self.coinType == 5 then
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ArtifactDrawUpPackView.Name)
+    elseif self.coinType == 7 then
+        ---灵兽礼包
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.PetDrawUpPackView.Name)
+    elseif self.coinType == 0 then
+        --刷新主城上方界面按钮
+        if self.curActivityClass.curState == require "ActivitySynManager".State.Open then
+            local ret = _G.MainManager:GetInstance():SetForShowGodSpecialGift(true)
+            if not ret then
+                _G.FunctionManager:GetInstance():OpenFunById(_G.MainFunctionItems.GodSpecialGift)
+            end
+        end
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.GodSpecialGiftView.Name)
+    elseif self.coinType == 9 then
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.PushSkinGiftView.Name)
+    elseif self.coinType == 11 then
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.JoinActivityDrawUpPackView.Name)
+    elseif self.coinType == 14 then
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.GiftPackGMCommonView.Name)
+    elseif self.coinType == 15 then
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SpBoxPackView.Name)
+    else
+        View = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SuperValuGiftSiegeView.Name)
+    end
+    if View then
+        View:UpdateView(self.curActivityClass, 2)
+    end
+end
+
+function TrainSuperValuModelGM:OnEnterActivity()
+    local window, windowName
+    if self.coinType == 4 then
+        windowName = _G.ConfigManager.ui_cfg.DrawUpPackView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.DrawUpPackView.Name)
+    elseif self.coinType == 5 then
+        windowName = _G.ConfigManager.ui_cfg.ArtifactDrawUpPackView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ArtifactDrawUpPackView.Name)
+    elseif self.coinType == 7 then
+        windowName = _G.ConfigManager.ui_cfg.PetDrawUpPackView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.PetDrawUpPackView.Name)
+    elseif self.coinType == 0 then
+        windowName = _G.ConfigManager.ui_cfg.GodSpecialGiftView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GodSpecialGiftView.Name)
+    elseif self.coinType == 8 then
+        windowName = _G.ConfigManager.ui_cfg.TarotPackView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.TarotPackView.Name)
+    elseif self.coinType == 9 then
+        windowName = _G.ConfigManager.ui_cfg.PushSkinGiftView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.PushSkinGiftView.Name)
+    elseif self.coinType == 10 then
+        windowName = _G.ConfigManager.ui_cfg.PenglaiPackView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.PenglaiPackView.Name)
+    elseif self.coinType == 11 then
+        windowName = _G.ConfigManager.ui_cfg.JoinActivityDrawUpPackView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.JoinActivityDrawUpPackView.Name)
+    elseif self.coinType == 12 or self.coinType == 13 then
+        --local subType = self.curActivityClass:GetJumpType()
+        windowName = _G.ConfigManager.ui_cfg.SpiritualDrawGMGiftPackView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.SpiritualDrawGMGiftPackView.Name)
+    elseif self.coinType == 14 then
+        windowName = _G.ConfigManager.ui_cfg.GiftPackGMCommonView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GiftPackGMCommonView.Name)
+    elseif self.coinType == 15 then
+        windowName = _G.ConfigManager.ui_cfg.SpBoxPackView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.SpBoxPackView.Name)
+    else
+        windowName = _G.ConfigManager.ui_cfg.SuperValuGiftSiegeView.Name
+        window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.SuperValuGiftSiegeView.Name)
+    end
+    if window then
+        window.View:UpdateView(self.curActivityClass, 2)
+    else
+        _G.UIManager:GetInstance():OpenWindow(windowName, self.curActivityClass, 2)
+    end
+end
+
+function TrainSuperValuModelGM:OnGetMainViewName()
+    local view = _G.ConfigManager.ui_cfg.SuperValuGiftSiegeView.Name
+    if self.coinType == 4 then
+        view = _G.ConfigManager.ui_cfg.DrawUpPackView.Name
+    elseif self.coinType == 5 then
+        view = _G.ConfigManager.ui_cfg.ArtifactDrawUpPackView.Name
+    elseif self.coinType == 7 then
+        view = _G.ConfigManager.ui_cfg.PetDrawUpPackView.Name
+    elseif self.coinType == 0 then
+        view = _G.ConfigManager.ui_cfg.GodSpecialGiftView.Name
+    elseif self.coinType == 9 then
+        view = _G.ConfigManager.ui_cfg.PushSkinGiftView.Name
+    elseif self.coinType == 11 then
+        view = _G.ConfigManager.ui_cfg.JoinActivityDrawUpPackView.Name
+    elseif self.coinType == 15 then
+        view = _G.ConfigManager.ui_cfg.SpBoxPackView.Name
+    end
+
+    return view
+end
+
+function TrainSuperValuModelGM:OnSixClockUpdate(endcall)
+    base.OnSixClockUpdate(self, endcall)
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "SuperValuGift"
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, 1)
+    end
+end
+
+---数据类 静态数据类
+function TrainSuperValuModelGM:InitModelData()
+    self.model_cfg = {}
+    self.FreeGift = {}
+    --local cfg = _G.ConfigManager.store_active_cfg
+    -- for key, value in pairs(cfg) do
+    --     if value.type_1 == 2 then
+    --         _G.table.insert(self.model_cfg, value)
+    --     end
+    -- end
+    for i = 1, #self.infocfg do
+        local data = {}
+        data = self.infocfg[i]
+        if data.price == 0 then
+            self.FreeGift = { sid = data.sid, count = data.count }
+            if data.special then
+                self.LiHuiSpine = data.special and string.trim(data.special) or nil
+            end
+        end
+        _G.table.insert(self.model_cfg, self.infocfg[i])
+    end
+    self.model_cfg = _G.table.toArray(self.model_cfg)
+end
+
+---过滤掉不显示的礼包
+function TrainSuperValuModelGM:GetModelCfgByCondition(ActivityID)
+    local modelCfg = {}
+    local checkArray
+    for i = 1, #self.infocfg do
+        checkArray = {}
+        if self.infocfg[i].display_con then
+            for _, v in pairs(self.infocfg[i].display_con) do
+                _G.table.insert(checkArray, { v.k, v.v })
+            end
+        end
+        if _G.GlobalConditionManager.CheckConditionByArray(checkArray) then
+            _G.table.insert(modelCfg, self.infocfg[i])
+        end
+    end
+    return modelCfg
+end
+
+---获取立绘资源路径
+function TrainSuperValuModelGM:GetLiHuiPath()
+    return (self.LiHuiPath or self.LiHuiSpine), self.LiHuiPath ~= nil
+end
+
+---获取立绘资源坐标
+function TrainSuperValuModelGM:GetLiHuiPos()
+    return self.LiHuiPos
+end
+
+---获取立绘资源缩放
+function TrainSuperValuModelGM:GetLiHuiScale()
+    return self.LihuiScale
+end
+
+---获取动态的商场数据  购买的次数
+function TrainSuperValuModelGM:InitDynamicData()
+    for i = 1, #self.model_cfg do
+        local data = self.model_cfg[i]
+        self.coinType = self.model_cfg[i].coin_type
+        self:ChangeCoinID()
+        data.goods = {}
+        ---恶灵入侵代币
+        if data.siege_coin and data.siege_coin > 0 then
+            local da = {
+                self.coinId, -- 配置 currency_type_client_cfg  101
+                --资源表中的
+                data.siege_coin
+            }
+
+            _G.table.insert(data.goods, da)
+        end
+        ---普通奖励
+        if data.award then
+            for i = 1, #data.award do
+                _G.table.insert(data.goods, data.award[i].type)
+            end
+        end
+    end
+end
+
+---限时招募用，打开页面时再修改货币类型
+function TrainSuperValuModelGM:UpdateDynamicData(ActivityID)
+    local DrawUpCoinModel = require("DrawUpCoinModel"):GetInstance()
+    for i = 1, #self.model_cfg do
+        local data = self.model_cfg[i]
+        self.coinType = self.model_cfg[i].coin_type
+        self:ChangeCoinID()
+        if self.coinType == 4 then
+            self.coinId = DrawUpCoinModel:GetCoinId(ActivityID)
+        end
+        data.goods = {}
+        ---恶灵入侵代币
+        if data.siege_coin and data.siege_coin > 0 then
+            local da = {
+                self.coinId, -- 配置 currency_type_client_cfg  101
+                --资源表中的
+                data.siege_coin
+            }
+
+            _G.table.insert(data.goods, da)
+        end
+        ---普通奖励
+        if data.award then
+            for j = 1, #data.award do
+                _G.table.insert(data.goods, data.award[j].type)
+            end
+        end
+    end
+end
+
+---限时招募用，打开页面时再修改货币类型
+function TrainSuperValuModelGM:ArtifactUpdateDynamicData(ActivityID)
+    local ArtifactDrawUpMainModel = require("ArtifactDrawUpMainModel"):GetInstance()
+    for i = 1, #self.model_cfg do
+        local data = self.model_cfg[i]
+        self.coinType = self.model_cfg[i].coin_type
+        self:ChangeCoinID()
+        if self.coinType == 5 then
+            self.coinId = ArtifactDrawUpMainModel:GetCoinId(ActivityID)
+        end
+        data.goods = {}
+        ---恶灵入侵代币
+        if data.siege_coin and data.siege_coin > 0 then
+            local da = {
+                self.coinId, -- 配置 currency_type_client_cfg  101
+                --资源表中的
+                data.siege_coin
+            }
+
+            _G.table.insert(data.goods, da)
+        end
+        ---普通奖励
+        if data.award then
+            for j = 1, #data.award do
+                _G.table.insert(data.goods, data.award[j].type)
+            end
+        end
+    end
+end
+
+function TrainSuperValuModelGM:ChangeCoinID()
+    if self.coinType == 1 then
+        self.coinId = 104
+    elseif self.coinType == 2 then
+        self.coinId = 101
+    elseif self.coinType == 3 then
+        self.coinId = 103
+    elseif self.coinType == 4 then
+        self.coinId = 106
+    elseif self.coinType == 6 then
+        self.coinId = 109
+    elseif self.coinType == 7 then
+        self.coinId = 115
+    elseif self.coinType == 8 then
+        self.coinId = 117
+    elseif self.coinType == 11 then
+        local activity = require "ActivitySynManager":GetInstance():GetChildAcitivity(10044,
+            self.curActivityClass:GetJumpType(self.curActivityClass.activityId))
+        if activity then
+            self.coinId = require "JointActivityDrawUpModel":GetInstance():GetCoinId(activity.activityID)
+        end
+    end
+end
+
+function TrainSuperValuModelGM:CheckOtherConditionExtra()
+    local flag = false
+    for i = 1, #self.model_cfg do
+        local data = self.model_cfg[i]
+        local buy_num = self:GetItemBuyTimes(data.sid, data.type_reset)
+        if buy_num ~= data.count_limit then
+            flag = true
+            break
+        end
+    end
+    return flag
+end
+
+---获取动态的商场数据  购买的次数
+---@param sid number 礼包sid
+function TrainSuperValuModelGM:GetItemBuyTimes(sid, _type)
+    if self.times_buy and self.times_buy[sid] then
+        return self.times_buy[sid]
+    else
+        return 0
+    end
+end
+
+---物品id
+---@param sid number 礼包id
+function TrainSuperValuModelGM:SetCoin(sid)
+    local data = {
+        type = {
+            [1] = self.coinId
+        }
+    }
+
+    for i = 1, #self.model_cfg do
+        if self.model_cfg[i].sid == sid then
+            data.type[2] = self.model_cfg[i].siege_coin
+            if self.coinType > 0 then
+                if self.coinId == 103 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetFairCoin, data.type[2])
+                elseif self.coinId == 104 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetGuessCoin, data.type[2])
+                elseif self.coinId == 101 then
+                    require "MonsterSiegeManager":GetInstance():SetCoinActivity(data.type[2])
+                elseif self.coinId == 109 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetSixVsSix, data.type[2])
+                elseif self.coinType == 4 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetDrawUp, data.type)
+                elseif self.coinType == 5 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetDrawUp, data.type)
+                elseif self.coinType == 7 or self.coinType == 11 or self.coinType == 14 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetDrawUp, data.type)
+                elseif self.coinType == 8 then
+                    require "TarotManager":GetInstance():AddCoin(data.type[2])
+                end
+            end
+            return data
+        end
+    end
+    return nil
+end
+
+---设置购买的id
+---@param sid number 充值成功
+function TrainSuperValuModelGM:SetItemBuyTimes(sid)
+    if self.times_buy and self.times_buy[sid] then
+        self.times_buy[sid] = self.times_buy[sid] + 1
+    else
+        self.times_buy[sid] = 1
+    end
+end
+
+---充值
+function TrainSuperValuModelGM:Chongzhi(giftinfo, call)
+    --清除之前的购买回调(如果玩家取消了支付OnMallCashListener接口将不会回调)
+    self.mallCall = nil
+
+    local activity_id = self.curActivityClass.realActivityId and self.curActivityClass.realActivityId or
+        self.curActivityClass:GetActivityID()
+    if giftinfo.price == 0 then
+        require "ActivitySynNet":GetInstance():GetAward(
+            activity_id,
+            { giftinfo.sid },
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                if call then
+                    self:SetItemBuyTimes(giftinfo.sid)
+                    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                    for _, v in pairs(giftinfo.goods) do
+                        if v[1] == self.coinId then
+                            _G.table.insert(msg.award.item, { type = v })
+                            break
+                        end
+                    end
+                    self:SetCoin(giftinfo.sid)
+                    self:UpdateRedpoint()
+                    _G.AudioManager.PlayAudio(_G.AudioType.PlaySound, buyAudioID)
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                    call(msg)
+                end
+            end
+        )
+    else
+        if giftinfo.consume_type == 0 then
+            _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+            local tb = {}
+            for _, v in pairs(giftinfo.goods) do
+                if v[1] == self.coinId then
+                    tb[1] = { type = v }
+                    break
+                end
+            end
+            require "MallManager":GetInstance():BuyActiveGift(giftinfo.price, activity_id, giftinfo.sid, tb)
+            self.mallCall = call
+        else
+            self:BuyRes(activity_id, giftinfo, call)
+        end
+    end
+end
+
+---初始化红点
+function TrainSuperValuModelGM:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckFreeGift }
+    self.redpointTree = { false, false }
+end
+
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function TrainSuperValuModelGM:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+function TrainSuperValuModelGM:UpdateRedpoint()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+---是否 每日的首次登录
+function TrainSuperValuModelGM:CheckFreeGift()
+    local sub_type = self.curActivityClass:GetJumpType()
+    if self.coinType == 9 then
+        return self:CheckGiftRed()
+    elseif sub_type == 100083 then
+        local model = require("ArenaGlobalModel"):GetInstance()
+        local isCanFight = model:CheckCanFight()
+        if isCanFight == false then
+            return 0
+        else
+            local flag = require "ActivitySynManager":GetInstance():CheckActivityConditionExtra(self.curActivityClass:GetActivityID())
+            if not flag then
+                return 0
+            end
+            if not _G.table.isEmptyOrNil(self.FreeGift) then
+                local buy_num = self:GetItemBuyTimes(self.FreeGift.sid)
+                if self.FreeGift.count > buy_num then
+                    return 1
+                else
+                    return 0
+                end
+            else
+                return 0
+            end
+        end
+    else
+        local flag = require "ActivitySynManager":GetInstance():CheckActivityConditionExtra(self.curActivityClass
+            :GetActivityID())
+        if not flag then
+            return 0
+        end
+        if not _G.table.isEmptyOrNil(self.FreeGift) then
+            local buy_num = self:GetItemBuyTimes(self.FreeGift.sid)
+            if self.FreeGift.count > buy_num then
+                return 1
+            else
+                return 0
+            end
+        else
+            return 0
+        end
+    end
+end
+
+---@param data store.p2c_store_cash
+function TrainSuperValuModelGM:OnMallCashListener(data)
+    if not self.model_cfg then
+        return
+    end
+    if self.mallCall then
+        self.mallCall()
+        self.mallCall = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+end
+
+---是否 每日的首次登录
+function TrainSuperValuModelGM:CheckFirstLogin()
+    --("刷新红点-----------超值礼包")
+    ---检测功能是否开启
+    local flag = require "ActivitySynManager":GetInstance():CheckActivityConditionExtra(self.curActivityClass
+        :GetActivityID())
+    if not flag then
+        return 0
+    end
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "SuperValuGift"
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+        if _G.CS.WechatGameCore.PlayerPrefs.GetInt(key) == 1 then
+            return 1
+        else
+            return 0
+        end
+    else
+        return 1
+    end
+    --return 1
+end
+
+---
+---@protected
+function TrainSuperValuModelGM:CheckSoldout()
+    local model_data = self:GetModelCfgByCondition()
+    local isSoldout = true
+    for i = 1, #model_data do
+        local data = model_data[i]
+        local limit = data.count
+        local buy_num = self:GetItemBuyTimes(data.id or data.sid, data.type_reset)
+        if limit ~= buy_num then
+            isSoldout = false
+            break
+        end
+    end
+    return isSoldout
+end
+
+function TrainSuperValuModelGM:CheckGiftRed()
+    --local isSoldout = self:CheckSoldout()
+    --if isSoldout == true then
+    --    return 0
+    --end
+
+    local num = _G.PlayerPrefsManager.GetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "PushSkinGiftView", 0)
+    if num == 0 then
+        return 1
+    else
+        local time = num
+        local time2 = self:GetTime()
+        return time < time2 and 1 or 0
+    end
+end
+
+function TrainSuperValuModelGM:GetTime()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local data = _G.TimeUtil.GetDateTime(time)
+    if data.hour < _G.TimeUtil.GAME_DAY_HOUR then
+        return _G.TimeUtil.GetDayBegin(time - _G.TimeUtil.GAME_DAY_TIME) + _G.TimeUtil.GAME_DAY_TIME
+    else
+        return _G.TimeUtil.GetDayBegin(time) + _G.TimeUtil.GAME_DAY_TIME
+    end
+end
+
+---
+---@protected
+function TrainSuperValuModelGM:ChangeLoginRed()
+    _G.PlayerPrefsManager.SetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "PushSkinGiftView", self:GetTime())
+    self:UpdateRedpoint()
+end
+
+function TrainSuperValuModelGM:IsShowBtn()
+    if
+        self.coinType == 4 or self.coinType == 5 or self.coinType == 0 or self.coinType == 7 or self.coinType == 8 or
+        self.coinType == 10 or self.coinType == 11
+    then
+        return false
+    end
+    return true
+end
+
+---资源购买礼包
+function TrainSuperValuModelGM:BuyRes(activity_id, giftinfo, call)
+    local num = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.ResProp, _G.ResPropID.Diamond)
+    if num < giftinfo.price then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, _G.ResPropID.Diamond)
+        return
+    end
+    require "ActivitySynNet":GetInstance():BuyGift(
+        activity_id,
+        giftinfo.sid,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if call then
+                self:SetItemBuyTimes(giftinfo.sid)
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                for _, v in pairs(giftinfo.goods) do
+                    if v[1] == self.coinId then
+                        _G.table.insert(msg.award.item, { type = v })
+                        break
+                    end
+                end
+                self:SetCoin(giftinfo.sid)
+                self:UpdateRedpoint()
+                if giftinfo.consume_type then
+                    _G.StorageManager:GetInstance():ConsumeItem(giftinfo.consume_type, 0, giftinfo.price)
+                end
+                _G.AudioManager.PlayAudio(_G.AudioType.PlaySound, buyAudioID)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                call(msg)
+            end
+        end
+    )
+end
+
+return TrainSuperValuModelGM

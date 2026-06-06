@@ -1,0 +1,682 @@
+-----------------------------------------------------------------------
+-- Created by szs on 24. 二月 2021 14:22
+--
+-- @Description 公会加入
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+---@class SociatyJoinView : UIBaseView
+---@field go_table SociatyJoinView_GoTable 公会加入
+---@field SociatyList SociatyData[] 公会列表
+---@field SociatyItemGotableList SociatyJoinView._obj_SociatyItem_GoTable[] 子节点序列化对象列表
+---@field SociatyItemList SociatyJoinView._obj_SociatyItem_GoTable[] 子节点列表
+---@field SociatyInfoPanel SociatyInfoPanel 公会信息组件
+---@field GetGuildIndex number 推荐列表请求索引
+---@field GetGuildIndex number 拖拽到底申请的索引
+---@field ListType number 1推荐2搜索
+---@field TempIndex number 快速入会搜索临时页码
+---@field TempMaxIndex number 快速入会搜索临时最大页码
+local SociatyJoinView = _G.BaseClass("SociatyJoinView", _G.UIBaseView)
+local SociatyInfoPanel = require("SociatyInfoPanel")
+local SociatyNet = require("SociatyNet")
+local SociatyData = require("SociatyData")
+local SociatyModel = require("SociatyModel")
+
+local otherName = {
+    "fort",
+    "wild",
+    "card",
+    "afk"
+}
+
+function SociatyJoinView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self.GetGuildIndex = 1
+    self.GetGuildDragEndIndex = 1
+    self.ListType = 1
+    self.InitLoopList = false
+    self.ChooseIndex = 1
+    _G.AudioManager.PlayAudio(_G.AudioType.PlaySound, _G.AudioClipTypeEnum.openPanel)
+end
+
+-- 启动
+function SociatyJoinView:OnCreate(isHide)
+    ---是否还有更多的重名公会
+    self.Page = 1
+    self.SociatyList = {}
+    self.SociatyItemGotableList = {}
+    self.SociatyItemList = {}
+    self.ListType = 1
+    self.isHide = isHide
+    --self.SociatyInfoPanel = self:AddComponent(self.go_table.obj_SociatyInfoPanel, SociatyInfoPanel.New(self))
+    _G.GameUtil.InputFieldCharacterLimit(self.go_table.input_input, 60, nil, true)
+    self.go_table.obj_panel:SetActiveE(0)
+    self:GetSociatyRecommedList()
+    --self:AddListener(_G.eSociatyEvent.RoleRefuseRequest, self.DoRoleRefuseRequest)
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_show, not self.isHide)
+    if isHide then
+        self.go_table.aortext_nil.text = _G.LangUtil.GetLangPackValue(90021800168)
+    else
+        self.go_table.aortext_nil.text = _G.LangUtil.GetLangPackValue(90021800063)
+    end
+    self:InitView()
+end
+
+function SociatyJoinView:OnEnable()
+end
+
+function SociatyJoinView:OnDisable()
+    if self.joinTimer then
+        self.joinTimer:Stop()
+        self.joinTimer = nil
+    end
+end
+
+function SociatyJoinView:InitView()
+    local resources = _G.ConfigManager.ui_cfg.SociatyJoinView.resources
+    self:AddComponent(
+            self.go_table.obj_GoldInfo,
+            require("ResourceCompont").New(self.go_table.obj_GoldInfo, resources)
+    )
+    self:AddComponent(
+            self.go_table.obj_PlayerHead,
+            require("PlayerComponent").New(self.go_table.obj_PlayerHead)
+    )
+    self:ChangeView()
+end
+
+function SociatyJoinView:InitTimer()
+    local cd, time = SociatyModel:GetInstance():IsCding()
+    self.go_table.aortext_time:SetActiveE(cd and 1 or 0)
+    if cd then
+        self:UpdateJoinTime()
+        if not self.joinTimer then
+            self.joinTimer = _G.TimerManager:GetInstance():GetTimer(
+                    1,
+                    self.UpdateJoinTime,
+                    self,
+                    false,
+                    false,
+                    true
+            )
+            self.joinTimer:Start()
+        end
+    end
+end
+
+---嵌入主界面公会面板
+function SociatyJoinView:ChangeView()
+    local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if mainView then
+        if not SociatyModel:GetInstance().parent then
+            SociatyModel:GetInstance().parent = mainView.go_table.obj_sociaty
+        end
+        mainView.go_table.toggle_sociaty.isOn = true
+        mainView.go_table.obj_sociaty:SetActiveE(1)
+        for _, v in pairs(otherName) do
+            mainView.go_table["toggle_" .. v].isOn = false
+            mainView.go_table["obj_" .. v]:SetActiveE(0)
+        end
+        self.gameObject:SetParentE(SociatyModel:GetInstance().parent)
+        _G.UIManager:GetInstance():ChangeCanvasOrder(_G.ConfigManager.ui_cfg.SociatyJoinView.Name, 50, true)
+    end
+end
+
+---玩家被拒绝申请
+---@param msg guild.p2c_guild_role_request_refuse
+function SociatyJoinView:DoRoleRefuseRequest(msg)
+    local sociaty = self.SociatyList[self.ChooseIndex]
+    if sociaty.Uid == msg.guild_uid then
+        if self:IsInRequests(sociaty.Uid) then
+            --self.SociatyInfoPanel:ShowCancelClickJoinText()
+        else
+            --self.SociatyInfoPanel:UpdateButtonText(sociaty)
+        end
+    end
+end
+
+---请求公会推荐列表
+function SociatyJoinView:GetSociatyRecommedList(isUpdate, resetPos)
+    if nil == isUpdate then
+        isUpdate = false
+    end
+    if nil == resetPos then
+        resetPos = false
+    end
+    ---@type rank.c2s_rank_public
+    --local msg = {}
+    --msg.page = self.GetGuildIndex
+    SociatyNet:GetInstance():GetGuildRecommend(
+    --msg,
+            _G.handlerbind(self, self.GetGuildRecommendBack, isUpdate, resetPos)
+    )
+end
+
+---返回推荐列表
+---@param msg rank.s2c_rank_get_guild_recommend 结构
+---@param isUpdate boolean 是否为更新方式请求
+---@param resetPos boolean 刷新位置
+function SociatyJoinView:GetGuildRecommendBack(msg, isUpdate, resetPos)
+    self.go_table.obj_panel:SetActiveE(1)
+    self:InitTimer()
+    self.SociatyList = {}
+    if msg.guilds then
+        for i = 1, #msg.guilds do
+            ---@type guild.i_guild
+            local guild = msg.guilds[i]
+            -- local levelCfg = _G.ConfigManager.guild_level_cfg[guild.level]
+            ---人满了也需要显示出来
+            -- if guild.num < levelCfg.num_player then
+            ---@type SociatyData
+            local sociaty = SociatyData.New()
+            sociaty:Parse(guild)
+            table.insert(self.SociatyList, sociaty)
+            -- end
+        end
+    else
+        self.GetGuildIndex = self.GetGuildDragEndIndex
+
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=#ff0000>查询推荐列表数据空</color>")
+        end
+        if #self.SociatyList <= 0 then
+            _G.GameUtil.SetActiveByCondition(self.go_table.obj_IsNil, true)
+            --_G.GameUtil.SetActiveByCondition(self.go_table.obj_SociatyInfoPanel, false)
+        end
+        return
+    end
+
+    -- ---排序规则：本周活跃>等级（人数已满的公会隐藏）>人数>id
+    -- ---@param sociaty SociatyData
+    -- _G.SortList(
+    --     self.SociatyList,
+    --     function(sociaty)
+    --         return sociaty.SevenDayLive, sociaty.Level, sociaty.SociatyMemberModule:GetCurMemberCount(), sociaty.Uid
+    --     end
+    -- )
+    ---乱序排列
+    _G.SortList(
+            self.SociatyList,
+            function(sociaty)
+                local num = _G.math.random(1, 40)
+                return -num, sociaty.Uid
+            end
+    )
+    local count = #self.SociatyList
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_IsNil, count <= 0)
+    --_G.GameUtil.SetActiveByCondition(self.go_table.obj_SociatyInfoPanel, count > 0)
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_have, count > 0)
+
+    if nil == self.ChooseIndex then
+        self.ChooseIndex = 1
+    end
+    ---更新的话直接刷新
+    if isUpdate then
+        self.go_table.scrollloopvectical_SociatyList:UpdateCount(#self.SociatyList)
+    else
+        self.go_table.scrollloopvectical_SociatyList:InitItemData(
+                #self.SociatyList,
+                _G.handler(self, self.RefreshRenItem)
+        )
+        self.InitLoopList = true
+    end
+
+    ---选择一个公会
+
+    --if _G.AppSetting.DEBUG then
+    --    _G.Log(self.ChooseIndex, "当前选中公会")
+    --end
+    --self:OnItemClickBtn(nil, nil)
+end
+
+---@param looplist2 SuperScrollView.LoopListView2 滚动组件
+---@param index number 该数据的索引   0起始
+function SociatyJoinView:RefreshRenItem(index, item)
+    if index < 0 then
+        return
+    end
+    local eIndex = index + 1
+    local id = item:GetInstanceIDE()
+    ---@type SociatyJoinView._obj_SociatyItem_GoTable
+    local itemGotable = self.SociatyItemList[id]
+    if not itemGotable then
+        itemGotable = _G.GetAutoGoTable(item)
+        _G.AddViewBtnClick(item, _G.handlerbind(self, self.OnItemClickBtn, itemGotable))
+        self.SociatyItemList[id] = itemGotable
+    end
+    self.SociatyItemList[eIndex] = item
+
+    itemGotable.index = eIndex
+    ---@type SociatyData
+    local sociaty = self.SociatyList[eIndex]
+    itemGotable.aortext_name.text = sociaty.Name
+    --itemGotable.aortext_lv.text = sociaty.Level
+    itemGotable.aortext_president.text = sociaty.SociatyMemberModule.Member[1].Name
+    itemGotable.aorrawimage_icon:LoadImage(_G.ConfigManager.guild_portrait_cfg[sociaty.Banner].portrait)
+    if sociaty:IsMax() then
+        itemGotable.aortext_num.text = _G.LangUtil.GetLangPackValue(90022501044) .. "：" .. "<color=#076815>" ..
+                sociaty.SociatyMemberModule:GetMaxMemberNum() .. "</color>/" ..
+                sociaty.SociatyMemberModule:GetMaxMemberNum()
+    else
+        itemGotable.aortext_num.text = _G.LangUtil.GetLangPackValue(90022501044) .. "：" .. "<color=#076815>" ..
+                sociaty.SociatyMemberModule:GetCurMemberCount() .. "</color>/" ..
+                sociaty.SociatyMemberModule:GetMaxMemberNum()
+    end
+    local power = sociaty.GuildPower or 0
+    itemGotable.aortext_power.text = _G.GameUtil.NumberToUnitStrFight(power)
+    --itemGotable.aortext_point.text = sociaty.SevenDayLive
+    --itemGotable.aortext_approve.text = self:GetApprovalStr(sociaty.NeedApproval)
+    itemGotable.aortext_condition.text = self:GetConditionStr(sociaty.LimitChapter or 1)
+
+    itemGotable.aortext_level.text = _G.LangUtil.GetLangPackValue(9002010022, sociaty.Level)
+    _G.GameUtil.SetActiveByCondition(itemGotable.aorbtn_Applyed, false)
+
+    local curChapter = require "AfkModel":GetInstance():GetCurAfkChapter()
+    itemGotable.aortext_condition:SetActiveE(0)
+    local canJoin = true
+
+    if sociaty.LimitLevel > _G.PlayerModel:GetInstance().role_lv or
+            sociaty.LimitChapter > curChapter or
+            sociaty.NeedApproval == 2
+    then
+        if sociaty.LimitLevel > _G.PlayerModel:GetInstance().role_lv or sociaty.LimitChapter > curChapter then
+            --itemGotable.aorimage_limit:SetGray(true)
+            itemGotable.aortext_condition:SetActiveE(1)
+            canJoin = false
+        end
+    end
+    _G.GameUtil.SetActiveByCondition(itemGotable.aorbtn_Join, canJoin)
+
+    if self:IsInRequests(sociaty.Uid) then
+        itemGotable.aorbtn_Join:SetActiveE(0)
+        itemGotable.aorbtn_Applyed:SetActiveE(1)
+    end
+    itemGotable.uid = sociaty.Uid
+    return item
+end
+
+function SociatyJoinView:UpdateJoinTime()
+    local cd, time = SociatyModel:GetInstance():IsCding()
+    self.go_table.aortext_time.text = _G.LangUtil.GetLangPackValue(90021800008, time)
+    if not cd then
+        self.go_table.aortext_time:SetActiveE(cd and 1 or 0)
+    end
+end
+
+---审核方式字符串
+---@param approval number 限制条件
+function SociatyJoinView:GetApprovalStr(approval)
+    if approval == 0 then
+        return _G.LangUtil.GetLangPackValue(90021800437)
+    elseif approval == 1 then
+        return _G.LangUtil.GetLangPackValue(90021800438)
+    end
+end
+
+---审核方式字符串
+---@param approval number 限制条件
+function SociatyJoinView:GetConditionStr(limitchapter)
+    local str = _G.LangUtil.GetLangPackValue(90022600040) .. limitchapter .. "-1"
+    return str
+end
+
+---公会点击选中
+---@param _ UnityEngine.Transform 点击对象
+---@param _ boolean 选中
+---@param index number 选中索引
+function SociatyJoinView:OnItemClickBtn(go, _, tb)
+    local name = go:GetName()
+    if name == "@_aorbtn_Join" or name == "@_aorbtn_Applyed" then
+        self.ChooseIndex = tb and tb.index or self.ChooseIndex
+
+        self:RequestJoin(self.SociatyList[self.ChooseIndex])
+    elseif name == "@_aorbtn_click" then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyInfoPreviewView.Name, tb.uid)
+    end
+end
+
+---快速加入公会
+function SociatyJoinView:QuickJoin()
+    local cd, time = SociatyModel:GetInstance():IsCding()
+    if cd then
+        _G.PopWindowManager:GetInstance():ShowAllTips(250301, _G.LangUtil.GetLangPackValue(90021800008, time))
+        return
+    end
+    local sociatys = {}
+    local index = 1
+    local roleLv = _G.PlayerModel:GetInstance().role_lv
+    local curChapter = require "AfkModel":GetInstance():GetCurAfkChapter()
+    for i = 1, #self.SociatyList do
+        local data = self.SociatyList[i]
+        local canJoin = data.LimitLevel <= roleLv and
+                data.LimitChapter <= curChapter and data.NeedApproval ~= 2
+        if canJoin and data.SociatyMemberModule.CurMemberCount < data.SociatyMemberModule.MaxMemberNum then
+            sociatys[index] = data
+            index = index + 1
+        end
+    end
+    _G.SortList(
+            sociatys,
+            function(v)
+                return v.SociatyMemberModule.CurMemberCount
+            end
+    )
+    if #sociatys == 0 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(250103)
+    end
+    for i = 1, #sociatys do
+        if require("SociatyManager"):GetInstance():GetGuildName() ~= "" then
+            break
+        end
+        self:RequestJoin(sociatys[i])
+    end
+end
+
+---申请加入公会
+function SociatyJoinView:RequestJoin(data)
+    local sociaty = data
+    if nil == sociaty then
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=#ff0000>推荐列表数据空</color>")
+        end
+        return
+    end
+    -- if sociaty:IsMax() then
+    --     ---申请公会人满了
+    --     _G.PopWindowManager:GetInstance():ShowAllTips(250101)
+    --     return
+    -- end
+    local cd, time = SociatyModel:GetInstance():IsCding()
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("是否CD中")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(cd)
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(time, "cd时间")
+    end
+    if cd then
+        ---入会冷却
+        _G.PopWindowManager:GetInstance():ShowAllTips(250301, _G.LangUtil.GetLangPackValue(90021800008, time))
+        return
+    end
+    local roleNum = _G.ConfigManager.discrete_cfg[101602][1][1]
+    if #SociatyModel:GetInstance().SociatyRoleSelf.requests >= roleNum then
+        ---申请上限了
+        _G.PopWindowManager:GetInstance():ShowAllTips(250108)
+        return
+    end
+    self.JoinSociatyId = sociaty.Uid
+    ---申请加入
+    ---@type guild.c2s_guild_request
+    local msg = {}
+    msg.uid = { sociaty.Uid }
+    SociatyNet:GetInstance():Request(msg, _G.handler(self, self.RequestBack))
+end
+
+---获取请求列表是否有这个对应公会id
+---@param uid number 公会id
+function SociatyJoinView:IsInRequests(uid)
+    for i = 1, #SociatyModel:GetInstance().SociatyRoleSelf.requests do
+        if SociatyModel:GetInstance().SociatyRoleSelf.requests[i].uid == uid then
+            return true
+        end
+    end
+    return false
+end
+
+---按钮单击事件
+function SociatyJoinView:OnClickBtn(go)
+    local name = go:GetName()
+    if name == "@_aorbtn_CloseView" then
+        ---关闭
+        self:Close()
+    elseif name == "@_aorbtn_Close" then
+        ---关闭
+        self:Close()
+    elseif name == "@_aorbtn_QJoin" then
+        self:QuickJoin()
+    elseif name == "@_aorbtn_Create" then
+        ---创建公会
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyCreateView.Name)
+    elseif name == "@_aorbtn_Search" then
+        ---搜索公会
+        if self.go_table.input_input.text == "" then
+            _G.PopWindowManager:GetInstance():ShowAllTips(250104)
+            return
+        end
+        ---@type guild.c2s_guild_select
+        local msg = {}
+        msg.name = self.go_table.input_input.text
+        msg.page = self.Page
+        self.NextPageMsg = msg
+        SociatyNet:GetInstance():Select(msg, _G.handler(self, self.SelectBack))
+    elseif name == "@_aorbtn_rank" then
+        ---公会排行
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyJoinRankView.Name)
+    end
+end
+
+---获得更多快速加入公会
+--function SociatyJoinView:GetRecommedMore()
+-- self.TempIndex = self.GetGuildIndex
+-- self.TempMaxIndex = self.GetGuildIndex + 3
+-- self.TempIndex = self.TempIndex + 1
+-- ---@type rank.c2s_rank_public
+-- local msg = {}
+-- msg.page = self.TempIndex
+-- SociatyNet:GetInstance():GetGuildRecommend(msg, _G.handlerbind(self, self.GetGuildRecommendMoreBack))
+--end
+
+---返回推荐列表
+---@param msg rank.s2c_rank_get_guild_recommend 结构
+function SociatyJoinView:GetGuildRecommendMoreBack(msg)
+    if msg.guilds then
+        self:CheckQJoin(msg.guilds)
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(250103)
+    end
+end
+
+---快速搜索检测
+---@param guilds guild.i_guild[]
+function SociatyJoinView:CheckQJoin(guilds)
+    ---@type guild.i_guild
+    local chooseSociaty
+    for i = 1, #guilds do
+        ---@type guild.i_guild
+        local soc = guilds[i]
+        local levelCfg = _G.ConfigManager.guild_level_cfg[soc.level]
+        if _G.PlayerModel:GetInstance().role_lv >= soc.join_lv and soc.is_check == 0 and soc.num < levelCfg.num_player then
+            chooseSociaty = soc
+            break
+        end
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(chooseSociaty, "快速加入筛选结果")
+    end
+    if chooseSociaty then
+        if self:IsInRequests(chooseSociaty.uid) then
+            return
+        end
+        local msg = {}
+        msg.uid = { chooseSociaty.uid }
+        SociatyNet:GetInstance():Request(msg, _G.handler(self, self.RequestBack))
+    else
+        --end
+
+        if _G.AppSetting.DEBUG then
+            _G.Log("没有找到可快速进入的公会")
+        end
+        -- if self.TempIndex < self.TempMaxIndex then
+        --     self:GetRecommedMore()
+        -- else
+        _G.PopWindowManager:GetInstance():ShowAllTips(250103)
+    end
+end
+
+---搜索回调
+---@param msg guild.s2c_guild_select
+function SociatyJoinView:SelectBack(msg)
+    if msg.guilds then
+        self.ListType = 2
+        self.SociatyList = {}
+        self.SociatyItemGotableList = {}
+        self.SociatyItemList = {}
+
+        for i = 1, #msg.guilds do
+            local guild = msg.guilds[i]
+            ---@type SociatyData
+            local sociaty = SociatyData.New()
+            sociaty:Parse(guild)
+            table.insert(self.SociatyList, sociaty)
+        end
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(250149)
+        self.go_table.scrollloopvectical_SociatyList:DetectingSlippage()
+        return
+    end
+
+    ---排序规则：公会等级>当前公会人数（搜索会显示人数已满）>创建时间
+    ---@param sociaty SociatyData
+    _G.SortList(
+            self.SociatyList,
+            function(sociaty)
+                return sociaty.Level, sociaty.SociatyMemberModule:GetCurMemberCount(), sociaty.CreateTime
+            end
+    )
+    _G.GameUtil.SetActiveByCondition(self.go_table.obj_IsNil, #self.SociatyList <= 0)
+    --_G.GameUtil.SetActiveByCondition(self.SociatyInfoPanel.gameObject, #self.SociatyList > 0)
+    ---没有初始化就初始化一下
+    if not self.InitLoopList then
+        self.go_table.scrollloopvectical_SociatyList:InitItemData(
+                #self.SociatyList,
+                _G.handler(self, self.RefreshRenItem)
+        )
+        self.InitLoopList = true
+    else
+        self.go_table.scrollloopvectical_SociatyList:UpdateCount(#self.SociatyList)
+    end
+    ---是否可以滑动刷新
+    self.go_table.scrollloopvectical_SociatyList:DetectingSlippage(_G.handler(self, self.onValueChanged))
+    self.ChooseIndex = 1
+    --self:OnItemClickBtn(nil, nil)
+end
+
+---滑动条滑动到下方后刷新显示
+function SociatyJoinView:onValueChanged(y)
+    if y < 0 then
+        self.Page = self.Page + 1
+        self.NextPageMsg.page = self.Page
+        SociatyNet:GetInstance():Select(self.NextPageMsg, _G.handler(self, self.SelectBack))
+    end
+end
+
+---申请加入回调
+---@param msg guild.s2c_guild_request
+function SociatyJoinView:RequestBack(msg)
+    if msg.ack == 1 then
+        ---加到申请列表中
+        local severTime = _G.TimeUtil.GetServerUnixTime()
+        for _, v in pairs(msg.guild_uid) do
+            table.insert(SociatyModel:GetInstance().SociatyRoleSelf.requests, { uid = v, time = severTime })
+        end
+
+        self.go_table.scrollloopvectical_SociatyList:UpdateCount(#self.SociatyList)
+        --self.SociatyInfoPanel:ShowClickJoinText()
+        -- elseif msg.ack == "guild_enter_cd" then
+        --     local cd, time = SociatyModel:GetInstance():IsCding()
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(250301, LangUtil.GetLangPackValue(90021800008, time or 0))
+        -- elseif msg.ack == "role_request_max" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(250108)
+        -- elseif msg.ack == "request_max" then
+        --     _G.PopWindowManager:GetInstance():ShowAllTips(250109)
+    end
+end
+
+---申请加入回调
+---@param msg guild.s2c_guild_request
+function SociatyJoinView:CancelRequestBack(msg, uid)
+    if msg.ack == 1 then
+        for i, v in pairs(SociatyModel:GetInstance().SociatyRoleSelf.requests) do
+            if v.uid == uid then
+                _G.table.remove(SociatyModel:GetInstance().SociatyRoleSelf.requests, i)
+                break
+            end
+        end
+        --self.SociatyInfoPanel:ShowCancelClickJoinText()
+    end
+    -- elseif msg.ack == "guild_enter_cd" then
+    --     local cd, time = SociatyModel:GetInstance():IsCding()
+    --     _G.PopWindowManager:GetInstance():ShowAllTips(250301, LangUtil.GetLangPackValue(90021800008, time or 0))
+    -- elseif msg.ack == "role_request_max" then
+    --     _G.PopWindowManager:GetInstance():ShowAllTips(250108)
+    -- elseif msg.ack == "request_max" then
+    --     _G.PopWindowManager:GetInstance():ShowAllTips(250109)
+    --end
+end
+
+---公会列表中，从上至下筛选5个符合公会限制条件且为系统审核且人数未满的公会
+function SociatyJoinView:GetConditionMeetList()
+    local chooseSociaty = {}
+    local max = _G.ConfigManager.discrete_cfg[101602][1][1]
+    local other = {}
+    local index = 1
+    for i = 1, #self.SociatyList do
+        ---@type SociatyData
+        local soc = self.SociatyList[i]
+        if _G.PlayerModel:GetInstance().role_lv >= soc.LimitLevel and not soc:IsMax() then
+            if not self:IsInRequests(soc.Uid) then
+                if soc.NeedApproval == 0 then
+                    chooseSociaty[index] = soc.Uid
+                    index = index + 1
+                    if index > max then
+                        break
+                    end
+                else
+                    _G.table.insert(other, soc.Uid)
+                end
+            end
+        end
+    end
+    --4299262263306
+    local count = #chooseSociaty
+    if count < max then
+        local coutn2 = #other
+        for i = 1, coutn2 do
+            chooseSociaty[index] = other[i]
+            index = index + 1
+            if index > max then
+                break
+            end
+        end
+    end
+    return chooseSociaty
+end
+
+---根据搜索字符查询匹配公会
+----@param str string 搜索关键字
+function SociatyJoinView:GetSociatyByStr(str)
+    local list = {}
+    for _, v in pairs(self.SociatyList) do
+        if _G.string.contains(v.Name, str) then
+            table.insert(list, v)
+        end
+    end
+    return list
+end
+
+function SociatyJoinView:OnDestroy()
+    for _, value in pairs(self.SociatyList) do
+        value:Dispose()
+    end
+    self.SociatyList = nil
+    self.SociatyItemGotableList = nil
+    self.SociatyItemList = nil
+end
+
+return SociatyJoinView

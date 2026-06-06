@@ -1,0 +1,166 @@
+-- 包路径:        Game.Story.Module.AutomaticPlayStory
+-- File Name:    AutomaticPlayStory.lua
+-- Description:    自动化播放Story抽象
+-- Author:       TangHuan
+-- Create Date:    2020/02/26
+
+--- Note:
+--- 此类主要用于解决StoryPlayController.lua(且为单例)只能同一时间播放一个Story的问题,用于支持多个自动化Story播放
+--- 跟剧情系统不同之处在于没有单独的播放系统，只负责自动化按顺序执行(播放完成后不会自动清除所有对象，自动播放流程里负责去处理销毁逻辑)
+--- 仅用于主世界做表现
+--- 所有的创建使用接口在父类定义
+
+--- Note:
+--- 如果有需求创建物体对象是受主世界控制，可能考虑通过扩展父类定义方法来支持
+--- 同时，Action和ActionData相关的代码也要写才能支持控制世界物体相关对象
+
+---@class AutomaticPlayStory : IStoryPlay @自动化播放Story抽象
+local AutomaticPlayStory = _G.BaseClass("AutomaticPlayStory", _G.IStoryPlay)
+AutomaticPlayStory.DefaultPoolType = _G.ePoolType.Temporary
+
+---测试用接口
+---测试播放指定Story ID的剧情
+function AutomaticPlayStory.TestPlayStoryByID(storyid)
+    AutomaticPlayStory.PlayStoryByID(storyid)
+end
+
+---剧情播放完成
+---@param storyid number @剧情ID
+---@param result boolean @播放剧情结果
+function AutomaticPlayStory:OnStoryPlayComplted(storyid, result)
+end
+
+---播放指定剧情
+function AutomaticPlayStory.PlayStoryByID(storyid, callback)
+    if _G.StoryManager:GetInstance():GetIsSkipStory() then
+        if callback ~= nil then
+            callback()
+        end
+        return
+    end
+
+    local nowStory = _G.StoryManager:GetInstance():GetNowStory()
+    if nowStory ~= nil and nowStory.CurrentAutoStory ~= nil and nowStory.CurrentAutoStory.CurrentStory ~= nil then
+        if nowStory.CurrentAutoStory.CurrentStory.StoryID == storyid then
+            return
+        end
+        local str = "当前有剧情正在播放 剧情id:" .. nowStory.CurrentAutoStory.CurrentStory.StoryID
+        -- _G.PopWindowManager:GetInstance():ShowAllTips(1001, str)
+
+        if _G.AppSetting.DEBUG then
+            _G.Log("", "<color=red>" .. "str" .. "</color>")
+        end
+    end
+    ---@type story_cfg
+    local story_cfg = _G.ConfigManager.story_cfg[storyid]
+    if story_cfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 未找到 剧情id 配置 " .. tostring(storyid))
+        end
+        if callback ~= nil then
+            callback()
+        end
+        return
+    end
+    if #story_cfg.Executed > 0 then
+        if _G.GlobalConditionManager.CheckCondition(story_cfg.Executed[1], story_cfg.Executed[2]) then
+            if _G.AppSetting.DEBUG then
+                _G.Log(string.format(" 剧情id:%s 满足不触发条件 直接判定播放完成 ", storyid))
+            end
+            if callback ~= nil then
+                callback()
+            end
+            return
+        end
+    end
+
+    -- _G.UIManager:GetInstance():CloseWindowsByLayer(_G.UILayers.NormalLayer, _G.UILayers.InfoLayer)
+    local autoplaystory = AutomaticPlayStory.New()
+    autoplaystory:Play(storyid, callback)
+end
+
+---AutomaticPlayStory构造函数
+function AutomaticPlayStory:__init()
+end
+
+---剧情播放准备
+function AutomaticPlayStory:PlayStoryPreparation()
+    -- 剧情挂载节点准备
+    -- 默认世界物体挂载的地方
+    self.StoryParentNode = _G.UIManager:GetInstance():GetUILayerTrans(_G.UILayers.TopLayer.Name)
+
+    --剧情资源准备
+    self.CurrentAutoStory:PreloadStoryResources(_G.handlerbind(self, self.OnPlayStoryPreparationCompleted))
+
+    self.IsMainWolrdHidePlay = false
+    local IsDialogueEnterWorld = _G.StoryManager:GetInstance():IsDialogueEnterWorld()
+    if IsDialogueEnterWorld then
+        _G.StoryManager:GetInstance():SetIsHideOtherPlayer(true)
+        self.IsMainWolrdHidePlay = true
+    end
+end
+
+---剧情播放完成
+function AutomaticPlayStory:PlayOver()
+    if self.CurrentAutoStory ~= nil then
+    end
+    _G.IStoryPlay.PlayOver(self)
+
+    if self.IsMainWolrdHidePlay == true then
+        _G.StoryManager:GetInstance():SetIsHideOtherPlayer(false)
+        self.IsMainWolrdHidePlay = nil
+        local world = _G.WorldManager:GetInstance():GetCurWorld()
+        world:StartObjectAlphaCheck()
+    end
+    _G.StoryManager:GetInstance():SetDialogueEnterWorld(nil)
+end
+
+---数据清空
+function AutomaticPlayStory:Clear()
+    _G.IStoryPlay.Clear(self)
+end
+---数据接口结束
+
+---重写剧情辅助管理接口(单个自动化表现不进剧情实体管理self.StoryItemMap)
+---添加实体对象[virtual]
+---@param storyitem WorldBaseItem @实体对象
+---@return boolean @是否添加成功
+function AutomaticPlayStory:AddStoryItem(storyitem)
+    assert(storyitem, "不允许添加空剧情实体对象!")
+    --单个剧情表现不负责管理剧情创建对象
+    return true
+end
+
+---销毁指定UID实体对象[abstract]
+---@param uid number @实体对象UID
+---@return boolean @是否销毁剧情实体成功
+function AutomaticPlayStory:DestroySpecificStoryItem(uid)
+    local world = _G.WorldManager:GetInstance():GetCurWorld()
+    --但剧情表现，不负责管理剧情实体对象，直接删除世界里的
+    local storyitem = world:GetItemInfo(uid)
+    if storyitem ~= nil then
+        world:RemoveWorldItems(uid)
+        return true
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log(string.format("找不到实体对象UID:%s，销毁剧情实体对象失败!", uid))
+        end
+        return false
+    end
+end
+
+---销毁所有实体对象
+function AutomaticPlayStory:DestroyAllStoryItem()
+    --单个剧情表现，不负责管理销毁创建的实体对象
+end
+
+---获取指定实体对象
+---@param uid number @实体对象UID
+---@return WorldBaseItem @符合条件的实体对象
+function AutomaticPlayStory:GetStoryItem(uid)
+    --单个剧情表现，直接世界里找，不进剧情实体对象管理里
+    return _G.WorldManager:GetInstance():GetCurWorld():GetItemInfo(uid)
+end
+
+---@type AutomaticPlayStory @自动化播放Story抽象
+_G.AutomaticPlayStory = AutomaticPlayStory

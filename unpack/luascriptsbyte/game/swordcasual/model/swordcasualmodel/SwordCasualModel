@@ -1,0 +1,297 @@
+local base = _G.GameDataModelBase
+
+---@class SwordCasualModel : GameDataModelBase
+---@field GetInstance fun():SwordCasualModel
+---@field stages jzxx_stage_cfg[]       关卡列表
+---@field curStageIndex number          当前进行中的关卡下标
+---@field challengeIndex number         挑战中关卡下标
+---@field arraignedStage jzxx_stage_cfg 提审挑战配置(当前进行中)
+---@field arraignedStages jzxx_stage_cfg[] 提审挑战配置列表
+---@field arraignedPass table<number,boolean>     提审挑战序号列表(已通关)
+local SwordCasualModel = _G.BaseClass("SwordCasualModel", base)
+
+function SwordCasualModel:__init()
+    self.stages = {}
+    self.curStageIndex = 1
+    for _, cfg in pairs(_G.ConfigManager.jzxx_stage_cfg) do
+        if cfg.type == 0 then
+            table.insert(self.stages, cfg)
+        end
+    end
+    table.sort(self.stages, function(a, b)
+        return a.id < b.id
+    end)
+end
+
+---从服务器拉取数据
+function SwordCasualModel:GetDataFormServer()
+    self:ParseData()
+end
+
+---@param msg any
+function SwordCasualModel:ParseData(msg)
+    base.ParseData(self)
+end
+
+---检测是否全部通关
+---@return boolean
+function SwordCasualModel:CheckIsAllPass()
+    local curStage = self.stages[self.curStageIndex]
+    return not curStage
+end
+
+---获取当前待挑战关卡下标
+---@return number
+function SwordCasualModel:GetCurSectionIndex()
+    return self.curStageIndex
+end
+
+---获取关卡配置
+---@return jzxx_stage_cfg[]
+function SwordCasualModel:GetSectionCfgs()
+    return self.stages
+end
+
+---挑战
+---@param sectionId number 关卡下标
+function SwordCasualModel:Challenge(stageIndex)
+    local stageCfg = self.stages[stageIndex]
+    if not stageCfg then
+        local cfg = _G.ConfigManager.jzxx_stage_cfg[stageIndex]
+        if cfg then
+            for index, _cfg in ipairs(self.stages) do
+                if _cfg.id == stageIndex then
+                    stageCfg = _cfg
+                    stageIndex = index
+                    break
+                end
+            end
+        end
+    end
+    if not stageCfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("挑战的关卡sectionId不存在: " .. tostring(stageIndex))
+        end
+        return
+    end
+    if _G.AppSetting.DEBUG then
+        if stageIndex ~= self.curStageIndex then
+            _G.LogError("当前挑战的关卡stageIndex错误: " .. tostring(stageIndex))
+        end
+    end
+    self.challengeIndex = stageIndex
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.SwordCasualView.Name,
+        stageIndex,
+        stageCfg,
+        _G.handler(self, self.OnChallengeSettlement)
+    )
+end
+
+---监听挑战结束事件
+---@param win boolean 是否胜利
+---@param kill number 击杀数量
+---@param time number 挑战时间
+function SwordCasualModel:OnChallengeSettlement(win, kill, time, jssc)
+    if win and self.curStageIndex == self.challengeIndex then
+        self.curStageIndex = self.curStageIndex + 1
+        self.challengeIndex = self.challengeIndex + 1
+        _G.Events:GetInstance():Broadcast(_G.eMiniSectionGame.MiniSectionPass)
+    end
+
+    local hasNextStage = win and (not not self.stages[self.challengeIndex])
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.SwordCasualSettlementView.Name,
+        { win = win, next = hasNextStage, kill = kill, time = time , jssc = jssc},
+        ---@param type number 0返回, 1-继续, 2-重新开始
+        function(type)
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SwordCasualView.Name)
+            if type == 1 or type == 2 then
+                self:Challenge(self.challengeIndex)
+            end
+        end
+    )
+end
+
+--region ====================审核模式====================
+
+---获取提审挑战配置
+---@return jzxx_stage_cfg[]
+function SwordCasualModel:GetArraignedSectionCfgs()
+    if not self.arraignedStages then
+        local deulfttype = 2
+        if _G.GameUtil.IsUsedRussian() then
+            deulfttype = 3
+        end
+        self.arraignedStages = {}
+        for _, cfg in pairs(_G.ConfigManager.jzxx_stage_cfg) do
+            if cfg.type == deulfttype then
+                table.insert(self.arraignedStages, cfg)
+            end
+        end
+        table.sort(self.arraignedStages, function(a, b)
+            return a.id < b.id
+        end)
+        if _G.table.isEmptyOrNil(self.arraignedStages) then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("提审挑战配置为空")
+            end
+            self.arraignedStages = self:GetSectionCfgs()
+        end
+    end
+    return self.arraignedStages
+end
+
+---获取已通关关卡列表
+---@return table<number,boolean>    @table<序号,状态>
+function SwordCasualModel:GetArraignedPass()
+    if not self.arraignedPass then
+        self.arraignedPass = {}
+        local sids = _G.PlayerPrefsManager.GetTable("Arraigned_SwordCasual_Pass", true)
+        if sids then
+            for _, sid in ipairs(sids) do
+                self.arraignedPass[sid] = true
+            end
+        end
+    end
+    return self.arraignedPass
+end
+
+---设置提审挑战序号(已通关)
+---@param index number 提审挑战序号(已通关)
+function SwordCasualModel:SetArraignedPass(index)
+    local data = self:GetArraignedPass()
+    data[index] = true
+
+    local sids = {}
+    for sid, _ in pairs(data) do
+        table.insert(sids, sid)
+    end
+    _G.PlayerPrefsManager.SetTable("Arraigned_SwordCasual_Pass", sids, true)
+end
+
+---设置提审挑战序号(已通关)
+---@param index number 提审挑战序号(已通关)
+function SwordCasualModel:IsArraignedPass(index)
+    return self:GetArraignedPass()[index] or false
+end
+
+---获取一个未通关关卡序号, 默认返回max
+function SwordCasualModel:GetArraignedNoPassIndex()
+    local cfgs = self:GetArraignedSectionCfgs()
+    for i = 1, #cfgs do
+        if not self:IsArraignedPass(i) then
+            return i
+        end
+    end
+    return #cfgs
+end
+
+---提审挑战关卡列表
+function SwordCasualModel:ArraignedChallenge()
+    self.arraignedStage = nil
+    --if _G.AppSetting.IsArraigned and _G.AppSetting.IsIos and 
+    if _G.GameUtil.IsUsedRussian() then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.ArraignedSectionGameView.Name,
+            1101
+        )
+    else
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.ArraignedSectionGameView.Name,
+            1001
+        )
+    end
+end
+
+---开启挑战游戏
+---@param stageCfg jzxx_stage_cfg 提审挑战配置
+function SwordCasualModel:ArraignedChallengeStage(stageCfg)
+    local isPayment = false
+    if _G.AppSetting.IsIos then
+        --ZHJH-16534【客户端】提审模式下强制进入剑之修行小游戏
+        --繁体ios使用10001这个关卡id
+        isPayment = true --启用提审支付模块
+    end
+    stageCfg = stageCfg or _G.ConfigManager.jzxx_stage_cfg[1001]
+
+    local index = _G.table.indexof(self:GetArraignedSectionCfgs(), stageCfg)
+    if not index or index <= 0 then
+        index = 1
+    end
+
+    self.arraignedStage = stageCfg
+
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnUIOpenedOfArraigned, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.SwordCasualView.Name,
+        index,
+        stageCfg,
+        _G.handler(self, self.ArraignedSettlement),
+        false,
+        isPayment --是否显示支付模块
+    )
+end
+
+---提审结算
+function SwordCasualModel:ArraignedSettlement(win, kill, time, score, jssc)
+    local index = self.arraignedStage and _G.table.indexof(self:GetArraignedSectionCfgs(), self.arraignedStage)
+    if not index or index <= 0 then
+        index = 1
+    end
+    --通关当前关卡
+    if win then
+        if not self:IsArraignedPass(index) then
+            self:SetArraignedPass(index)
+            if self.arraignedStage and self.arraignedStage.reward and #self.arraignedStage.reward > 0 then
+                require("ArraignedMallModel"):GetInstance():AddPointNum(self.arraignedStage.reward[1][2])
+            end
+        end
+    end
+
+    ---@type SwordCasualView
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SwordCasualView.Name)
+    if view then
+        view:SetCloseCallback(nil) --打开了结算面板, 不再监听关闭事件
+    end
+
+    local hasNextStage = index < #self:GetArraignedSectionCfgs()
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.SwordCasualSettlementView.Name,
+        { win = win, next = hasNextStage, kill = kill, time = time, jssc = jssc },
+        ---@param type number type: 0返回, 1-继续, 2-重新开始
+        function(type)
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SwordCasualView.Name)
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SwordCasualSettlementView.Name)
+            if type == 2 and self.arraignedStage then
+                self:ArraignedChallengeStage(self.arraignedStage)
+            elseif type == 1 and win and self.arraignedStage then
+                local cfgs = self:GetArraignedSectionCfgs()
+                self:ArraignedChallengeStage(cfgs[index + 1] or cfgs[#cfgs])
+            else
+                self:ArraignedChallenge()
+            end
+        end
+    )
+end
+
+function SwordCasualModel:OnUIOpenedOfArraigned(name)
+    if name ~= _G.ConfigManager.ui_cfg.SwordCasualView.Name then
+        return
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnUIOpenedOfArraigned, self)
+    ---@type SwordCasualView
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(
+        _G.ConfigManager.ui_cfg.SwordCasualView.Name
+    )
+    if view then
+        view:SetHelpButtonActive(false)
+        view:SetSettingsButtonActive(false)
+        --view:SetCloseButtonActive(false)
+        view:SetCloseCallback(_G.handler(self, self.ArraignedChallenge)) --关闭按钮回调
+    end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArraignedSectionGameView.Name)
+end
+
+--endregion
+return SwordCasualModel

@@ -1,0 +1,344 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.World.Object.WorldEnemyItem	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/08/06
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local ItemEvent = _G.WorldItemManager.ItemEvent
+local base = require "WorldBaseItem"
+---@class WorldEnemyItem	中文描述
+---@field isEnterFight boolean 是否触发进入战斗（防止多次触发）
+local WorldEnemyItem = _G.BaseClass("WorldEnemyItem", base)
+
+---类的构造函数
+function WorldEnemyItem:__init()
+end
+
+---类的析构函数
+function WorldEnemyItem:Dispose()
+    self.isInteracted = nil
+    self.openInteractedView = nil
+end
+
+---初始化
+function WorldEnemyItem:Init()
+    base.LoadObject(self)
+end
+
+-----加载配置资源节点
+function WorldEnemyItem:LoadResObj()
+    base.LoadResObj(self)
+end
+
+---加载资源完成
+function WorldEnemyItem:OnLoadResObjComplete()
+    local name
+    if self.Cfg then
+        if self.Cfg.Name ~= 0 then
+            name = _G.GetLangPackValue(self.Cfg.Name)
+        end
+    else
+        if self.ItemData.Name then
+            name = self.ItemData.Name
+        end
+    end
+    if name then
+        self.ItemData.role_name = name
+        self:InitTitle(name)
+    end
+    --新增模型的缩放设置
+    local scale = self.Cfg.Scale or 1
+    self.Transform:SetLocalScaleXYZ(scale)
+    if self.TitleTransform then
+        scale = 1 / scale
+        self.TitleTransform:SetLocalScaleXYZ(scale)
+    end
+    self:AddTriggerComponent(
+        function()
+            base.OnLoadResObjComplete(self)
+        end
+    )
+end
+
+function WorldEnemyItem:OnGameObjShow()
+    if self.isInteracted then
+        return
+    end
+    if not self.ObjectMod then
+        return
+    end
+    base.OnGameObjShow(self)
+    self:CheckInitState()
+    if not _G.table.isEmptyOrNil(self.AllNode) then
+        local WorldItemManagerIns = _G.WorldItemManager:GetInstance()
+        WorldItemManagerIns:RegiestWorldItemEvent(ItemEvent.interactionBoxStart, self.StopCfgMove, self)
+        WorldItemManagerIns:RegiestWorldItemEvent(ItemEvent.interactionBoxEnd, self.ContinueCfgMove, self)
+    end
+end
+function WorldEnemyItem:OnGameObjHide()
+    base.OnGameObjHide(self)
+    if not _G.table.isEmptyOrNil(self.AllNode) then
+        local WorldItemManagerIns = _G.WorldItemManager:GetInstance()
+        WorldItemManagerIns:UnRegiestWorldItemEvent(ItemEvent.interactionBoxStart, self.StopCfgMove, self)
+        WorldItemManagerIns:UnRegiestWorldItemEvent(ItemEvent.interactionBoxEnd, self.ContinueCfgMove, self)
+    end
+end
+function WorldEnemyItem:OnEnterWorld()
+    if self.isInteracted == nil then
+        self.isInteracted = _G.ChapterRoomManager:GetInstance():CheckRoomMonstergroupDone(self.ItemData.EnterFightId)
+    end
+    if self.isInteracted then
+        return
+    end
+    self:StartUpdateMove()
+    _G.Events:GetInstance():AddListener(_G.WorldItemManager.ItemEvent.enemyBattleDone, self.OnEnemyBattleDone, self)
+    base.OnEnterWorld(self)
+end
+function WorldEnemyItem:OnExitWorld()
+    _G.Events:GetInstance():RemoveListener(
+        _G.WorldItemManager.ItemEvent.resetPlayerSafePoint,
+        self.OnPlayerToSafePoint,
+        self
+    )
+    if not self.isInteracted then
+        _G.Events:GetInstance():RemoveListener(
+            _G.WorldItemManager.ItemEvent.enemyBattleDone,
+            self.OnEnemyBattleDone,
+            self
+        )
+    end
+    base.OnExitWorld(self)
+end
+
+---初始化头顶标题
+---@param nameStr string 名字
+function WorldEnemyItem:InitTitle(nameStr)
+    _G.PoolsManager:GetInstance():Spawn(
+        "CommonPrefab/World/Enemy_Title",
+        _G.ePoolType.Default,
+        self.World:GetTitleRoot(),
+        function(title)
+            local go_table = _G.GetAutoGoTable(title)
+            self.TitleTransform = title
+            self.TitleTextName = go_table.aortext_TextName
+            self.TitleScaleRoot = go_table.trans_root
+            self.TitleTextName.text = nameStr
+            self.TitleTransform:SetLocalPosition(1000, 1000, 1000)
+            if self.Cfg.Params[1] == _G.HeroType.Elite then
+                go_table.aorimage_title.SpriteName = "ui_jq_font_jingy"
+            elseif self.Cfg.Params[1] == _G.HeroType.Boss then
+                go_table.aorimage_title.SpriteName = "ui_jq_font_sl"
+            else
+                go_table.aorimage_title.SpriteName = "ui_jq_font_put"
+            end
+            self.TitleTransform:SetActiveE(0)
+        end
+    )
+end
+
+--region 触发器
+function WorldEnemyItem:OnClick()
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    if player then
+        player:GotoPoint(
+            _G.Vector3.New(self.Transform:GetPosition()),
+            _G.handler(self, self.InteractedAction),
+            nil,
+            self.Cfg.ActionRadius
+        )
+        --点击NPC 不显示自动寻路
+        _G.Events:GetInstance():Broadcast(_G.eNav.HideFlag, player.Uid)
+    end
+end
+
+-----行为触发
+---@param isEnter boolean 是否是进入
+---@param tarInstId number 碰撞到的物体InstId
+---@param tarObj UnityEngine.GameObject 碰撞到的物体
+---@param luaObj WorldBaseItem 碰撞到的物体Lua对象
+function WorldEnemyItem:NodeActionTriggerEvent(isEnter, tarInstId, tarObj, luaObj)
+    -- if not self:CheckPlayerClickTarget() then
+    --     return
+    -- end
+    self:SetPlayerClickTargetNil()
+    if self.isInteracted then
+        return
+    end
+    if not self.Enable then
+        return
+    end
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    --和主角发生碰撞
+    if tarInstId == player.InstID then
+        if #self.Cfg.shader_type > 0 and self.ObjectMod then
+            local r = self.Cfg.shader_type[1] and self.Cfg.shader_type[1] or 255
+            local g = self.Cfg.shader_type[2] and self.Cfg.shader_type[2] or 255
+            local b = self.Cfg.shader_type[3] and self.Cfg.shader_type[3] or 255
+            self.World.CommonEff:SetSelectState(self.ObjectMod, isEnter, r, g, b)
+        end
+        if isEnter then
+            if self.Cfg.TriggerType == 1 then --靠近触发
+                self:InteractedAction()
+            elseif self.Cfg.TriggerType == 2 then --交互触发
+                self.openInteractedView = true
+                _G.WorldItemManager:GetInstance():OpenInteractedView(
+                    _G.WorldItemType.Enemy,
+                    _G.handler(self, self.InteractedAction),
+                    self.Transform
+                )
+            end
+            _G.Events:GetInstance():AddListener(
+                _G.WorldItemManager.ItemEvent.resetPlayerSafePoint,
+                self.OnPlayerToSafePoint,
+                self
+            )
+        else
+            self.openInteractedView = false
+            _G.WorldItemManager:GetInstance():CloseInteractedView(_G.WorldItemType.Enemy, self.Transform)
+            _G.Events:GetInstance():RemoveListener(
+                _G.WorldItemManager.ItemEvent.resetPlayerSafePoint,
+                self.OnPlayerToSafePoint,
+                self
+            )
+        end
+    end
+end
+--endregion
+function WorldEnemyItem:OnPlayerToSafePoint()
+    _G.Events:GetInstance():RemoveListener(
+        _G.WorldItemManager.ItemEvent.resetPlayerSafePoint,
+        self.OnPlayerToSafePoint,
+        self
+    )
+    self.World.CommonEff:SetSelectState(self.ObjectMod, false)
+end
+---交互行为
+function WorldEnemyItem:InteractedAction()
+    if self.isInteracted then
+        return
+    end
+    if self.openInteractedView then
+        _G.WorldItemManager:GetInstance():CloseInteractedView(_G.WorldItemType.Enemy, self.Transform)
+        self.openInteractedView = false
+    end
+    self:StopCfgMove()
+    if not self:CheckLimitType(_G.handler(self, self.ContinueCfgMove)) then
+        return
+    end
+    if #self.Cfg.default_interaction_plot > 0 and self.Cfg.default_interaction_plot[1] > 0 then
+        _G.AutomaticPlayStory.PlayStoryByID(
+            self.Cfg.default_interaction_plot[1],
+            _G.handler(self, self.OnInteractedStoryEnd)
+        )
+    else
+        self:OnInteractedStoryEnd()
+    end
+end
+---当交互剧情播完(战斗开始之前的剧情)
+function WorldEnemyItem:OnInteractedStoryEnd()
+    if self.isEnterFight then
+        return
+    end
+    self.isEnterFight = true
+    _G.ChapterRoomManager:GetInstance():TriggerRoomEnemyBattle(
+        self.ItemData.EnterFightId,
+        self.Sid,
+        _G.handler(self, self.OnBattleEnd)
+    )
+end
+function WorldEnemyItem:OnEnemyBattleDone(id)
+    local sid = _G.ChapterRoomManager:GetInstance():GetRoomMonstergroupID(self.ItemData.EnterFightId)
+    if sid == id then
+        self:OnBattleEnd(true)
+    end
+end
+---死亡动作播完后的剧情序列
+local PlayBattleStoryIndex = 2
+---战斗结束
+function WorldEnemyItem:OnBattleEnd(success)
+    self.isEnterFight = false
+    _G.Events:GetInstance():RemoveListener(
+        _G.WorldItemManager.ItemEvent.resetPlayerSafePoint,
+        self.OnPlayerToSafePoint,
+        self
+    )
+    _G.Events:GetInstance():RemoveListener(_G.WorldItemManager.ItemEvent.enemyBattleDone, self.OnEnemyBattleDone, self)
+    self.World.CommonEff:SetSelectState(self.ObjectMod, false)
+    if success then
+        local id = _G.ChapterRoomManager:GetInstance():GetRoomMonstergroupID(self.ItemData.EnterFightId)
+        _G.Events:GetInstance():Broadcast(_G.WorldItemManager.ItemEvent.enemyBattleDone, id)
+        base.OnGameObjHide(self)
+        self.isInteracted = true
+        _G.WorldManager:GetInstance():SetBaseViewVisible(false)
+        _G.WorldManager:GetInstance():GetCurWorldPlayer():SetTransformLock(true)
+        if
+            #self.Cfg.default_interaction_plot >= PlayBattleStoryIndex and
+                self.Cfg.default_interaction_plot[PlayBattleStoryIndex] > 0
+         then
+            _G.AutomaticPlayStory.PlayStoryByID(
+                self.Cfg.default_interaction_plot[PlayBattleStoryIndex],
+                _G.handler(self, self.OnBattleEndStoryEnd)
+            )
+        else
+            self:OnBattleEndStoryEnd()
+        end
+    end
+end
+---当战斗结束剧情播完(战斗结束之后的剧情，结算完)
+function WorldEnemyItem:OnBattleEndStoryEnd()
+    if self.Transform:GetActiveSelf() == 1 then
+        _G.AnimatorPlayEndCallback.AddCallback(
+            _G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE(),
+            _G.handler(self, self.PlayDeathActionEndCall)
+        )
+        self:CheckInteractionEndState(true, _G.handler(self, self.PlayDeathActionEndCall))
+    else
+        self.OriginalShowState = false
+        _G.WorldManager:GetInstance():GetCurWorldPlayer():SetTransformLock(false)
+        _G.WorldManager:GetInstance():SetBaseViewVisible(true)
+        _G.Events:GetInstance():Broadcast(
+            _G.WorldItemManager.ItemEvent.enemyDispeared,
+            _G.ChapterRoomManager:GetInstance():GetCurRoomCfg().battle_serial[self.ItemData.EnterFightId]
+        )
+    end
+end
+---死亡动作播完后的剧情序列
+local PlayDeathStoryIndex = 5
+---当死亡动作播放完回调
+function WorldEnemyItem:PlayDeathActionEndCall()
+    _G.AnimatorPlayEndCallback.RemoveCallback(
+        _G.IsNil(self.Transform) and 0 or self.Transform:GetInstanceIDE(),
+        _G.handler(self, self.PlayDeathActionEndCall)
+    )
+    if
+        #self.Cfg.default_interaction_plot >= PlayDeathStoryIndex and
+            self.Cfg.default_interaction_plot[PlayDeathStoryIndex] > 0
+     then
+        -- _G.WorldManager:GetInstance():SetBaseViewVisible(false)
+        _G.AutomaticPlayStory.PlayStoryByID(
+            self.Cfg.default_interaction_plot[PlayDeathStoryIndex],
+            _G.handler(self, self.OnPlayDeathStoryEndCall)
+        )
+    else
+        self:OnPlayDeathStoryEndCall()
+    end
+end
+---当死亡动画后剧情完毕回调
+function WorldEnemyItem:OnPlayDeathStoryEndCall()
+    self:OnExitWorld()
+    self.OriginalShowState = false
+    _G.WorldManager:GetInstance():SetBaseViewVisible(true)
+    _G.TimerManager:GetInstance():GetTimer(2, self.GetTimerCallBack, self, true, true):Start()
+end
+
+function WorldEnemyItem:GetTimerCallBack()
+    _G.WorldManager:GetInstance():GetCurWorldPlayer():SetTransformLock(false)
+    --发送宝箱播放开启的事件
+    local roomCfg = _G.ChapterRoomManager:GetInstance():GetCurRoomCfg()
+    _G.WorldItemManager:GetInstance():BroadcastWorldItemEvent(
+        _G.WorldItemManager.ItemEvent.enemyDispeared,
+        roomCfg.battle_serial[self.ItemData.EnterFightId]
+    )
+end
+
+return WorldEnemyItem

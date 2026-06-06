@@ -1,0 +1,1124 @@
+-------------------------------------------------------------------------
+-- D:.Game.Client.Assets.Resources.LuaScripts.Game.MonsterSiege.Model.MonsterSiegeModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/10/28
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local RankItemData = require("LingRankItemData")
+local MonsterSiegeManager = require "MonsterSiegeManager"
+local base = require "ActivitySynTypeBase"
+---@class MonsterSiegeModel : ActivitySynTypeBase	怪物攻城 model
+local MonsterSiegeModel = _G.BaseClass("MonsterSiegeModel", base)
+
+-- function MonsterSiegeModel:__init()
+--     _G.Events:GetInstance():AddListener(self.curActivityClass.regiestStateChangedStr, self.OnCloseMonsterSiege, self)
+-- end
+-- ---活动结束
+-- function MonsterSiegeModel:OnCloseMonsterSiege(state)
+--     if state == require "ActivitySynManager".State.Close then
+--         local isExist, view = _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name)
+--         if isExist then
+--             isExist, view = _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.EmbattleView.Name)
+--             if isExist then
+--                 view.View:QuitEmbattle()
+--             end
+--             MonsterSiegeManager:GetInstance():ExitSection()
+--         end
+--     end
+-- end
+
+local bossid = 10
+---@return MonsterSiegeModel MonsterSiegeModel
+function MonsterSiegeModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function MonsterSiegeModel:__init()
+    self.cur_monsterID = 1
+    self.isPaomadeng = true --登录时 记录数据使用
+    self.maxRefreshNum = _G.ConfigManager.discrete_cfg[106509][1][1] + 1
+end
+
+---销毁对象时,析构函数
+function MonsterSiegeModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+
+---测试代码 获取 info信息
+------@field  data  achieve.s2c_achieve_info  ack = 是否成功 ，activity = 信息
+function MonsterSiegeModel:TestGetInfo(call)
+    require "ActivitySynNet":GetInstance():InitActivity(
+        self:GetActivieID(),
+        function(data)
+            if data.ack ~= 1 then
+                if _G.AppSetting.DEBUG then
+                    _G.Log("活动信息为空")
+                end
+                return
+            end
+            ---@field  activity activity.i_activity
+            ---@field  info activity.i_activity_info 活动公共信息
+            ---@field  time activity.i_activity_time 活动时间
+            ---@field  self_info activity.i_activity_self_info 活动独立信息
+            local msg = data.activity[1].self_info.siege
+            self:InitDataSiege(msg)
+            self:UpdateRedpoint()
+            self:UpdateRank()
+            self:RankPlayerGongXZiang(
+                function()
+                    if call then
+                        call()
+                    end
+                end
+            )
+        end
+    )
+end
+---获取数据
+function MonsterSiegeModel:OnHandleGMData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+function MonsterSiegeModel:ParseData(data)
+    self:SetSelfData(data)
+    base.ParseData(self)
+end
+function MonsterSiegeModel:SetSelfData(info)
+    if info == nil or info.siege == nil then
+        --("获取数据信息为空")
+        return
+    end
+    self.info = info
+    self:InitDataSiege(info.siege)
+end
+
+function MonsterSiegeModel:OnCheckActivityAwardDone()
+    return not self.curActivityClass:GetFunctionOpen()
+end
+-- ---在界面中 跨天刷新 （离开，跳转界面 未刷新红点）
+-- function MonsterSiegeModel:CloseSetRedPoint()
+--     local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "monstersiege"
+--     _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, 0)
+--     self:UpdateRedpoint()
+-- end
+function MonsterSiegeModel:OnEnterActivity()
+    if self.curActivityClass:GetCurActivityState() == 4 or self.curActivityClass:GetCurActivityState() == 1 then
+        _G.GlobalInterface.JumpActivityByGM(10005, self.curActivityClass:GetJumpType())
+        --_G.FloatTipsModel:GetInstance():Show("活动结算时间")
+        return
+    end
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "monstersiege"
+    _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, 0)
+    MonsterSiegeManager:GetInstance():InitActivityClass(self.curActivityClass)
+    self:UpdateRedpoint()
+    --MonsterSiegeManager:GetInstance():EnterScence()
+    ---重新拉取下服务器数据
+    self:TestGetInfo(
+        function()
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.MonsterSiegeStartView.Name,
+                self.curActivityClass
+            )
+        end
+    )
+end
+--初始化数据
+function MonsterSiegeModel:InitFunction()
+    self:InitDataSiege(self.info.siege)
+    self:SetRedpointLogin()
+    self:UpdateRedpoint()
+    local wind = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name)
+    if wind then
+        self.player_jifen_rank = nil
+        self.playerself = nil
+        self:RankPlayerGongXZiang(
+            function()
+                wind.View:UpdateView()
+                self:UpdateRank(
+                    function()
+                        local wind1 =
+                            _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MonsterSiegeRankView.Name)
+                        if wind1 then
+                            wind1.View:UpdateView()
+                        end
+                    end
+                )
+            end
+        )
+    end
+    ---结算时间 关闭
+    if self.curActivityClass:GetCurActivityState() == 4 or self.curActivityClass:GetCurActivityState() == 1 then
+        self.curActivityClass.curState = 1
+        self.curActivityClass:ChangeState(1)
+    end
+end
+function MonsterSiegeModel:SetRedpointLogin()
+    local nowtime = _G.TimeUtil.GetServerUnixTime()
+    local tb = _G.TimeUtil.GetDateTime(nowtime)
+    local flag = true
+    if tb.hour < _G.TimeUtil.GAME_DAY_HOUR then
+        flag = false
+    end
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "monstersiege_time"
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+        local login_time = _G.CS.WechatGameCore.PlayerPrefs.GetInt(key)
+        if _G.TimeUtil.CheckTheSameDay(login_time, nowtime) then
+        else
+            if flag then
+                --检测是否 还有未充值的
+                _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, nowtime)
+                local key2 = tostring(_G.PlayerModel:GetInstance().role_uid) .. "monstersiege"
+                _G.CS.WechatGameCore.PlayerPrefs.SetInt(key2, 1)
+            end
+        end
+    else
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key, nowtime)
+        local key1 = tostring(_G.PlayerModel:GetInstance().role_uid) .. "monstersiege"
+        _G.CS.WechatGameCore.PlayerPrefs.SetInt(key1, 1)
+    end
+end
+
+-- function MonsterSiegeModel:OnGetMainViewName()
+--     return _G.ConfigManager.ui_cfg.MonsterSiegeStartView.Name
+-- end
+---初始化 活动信息数据
+---@param msg activity.i_activity_self_info 活动信息
+function MonsterSiegeModel:InitDataSiege(msg)
+    self.f_lv = msg.f_lv or 1 -- 集结等级 (已代表怪物的sid)
+    require "MonsterSiegeTaskModel":GetInstance():initTaskAll(msg)
+    self.buff_list = msg.buff_list or {} --已获取的buff
+    self.coin_num = msg.coin_num or {} --活动币数量
+    require "MonsterSiegeManager":GetInstance():Clear()
+    require "MonsterSiegeManager":GetInstance():SetCoinActivity(msg.coin_num)
+    --self.cards_team = msg.cards --动态怪数据
+    self.dam = msg.dam --今日贡献
+    self.guild_dam = msg.guild_dam --所在公会得贡献值(有公会才发)
+    self.dps = msg.dps --今日最高伤害
+    self.playerself = {}
+    self.refreshNum = self.maxRefreshNum - msg.refresh_times
+    self.random_buff_list = msg.random_buff_list or {}
+    -- self:SetMonsterID(self.f_lv)
+    local time = _G.TimeUtil.GetSixClockTimer()
+    if time == 0 or _G.math.abs(86400 - time) <= 1 then
+        if self.curActivityClass:GetCurActivityState() == require "ActivitySynManager".State.Close then
+            return
+        end
+        self.timer =
+            _G.TimerManager:GetInstance():GetTimer(
+            60,
+            self.TestGetInfo,
+            self,
+            true,
+            false,
+            true,
+            function()
+                _G.Events:GetInstance():Broadcast(_G.eMonsterSiege.RefreshRank)
+            end
+        )
+        self.timer:Start()
+    end
+end
+function MonsterSiegeModel:SetCoinActivity(coinnum)
+    self.coin_num = self.coin_num + coinnum
+end
+function MonsterSiegeModel:GetCoinActivity()
+    return self.coin_num or 0
+end
+---获得今日最高伤害
+function MonsterSiegeModel:GetDps()
+    return self.dps
+end
+
+function MonsterSiegeModel:SetDps(dps)
+    if self.dps and self.dps < dps then
+        self.dps = dps
+    end
+end
+
+---获得公会积分
+-- function MonsterSiegeModel:GetGuildDam()
+--     return self.guild_dam or ""
+-- end
+---增加公会积分
+-- function MonsterSiegeModel:AddGuildDam(num)
+--     if not require "SociatyManager":GetInstance():HasSociaty() then
+--         return
+--     end
+--     if not self.guild_dam then
+--         self.guild_dam = 0
+--     end
+--     return self.guild_dam + num
+-- end
+
+---获得个人得积分
+function MonsterSiegeModel:GetPlayerDam()
+    return self.dam or 0
+end
+---增加个人积分
+function MonsterSiegeModel:AddPlayerDam(num)
+    self.dam = self.dam + num
+    --self:AddGuildDam(num)
+end
+
+---获得个人得战斗力
+function MonsterSiegeModel:GetPower()
+    return self.power or 0
+end
+---获得集结等级
+function MonsterSiegeModel:GetLevel()
+    return self.f_lv or 1
+end
+---获取活动id
+function MonsterSiegeModel:GetActivieID()
+    return self.curActivityClass:GetActivityID()
+end
+---获得当前的怪物id
+function MonsterSiegeModel:GetMonsterID()
+    return self.cur_monsterID or 1
+end
+---设置当前的怪物id
+function MonsterSiegeModel:SetMonsterID(mon_id)
+    self.cur_monsterID = mon_id
+end
+
+---获取随机buff
+function MonsterSiegeModel:GetBuffList()
+    return self.buff_list
+end
+
+---获取未确定的随机buff
+function MonsterSiegeModel:GetRandomBuffList()
+    return self.random_buff_list
+end
+-- ---检测buff 是否存在
+-- ---@return true,false true =存在buff false = 没有buff
+-- function MonsterSiegeModel:CheckISBuffList()
+--     if self.buff_list == nil or _G.table.isEmptyOrNil(self.buff_list) then
+--         return false
+--     elseif #self.buff_list >= self:GetMonsterID() - 1 then
+--         return true
+--     else
+--         return false
+--     end
+--     return true
+-- end
+------------------------- 红点 ----------------------------------------
+---刷新红点
+---红点
+function MonsterSiegeModel:InitRedPointTree()
+    self.checkRedPointFunc = {self.CheckFirstLogin, nil, self.CheckRankAward}
+    self.redpointTree = {{3}, false, {4}}
+end
+--红点 主界面的
+function MonsterSiegeModel:UpdateRedpoint()
+    local node = self.redpointTree[1][1]
+    require("RedPointManager"):GetInstance():RefreshNode(node)
+    --require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+    --require("RedPointManager"):GetInstance():RefreshNode(0)
+end
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function MonsterSiegeModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+---检测排行的数据
+function MonsterSiegeModel:CheckRankAward()
+    local alltask = require "MonsterSiegeTaskModel":GetInstance().alltask
+    local flag = false
+    if alltask then
+        for i = 1, #alltask do
+            --任务未完成或未领取奖励
+            if alltask[i]:GetAwardState() ~= 2 then
+                flag = true
+                break
+            end
+        end
+    end
+    return flag and 1 or 0
+end
+---检测逻辑 1、当活动开启时，入口界面的按钮有右上角出现红点，点击后消失
+---2、活动持续时间内，每日时间刷新时，主界面右上角出现。点击进入后消失
+function MonsterSiegeModel:CheckFirstLogin()
+    local key = tostring(_G.PlayerModel:GetInstance().role_uid) .. "monstersiege"
+    if _G.CS.WechatGameCore.PlayerPrefs.HasKey(key) then
+        if _G.CS.WechatGameCore.PlayerPrefs.GetInt(key) == 1 then
+            return 1
+        else
+            return 0
+        end
+    else
+        return 1
+    end
+end
+------------------------- 跑马灯 -------------------------------
+function MonsterSiegeModel:GetPaoMadengMsg()
+    if self.msg_paoma then
+        local msg = self.msg_paoma[1]
+        table.remove(self.msg_paoma, 1)
+        return msg
+    end
+    return nil
+end
+function MonsterSiegeModel:ClearPaoma()
+    self.msg_paoma[1] = nil
+end
+------------------------- 排行 ----------------------------------------
+---个人积分榜(所有数据信息)
+function MonsterSiegeModel:RankPlayerGongXZiang(callback)
+    local count = 2
+    require "MonsterSiegeNet":GetInstance():RankPlayerGongXZiang(
+        function(data)
+            self.all_rank_player_jifen = {}
+            self:SetAllRankJifen(data)
+            count = count - 1
+            if count <= 0 then
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+    require "MonsterSiegeNet":GetInstance():RankPlayerSelfGongXZiang(
+        function(data)
+            self.player_jifen_rank = nil
+            count = count - 1
+            local itemData = self:GetSelfRankData()
+            local power = _G.StorageManager:GetInstance():GetPlayerPower()
+            itemData:SetDamage(data.value)
+            itemData:SetParams(power)
+            itemData:SetPlayerMingCi(data.index)
+            self:SetPlayerSelf(itemData, 2)
+            if count <= 0 then
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+function MonsterSiegeModel:GetSelfRankData()
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    local frame = _G.PlayerModel:GetInstance():GetCurFrame()
+    local level = _G.PlayerModel:GetInstance():GetLevel()
+    local name = _G.PlayerModel:GetInstance():GetName()
+    local portrait = _G.PlayerModel:GetInstance():GetRoleStyle()
+    local title = _G.PlayerModel:GetInstance():GetTitle()
+    local itemData = RankItemData.New()
+    itemData:Parse()
+    itemData:SetPlayerName(name)
+    itemData:SetPlayerFrame(frame)
+    itemData:SetSign(title)
+    itemData:Setplaye_level(level)
+    itemData:SetPlayerHead(portrait)
+    itemData:SetisRank(false)
+    itemData:SetPlayerUid(uid)
+    itemData:SetIsMySelf(true)
+    return itemData
+end
+function MonsterSiegeModel:SetAllRankJifen(data)
+    if data == nil then
+        if _G.AppSetting.DEBUG then
+            _G.Log("没有玩家上榜")
+        end
+        return
+    end
+    self:SetRankAllPlayer(data.rank_info, 2, 2, self.all_rank_player_jifen)
+end
+
+function MonsterSiegeModel:SetPaomadeng()
+    for _, v in pairs(self.rank_all_player) do
+        if self.old_all_playes[v:GetPalyerUid()] then
+            if self.old_all_playes[v:GetPalyerUid()]:GetPlayermingCi() > v:GetPlayermingCi() then
+                self.old_all_playes[v:GetPalyerUid()] = v
+                _G.table.insert(self.msg_paoma, v)
+            end
+        else
+            self.old_all_playes[v:GetPalyerUid()] = v
+            _G.table.insert(self.msg_paoma, v)
+        end
+    end
+end
+
+---获取排行榜信息 (战报)
+function MonsterSiegeModel:UpdateRank(callback)
+    --WorldBossNet:GetInstance():GetRank({page = 1}, _G.handler(self, self.GetRankCall))
+    self.playerself = nil
+    require "LingRankNet":GetInstance():GetRankAllInfos({type = 70}, _G.handlerbind(self, self.GetRankCall, callback))
+end
+--ZHJ-20337【客户端】恶灵入侵BOSS展示观众调整
+function MonsterSiegeModel:GetAudienceData()
+    local audienceData = {}
+    local data
+    local proportion = _G.ConfigManager.discrete_cfg[106502]
+    if #self.rank_all_player > 0 then
+        local tempArray = _G.GlobalInterface.GetNewArray(self.rank_all_player)
+        for i = #tempArray, 1, -1 do
+            if tempArray[i]:GetPalyerUid() == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                _G.table.remove(tempArray, i)
+            end
+        end
+        local num = #tempArray
+        if num <= 3 then
+            for i = 1, num do
+                data = {}
+                data.name = tempArray[i]:GetPlayerName()
+                data.style = tempArray[i]:GetPlayerHeadSid()
+                data.city_style = tempArray[i]:GetCityStyle()
+                data.num = tempArray[i]:GetDamage()
+                data.lv = tempArray[i]:GetPlayerLevel()
+                data.halo = tempArray[i]:GetHaloSid()
+                data.title = tempArray[i]:GetPlayerTitle()
+                data.frame = tempArray[i]:GetCurFrameSid()
+                _G.table.insert(audienceData, data)
+            end
+        else
+            local one, two, three =
+                Mathf.Ceil(num * proportion[1][1] / 10000),
+                Mathf.Ceil(num * proportion[1][2] / 10000),
+                Mathf.Floor(num * proportion[1][3] / 10000)
+            local indexs = {Mathf.Random(1, one), Mathf.Random(one + 1, two), Mathf.Random(two + 1, three)}
+            for i = 1, #indexs do
+                data = {}
+                data.name = tempArray[indexs[i]]:GetPlayerName()
+                data.style = tempArray[indexs[i]]:GetPlayerHeadSid()
+                data.num = tempArray[indexs[i]]:GetDamage()
+                data.city_style = tempArray[i]:GetCityStyle()
+                data.lv = tempArray[indexs[i]]:GetPlayerLevel()
+                data.halo = tempArray[indexs[i]]:GetHaloSid()
+                data.title = tempArray[indexs[i]]:GetPlayerTitle()
+                data.frame = tempArray[indexs[i]]:GetCurFrameSid()
+                _G.table.insert(audienceData, data)
+            end
+        end
+    end
+    if _G.table.isEmptyOrNil(audienceData) then
+        return nil
+    end
+    return audienceData
+end
+---获取排行榜回调
+---@param msg rank.s2c_rank_world_boss （战报）
+function MonsterSiegeModel:GetRankCall(msg, callback)
+    self.rankData = msg.rank
+    ---@type LingRankItemData[]
+    self.rank_all_player = {}
+    self:SetRankAllPlayer(msg.rank, 70, 1, self.rank_all_player)
+    ---第一次记录数据 跑马灯信息 需要数据
+    if not _G.table.isEmptyOrNil(self.rank_all_player) then
+        if self.isPaomadeng then
+            self.msg_paoma = {}
+            self.old_all_playes = {}
+            for _, v in pairs(self.rank_all_player) do
+                self.old_all_playes[v:GetPalyerUid()] = v
+            end
+            -- local data = {
+            --     name = self.old_all_playes[1].playerName,
+            --     dame = self.old_all_playes[1]:GetDamage()
+            -- }
+            -- _G.table.insert(self.msg_paoma, data)
+            -- if self.old_all_playes[6] then
+            --     data = {
+            --         name = self.old_all_playes[6].playerName,
+            --         dame = self.old_all_playes[6]:GetDamage()
+            --     }
+            --     _G.table.insert(self.msg_paoma, data)
+            -- end
+            -- if self.old_all_playes[11] then
+            --     data = {
+            --         name = self.old_all_playes[11].playerName,
+            --         dame = self.old_all_playes[11]:GetDamage()
+            --     }
+            --     _G.table.insert(self.msg_paoma, data)
+            -- end
+            self.isPaomadeng = false
+        else
+            self:SetPaomadeng()
+        end
+    end
+    if callback then
+        callback()
+    end
+end
+---所有玩家得数据(战报)
+function MonsterSiegeModel:GetALlPlayers()
+    return self.rank_all_player or {}
+end
+---战报()
+function MonsterSiegeModel:GetALlGuildRank()
+    return self.rank_all_player or {}
+end
+---设置所有玩家得排行数据(战报)
+---@param type number 1 战报,2 = 贡献值
+function MonsterSiegeModel:SetRankAllPlayer(data, rankID, type, tb)
+    local temp = data or {}
+    if _G.table.isEmptyOrNil(temp) then
+        return
+    end
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    for i = 1, #temp do
+        local d_temp = temp[i]
+        if type and type == 2 then
+            d_temp = temp[i].role_info
+        end
+        local itemData = RankItemData.New()
+        itemData:Parse()
+        itemData:SetTypeRankID(rankID) --榜单类型
+        itemData:SetPlayerName(d_temp.name)
+        itemData:Setplaye_level(d_temp.lv)
+        itemData:SetPlayerFrame(d_temp.frame)
+        itemData:SetPlayerHead(d_temp.portrait or d_temp.style)
+        itemData:SetPlayerUid(d_temp.uid)
+        if type and type == 2 then
+            itemData:SetDamage(temp[i].num) --贡献值
+            itemData:SetParams(d_temp.power)
+        else
+            itemData:SetDamage(d_temp.value)
+            itemData:SetTeamCard(d_temp.sids[1].sids)
+            itemData:SetParams(d_temp.params)
+        end
+        -- ZHJ-20337【客户端】恶灵入侵BOSS展示观众调整
+        itemData:SetHaloSid(d_temp.halo)
+        itemData:SetCityStyle(d_temp.city_style)
+        itemData:SetSign(d_temp.title)
+        itemData:SetisRank(true)
+        itemData:SetPlayerMingCi(i)
+        itemData:SetSnapShotTitle(d_temp.snapshot_title)
+        itemData:SetSnapShotHalo(d_temp.snapshot_halo)
+        if uid == d_temp.uid then
+            itemData:SetIsMySelf(true)
+            self:SetPlayerSelf(itemData, type)
+        else
+            itemData:SetIsMySelf(false)
+        end
+        _G.table.insert(tb, itemData)
+    end
+end
+
+function MonsterSiegeModel:SetPlayerSelf(itemdata, type)
+    if type and type == 2 then
+        self.player_jifen_rank = itemdata
+    else
+        self.playerself = itemdata
+    end
+end
+---获得自己得积分榜信息
+function MonsterSiegeModel:GetPlayerJifen()
+    if self.player_jifen_rank ~= nil then
+        return self.player_jifen_rank
+    end
+    ---没在榜单上
+    self.player_jifen_rank = {}
+    self.player_jifen_rank = self:SetPlayer(2)
+    return self.player_jifen_rank
+end
+---@param type number 1= 战报得排行，2 = 积分得排行
+function MonsterSiegeModel:SetPlayer(type)
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    local frame = _G.PlayerModel:GetInstance():GetCurFrame()
+    local level = _G.PlayerModel:GetInstance():GetLevel()
+    local name = _G.PlayerModel:GetInstance():GetName()
+    local portrait = _G.PlayerModel:GetInstance():GetRoleStyle()
+    local title = _G.PlayerModel:GetInstance():GetTitle()
+    local power = _G.StorageManager:GetInstance():GetPlayerPower()
+    local itemData = RankItemData.New()
+    itemData:Parse()
+    itemData:SetPlayerName(name)
+    itemData:SetPlayerFrame(frame)
+    itemData:SetSign(title)
+    itemData:Setplaye_level(level)
+    itemData:SetPlayerHead(portrait)
+    local damage = self:GetDps()
+    if type == 2 then
+        damage = self:GetPlayerDam()
+        itemData:SetDamage(damage)
+        itemData:SetParams(power)
+    else
+        itemData:SetDamage(damage)
+    end
+    itemData:SetisRank(false)
+    itemData:SetPlayerUid(uid)
+    itemData:SetIsMySelf(true)
+    itemData:SetPlayerMingCi(0)
+    return itemData
+end
+---战报（）
+function MonsterSiegeModel:GetPlayerSelf()
+    if not _G.table.isEmptyOrNil(self.playerself) then
+        return self.playerself
+    end
+    self.playerself = {}
+    self.playerself = self:SetPlayer(1)
+    return self.playerself
+end
+---排行信息 (公会贡献排行榜)
+-- function MonsterSiegeModel:RankGuild(callback)
+--     self.guidlRank_lists = {}
+--     local hasGuild = require "SociatyManager":GetInstance():GetGuildUid() > 0
+--     local count = hasGuild and 2 or 1
+--     require "MonsterSiegeNet":GetInstance():RankGuild(
+--         function(data)
+--             count = count - 1
+--             if data.ack then
+--             -- (data)
+--             end
+--             self.guidlRank_lists = {}
+--             self:SetAllRankGuild(data)
+--             if count == 0 then
+--                 if callback then
+--                     callback()
+--                 end
+--             end
+--         end
+--     )
+--     self.guild_self = nil
+--     if hasGuild then
+--         require "MonsterSiegeNet":GetInstance():RankSelfGuild(
+--             function(data)
+--                 self.guild_self = {}
+--                 if data.index <= 0 then
+--                     self.guild_self.mingci = -1 --有公会未上榜
+--                     self.guild_self.banner = require "SociatyManager":GetInstance():GetSociatyIcon()
+--                     self.guild_self.num = self:GetGuildDam()
+--                     self.guild_self.name = require "SociatyManager":GetInstance():GetGuildName()
+--                 else
+--                     self.guild_self.mingci = data.index
+--                     self.guild_self.banner = require "SociatyManager":GetInstance():GetSociatyIcon()
+--                     self.guild_self.num = data.value
+--                     self.guild_self.name = require "SociatyManager":GetInstance():GetGuildName()
+--                 end
+--                 count = count - 1
+--                 if count == 0 then
+--                     if callback then
+--                         callback()
+--                     end
+--                 end
+--             end
+--         )
+--     end
+-- end
+-- function MonsterSiegeModel:SetAllRankGuild(data)
+--     local temp = data or {}
+--     if _G.table.isEmptyOrNil(temp) then
+--         return
+--     end
+--     local player_union_uid = require "SociatyManager":GetInstance():GetGuildUid()
+--     temp = data.rank_info
+--     for i = 1, #temp do
+--         local da = temp[i]
+--         da.mingci = i
+--         if da.uid == player_union_uid then
+--             self.guild_self = da
+--         end
+--         _G.table.insert(self.guidlRank_lists, da)
+--     end
+-- end
+-- function MonsterSiegeModel:GetGuildSelf()
+--     if not _G.table.isEmptyOrNil(self.guild_self) then
+--         return self.guild_self
+--     end
+--     self.guild_self = {}
+--     local player_union_uid = require "SociatyManager":GetInstance():GetGuildUid()
+--     local da = {}
+--     if player_union_uid == 0 then --没有公会
+--         da.mingci = 0
+--         da.banner = ""
+--         da.num = self:GetGuildDam()
+--         da.name = ""
+--     else
+--         da.mingci = -1 --有公会未上榜
+--         da.banner = require "SociatyManager":GetInstance():GetSociatyIcon()
+--         da.num = self:GetGuildDam()
+--         da.name = require "SociatyManager":GetInstance():GetGuildName()
+--     end
+
+--     return da
+-- end
+---公会奖励道具数据
+-- function MonsterSiegeModel:GetRankRewardGuildData()
+--     self.rewardDatas = {}
+--     local array = _G.ConfigManager.discrete_cfg[106504][1]
+--     for _, v in pairs(array) do
+--         _G.table.insert(self.rewardDatas, _G.ConfigManager.system_rank_cfg[v])
+--     end
+--     _G.SortList(
+--         self.rewardDatas,
+--         function(a)
+--             return -a.id
+--         end
+--     )
+--     return self.rewardDatas or {}
+-- end
+---个人奖励道具数据
+function MonsterSiegeModel:GetRankRewardPersonData()
+    if not self.rewardPerDatas then
+        self.rewardPerDatas = {}
+        local array = _G.ConfigManager.discrete_cfg[106503][1]
+        for _, v in pairs(array) do
+            local tb = _G.SimpleCopy(_G.ConfigManager.system_rank_cfg[v])
+            tb.rewards = _G.GlobalInterface.GetNewArray(tb.rewards)
+            if tb.rewards_remove > 0 then
+                _G.table.insert(tb.rewards, {101, tb.rewards_remove})
+            end
+
+            _G.table.insert(self.rewardPerDatas, tb)
+        end
+        _G.SortList(
+            self.rewardPerDatas,
+            function(a)
+                return -a.id
+            end
+        )
+    end
+
+    return self.rewardPerDatas
+end
+
+-----------------------  布阵  -----------------------------
+---进入布阵前  抽取随机buff  (不存在，播放动画，存在直接跳过动画)
+function MonsterSiegeModel:EnterEmbattle()
+    -- if self:GetMonsterID() > self:GetLevel() + 1 then
+    --     _G.FloatTipsModel:GetInstance():Show("请另选择怪物")
+    --     return
+    -- end
+    self.isRandom_buff = false
+    if self:GetMonsterID() == bossid then --boss
+        if #self.buff_list < self:GetLevel() then
+            self.isRandom_buff = true
+            self:RandomBuff()
+        else
+            self:EnterEmbattleView()
+        end
+    else
+        self:EnterEmbattleView()
+    end
+end
+---获得动态怪物信息
+function MonsterSiegeModel:GetActivityModule(callback)
+    local msg = {
+        id = self:GetActivieID()
+    }
+    require "MonsterSiegeNet":GetInstance():GetActivityModule(
+        msg,
+        function(data)
+            if data.ack ~= 1 then
+                if callback then
+                    callback()
+                end
+                return
+            end
+            self.cards_team = {}
+            ---@param i_card activity_siege.i_card sid = 怪物id cards = 卡牌动态数据
+            self.cards_team = data.card_info
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+---查抄动态怪物的数据
+---@param sid number 怪物sid
+function MonsterSiegeModel:CheckMonsterDy(sid)
+    local data = {}
+    if self.cards_team then
+        for i = 1, #self.cards_team do
+            if self.cards_team[i].sid == sid then
+                data = self.cards_team[i]
+                return true, data
+            end
+        end
+    end
+    return false
+end
+function MonsterSiegeModel:OpenEmMonsterData()
+    if self.cards_team == nil then
+        if _G.AppSetting.DEBUG then
+            _G.Log("动态怪的 数据是空 ", "怪物攻城")
+        end
+        return
+    end
+    local flag, data = self:CheckMonsterDy(self:GetMonsterID())
+    local da = {}
+    if flag then
+        local team = data.cards[1].fights
+        for i = 1, #team do
+            if da[i] == nil then
+                da[i] = {}
+            end
+            da[i] = {
+                uid = team[i].uid,
+                sid = team[i].sid,
+                level = team[i].lv,
+                star = team[i].star
+            }
+        end
+    else
+        local siege_cfg = _G.ConfigManager.siege_cfg[self:GetMonsterID()]
+        local monsterid = _G.ConfigManager.guild_boss_cfg[siege_cfg.event_params[1]].monster
+        local cardsid = _G.ConfigManager.monster_cfg[monsterid].CardID
+        local level = _G.ConfigManager.monster_cfg[monsterid].Level
+        local star = _G.ConfigManager.monster_cfg[monsterid].Stars
+        da = {
+            [1] = {
+                uid = 0,
+                sid = 0,
+                level = 0,
+                star = 0
+            },
+            [2] = {
+                uid = 0,
+                sid = 0,
+                level = 0,
+                star = 0
+            },
+            [3] = {
+                uid = 0,
+                sid = 0,
+                level = 0,
+                star = 0
+            },
+            [4] = {
+                uid = 0,
+                sid = 0,
+                level = 0,
+                star = 0
+            },
+            [5] = {
+                uid = 0,
+                sid = 0,
+                level = 0,
+                star = 0
+            }
+        }
+        da[4] = {
+            uid = monsterid,
+            sid = cardsid,
+            level = level,
+            star = star
+        }
+    end
+
+    return da
+end
+function MonsterSiegeModel:EnterEmbattleView()
+    --是否满足跳过战斗开启条件
+    local params = _G.ConfigManager.discrete_cfg[115602]
+    local showSkipBattle = params and _G.GlobalConditionManager.CheckConditionArrays(params)
+
+    local embattleType = _G.EmbattleType.MonsterSiege
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.MainSiegeEmbattleView.Name,
+        embattleType,
+        _G.handler(self, self.ExitEmbattle),
+        function(_, _, _skipBattle)
+            if _skipBattle then
+                self:SkipFight()
+            else
+                self:EnterFight()
+            end
+        end,
+        self:GetMonsterID() == bossid,
+        self.isRandom_buff,
+        showSkipBattle
+    )
+end
+function MonsterSiegeModel:OnEmbattleViewOpened(name)
+    if name == _G.ConfigManager.ui_cfg.MainSiegeEmbattleView.Name then
+        local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name)
+        if window then
+            window.View:Hide()
+        end
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    end
+end
+---退出布阵
+function MonsterSiegeModel:ExitEmbattle()
+    if _G.AppSetting.DEBUG then
+        _G.Log("退出布阵", "怪物攻城")
+    end
+    require "BattleAudienceManager":GetInstance():ClearAudiences()
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name)
+    if window then
+        window.View:Show()
+    end
+end
+
+---进入战斗
+function MonsterSiegeModel:EnterFight()
+    if _G.AppSetting.DEBUG then
+        _G.Log("进入战斗", "怪物攻城")
+    end
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.MonsterSiege, self:GetDps())
+end
+---跳过战斗直接显示结算页面
+---@return void
+function MonsterSiegeModel:SkipFight()
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.MainSiegeEmbattleView.Name)
+    local pbData = {
+        id = self:GetActivieID(),
+        sid = self:GetMonsterID()
+    }
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    require "MonsterSiegeNet":GetInstance():SiegeFight(
+        pbData,
+        function(msg)
+            if not msg or msg.ack ~= 1 then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+            --计算战斗结果
+            _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+            local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+            if not record or not record.result then
+                _G.BattleManager:GetInstance():SetInBattle(false)
+                return
+            end
+
+            ---@type BattleControllerMonsterSiege
+            local controller = _G.require(_G.BattleControllerType.MonsterSiege).New()
+            controller.curFightState = 4 --设置战斗结束
+
+            _G.BattleManager:GetInstance():SetArgData(msg.fight_arg)
+            _G.BattleManager:GetInstance():SetStatisticsCached(record)
+            _G.BattleManager:GetInstance():SetBattleController(controller)
+            --显示结算界面
+            controller:FightResultFunc(record.result)
+        end
+    )
+end
+
+---怪物战斗结束
+function MonsterSiegeModel:FightEndUpdate(isWin)
+    --_G.world
+    ---从新获取下info 信息
+    self:TestGetInfo(
+        function()
+            --刷新 （测试数据）
+            --self:SetMonsterID(self.cur_monsterID + 1)
+            --刷新界面
+            _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+            local window = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name)
+            if window then
+                window.View:UpdateView()
+                window.View:Show()
+                if isWin and self:GetMonsterID() == bossid then
+                    local siege_cfg = _G.ConfigManager.siege_cfg[self:GetMonsterID()]
+                    local monsterId = _G.ConfigManager.guild_boss_cfg[siege_cfg.event_params[1]].monster
+                    local monsterCfg = _G.ConfigManager.monster_cfg[monsterId]
+
+                    _G.GlobalInterface.OpenFightBossWinView(
+                        _G.FightBossWinType.MonsterSiege,
+                        nil,
+                        nil,
+                        _G.ConfigManager.card_cfg[monsterCfg.CardID].Portrait,
+                        _G.GetLangPackValue(monsterCfg.Name),
+                        _G.ZoneRankType.MonsterSiege,
+                        self:GetActivieID(),
+                        monsterCfg.CardID
+                    )
+                end
+            end
+        end
+    )
+end
+-----------------------------  战斗 --------------------------------
+---挑战
+function MonsterSiegeModel:SiegeFight(call)
+    local msg = {
+        id = self:GetActivieID(),
+        sid = self:GetMonsterID()
+    }
+    local port =
+        require "MonsterSiegeNet":GetInstance():SiegeFight(
+        msg,
+        function(data)
+            if call then
+                call(data)
+            end
+        end
+    )
+    _G.BattleManager:GetInstance():AddLuaNetEvent(port)
+end
+
+---随机buff (在布阵后 ，战斗开始前，会有一个 buff 播放动画)
+function MonsterSiegeModel:RandomBuff(call)
+    if _G.table.isEmptyOrNil(self.random_buff_list) then
+        local msg = {
+            id = self:GetActivieID()
+        }
+        require "MonsterSiegeNet":GetInstance():RandomBuff(
+            msg,
+            function(data)
+                if data.ack ~= 1 then
+                    return
+                end
+                self.refreshNum = self.refreshNum - 1
+                self.random_buff_list = data.buff_id
+                self:EnterEmbattleView()
+            end
+        )
+    else
+        self:EnterEmbattleView()
+    end
+end
+---刷新buff
+function MonsterSiegeModel:RefreshBuff(call)
+    local msg = {
+        id = self:GetActivieID()
+    }
+    require "MonsterSiegeNet":GetInstance():RandomBuff(
+        msg,
+        function(data)
+            if data.ack ~= 1 then
+                if call then
+                    call(false)
+                end
+                return
+            end
+            self.refreshNum = self.refreshNum - 1
+            self.random_buff_list = data.buff_id
+            if call then
+                call(true)
+            end
+        end
+    )
+end
+---获取刷新次数
+function MonsterSiegeModel:GetRefreshNum()
+    return self.refreshNum
+end
+---重置刷新次数
+function MonsterSiegeModel:ResetRefreshNum()
+    self.refreshNum = self.maxRefreshNum
+end
+---确认buff
+function MonsterSiegeModel:EnterBuff(call)
+    local msg = {
+        id = self:GetActivieID()
+    }
+    require "MonsterSiegeNet":GetInstance():EnterBuff(
+        msg,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            self.buff_list = self.random_buff_list
+            self.random_buff_list = {}
+            self:ResetRefreshNum()
+            if call then
+                call()
+            end
+        end
+    )
+end
+return MonsterSiegeModel

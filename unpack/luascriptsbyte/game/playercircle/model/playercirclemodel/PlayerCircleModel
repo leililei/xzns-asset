@@ -1,0 +1,283 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie.Client.Assets.Resources.LuaScripts.Game.PlayerCircle.Model.PlayerCircleModel	(修改路径必须修正此项!)
+-- Created by cy
+-- DateTime: 2025/05/30
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local PlayerCircleNet = require("PlayerCircleNet")
+local base = _G.GameDataModelBase
+---@class PlayerCircleModel : Singleton    中文描述
+local PlayerCircleModel = _G.BaseClass("PlayerCircleModel", base)
+
+local TaskType = {
+    --点赞
+    Link = 1,
+    --评论
+    Comment = 3,
+    --浏览x秒
+    PostOfficial = 4,
+}
+
+---@return PlayerCircleModel PlayerCircleModel
+function PlayerCircleModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---从服务器拉取数据
+function PlayerCircleModel:GetData(call)
+    self.call = call
+    self:GetSdkData(
+        function()
+            local pbData = {}
+            for i, v in pairs(TaskType) do
+                local data = {}
+                data.k = v
+                data.v = self:GetSdkInfoByType(v)
+                _G.table.insert(pbData, data)
+            end
+            self:Synchronous(
+                pbData,
+                function()
+                    PlayerCircleNet:GetInstance():GetInfo(_G.handler(self, self.ParseData), self:GetPlayerCircleType())
+                end
+            )
+        end
+    )
+end
+
+---
+---@protected
+function PlayerCircleModel:GetPlayerCircleType()
+    local type = 1
+    if _G.AppSetting.IsWeiXin then
+        type = 1
+    elseif _G.AppSetting.IsDouYin then
+        type = 2
+    elseif _G.AppSetting.IsAlipay then
+        type = 3
+    end
+    return type
+end
+
+---@param msg gaming_circles.s2c_gaming_circles_info
+function PlayerCircleModel:ParseData(msg)
+    self.data = msg
+    self.taskInfo = {}
+    self.TaskCfgInfo = nil --清理任务缓存列表
+    self.taskProgress = {}
+    for i, v in ipairs(msg.award_log) do
+        self.taskInfo[v.award_id] = v
+    end
+    for i, v in ipairs(msg.task_progress) do
+        self.taskProgress[v.k] = v.v
+    end
+    if self.call then
+        self.call()
+    end
+    _G.Events:GetInstance():Broadcast(_G.ePlayerCircle.Refresh)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerCircleNew.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerCircleSign.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.PlayerCircleMission.id
+    )
+    self.super.ParseData(self)
+end
+
+---
+---@protected
+function PlayerCircleModel:GetSdkData(call)
+    if _G.AppSetting.IS_EDITOR then
+        if call then
+            call()
+        end
+    else
+        if _G.AppSetting.IsWeiXin then
+            _G.SDKManager:GetInstance():GetGameClubData(
+                function(b, info)
+                    self.info = info
+                    if self.info.code then
+                        return
+                    end
+                    if call then
+                        call()
+                    end
+                end
+            )
+        elseif _G.AppSetting.IsDouYin then
+            if self.info == nil then
+                self.info = {like_num = 0, comment_num = 0}
+            end
+            if call then
+                call()
+            end
+        elseif _G.AppSetting.IsAlipay then
+            _G.SDKManager:GetInstance():GetGameClubData(
+                function(b, info)
+                    self.info = info
+                    if self.info.code then
+                        return
+                    end
+                    if call then
+                        call()
+                    end
+                end
+            )
+        else
+            if call then
+                call()
+            end
+        end
+    end
+end
+
+---从sdk获取点赞或者评论数（1-点赞 3-评论）
+function PlayerCircleModel:GetSdkInfoByType(type)
+    if not self.info then
+        return 0
+    end
+    if type == TaskType.Link then             -- 点赞
+        return self.info.like_num or 0
+    elseif type == TaskType.Comment then      -- 评论
+        return self.info.comment_num or 0
+    elseif type == TaskType.PostOfficial then --浏览x秒
+        return self.info.post_official_num or 0
+    end
+    return 0
+end
+
+function PlayerCircleModel:GetTaskCfgInfoByType(type)
+    if self.TaskCfgInfo == nil then
+        self.TaskCfgInfo = {}
+        local channelId = _G.GameUtil:GetPlatform()
+        for i, v in pairs(_G.ConfigManager.player_circle_mission_cfg) do
+            --只显示服务器初始化的任务
+            if not self.taskInfo or self.taskInfo[v.id] then
+                --限定渠道任务
+                if _G.table.isEmptyOrNil(v.channel) or _G.table.ContainsValue(v.channel, channelId) then
+                    if self.TaskCfgInfo[v.tag] == nil then
+                        self.TaskCfgInfo[v.tag] = {}
+                    end
+                    _G.table.insert(self.TaskCfgInfo[v.tag], v)
+                end
+            end
+        end
+    end
+    return self.TaskCfgInfo[type]
+end
+
+---获取任务状态
+function PlayerCircleModel:GetTaskAwardStateById(id)
+    if not self.taskInfo or not self.taskInfo[id] then
+        return 0
+    end
+    return self.taskInfo[id].award_state
+end
+
+---获取任务进度
+function PlayerCircleModel:GetTaskProgressById(id)
+    return self.taskProgress[id]
+end
+
+---领奖
+function PlayerCircleModel:GetAwardById(ids, call)
+    local pbData = {award_id = ids}
+    PlayerCircleNet:GetInstance():Award(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            for k, id in ipairs(ids) do
+                if self.taskInfo[id] then
+                    self.taskInfo[id].award_state = 2
+                else
+                    self.taskInfo[id] = {award_id = id, award_state = 2}
+                end
+            end
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.PlayerCircleNew.id
+            )
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.PlayerCircleSign.id
+            )
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.PlayerCircleMission.id
+            )
+            if call then
+                call(msg)
+            end
+        end,
+        self:GetPlayerCircleType()
+    )
+end
+
+---游戏圈行为数据同步(当天)
+function PlayerCircleModel:Synchronous(pbData, call)
+    local pbData = {actions = pbData}
+    PlayerCircleNet:GetInstance():Synchronous(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if call then
+                call()
+            end
+        end,
+        self:GetPlayerCircleType()
+    )
+end
+
+---根据类型获取红点信息
+function PlayerCircleModel:CheckRedPointByType(type)
+    if not self:CheckShowYxqBtn() then
+        return false
+    end
+    local data = self:GetTaskCfgInfoByType(type)
+    for i, v in ipairs(data) do
+        local state = self:GetTaskAwardStateById(v.id)
+        if state == 1 then
+            return true
+        end
+    end
+    return false
+end
+
+---游戏圈页签红点信息
+function PlayerCircleModel:CheckRedPointHome()
+    if self:CheckShowYxqBtn() and self.homeRed == nil then
+        return true
+    end
+    return false
+end
+
+---检测是否显示游戏圈按钮
+function PlayerCircleModel:CheckShowYxqBtn()
+    if _G.AppSetting.IsHuaWei or _G.AppSetting.IsAlipayPC or _G.AppSetting.IsFastRpkGame then
+       return false 
+    end
+    if _G.ServerManager:GetInstance().AppInfo == nil then
+        return false
+    end
+    return (_G.AppSetting.IsWeiXin or _G.AppSetting.IsDouYin or _G.AppSetting.IsAlipay) and
+        _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.GameCircle)
+end
+
+---
+---@protected
+function PlayerCircleModel:ChangeHomeRed()
+    self.homeRed = true
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.PlayerCircleLog.id)
+end
+
+---创建对象时,入口构造函数
+function PlayerCircleModel:__init()
+end
+
+---销毁对象时,析构函数
+function PlayerCircleModel:Dispose()
+end
+
+return PlayerCircleModel

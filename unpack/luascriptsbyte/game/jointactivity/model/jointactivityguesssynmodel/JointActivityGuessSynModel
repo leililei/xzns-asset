@@ -1,0 +1,385 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.JointActivity.Model.JointActivityGuessSynModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/11/11
+-- Description: 联动活动-风雷对决
+-----------------------------------------------------------------------
+local base = require "ActivitySynTypeBase"
+local ActivitySynManager = require "ActivitySynManager"
+---@class JointActivityGuessSynModel:ActivitySynTypeBase	联动活动
+local JointActivityGuessSynModel = _G.BaseClass("JointActivityGuessSynModel", base)
+_G.JointActivityGuessSynModel = JointActivityGuessSynModel
+
+---类的构造函数
+function JointActivityGuessSynModel:__init()
+    _G.Events:GetInstance():AddListener(self.curActivityClass.regiestStateChangedStr, self.StateChanged, self)
+end
+
+function JointActivityGuessSynModel:StateChanged(state)
+    if state == ActivitySynManager.State.Close then
+        if self.betTimer then
+            self.betTimer:Stop()
+            self.betTimer = nil
+        end
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.JointActivityGuessView.Name)
+        if view then
+            view:OnCloseActivity(self.curActivityClass:GetActivityID())
+        end
+    end
+end
+
+---获取GM数据
+function JointActivityGuessSynModel:OnHandleGMData(info)
+    self:ParseData(info)
+end
+
+---解析数据
+function JointActivityGuessSynModel:ParseData(info)
+    self.activityId = self.curActivityClass:GetActivityID()
+    ---历史竞猜数据
+    self.sessionInfo = info.guess_2.session_info or {}
+    ---今天的竞猜数据
+    self.todaySessions = info.guess_2.today_sessions or {}
+    if not _G.table.isEmptyOrNil(self.todaySessions) then
+        _G.SortList(
+            self.todaySessions,
+            function(data)
+                return -data.time_end
+            end
+        )
+    end
+    ---活动开始时间
+    local startTime = self.curActivityClass.cfg.time.start_time
+    self.openDay = _G.math.ceil((_G.TimeUtil.GetServerUnixTime() - startTime) / 86400)
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.JointActivityGuessView.Name)
+    if view then
+        view:RefreshView()
+    end
+    self:BetTimer()
+    self:RefreshRedPoint(1)
+    base.ParseData(self)
+end
+
+---竞猜计时器
+function JointActivityGuessSynModel:BetTimer()
+    local leftTime = 0
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    for _, v in ipairs(self.todaySessions) do
+        if serverTime < v.time_end then
+            leftTime = v.time_end - serverTime
+            break
+        end
+    end
+    if self.betTimer then
+        self.betTimer:Stop()
+        self.betTimer = nil
+    end
+    if leftTime > 0 then
+        self.betTimer = _G.TimerManager:GetInstance():GetTimer(leftTime, self.UpdateBetTimer, self, true, false)
+        self.betTimer:Start()
+    end
+end
+
+function JointActivityGuessSynModel:UpdateBetTimer()
+    self:RefreshRedPoint(1)
+    self:RefreshRedPoint(2)
+    self:BetTimer()
+end
+
+---获取活动相对开启天数
+function JointActivityGuessSynModel:GetGuessOpenDay()
+    return self.openDay
+end
+
+---获取历史的竞猜数据
+function JointActivityGuessSynModel:GetHistorySessionInfo()
+    return self.sessionInfo
+end
+
+---获取今天的竞猜数据
+function JointActivityGuessSynModel:GetTodaySessions(index)
+    if index then
+        return self.todaySessions[index]
+    end
+    return self.todaySessions
+end
+
+---获取所有的竞猜数据，按照开始时间从大道小排序
+function JointActivityGuessSynModel:GetAllSessionInfo()
+    local allSessionInfo = {}
+    for _, v in pairs(self.sessionInfo) do
+        _G.table.insert(allSessionInfo, v)
+    end
+    for _, v in pairs(self.todaySessions) do
+        _G.table.insert(allSessionInfo, v)
+    end
+    _G.SortList(
+        allSessionInfo,
+        function(data)
+            return data.time_end
+        end
+    )
+    return allSessionInfo
+end
+
+---竞猜时间
+function JointActivityGuessSynModel:GetGuessStartTime(index)
+    local sessionInfo = self.todaySessions[index]
+    local servertime = _G.TimeUtil.GetServerUnixTime()
+    local zeroClock = _G.TimeUtil.GetDayBySix(servertime) - _G.TimeUtil.GAME_DAY_TIME
+    return _G.TimeUtil.TimeToString(sessionInfo.time_end - zeroClock, 3)
+end
+
+function JointActivityGuessSynModel:RandomName()
+    return _G.LoginManager:GetInstance():GetRandomName()
+end
+
+--region 服务器通讯协议
+---竞猜下注
+---@param index number 竞猜序列号
+---@param bet number 下注灵兽id
+function JointActivityGuessSynModel:GuessBet(times, bet, index, callback)
+    require("JointActivityNet"):GetInstance():GuessBet(
+        { times = times, bet = bet, id = self.activityId },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.JointActivity.PetGuess
+                },
+                1
+            )
+            if self.todaySessions[index] then
+                self.todaySessions[index].bet = bet
+            end
+            self:RefreshRedPoint(1)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---获取竞猜信息
+function JointActivityGuessSynModel:GetBetInfo(callback)
+    require("JointActivityNet"):GetInstance():GetBetInfo(
+        { id = self.activityId },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            if callback then
+                callback(msg.info)
+            end
+        end
+    )
+end
+
+---竞猜奖励
+---@param index number 竞猜序列号
+function JointActivityGuessSynModel:GetGuessAward(index, callback)
+    require("JointActivityNet"):GetInstance():GetGuessAward(
+        { f_sid = index, activity_id = self.activityId },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            local isRecvAward = false
+            for _, v in pairs(self.todaySessions) do
+                if self:ModifyAwardData(msg, v, index) then
+                    isRecvAward = true
+                    break
+                end
+            end
+            if not isRecvAward then
+                for _, v in pairs(self.sessionInfo) do
+                    if self:ModifyAwardData(msg, v, index) then
+                        break
+                    end
+                end
+            end
+            _G.UIUtils.ShowCommonAward(msg)
+            self:RefreshRedPoint(2)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+function JointActivityGuessSynModel:ModifyAwardData(msg, v, index)
+    if v.f_index == index then
+        v.award = 1
+        if not msg.award then
+            msg.award = {}
+        end
+        if not msg.award.item then
+            msg.award.item = {}
+        end
+        if v.win == v.bet and v.win_coin then
+            for _, coinData in ipairs(v.win_coin) do
+                local tb = _G.StorageManager:GetInstance():SimulationAward(
+                    coinData.coin[2],
+                    coinData.coin[3]
+                )
+                _G.table.insert(msg.award.item, { type = tb })
+                _G.Events:GetInstance():Broadcast(
+                    _G.eArena.SetDrawUp,
+                    { coinData.coin[2], coinData.coin[3] }
+                )
+            end
+        elseif v.win ~= v.bet and v.lose_coin then
+            for _, coinData in ipairs(v.lose_coin) do
+                local tb = _G.StorageManager:GetInstance():SimulationAward(
+                    coinData.coin[2],
+                    coinData.coin[3]
+                )
+                _G.table.insert(msg.award.item, { type = tb })
+                _G.Events:GetInstance():Broadcast(
+                    _G.eArena.SetDrawUp,
+                    { coinData.coin[2], coinData.coin[3] }
+                )
+            end
+        end
+        return true
+    end
+
+    return false
+end
+
+---发生聊天或者弹幕
+function JointActivityGuessSynModel:SendGuessBullet(pbData, callback)
+    require("JointActivityNet"):GetInstance():SendGuessBullet(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---获取弹幕信息
+function JointActivityGuessSynModel:GetBulletInfo(callback)
+    require("JointActivityNet"):GetInstance():GetBulletInfo(
+        { id = self.activityId },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            if callback then
+                callback(msg.info)
+            end
+        end
+    )
+end
+
+function JointActivityGuessSynModel:CheckActivityOpened()
+    local state = self.curActivityClass:GetCurActivityState()
+    if state == require("ActivitySynManager").State.Notice then
+        return false
+    end
+    return state == require("ActivitySynManager").State.Open
+end
+
+---进入活动主体
+function JointActivityGuessSynModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.JointActivityGuessView.Name, self.curActivityClass)
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+
+function JointActivityGuessSynModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.JointActivityGuessView.Name
+end
+
+---子活动列表
+function JointActivityGuessSynModel:GetOtherActivityRedPointIds()
+    return {}
+end
+
+---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function JointActivityGuessSynModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckRedPoint, self.CheckAwardRedPoint }
+    self.redpointTree = { { 2 }, false }
+end
+
+---奖励红点
+function JointActivityGuessSynModel:CheckAwardRedPoint()
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    for _, v in pairs(self.todaySessions) do
+        if serverTime >= v.time_end and v.bet > 0 and v.award == 0 then
+            return 1
+        end
+    end
+
+    for _, v in pairs(self.sessionInfo) do
+        if serverTime >= v.time_end and v.bet > 0 and v.award == 0 then
+            return 1
+        end
+    end
+
+    return 0
+end
+
+function JointActivityGuessSynModel:CheckRedPoint()
+    if _G.PlayerPrefsManager.GetInt("JointActivityGuess_" .. self.activityId, 0) == 0 then
+        return 1
+    end
+
+    local serverTime = _G.TimeUtil.GetServerUnixTime()
+    for _, v in pairs(self.todaySessions) do
+        if serverTime < v.time_end and v.bet == 0 then
+            return 1
+        end
+    end
+
+    return 0
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@return number 红点数量
+function JointActivityGuessSynModel:CheckRedPointNumChild(index)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+function JointActivityGuessSynModel:RefreshRedPoint(param)
+    param = param or 1
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(param))
+end
+
+---隐藏按钮
+function JointActivityGuessSynModel:IsShowBtn()
+    return false
+end
+
+---类的析构函数
+function JointActivityGuessSynModel:Dispose()
+    if self.betTimer then
+        self.betTimer:Stop()
+        self.betTimer = nil
+    end
+    if self.curActivityClass then
+        _G.Events:GetInstance():RemoveListener(self.curActivityClass.regiestStateChangedStr, self.StateChanged, self)
+    end
+end
+
+return JointActivityGuessSynModel

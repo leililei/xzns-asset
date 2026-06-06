@@ -1,0 +1,238 @@
+-----------------------------------------------------------------------
+-- Created by szs
+--
+-- @Description
+-- 生命周期 Awake, Start, OnCreate, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+---@class SwornManager : Singleton 结义管理
+---@field GetInstance fun():SwornManager
+local SwornManager = _G.BaseClass("SwornManager", _G.Singleton)
+
+function SwornManager:__init()
+    local dc = _G.ConfigManager.discrete_cfg[114601][1]
+    self.QmType = {
+        _G.GetLangPackValue(dc[1]),
+        _G.GetLangPackValue(dc[2]),
+        _G.GetLangPackValue(dc[3]),
+        _G.GetLangPackValue(dc[4])
+    }
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.friend_battle_operation.Cmd, self.OnFBOListener, self)
+end
+
+function SwornManager:StartUp()
+end
+
+---@param data friend_battle.p2c_friend_battle_operation
+-- required uint32 type = 1;//1:被申请 2:同意结义申请 3:结义关系修改 4:解除结义 5:赠送礼物 6:完成任务 7:浇花
+-- optional role.i_role role = 2;//申请结义玩家信息
+-- optional uint32 index = 3; //修改后关系index
+-- optional i_box_gift gift = 4;//赠送礼物信息
+-- repeated uint32 task_sid = 5;//任务sid
+-- optional uint32 add_exp = 6;//增加战令经验
+function SwornManager:OnFBOListener(data)
+    if _G.AppSetting.DEBUG then
+        _G.Log(data, "结义推送数据")
+    end
+    local SmInstance = require "SwornModel":GetInstance()
+    if data.type == 1 then
+        if data.role then
+            if _G.AppSetting.DEBUG then
+                _G.Log(data.role.name .. "申请和你结义")
+            end
+            table.insert(SmInstance.NewAppcetList, 1)
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SwornAcceptPage.id)
+        end
+    elseif data.type == 2 then
+        SmInstance:UpdateInfo(
+            function()
+                local sv = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.SwornView.Name)
+                if nil ~= sv then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(
+                        940104,
+                        nil,
+                        function()
+                            SmInstance:CreateRefreshRedPoint()
+                            _G.Events:GetInstance():Broadcast(_G.SwornEvents.OtherDoSworn)
+                        end,
+                        nil,
+                        nil,
+                        false,
+                        SmInstance:GetSelfInfo().role_info.name
+                    )
+                end
+
+                _G.PlayerPrefsManager.SetInt("SwornTaskFirst", 1)
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SwornTask.id)
+            end
+        )
+    elseif data.type == 3 then
+        SmInstance:GetPubInfo().link = data.index
+        _G.Events:GetInstance():Broadcast(_G.SwornEvents.UpdateLink)
+    elseif data.type == 4 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            940105,
+            nil,
+            function()
+                SmInstance:ClearRefreshRedPoint()
+                _G.Events:GetInstance():Broadcast(_G.SwornEvents.UnSworn)
+            end,
+            nil,
+            nil,
+            false,
+            SmInstance:GetSelfInfo().role_info.name
+        )
+    elseif data.type == 5 then
+        if nil == SmInstance:GetSelfInfo().gift_info then
+            SmInstance:GetSelfInfo().gift_info = {}
+        end
+        _G.table.insert(SmInstance:GetSelfInfo().gift_info, data.gift)
+        _G.PlayerPrefsManager.SetInt("SwornGiftBox", 1)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SwornGift.id)
+        local addExp = 0
+        local gifts = _G.ConfigManager.discrete_cfg[114607]
+        for i = 1, #gifts do
+            if gifts[i][1] == data.gift.sid then
+                addExp = gifts[i][2] * data.gift.num
+            end
+        end
+        SmInstance:GetPubInfo().exp = SmInstance:GetPubInfo().exp + addExp
+        _G.Events:GetInstance():Broadcast(_G.SwornEvents.UpdateExp)
+    elseif data.type == 6 then
+        local addExp = 0
+        for k = 1, #data.task_sid do
+            local info
+            for i = 1, #SmInstance.CurrTask do
+                if SmInstance.CurrTask[i].k == data.task_sid[k] then
+                    info = SmInstance.CurrTask[i]
+                end
+            end
+            if nil == info then
+                local kv = {}
+                kv.k = data.task_sid[k]
+                kv.v = 1
+                table.insert(SmInstance.CurrTask, kv)
+            else
+                info.v = info.v + 1
+            end
+            local exp, water = self:GetFnishGetNum(data.task_sid[k])
+            addExp = addExp + exp
+        end
+        SmInstance:GetPubInfo().exp = SmInstance:GetPubInfo().exp + addExp
+        _G.Events:GetInstance():Broadcast(_G.SwornEvents.UpdateExp)
+        _G.Events:GetInstance():Broadcast(_G.SwornEvents.TaskFinish)
+    elseif data.type == 7 then
+        local battleInfo = SmInstance:GetSelfInfo().battle_info
+        battleInfo.exp = battleInfo.exp + data.add_exp
+        self:CheckBattleExp()
+
+        local info = {}
+        info.role_name = SmInstance:GetSelfInfo().role_info.name
+        info.add_exp = data.add_exp
+        info.time = _G.TimeUtil.GetServerUnixTime()
+        if nil == SmInstance:GetPubInfo().battle_record then
+            SmInstance:GetPubInfo().battle_record = {}
+        end
+        table.insert(SmInstance:GetPubInfo().battle_record, 1, info)
+        _G.Events:GetInstance():Broadcast(_G.SwornEvents.OtherWater)
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SwornPass.id)
+    end
+end
+
+---获取任务完成获得经验和水壶
+function SwornManager:GetFnishGetNum(id)
+    local cfg = _G.ConfigManager.discrete_cfg[114610]
+    for i = 1, #cfg do
+        if cfg[i][1] == id then
+            return cfg[i][2], cfg[i][3]
+        end
+    end
+    return 0, 0
+end
+
+---检测战令经验
+function SwornManager:CheckBattleExp()
+    local SmInstance = require "SwornModel":GetInstance()
+    local battleInfo = SmInstance:GetSelfInfo().battle_info
+    local ssbc = _G.ConfigManager.store_season_battle_cfg[708001]
+
+    local lv = battleInfo.lv or 0
+
+    local maxExp
+    if lv >= #ssbc.content then
+        maxExp = _G.ConfigManager.store_season_battlecon_cfg[ssbc.content[lv]].conditions[2]
+    else
+        maxExp = _G.ConfigManager.store_season_battlecon_cfg[ssbc.content[lv + 1]].conditions[2]
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(battleInfo.exp, "CheckBattleExp当前经验")
+        _G.Log(maxExp, "CheckBattleExp上限经验")
+        _G.Log(lv, "CheckBattleExp当前等级")
+        _G.Log(#ssbc.content, "CheckBattleExp最大等级")
+    end
+
+    if battleInfo.exp >= maxExp then
+        if lv >= #ssbc.content then
+            battleInfo.exp = maxExp
+        else
+            battleInfo.lv = battleInfo.lv + 1
+            battleInfo.exp = battleInfo.exp - maxExp
+            self:CheckBattleExp()
+        end
+    end
+end
+
+---亲密度经验检测
+function SwornManager:CheckPublicExp()
+    local SmInstance = require "SwornModel":GetInstance()
+    local publicInfo = SmInstance:GetPubInfo()
+    local lv = publicInfo.lv or 0
+
+    -- local lastExp = 0
+    -- if lv >= 1 then
+    --     lastExp = _G.ConfigManager.friend_level_cfg[lv].exp
+    -- end
+    local maxExp
+
+    if lv >= #_G.ConfigManager.friend_level_cfg then
+        maxExp = _G.ConfigManager.friend_level_cfg[lv].exp
+    else
+        maxExp = _G.ConfigManager.friend_level_cfg[lv + 1].exp
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(publicInfo.exp, "CheckPublicExp当前经验")
+        _G.Log(maxExp, "CheckPublicExp上限经验")
+        _G.Log(lv, "CheckPublicExp当前等级")
+        _G.Log(#_G.ConfigManager.friend_level_cfg, "CheckPublicExp最大等级")
+    end
+
+    --if publicInfo.exp + lastExp >= maxExp then
+    if publicInfo.exp >= maxExp then
+        if lv >= #_G.ConfigManager.friend_level_cfg then
+            publicInfo.exp = maxExp
+        else
+            publicInfo.lv = publicInfo.lv + 1
+            --publicInfo.exp = publicInfo.exp + lastExp - maxExp
+            self:CheckPublicExp()
+        end
+    end
+end
+
+---判断功能是否解锁
+---@param sid number function_open_cfg 表Id
+function SwornManager:CheckFunctionIsUnlock(sid)
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(sid) then
+        return true
+    end
+    return false, _G.ConfigManager.function_open_cfg[sid].condition_params
+end
+
+function SwornManager:GetQmName(type)
+    if self.QmType[type] then
+        return self.QmType[type]
+    end
+    return "没关系"
+end
+
+return SwornManager

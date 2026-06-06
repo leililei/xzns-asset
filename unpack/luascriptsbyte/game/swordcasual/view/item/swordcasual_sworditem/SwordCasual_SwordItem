@@ -1,0 +1,369 @@
+local SWORD_MODELS = {
+    "dao",
+    "dao2",
+    "dao3",
+    "dao4",
+}
+
+---@class SwordCasual_SwordItem : Component	剑之修行_战斗页面_剑的控制逻辑
+---@field go_table SwordCasualView._trans_sword_GoTable
+---@field rect SwordCasual_Rect
+---@field parent SwordCasual_RoleItem       @父节点
+---@field hp number                         @当前单位生命值
+---@field attack number                     @当前单位攻击力
+---@field team number                       @阵营id
+---@field posLength number                  @刀柄到刀中心点距离
+---@field angle number                      @当前角度
+---@field speed number                      @速度: <=0:顺时针旋转, >=0: 逆时针旋转
+---@field speedSacle number                 @速度倍率
+---@field modelState number                 @模型状态
+---@field modelCfgs string[]                @模型配置列表
+----------------------------------------------------------------------
+---@field onHpChange fun(role:SwordCasual_SwordItem,newValue:number,offset:number):void @生命值改变事件回调
+local SwordCasual_SwordItem = _G.BaseClass("SwordCasual_SwordItem", _G.Component)
+
+---入口函数
+function SwordCasual_SwordItem:OnCreate(trans)
+    self.go_table = _G.GetAutoGoTable(trans)
+
+    self.angle = 0
+    self.speed = -150
+    self.speedSacle = 1
+
+    self.hp = 1
+    self.attack = 1
+
+    self.effDic = {}
+    self.effDicStates = {}
+    self:UpdatePositionLength()
+    self:UpdateModel(true)
+    --self:SetSeniorEff(self.attack >= 2)
+end
+
+---物理逻辑更新
+---@param deltaTime number @时间间隔
+function SwordCasual_SwordItem:Update(deltaTime)
+    local angle = self.angle + self.speed * self.speedSacle * deltaTime
+    self:SetAngle(angle)
+
+    --更新矩形信息
+    self:UpdateRect()
+end
+
+---设置父节点
+---@param parent SwordCasual_RoleItem @父节点
+function SwordCasual_SwordItem:SetParent(parent)
+    self.parent = parent
+end
+
+---获取父节点
+---@return SwordCasual_RoleItem @父节点
+function SwordCasual_SwordItem:GetParent()
+    return self.parent
+end
+
+---更新刀柄到到中心点的长度
+function SwordCasual_SwordItem:UpdatePositionLength()
+    local _, h1 = self.go_table.transform:GetRectTransformWidthHeight()
+    local _, h2 = self.go_table.trans_trigger:GetRectTransformWidthHeight()
+    self.posLength = h1 - h2 * 0.5 --刀固定朝向向下, 刀永远在远离刀柄的一端
+end
+
+--region ===================战斗属性相关===================
+
+---设置生命值
+---@param hp number @生命值
+function SwordCasual_SwordItem:SetHp(hp)
+    self.hp = hp
+    self:UpdateModel()
+end
+
+---改变生命值
+---@param deltaHp number @生命值变化量
+function SwordCasual_SwordItem:ChangeHp(offset)
+    self.hp = self.hp + offset
+    if self.hp < 0 then
+        self.hp = 0
+    end
+    --触发生命值改变事件
+    if self.onHpChange then
+        self.onHpChange(self, self.hp, offset)
+    end
+    self:UpdateModel()
+end
+
+---获取生命值
+---@return number @生命值
+function SwordCasual_SwordItem:GetHp()
+    return self.hp
+end
+
+---是否死亡
+---@return boolean @是否死亡
+function SwordCasual_SwordItem:IsDeath()
+    return self.hp <= 0
+end
+
+---设置攻击值
+---@param attack number @攻击值
+function SwordCasual_SwordItem:SetAttack(attack)
+    self.attack = attack
+    self:SetSeniorEff(self.attack >= 2)
+end
+
+---获取攻击值
+---@return number @攻击值
+function SwordCasual_SwordItem:GetAttack()
+    return self.attack
+end
+
+---设置阵营id
+---@param team number @阵营id
+function SwordCasual_SwordItem:SetTeam(team)
+    self.team = team
+end
+
+---获取阵营id
+---@return number @阵营id
+function SwordCasual_SwordItem:GetTeam()
+    return self.team
+end
+
+--获取刀的等级
+function SwordCasual_SwordItem:GetLevel()
+    return math.max(1, self.hp)
+end
+
+--endregion
+
+--region ===================物理/重叠判断相关===================
+
+---更新自身矩形信息(立即更新信息/位置信息依托于父节点信息)
+function SwordCasual_SwordItem:UpdateRect()
+    if not self.rect then
+        local w, h = self.go_table.trans_trigger:GetRectTransformWidthHeight()
+        self.rect = { x = 0, y = 0, w = w, h = h, rot = 0 }
+    end
+    local rad = _G.math.rad(self.angle)
+    self.rect.rot = rad
+
+    --计算刀的中心点位置(局部坐标)
+    local x, y = self.posLength * _G.math.sin(rad),
+        self.posLength * _G.math.cos(rad)
+    y = y * -1 --y轴取反(刀固定朝下)
+
+    --加上父节点所在的坐标(世界坐标)
+    local px, py = self.parent:GetPosition()
+    self.rect.x = px + x
+    self.rect.y = py + y
+end
+
+---获取自身矩形信息
+---@return SwordCasual_Rect @矩形a
+function SwordCasual_SwordItem:GetRect()
+    if not self.rect then
+        self:UpdateRect()
+    end
+    return self.rect
+end
+
+--endregion
+
+--region ===================速度/角度相关===================
+
+---设置速度
+---@param speed number @速度: <=0:顺时针旋转, >=0: 逆时针旋转
+---@param force? boolean @是否强制更新
+function SwordCasual_SwordItem:SetSpeed(speed, force)
+    if self.speed == speed and not force then
+        return
+    end
+    self.speed = speed
+    self:UpdateRotateAnimation()
+end
+
+---设置速度倍率
+---@param scale number @速度倍率
+---@param force? boolean @是否强制更新
+function SwordCasual_SwordItem:SetSpeedScale(scale, force)
+    if self.speedSacle == scale and not force then
+        return
+    end
+    self.speedSacle = scale
+    self:UpdateRotateAnimation()
+end
+
+---获取速度
+---@return number @速度
+function SwordCasual_SwordItem:GetSpeed()
+    return self.speed
+end
+
+---设置角度
+---@param angle number @角度
+function SwordCasual_SwordItem:SetAngle(angle)
+    if angle < -180 then
+        angle = angle + 360
+    elseif angle > 180 then
+        angle = angle - 360
+    end
+    self.angle = angle
+    --self.go_table.trans_sword:SetLocalEulerAngles(0, 0, self.angle)
+end
+
+---获取角度
+---@return number @角度
+function SwordCasual_SwordItem:GetAngle()
+    return self.angle
+end
+
+---停止旋转动画
+function SwordCasual_SwordItem:StopRotateAnimation()
+    self.go_table.trans_sword:DOKill()
+    self.go_table.trans_sword:SetLocalEulerAngles(0, 0, self.angle)
+end
+
+---更新旋转动画
+function SwordCasual_SwordItem:UpdateRotateAnimation()
+    self:StopRotateAnimation()
+
+    local zAxisSpeed = self.speed * self.speedSacle
+    local duration = 1
+    if math.abs(zAxisSpeed) <= 0.001 then
+        return
+    end
+
+    --abs(zAxisSpeed)大于180度时, 需要将其角度处理为-180~180度
+    local multiples = math.ceil(math.abs(zAxisSpeed) / 180)
+    if multiples > 1 then
+        zAxisSpeed = zAxisSpeed / multiples
+        duration = duration / multiples
+    end
+
+    --local tweener = self.go_table.trans_sword:DOLocalRotate(0, 0, zAxisSpeed, 1, nil)
+    local tweener = self.go_table.trans_sword:DOBlendableLocalRotateBy(_G.Vector3(0, 0, zAxisSpeed), duration)
+    tweener:SetEase(_G.CS.DG.Tweening.Ease.Linear)
+    tweener:SetLoops(-1, _G.CS.DG.Tweening.LoopType.Incremental)
+    tweener:SetTarget(self.go_table.trans_sword)
+end
+
+--endregion
+
+--region ===================模型相关===================
+
+---设置武器模型配置
+---@param cfgs string[] @武器模型配置
+function SwordCasual_SwordItem:SetModelCfgs(cfgs)
+    self.modelCfgs = cfgs and #cfgs > 0 and cfgs or nil
+    self:UpdateModel(true)
+end
+
+---根据当前血量更新模型
+---@param force? boolean @是否强制更新
+function SwordCasual_SwordItem:UpdateModel(force)
+    local level = self:GetLevel()
+    local models = self.modelCfgs or SWORD_MODELS
+    local state = level <= 1 and 1 or level >= #models and #models or level
+    if state == self.modelState and not force then
+        return
+    end
+    self.modelState = state
+    self.go_table.aorimage_renderer.SpriteName = models[state]
+    self.go_table.aorimage_renderer:SetNativeSize()
+end
+
+---直接设置模型
+---@param spriteName string @模型名称
+function SwordCasual_SwordItem:SetModel(spriteName)
+    self.modelState = nil
+    self.go_table.aorimage_renderer.SpriteName = spriteName
+    self.go_table.aorimage_renderer:SetNativeSize()
+end
+
+--endregion
+
+--region ===================播放特效/音效===================
+
+---碰撞特效
+function SwordCasual_SwordItem:PlayHitEff()
+    _G.AudioManager.PlayAudioByAudioCfgID(5009)
+    self.effDicStates.Destroy = true
+    if not self.effDic.Destroy then
+        self.effDic.Destroy = true
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_daopengzhuang,
+            self.go_table.obj_eff,
+            function(trans)
+                if self.go_table == nil then
+                    _G.UIUtils.RemoveEffect(trans)
+                    return
+                end
+                trans:SetLocalPosition(0, -80, 0)
+                self.effDic.Destroy = trans
+                if not self.effDicStates.Destroy then
+                    self.effDic.Destroy:SetActiveE(0)
+                end
+            end
+        )
+    elseif self.effDic.Destroy ~= true then
+        self.effDic.Destroy:SetActiveE(0)
+        self.effDic.Destroy:SetActiveE(1)
+    end
+end
+
+---设置二攻刀特效是否显示
+---@param active boolean @是否显示
+function SwordCasual_SwordItem:SetSeniorEff(active)
+    self.effDicStates.Senior = active
+    if not self.effDic.Senior then
+        if not active then
+            return
+        end
+        self.effDic.Senior = true
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_daoshengjiglow,
+            self.go_table.obj_eff,
+            function(trans)
+                if self.go_table == nil then
+                    _G.UIUtils.RemoveEffect(trans)
+                    return
+                end
+                self.effDic.Senior = trans
+                if not self.effDicStates.Senior then
+                    self.effDic.Senior:SetActiveE(0)
+                end
+            end
+        )
+    elseif self.effDic.Senior ~= true then
+        self.effDic.Senior:SetActiveE(0)
+        if active then
+            self.effDic.Senior:SetActiveE(1)
+        end
+    end
+end
+
+---隐藏全部特效
+function SwordCasual_SwordItem:HideAllEff()
+    for k, _ in pairs(self.effDicStates) do
+        self.effDicStates[k] = false
+    end
+    for _, v in pairs(self.effDic) do
+        if v ~= true then
+            v:SetActiveE(0)
+        end
+    end
+end
+
+--endregion
+
+--region ===================注册事件===================
+
+---注册生命值改变事件
+---@param callback fun(role:SwordCasual_SwordItem,newValue:number,offset:number):void @事件回调
+function SwordCasual_SwordItem:OnHpChange(callback)
+    self.onHpChange = callback
+end
+
+--endregion
+
+return SwordCasual_SwordItem

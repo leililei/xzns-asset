@@ -1,0 +1,530 @@
+---捐献次数阶段
+local DonateLanguages = {
+    1, 10, 50,
+}
+
+---@class GloryAssemblyView : UIBaseView    荣耀集结主页
+---@field go_table GloryAssemblyView_GoTable
+---@field activity ActivitySynBase
+---@field model GloryAssemblyModel
+---@field toggleSelf GloryAssemblyView._toggle_self_GoTable
+---@field toggleServer GloryAssemblyView._toggle_server_GoTable
+---@field type number                                                           @当前类型: 1个人, 2全服
+---@field value number                                                          @当前进度值
+---@field awardDatas activity_honor_gathering.i_cfg_list[]                      @奖励数据
+---@field awardItems table<any,GloryAssemblyView._obj_awardItem_GoTable>        @奖励节点
+---@field topPlayerItems GloryAssemblyView._obj_player1_GoTable[]               @顶级玩家节点
+---@field remainTime number                                                     @活动剩余时长
+---@field cdTimer Timer                                                         @活动时长计时器
+local GloryAssemblyView = _G.BaseClass("GloryAssemblyView", _G.UIBaseView)
+
+function GloryAssemblyView:Awake()
+    --初始化状态
+    self.type = 1
+    self.go_table.toggle_self.isOn = true
+    self.toggleSelf = _G.GetAutoGoTable(self.go_table.toggle_self)
+    self.toggleServer = _G.GetAutoGoTable(self.go_table.toggle_server)
+    self.toggleSelf.aorimage_isOn:SetActiveE(1)
+    self.toggleServer.aorimage_isOn:SetActiveE(0)
+    --初始化顶级玩家节点
+    self.topPlayerItems = {
+        _G.GetAutoGoTable(self.go_table.obj_player1),
+        _G.GetAutoGoTable(self.go_table.obj_player2),
+        _G.GetAutoGoTable(self.go_table.obj_player3),
+        _G.GetAutoGoTable(self.go_table.obj_player4),
+    }
+    for _, item in ipairs(self.topPlayerItems) do
+        _G.AddViewBtnClick(item.gameObject, _G.handlerbind(self, self.OnClickTopPlayer, item))
+    end
+    --初始化列表
+    self.go_table.scrollloophorizontal_award:InitItemData(0, _G.handler(self, self.RefreshAwardItem))
+
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+function GloryAssemblyView:OnDestroy()
+    if self.model then
+        self.model:SetViewInstance(nil)
+        self.model = nil
+    end
+    if self.cdTimer then
+        self.cdTimer:Stop()
+        self.cdTimer = nil
+    end
+end
+
+---界面的入口函数
+function GloryAssemblyView:OnCreate(activity)
+    self.activity = activity
+    self.model = activity:GetActivityTypeCls()
+    self.model:SetViewInstance(self)
+    self.model:RefreshRedPoint()
+
+    self:InitView()
+    self:UpdateView()
+
+    --活动倒计时
+    local _, endTime = self.model:GetTime()
+    self.remainTime = endTime - _G.TimeUtil.GetServerUnixTime()
+    self:UpdateTimeView(0)
+    self.cdTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTimeView, self, false, false, true)
+    self.cdTimer:Start()
+end
+
+---初始页面状态
+function GloryAssemblyView:InitView()
+    local resources = _G.ConfigManager.ui_cfg.GloryAssemblyView.resources
+    --追加自定义货币id
+    local coinSid = self.model:GetCoinSid()
+    if coinSid and coinSid > 0 then
+        resources = { table.unpack(resources) }
+        table.insert(resources, coinSid)
+    end
+    self:AddComponent(
+        self.go_table.obj_goldInfo,
+        require("ResourceCompont").New(self.go_table.obj_goldInfo, resources)
+    )
+    self:AddComponent(
+        self.go_table.obj_playerInfo,
+        require("PlayerComponent").New(self.go_table.obj_playerInfo)
+    )
+
+    --初始化红点
+    self.go_table.obj_donateRedpoint:UpdateRedPointItemIDAndParam(self.model:GetRedpointIDByIndex(2))
+    self.toggleSelf.obj_redpoint:UpdateRedPointItemIDAndParam(self.model:GetRedpointIDByIndex(3))
+    self.toggleServer.obj_redpoint:UpdateRedPointItemIDAndParam(self.model:GetRedpointIDByIndex(4))
+
+    ---@type GloryAssemblyView._aorbtn_main_GoTable
+    -- local mainGoTable = _G.GetAutoGoTable(self.go_table.aorbtn_main)
+    -- mainGoTable.obj_redpoint:UpdateRedPointItemIDAndParam(self.model:GetRedpointIDByIndex(1))
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.ef_caidai,
+        self.go_table.obj_effect,
+        function(obj)
+            if _G.IsNil(self.go_table) then
+                _G.UIUtils.RemoveEffect(obj)
+                return
+            end
+        end
+    )
+
+    if self.go_table.aorimage_title and self.activity.cfg.info.front.gift_group_show then
+        ---@type activity.i_gift_group_show
+        local show = self.activity.cfg.info.front.gift_group_show
+        for _, v in pairs(show.images) do
+            local imgTb, pos
+            if v.index == 1 then
+                imgTb = self.go_table.aorimage_title
+            end
+            pos = _G.string.split(v.xyz, "#")
+            imgTb:SetLocalScaleXYZ(v.size / 10000)
+            imgTb:SetLocalPosition(
+                _G.tonumber(pos[1]),
+                _G.tonumber(pos[2]),
+                _G.tonumber(pos[3])
+            )
+            imgTb.SpriteName = v.path
+            imgTb:SetNativeSize()
+        end
+    end
+end
+
+---更新页面状态
+function GloryAssemblyView:UpdateView()
+    self:UpdateAwardView()
+    self:UpdateCoinView()
+    --更新顶级玩家信息
+    for index, item in pairs(self.topPlayerItems) do
+        local roleInfo = self.model:GetTopRoleInfo(index)
+        item.roleInfo = roleInfo
+        self:UpdateTopRoleInfo(item, roleInfo)
+
+        --服务器不传city_style_id信息, 去请求玩家完整信息
+        if roleInfo and (not roleInfo.city_style_id or roleInfo.city_style_id == 0) then
+            require("SystemSettingNet"):GetInstance():GetPlayerInfo(
+                { uid = roleInfo.uid },
+                function(msg)
+                    if item.roleInfo ~= roleInfo then
+                        --加载逻辑已被中断
+                        return
+                    end
+                    if not msg.info then
+                        return
+                    end
+                    item.roleInfo = msg.info
+                    item.roleInfo.uid = roleInfo.uid
+                    self:UpdateTopRoleInfo(item, item.roleInfo)
+                end
+            )
+        end
+    end
+
+    --任务子活动状态
+    local taskActivity = require("ActivitySynManager"):GetInstance():GetChildAcitivity(
+        _G.ActivityMainType.Task,
+        self.activity:GetJumpType()
+    )
+    self.go_table.aorbtn_task:SetActiveE(taskActivity and 1 or 0)
+    if taskActivity then
+        ---@type DrawUpBattlePassTaskModel
+        local taskModel = taskActivity:GetActivityTypeCls()
+        self.go_table.obj_taskRedpoint:UpdateRedPointItemIDAndParam(taskModel:GetRedpointIDByIndex(1))
+        if taskActivity.cfg.info.name then
+            if self.viewName == "WinterVeilGloryAssemblyView" then
+                self.go_table.aortext_task.text = _G.GetLangPackValue(92010400034)
+            else
+                --按钮名称
+                self.go_table.aortext_task.text = tostring(taskActivity.cfg.info.name)
+            end
+        end
+        -- else
+        --     self.go_table.obj_taskRedpoint:UpdateRedPointItemIDAndParam(0)
+    end
+end
+
+---更新货币状态
+function GloryAssemblyView:UpdateCoinView()
+    local coinSid, coinNum = self.model:GetCoinSid(), self.model:GetCoinNumber()
+    local iconPath = _G.StorageManager:GetInstance():GetItemIcon(coinSid)
+
+    --按钮状态
+    local baseNum = DonateLanguages[1]
+    if coinNum <= DonateLanguages[2] then
+        baseNum = coinNum > 0 and coinNum or DonateLanguages[1]
+    else
+        for i = #DonateLanguages, 2, -1 do
+            if coinNum >= DonateLanguages[i] or i == 1 then
+                baseNum = DonateLanguages[i]
+                break
+            end
+        end
+    end
+    self.go_table.aortext_donate.text = _G.GetLangPackValue(90000013205, baseNum)
+    self.go_table.aorrawimage_consume:LoadImage(iconPath)
+    self.go_table.aortext_consume.text = string.format(coinNum < baseNum and "<color=red>%s</color>/%s" or "%s/%s", coinNum, baseNum)
+end
+
+---更新活动倒计时
+---@param elapsed number
+function GloryAssemblyView:UpdateTimeView(elapsed)
+    if elapsed then
+        self.remainTime = self.remainTime - elapsed
+    end
+    local t = _G.TimeUtil.TranslateSecond(self.remainTime)
+    local tStr
+    if t.day > 0 then
+        tStr = _G.GetLangPackValue(90022100001, t.day, t.hour)
+    else
+        tStr = _G.GetLangPackValue(90022100002, t.hour, t.min)
+    end
+    self.go_table.aortext_time.text = _G.GetLangPackValue(90000013201, tStr)
+end
+
+---更新奖励视图
+---@param type? number 1,个人奖励 2,服务器奖励
+function GloryAssemblyView:UpdateAwardView(type)
+    if type then
+        self.type = type
+    else
+        type = self.type
+    end
+    self.awardDatas = self.model:GetCfgs(self.type) or {}
+    self.value = self.type == 1 and self.model:GetSelfValue() or self.model:GetServerValue()
+
+    --视图页面
+    self.go_table.aortext_progress.text = tostring(self.value)
+    --奖励列表
+    local jumpIndex = 1 --跳转到可领取奖励丶最新进度处
+    for index, t in ipairs(self.awardDatas) do
+        if self.value >= t.condition then
+            jumpIndex = index
+            if not self.model:CheckAward(self.type, t.sid) then
+                break
+            end
+        else
+            jumpIndex = index
+            break
+        end
+    end
+    self.go_table.scrollloophorizontal_award:UpdateCount(#self.awardDatas, jumpIndex - 1) --lua下标从1开始, C#下标从0开始
+end
+
+---刷新奖励节点
+---@param index number
+---@param go UnityEngine.GameObject
+function GloryAssemblyView:RefreshAwardItem(index, go)
+    if not self.awardItems then
+        self.awardItems = {}
+    end
+    ---@type GloryAssemblyView._obj_awardItem_GoTable
+    local item = self.awardItems[go:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(go)
+        self.awardItems[go:GetInstanceIDE()] = item
+    end
+
+    local data = self.awardDatas[index + 1]
+    local meet = data.condition <= self.value --是否满足目标
+    local nextData = self.awardDatas[index + 2]
+
+    item.data = data
+    item.obj_fillLast:SetActiveE(meet and 1 or 0)
+    item.obj_fillNext:SetActiveE(meet and nextData and 1 or 0)
+    item.aortext_value.text = _G.UIUtils.NumberToUnitStr_CardFightNum(data.condition, false)
+
+    --奖励信息
+    item.obj_reward:ClearChildren()
+    if data.award and #data.award > 0 then
+        local isGetAward = self.model:CheckAward(self.type, data.sid)
+        local canGetAward = not isGetAward and data.condition <= self.value
+        local firstAward = data.award[1].type
+        if firstAward[1] == 0 and #firstAward >= 5 then
+            --活动代币格式: 0 # 活动id # 活动jumpid # 物品id # 物品数量...
+            local temp = {}
+            for i = 4, #firstAward do
+                table.insert(temp, firstAward[i])
+            end
+            firstAward = temp
+        end
+        _G.StorageManager:GetInstance():GetItemBaseViewNew(
+            firstAward,
+            item.obj_reward,
+            function(node)
+                if self:IsNil() or item.data ~= data then
+                    _G.DestroyObject(node.gameObject)
+                    return
+                end
+
+                --node.gameObject:SetActiveE(1)
+                node.gameObject:SetLocalScaleXYZ(0.7)
+                --node.gameObject:SetLocalPositionToZero()
+                node:SetGou(isGetAward)
+                if node.go_table.aorrawimage_Icon then
+                    node.go_table.aorrawimage_Icon:SetGray(isGetAward)
+                end
+                if node.go_table.aorimage_Color then
+                    node.go_table.aorimage_Color:SetGray(isGetAward)
+                end
+                node:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+                if node.ShowEffectOrder and canGetAward then
+                    node:ShowEffectOrder(true)
+                end
+            end,
+            function(go, isOn)
+                if self.value >= data.condition and not self.model:CheckAward(self.type, data.sid) then
+                    self:GetAward()
+                else
+                    require("CommonTipManager"):GetInstance():OpenTip(go.gameObject, firstAward[1])
+                end
+            end
+        )
+    end
+end
+
+---更新角色展示节点
+---@param item GloryAssemblyView._obj_player1_GoTable
+---@param roleInfo role.i_role_info
+function GloryAssemblyView:UpdateTopRoleInfo(item, roleInfo)
+    item.obj_role:ClearChildren()
+    item.obj_roleEmpty:SetActiveE(1)
+    item.obj_title:SetActiveE(0)
+
+    if roleInfo then
+        if not item.effect then
+            _G.UIUtils.LoadEffectByCfg(
+                _G.ConfigManager.ui_effect_cfg.ef_lihua,
+                item.obj_effect,
+                function(obj)
+                    if _G.IsNil(self.go_table) or item.effect then
+                        _G.UIUtils.RemoveEffect(obj)
+                        return
+                    end
+                    item.effect = obj
+                end
+            )
+        elseif item.effect:GetActiveSelf() == 0 then
+            item.effect:SetActiveE(1)
+        end
+        local loadingId = "load_" .. tostring(math.random())
+        item.loadingId = loadingId
+        --角色基础信息
+        item.aortext_name.text = roleInfo.name
+        --加载角色模型
+        if roleInfo.city_style_id and roleInfo.city_style_id > 0 then
+            local cfg = require "CardCommentManager":GetInstance():CardData(roleInfo.city_style_id, false)
+            local rolepath = _G.UIUtils.GetBattleSpine(cfg, _G.UseBattleSpine.RankView)
+            _G.PoolsManager:GetInstance():Spawn(
+                rolepath,
+                _G.ePoolType.Temporary,
+                nil,
+                function(trans)
+                    if trans == nil then
+                        if _G.AppSetting.DEBUG then
+                            _G.LogError("角色无法加载 path:" .. rolepath .. "    CardInfoView LoadRoleScene")
+                        end
+                        return
+                    end
+                    if self:IsNil() or item.loadingId ~= loadingId then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    trans:SetParentE(item.obj_role)
+                    trans:SetLocalPosition(0, 0, 0)
+                    trans:SetLocalScaleXYZ(cfg.size4)
+
+                    item.obj_roleEmpty:SetActiveE(0)
+                end
+            )
+        end
+        --加载角色称号
+        local titleId = roleInfo.title and roleInfo.title.sid or 0
+        if titleId > 0 then
+            item.obj_title:SetActiveE(1)
+            local titleScale = _G.ConfigManager.discrete_cfg[100111] and _G.ConfigManager.discrete_cfg[100111][1][1] or 1
+            local titleCfg = _G.ConfigManager.player_title_effect_cfg[titleId]
+            if titleCfg.type_title == 1 then
+                item.aorrawimage_title:LoadImage(titleCfg.title,
+                    function(img)
+                        if self:IsNil() then
+                            return
+                        end
+                        img:SetNativeSize()
+                    end
+                )
+                item.aorrawimage_title:SetActiveE(1)
+                item.aorrawimage_title:SetLocalScaleXYZ(0.29 * titleScale)
+                item.obj_effectTitle:RemoveAllChildren()
+                item.curShowEffTitle = nil
+            elseif titleCfg.type_title == 2 then
+                if item.curShowEffTitle ~= titleCfg.title then
+                    item.curShowEffTitle = titleCfg.title
+                    item.obj_effectTitle:RemoveAllChildren()
+                    _G.UIUtils.LoadEffectTitleOrFrame(
+                        titleCfg.title,
+                        item.obj_effectTitle,
+                        function(trans)
+                            if item.loadingId ~= loadingId then
+                                trans:DestroyObject()
+                                return
+                            end
+                            local parClip = trans:AddComponentE(_G.typeof(_G.CS.ParticleClipRect))
+                            parClip.NeedCheck = true
+                            parClip.CheckCount = 10
+                            parClip.CheckOne = 3
+                            trans:SetLocalScaleXYZ(0.8 * titleScale)
+                        end
+                    )
+                end
+                item.aorrawimage_title:SetActiveE(0)
+            end
+        end
+    else
+        if item.effect then
+            item.effect:SetActiveE(0)
+        end
+        item.loadingId = nil
+        item.aortext_name.text = _G.GetLangPackValue(90022300109)
+    end
+end
+
+---领取节点奖励
+function GloryAssemblyView:GetAward()
+    local sids = {}
+    for _, data in pairs(self.awardDatas) do
+        if data.condition > self.value then
+            break
+        end
+        if not self.model:CheckAward(self.type, data.sid) then
+            table.insert(sids, data.sid)
+        end
+    end
+    if #sids == 0 then
+        return
+    end
+
+    ---发起领取请求
+    self.model:GetAward(self.type, sids, function(msg)
+        self:UpdateView()
+        _G.UIUtils.ShowCommonAward(msg)
+    end)
+end
+
+---点击玩家信息
+---@param item GloryAssemblyView._obj_player1_GoTable|{roleInfo:role.i_role|role.i_role_info}
+function GloryAssemblyView:OnClickTopPlayer(go, isOn, item)
+    local roleInfo = item.roleInfo
+    if not roleInfo then
+        if self.viewName == "WinterVeilGloryAssemblyView" then
+            _G.PopWindowManager:GetInstance():ShowAllTips(1190002)
+        else
+            _G.PopWindowManager:GetInstance():ShowAllTips(1130002)
+        end
+        return
+    end
+    if roleInfo.uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+        if self.viewName == "WinterVeilGloryAssemblyView" then
+            _G.PopWindowManager:GetInstance():ShowAllTips(1190001)
+        else
+            _G.PopWindowManager:GetInstance():ShowAllTips(1130001)
+        end
+        return
+    end
+    _G.SystemSettingManager:GetInstance():OpenView(roleInfo.uid)
+end
+
+---按钮点击事件在这里派发
+function GloryAssemblyView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_CloseView then
+        self:Close()
+    elseif go == self.go_table.aorbtn_task then
+        --打开限时任务界面
+        _G.GlobalInterface.JumpActivityByGM(_G.ActivityMainType.Task, self.activity:GetJumpType())
+    elseif go == self.go_table.aorbtn_donate then
+        local coinSid, coinNum = self.model:GetCoinSid(), self.model:GetCoinNumber()
+        local num = 0
+        if coinNum <= DonateLanguages[2] then
+            num = coinNum
+        else
+            for i = #DonateLanguages, 2, -1 do
+                if coinNum >= DonateLanguages[i] then
+                    num = DonateLanguages[i]
+                    break
+                end
+            end
+        end
+        if num > 0 and coinNum >= num then
+            self.model:Donate(coinSid, num, function(msg)
+                if msg and msg.ack == 1 then
+                    self:UpdateView()
+                    if msg.award then
+                        _G.UIUtils.ShowCommonAward(msg)
+                    end
+                end
+            end)
+        else
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GetItemWayView.Name, coinSid)
+        end
+    elseif go == self.go_table.aorbtn_help then
+        if self.model.precast and self.model.precast[1] and self.model.precast[1] == "MTGloryAssemblyView" then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 194)
+        elseif self.model.precast and self.model.precast[1] and self.model.precast[1] == "WinterVeilGloryAssemblyView" then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 211)
+        elseif self.model.precast and self.model.precast[1] and self.model.precast[1] == "SpringGloryAssemblyView" then
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 225)
+        else
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, 183)
+        end
+    elseif go == self.go_table.toggle_self then
+        self.toggleSelf.aorimage_isOn:SetActiveE(isOn and 1 or 0)
+        if isOn then
+            self:UpdateAwardView(1)
+        end
+    elseif go == self.go_table.toggle_server then
+        self.toggleServer.aorimage_isOn:SetActiveE(isOn and 1 or 0)
+        if isOn then
+            self:UpdateAwardView(2)
+        end
+    end
+end
+
+return GloryAssemblyView

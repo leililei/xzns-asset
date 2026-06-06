@@ -1,0 +1,212 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Spoils.Model.SpoilsDrawModel	(修改路径必须修正此项!)
+-- Created by
+-- DateTime:
+-- Description: 战利品抽卡模型
+-----------------------------------------------------------------------
+local SpoilsNet = require("SpoilsNet")
+
+local base = _G.GameDataModelBase
+---@class SpoilsDrawModel : GameDataModelBase
+local SpoilsDrawModel = _G.BaseClass("SpoilsDrawModel", base)
+
+---@return SpoilsDrawModel SpoilsDrawModel
+function SpoilsDrawModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SpoilsDrawModel:__init()
+    self.cfgid = 50100
+    self.awardState = {}
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+---从服务器拉取数据
+function SpoilsDrawModel:GetDataFormServer()
+    SpoilsNet:GetInstance():GetDrawInfo(_G.handler(self, self.ParseData))
+end
+
+function SpoilsDrawModel:OnUpData(data)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SpoilsDraw.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SpoilsCanUp.id)
+end
+
+---@param msg spoils.s2c_spoils_draw_info
+function SpoilsDrawModel:ParseData(msg)
+    self.day_count = msg.day_count or 0
+    self.total_times = msg.total_count or 0
+    self.diamond_times = msg.diamond_times or 0
+    self.need_count = msg.need_count or 0
+    self.wish_sid = msg.wish_sid or 0
+    self.awardState = msg.award or {}
+    self.free_count = msg.free_count or 0
+    self.super.ParseData(self)
+end
+
+function SpoilsDrawModel:GetTotalTimes()
+    return self.total_times
+end
+
+---获取心愿单
+function SpoilsDrawModel:GetWishsids()
+    return self.wish_sid or 0
+end
+
+---获取心愿剩余次数
+function SpoilsDrawModel:GetWishNeedCounts()
+    return self.need_count
+end
+
+---获取召唤积分
+function SpoilsDrawModel:IsGetAwardByIndex(index)
+    return _G.table.ContainsValue(self.awardState, index)
+end
+
+---增加已使用魂玉召唤次数
+---@param num number 次数
+---@return number   当前次数
+function SpoilsDrawModel:AddDiamondTimes(num)
+    self.diamond_times = (self.diamond_times or 0) + num
+    return self.diamond_times
+end
+
+---获取已使用魂玉召唤次数
+---@return number
+function SpoilsDrawModel:GetDiamondTimes()
+    return self.diamond_times or 0
+end
+
+---获取魂玉召唤次数上限
+---@return number
+function SpoilsDrawModel:GetDiamondTotalTimes()
+    self.diamond_total_times = self.diamond_total_times or _G.ConfigManager.item_roller_cfg[self.cfgid].count_diamond
+    local num = self.diamond_total_times
+    -- local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.LimitedTimePrivilege
+    --     .ShopNumAdd, 3 })
+    -- if data[1] then
+    --     num = data[1] + num
+    -- end
+    return num
+end
+
+---获取剩余魂玉召唤次数
+function SpoilsDrawModel:GetLastDiamondTimes()
+    return self:GetDiamondTotalTimes() - self:GetDiamondTimes()
+end
+
+---@param sid number
+function SpoilsDrawModel:SetWish(sid, callback)
+    local pbData = { wish_sid = sid }
+    SpoilsNet:GetInstance():DrawSetWish(pbData, function(msg)
+        if msg.ack == 1 then
+            self.wish_sid = sid
+            _G.Events:GetInstance():Broadcast(_G.eSpoilsDraw.SpoilsDrawWishRefresh)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SpoilsDrawWish.id)
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---抽卡
+---@param num number 抽奖次数
+---@param consume_type number 消耗类型（1:道具 2:魂玉）
+function SpoilsDrawModel:Draw(drawNum, consume_type, callback)
+    local pbData = { draw_times = drawNum, consume_type = consume_type }
+    SpoilsNet:GetInstance():DrawExecute(pbData, function(msg)
+        if msg.ack == 1 then
+            _G.StorageManager:GetInstance():ReceiveAwardData({ award = msg.award })
+            if msg.award.overflow then
+                _G.PopWindowManager:GetInstance():ShowAllTips(380104)
+            end
+            self.need_count = msg.need_count
+            local sid
+            local num
+            if consume_type == 1 then
+                sid = _G.ConfigManager.item_roller_cfg[self.cfgid].ticket[1]
+                num = drawNum
+            else
+                self:AddDiamondTimes(drawNum)
+                sid, num = self:GetDiamondCurrencyByType(drawNum)
+            end
+            _G.StorageManager:GetInstance():ConsumeItem(sid, 0, num)
+            
+            _G.PlayerPrefsManager.SetInt("SpoilsFirstDraw", 1)
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SpoilsDraw.id)
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.SpoilsCanUp.id)
+            _G.Events:GetInstance():Broadcast(_G.eSpoilsDraw.SpoilsDrawEnd)
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---获取魂玉抽卡的sid和num
+---@param drawNum number 抽奖次数
+---@return number,number,number 消耗id，消耗值，折扣
+function SpoilsDrawModel:GetDiamondCurrencyByType(drawNum)
+    local sid
+    local num
+    sid = _G.ConfigManager.item_roller_cfg[self.cfgid].ticket_2[1]
+    local baseNum = _G.ConfigManager.item_roller_cfg[self.cfgid].ticket_2[2]
+    num = drawNum * baseNum
+    local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.LimitedTimePrivilege
+        .ConsumeReduce, self.cfgid })
+    local discount = 1
+    if data[1] then
+        discount = data[1] * 0.0001
+        num = num - num * discount
+    end
+    return sid, _G.math.ceil(num), 1 - discount
+end
+
+---@param score number
+function SpoilsDrawModel:GetAward(score, callback)
+    local pbData = { index_list = { score } }
+    SpoilsNet:GetInstance():SpoilsDrawGetAward(pbData, function(msg)
+        if msg.ack == 1 then
+            _G.table.insert(self.awardState, score)
+            if #self.awardState == 4 then
+                self.awardState = {}
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+
+---抽奖红点（包含道具和魂玉都满足时）
+function SpoilsDrawModel:CheckDrawPointRed()
+    local sid = _G.ConfigManager.item_roller_cfg[self.cfgid].ticket[1]
+    local itemNum = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.Prop, sid)
+    if itemNum ~= nil and itemNum > 0 then
+        --ZHJH-3174 有足够道具时，打开招募界面红点消失
+        if _G.PlayerPrefsManager.HasKey("SpoilsDrawRedPoint") then
+            return false
+        end
+        return true
+        -- elseif itemNum == 0 and (self:GetDiamondTotalTimes() - self:GetDiamondTimes()) > 10 then
+        --     local sidCurrency,num = self:GetDiamondCurrencyByType(10)
+        --     local curNum = _G.StorageManager:GetInstance():GetItemCountByID(_G.StorageID.ResProp, sidCurrency)
+        --     return curNum >= num
+    end
+    return false
+end
+
+---抽奖心愿单红点
+function SpoilsDrawModel:CheckDrawWishPointRed(index)
+    return self.wish_sid == 0
+end
+
+---销毁对象时,析构函数
+function SpoilsDrawModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+return SpoilsDrawModel

@@ -1,0 +1,1406 @@
+--------------------------------------------------------------------------
+-- D:.Game.Client.Assets.Resources.LuaScripts.Game.ArenaGlobal.Model.ArenaGlobalModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2025/09/05
+-- Description 晋升堡垒
+-----------------------------------------------------------------------
+local ArenaGlobalNet = require("ArenaGlobalNet")
+local ArenaGlobalTaskData = require("ArenaGlobalTaskData")
+
+local net_map = _G.ConfigManager.net_map
+
+---@class ArenaGlobalModel : GameDataModelBase 晋升堡垒
+local ArenaGlobalModel = _G.BaseClass("ArenaGlobalModel", _G.GameDataModelBase)
+
+function ArenaGlobalModel:__init()
+    self.rankData = {}
+    ---@type table<number[][],i_garray>
+    self.atkArray = {}
+    self.defArray = {}
+    self.maxGroupNum = _G.ConfigManager.discrete_cfg[127107][1][1]
+    local fCfg = _G.ConfigManager.discrete_cfg[127110]
+    self.fightStartSec = fCfg[1][1] * 3600 + fCfg[1][2] * 60
+    self.fightEndSec = fCfg[2][1] * 3600 + fCfg[2][2] * 60
+    _G.Events:GetInstance():AddListener(net_map.p2c_arena_global_def_fight.Cmd, self.SetHasNewReport, self)
+    _G.Events:GetInstance():AddListener(net_map.p2c_global_fight_result.Cmd, self.GetBattleResults, self)
+end
+
+---@return ArenaGlobalModel ArenaGlobalModel
+function ArenaGlobalModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---战区活动无法多开，GM仅作为开启标识，故信息存放进单例中
+function ArenaGlobalModel:SetActivity(activity, activityID)
+    ---@type ArenaGlobalSynModel
+    self.activity = activity
+    self.activityID = activityID
+    self.typeClass = activity.typeClass
+end
+
+function ArenaGlobalModel:GetActivity()
+    return self.activity
+end
+
+function ArenaGlobalModel:GetInfo(call)
+    ArenaGlobalNet:GetInstance():GetInfo(_G.handlerbind(self, self.ParseData, call))
+end
+
+---@param msg arena_global.s2c_arena_global_info
+function ArenaGlobalModel:ParseData(msg, call)
+    if msg.ack ~= 1 then
+        self.super.ParseData(self)
+        if call then
+            call()
+        end
+        if msg.ack == 5301 then
+            self:DelayToGetInfo()
+        else
+            if self.activity then
+                self.activity:ChangeState(require("ActivitySynManager").State.Close)
+            end
+        end
+        return
+    end
+    local eggTime = 0
+    if self.activity then
+        eggTime = self.activity.cfg.time.get_time
+    end
+    local pubInfo = msg.pub
+    self.startTime = pubInfo.start_timer
+    self.endTime = pubInfo.end_time - eggTime
+    self.maxDan = pubInfo.max_dan or 0
+    self.EggEndTime = msg.pub.end_time
+    if pubInfo.end_time < _G.TimeUtil.GetServerUnixTime() then
+        if self.activity then
+            self.activity:ChangeState(require("ActivitySynManager").State.Close)
+        end
+        if call then
+            call()
+        end
+        return
+    end
+    self.joinTime = pubInfo.join_time
+    self.fightTime = pubInfo.fight_time
+
+    local info = msg.global_info
+    if info == nil then --活动在线同步，服务器尚未初始化完成
+        self:DelayToGetInfo()
+        if call then
+            call()
+        end
+        return
+    end
+    self.EggAwardFlag = info.easter_egg
+    self.retryTimes = 0
+    self.dan = info.dan
+    self.danGroup = info.dan_group
+    self.score = info.score
+    self.peakScore = info.rank_score
+    self.refreshTodayTimes = info.re_num
+    self.lastRefreshTime = info.re_time
+    self.enemyInfo = info.enemy
+    self.fightTimes = info.fight_time or 0
+    self.ungetDayAward = info.dan_day_award or {}
+    self.lastDan = info.last_dan or 0
+    self.lastRank = info.last_index or 0
+    self.lastPointsAdd = info.last_add_score or 0
+
+    self.atkArray = {}
+    self.defArray = {}
+    if info.a_array then
+        for _, v in pairs(info.a_array) do
+            self.atkArray[v.dan] = {}
+            if v.garrays then
+                for _, team in pairs(v.garrays) do
+                    self.atkArray[v.dan][team.id % 100] = team
+                end
+            end
+        end
+    end
+    if info.d_array then
+        for _, v in pairs(info.d_array) do
+            self.defArray[v.dan] = {}
+            if v.garrays then
+                for _, team in pairs(v.garrays) do
+                    self.defArray[v.dan][team.id % 100] = team
+                end
+            end
+        end
+    end
+    self.totalTimes = 0
+    self.todayTimes = 0
+    self:InitTaskData(msg.global_info)
+
+    if _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.ArenaGlobalFace) ~= self.startTime and not self.hasAddFace and not self:CheckInEggAwrdStatus() then
+        self.hasAddFace = true
+        local MainOpenViewFunItem = {}
+        MainOpenViewFunItem.OpenViewFun = function()
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.ArenaGlobalFaceView.Name)
+        end
+        _G.MainManager:GetInstance():AddMainFunQueue(MainOpenViewFunItem, _G.MainViewShowOrder.ArenaGlobal)
+    end
+
+    if call then
+        call()
+    end
+    _G.Events:GetInstance():Broadcast(_G.eArenaGlobal.ArenaGlobalInfo)
+    local gSettle, fSettle, time = self:CheckIsSettle()
+    if (gSettle or fSettle) and time > 0 then
+        if self.timer then
+            self.timer:Stop()
+            self.timer = nil
+        end
+        self.timer = _G.TimerManager:GetInstance():GetTimer(time, self.OnGetInfo, self, true, false, true)
+        self.timer:Start()
+    end
+    --在线新功能开放, redId带params时AddRedPointChild无法正常刷新父节点, 此处手动刷新一下
+    --require "RedPointManager":GetInstance():RefreshNodeByAllParams(self.activity:GetActivityTypeCls():GetRedpointIDByIndex(1))
+end
+
+---判断是不是能越级
+---@param dan number 段位
+function ArenaGlobalModel:GetSkipInfo(dan)
+    if dan == 0 then
+        return false, 0, 0, 0
+    end
+    local cfg = _G.ConfigManager.arena_global_league_cfg[dan]
+    if nil == cfg.openskip or cfg.openskip == 0 then
+        return false, 0, 0, 0
+    end
+    if self.maxDan >= cfg.openskip then
+        local srank = 0
+        local sscore = 0
+        for i = 1, #cfg.skip do
+            local key = cfg.skip[i][1]
+            local v1 = cfg.skip[i][2]
+            local v2 = cfg.skip[i][3]
+            if key == 1 then
+                srank = v2
+            elseif key == 2 then
+                sscore = v1
+            end
+        end
+        local scfg = _G.ConfigManager.arena_global_league_cfg[cfg.openskip + 1]
+        return true, srank, sscore, scfg.name
+    end
+    return false, 0, 0, 0
+end
+
+---判断是不是能越级
+---@param dan number 段位
+---@param rank number 排名
+---@param score number 积分
+function ArenaGlobalModel:CheckCanSkip(dan, rank, score)
+    if dan == 0 then
+        return false
+    end
+    local cfg = _G.ConfigManager.arena_global_league_cfg[dan]
+    if nil == cfg.openskip or cfg.openskip == 0 then
+        return false
+    end
+    if self.maxDan >= cfg.openskip then
+        local skipnum = 0
+        for i = 1, #cfg.skip do
+            local key = cfg.skip[i][1]
+            local v1 = cfg.skip[i][2]
+            local v2 = cfg.skip[i][3]
+            if key == 1 then
+                if rank >= v1 and rank <= v2 then
+                    skipnum = skipnum + 1
+                end
+            elseif key == 2 then
+                if score >= v1 then
+                    skipnum = skipnum + 1
+                end
+            end
+        end
+        if skipnum >= #cfg.skip then
+            return true
+        end
+    end
+    return false
+end
+
+function ArenaGlobalModel:OnGetInfo()
+    self:GetInfo()
+end
+
+function ArenaGlobalModel:CheckInEggAwrdStatus()
+    local nowTime = _G.TimeUtil.GetServerUnixTime()
+    if self.activity and self.EggEndTime and self.endTime < nowTime and self.EggEndTime > nowTime then
+        return true
+    end
+    return false
+end
+
+---获取结算后全服奖励
+function ArenaGlobalModel:GetEggAward(callback)
+    require "ActivitySynNet":GetInstance():GetAward(
+        self.activity:GetActivityID(),
+        {},
+        function(msg)
+            if msg.ack == 1 then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                self.EggAwardFlag = true
+                if callback then
+                    callback()
+                end
+                self:RefreshActivityRedPoint(6)
+            end
+        end
+    )
+end
+
+function ArenaGlobalModel:DelayToGetInfo()
+    if not self.retryTimes then
+        self.retryTimes = 0
+    end
+    self.retryTimes = self.retryTimes + 1
+    if self.retryTimes > 5 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("晋升堡垒请求5次服务器仍未初始化完成,不再重新请求")
+        end
+        return
+    end
+    _G.DelayDo(30, _G.handler(self, self.GetInfo))
+end
+
+function ArenaGlobalModel:Apply(call)
+    ArenaGlobalNet:GetInstance():Apply(
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.dan = msg.dan
+            self.danGroup = msg.dan_group
+            local cfg = self:GetCurDanCfg()
+            self.score = cfg.base_score
+            _G.Events:GetInstance():Broadcast(_G.eArenaGlobal.ArenaGlobalApply)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+function ArenaGlobalModel:GetServerList(call)
+    ArenaGlobalNet:GetInstance():GetServerList(
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---进入/退出主界面 1进入2离开
+function ArenaGlobalModel:EnterOrQuit(type)
+    local pbData = { type = type }
+    ArenaGlobalNet:GetInstance():EnterOrQuit(pbData)
+end
+
+---检测报名或分组状态（未报名或未分组无法刷新和战斗）
+function ArenaGlobalModel:CheckApplyAndGroup()
+    if not self:CheckHasApply() then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("【非报错打印】晋升堡垒未报名")
+        end
+        return false
+    end
+    if self.danGroup == 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("【结算时间内请无视】未分组，无法刷新（联系服务器查明原因）")
+        end
+        return false
+    end
+    return true
+end
+
+---刷新对手信息(首次刷新无消耗)
+function ArenaGlobalModel:RefreshEnemy(call)
+    if not self:CheckApplyAndGroup() then
+        if call then
+            call()
+        end
+        return
+    end
+    local consume
+    if self.refreshTodayTimes > 0 then
+        consume = self:GetRefreshConsume()
+        if not _G.StorageManager:GetInstance():CheckItemNew(consume[1], consume[2]) then
+            if call then
+                call()
+            end
+            return
+        end
+    end
+    ArenaGlobalNet:GetInstance():RefreshEnemy(
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(msg)
+                end
+                return
+            end
+            self.enemyInfo = msg.enemy
+            if self.refreshTodayTimes > 0 and consume then
+                _G.StorageManager:GetInstance():ConsumeItem(consume[1], nil, consume[2])
+            end
+            self.refreshTodayTimes = self.refreshTodayTimes + 1
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+function ArenaGlobalModel:GetRefreshConsume()
+    if self.refreshTodayTimes == 0 then
+        return {}
+    end
+    local cfg = _G.ConfigManager.discrete_cfg[127108]
+    return cfg[self.refreshTodayTimes] or cfg[#cfg]
+end
+
+---获取对手阵容详细信息
+function ArenaGlobalModel:GetEnemyArray(uid, call)
+    local pbData = { uid = uid }
+    ArenaGlobalNet:GetInstance():GetEnemyArray(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if call then
+                call(msg.team)
+            end
+        end
+    )
+end
+
+---是否已经报名
+function ArenaGlobalModel:CheckHasApply()
+    return self.dan ~= 0
+end
+
+function ArenaGlobalModel:GetScore()
+    return self.score or 0
+end
+
+function ArenaGlobalModel:GetPeakScore()
+    return self.peakScore or 0
+end
+
+function ArenaGlobalModel:GetDan()
+    return self.dan or 0
+end
+
+--获取昨日段位
+function ArenaGlobalModel:GetLastDan()
+    return self.lastDan
+end
+
+function ArenaGlobalModel:GetCurDanCfg()
+    if self.dan == 0 or self.dan == nil then
+        return _G.ConfigManager.arena_global_league_cfg[1]
+    end
+    return _G.ConfigManager.arena_global_league_cfg[self.dan]
+end
+
+function ArenaGlobalModel:GetState()
+    local now = _G.TimeUtil.GetServerUnixTime()
+    if self.startTime == nil then
+        return _G.ArenaGlobalState.Settlement
+    end
+    local limit = self.startTime + self.joinTime
+    if now < limit then
+        return _G.ArenaGlobalState.Prepare, limit - now
+    end
+    limit = limit + self.fightTime
+    if now < limit then
+        return _G.ArenaGlobalState.Battle, limit - now
+    end
+    return _G.ArenaGlobalState.Settlement, self.endTime - now
+end
+
+function ArenaGlobalModel:GetBattleDay()
+    local now = _G.TimeUtil.GetServerUnixTime()
+    local limit = self.startTime + self.joinTime
+    if now < limit then
+        return 1
+    end
+    limit = limit + self.fightTime
+    if now < limit then
+        local left = limit - now
+        return TimeUtil.TranslateSecond(left).day
+    end
+    return 1
+end
+
+---检测是否显示战斗页面（否则准备页面）
+function ArenaGlobalModel:CheckShowBattle()
+    if not self:CheckHasApply() then
+        return false
+    end
+    local state = self:GetState()
+    if state ~= _G.ArenaGlobalState.Battle then
+        return false
+    end
+    -- local settle = _G.ConfigManager.discrete_cfg[127116]
+    local sec = _G.TimeUtil.GetSecondsOfDay()
+    if sec < self.fightStartSec or sec >= self.fightEndSec then
+        return false
+    end
+    return true
+end
+
+function ArenaGlobalModel:GetEnemyInfo()
+    return self.enemyInfo or {}
+end
+
+function ArenaGlobalModel:GetStartTime()
+    return self.startTime
+end
+
+function ArenaGlobalModel:GetEndTime()
+    return self.endTime
+end
+
+function ArenaGlobalModel:GetRefreshTimes()
+    return self.refreshTodayTimes
+end
+
+---获取免费挑战次数
+function ArenaGlobalModel:GetFreeFightTimes()
+    return self.fightTimes
+end
+
+---获取今日战斗次数
+function ArenaGlobalModel:GetTodayFightTimes()
+    return self.todayTimes
+end
+
+---获取总战斗次数
+function ArenaGlobalModel:GetTotalFightTimes()
+    return self.totalTimes
+end
+
+---获取是否达到保级最低限度
+function ArenaGlobalModel:CheckMinFightTimes()
+    local cfg = self:GetCurDanCfg()
+    return self:GetTodayFightTimes() >= cfg.min_number
+end
+
+function ArenaGlobalModel:CheckHasNewReport()
+    return self.hasNewReport
+end
+
+---被攻击/打开战报页面
+---@param msg arena_global.p2c_def_fight
+function ArenaGlobalModel:SetHasNewReport(msg)
+    if msg then
+        self.score = msg.n_score
+        self.hasNewReport = true
+        self:UpdateRankData()
+        if msg.del_score > 0 then
+            local time = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+            _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.ArenaGlobalDefence, time)
+            _G.Events:GetInstance():Broadcast(_G.eArenaGlobal.ArenaGlobalScoreChange)
+        end
+    else
+        self.hasNewReport = false
+        _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.ArenaGlobalDefence, 0)
+    end
+    self:RefreshActivityRedPoint(2)
+end
+
+function ArenaGlobalModel:GetRank(type, page, call)
+    local pbData = { type = type, page = page }
+    ArenaGlobalNet:GetInstance():GetRank(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.rankData[type] = msg
+            self.rankData[type].rank = self.rankData[type].rank or {}
+            -- if type == 1 then
+            --     self.rank = msg.rank_num or 0
+            --     self.groupNum = msg.r_num or 0
+            -- end
+            if call then
+                call(self.rankData[type])
+            end
+        end
+    )
+end
+
+---@param type number 1段位分组2巅峰
+function ArenaGlobalModel:GetRankData(type, page, call)
+    page = page or 1
+    if self.rankData[type] == nil then
+        self:GetRank(type, page, call)
+    else
+        if call then
+            call(self.rankData[type])
+        end
+    end
+end
+
+function ArenaGlobalModel:UpdateRankData()
+    if not self.rankData[1] then
+        return
+    end
+    local selfData
+    local rank = self.rankData[1].rank
+    if self.rankData[1].rank_num > 0 and #rank >= self.rankData[1].rank_num then
+        selfData = _G.table.remove(rank, self.rankData[1].rank_num)
+    else
+        selfData = _G.PlayerModel:GetInstance():GetIRroleTable(true)
+    end
+    selfData.score = self.score
+    local index = 1
+    for i = 1, #rank do
+        if self.score < rank[i].score then
+            index = i + 1
+        else
+            break
+        end
+    end
+    _G.table.insert(rank, index, selfData)
+    self.rankData[1].rank_num = index
+end
+
+function ArenaGlobalModel:ClearRankData(type)
+    if type == nil then
+        self.rankData = {}
+    else
+        self.rankData[type] = nil
+    end
+end
+
+---@return boolean, boolean 个人榜，巅峰榜
+function ArenaGlobalModel:CheckCanRequestRank()
+    local state = self:GetState()
+    if state == _G.ArenaGlobalState.Prepare then
+        return false, false
+    end
+    if state == _G.ArenaGlobalState.Settlement then
+        return false, true
+    end
+    local gSettle, fSettle = self:CheckIsSettle(state)
+    if gSettle then
+        return false, false
+    elseif fSettle then
+        return false, true
+    end
+    return true, true
+end
+
+---获取晋级/降级线
+function ArenaGlobalModel:GetRankLimit(rankNum)
+    local danCfg = ArenaGlobalModel:GetInstance():GetCurDanCfg()
+    local layer = danCfg.layer
+    if rankNum == 0 then
+        if layer[2][1] == 10000 then --无人降级
+            return 0, 1, layer       --保级
+        else
+            return 0, 0, layer       --降级
+        end
+    else
+        local limit1 = rankNum * layer[1][1] // 10000
+        limit1 = _G.Mathf.Max(limit1, layer[1][2])
+        local limit2 = rankNum * layer[2][1] // 10000
+        limit2 = _G.Mathf.Max(limit2, rankNum - layer[2][2] + 1)
+        return limit1, limit2, layer
+    end
+end
+
+---获取段位状态
+---@return number 1晋级2保级3降级
+function ArenaGlobalModel:GetRankState(layer, limit1, limit2, rankNum)
+    if rankNum == 0 then
+        if layer[2][1] == 10000 then
+            return 2
+        else
+            return 3
+        end
+    else
+        if rankNum <= limit1 or rankNum == 1 or rankNum <= layer[1][2] then
+            if layer[1][1] == 0 then --无人晋级
+                return 2
+            else
+                return 1
+            end
+        else
+            if rankNum >= limit2 and layer[2][1] < 10000 then
+                return 3
+            else
+                return 2
+            end
+        end
+    end
+end
+
+---是否在结算时间(服务器分组)
+---@return boolean 服务器分组中，服务器战斗结算中, 结算结束的时间
+function ArenaGlobalModel:CheckIsSettle(state)
+    state = state or self:GetState()
+    if state == _G.ArenaGlobalState.Prepare then
+        return false, false, 0
+    end
+    local cfg = _G.ConfigManager.discrete_cfg[127116]
+    local startT = cfg[1][1] * 3600 + cfg[1][2] * 60
+    local endT = cfg[2][1] * 3600 + cfg[2][2] * 60
+    local sec = _G.TimeUtil.GetSecondsOfDay()
+    if sec >= startT and sec <= endT then
+        return true, false, endT - sec
+    elseif sec >= self.fightEndSec then
+        return false, true, startT + 86400 - sec
+    elseif sec < startT then
+        return false, true, startT - sec
+    end
+    return false, false, 0
+end
+
+---@param msg arena_global.i_global_info
+function ArenaGlobalModel:InitTaskData(msg)
+    local taskIds = _G.ConfigManager.discrete_cfg[127101][1]
+    self:ClearTask()
+    self.taskList = {}
+    self.finishTaskList = {}
+    local day_col = msg.day_col or {}
+    local taskCurr = {}
+    for _, v in pairs(day_col) do
+        taskCurr[v.type[1]] = v.value
+        if v.type[1] == 2 then     --总挑战次数
+            self.totalTimes = v.value
+        elseif v.type[1] == 1 then --今日挑战次数
+            self.todayTimes = v.value
+        end
+    end
+    ---@type arena_global_task_cfg
+    local taskCfg
+    for _, v in pairs(taskIds) do
+        taskCfg = _G.ConfigManager.arena_global_task_cfg[v]
+        self.taskList[v] =
+            ArenaGlobalTaskData.New(
+                { sid = v, target = { taskCurr[taskCfg.condition[1][1]] or 0 }, state = _G.TaskEnum.ETaskState.Claimed },
+                function()
+                    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.StroePassMission
+                        .id)
+                end
+            )
+    end
+    if msg.finish_task then
+        local iTask
+        for _, v in pairs(msg.finish_task) do
+            iTask = { sid = v, state = _G.TaskEnum.ETaskState.Submited, target = { 0 } }
+            self.taskList[v] = ArenaGlobalTaskData.New(iTask, nil)
+            self.finishTaskList[v] = true
+        end
+    end
+end
+
+function ArenaGlobalModel:ClearTask()
+    if self.taskList == nil then
+        return
+    end
+    for _, v in pairs(self.taskList) do
+        v:Dispose()
+    end
+    self.taskList = nil
+    self.finishTaskList = nil
+end
+
+function ArenaGlobalModel:GetTaskData()
+    return self.taskList
+end
+
+function ArenaGlobalModel:GetTaskByTaskid(taskid)
+    return self.taskList[taskid]
+end
+
+function ArenaGlobalModel:CheckTaskIsFinish(sid)
+    return self.finishTaskList[sid] or false
+end
+
+function ArenaGlobalModel:FinishTask(sids, call)
+    local pbData = { sids = sids }
+    ArenaGlobalNet:GetInstance():FinishTask(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            for _, v in pairs(msg.f_sid) do
+                self.finishTaskList[v] = true
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self:RefreshActivityRedPoint(5)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---获取所有可完成的任务
+function ArenaGlobalModel:GetAllCanFinishTask()
+    local taskIds = {}
+    if self.taskList then
+        local startTime = self:GetStartTime()
+        local now = _G.TimeUtil.GetServerUnixTime()
+        local day = _G.TimeUtil.GetIntervalDayBySix1(startTime, now) + 1
+        for _, v in pairs(self.taskList) do
+            if v.i_task.state == _G.TaskEnum.ETaskState.Submited and not self:CheckTaskIsFinish(v.i_task.sid) then
+                if day >= v.Cfg.day then
+                    _G.table.insert(taskIds, v.i_task.sid)
+                end
+            end
+        end
+    end
+    return taskIds
+end
+
+function ArenaGlobalModel:GetNextAward()
+    local tasks =
+        _G.table.chooseToArray(
+            self.taskList,
+            function(i, data)
+                return data.Cfg.condition[1][1] == 2 and #data.Cfg.prize > 0
+            end
+        )
+    _G.table.sort(
+        tasks,
+        function(a, b)
+            return a.Cfg.condition[1][2] < b.Cfg.condition[1][2]
+        end
+    )
+    for _, v in pairs(tasks) do
+        if self.totalTimes < v.Cfg.condition[1][2] then
+            return v
+        end
+    end
+    return tasks[#tasks]
+end
+
+---状态与时间能否挑战
+function ArenaGlobalModel:CheckCanFight()
+    if self:GetState() ~= _G.ArenaGlobalState.Battle then
+        return false
+    end
+    if not self:CheckApplyAndGroup() then
+        return false
+    end
+    local sec = _G.TimeUtil.GetSecondsOfDay()
+    local isGroupIng,isBattleset = self:CheckIsSettle()
+    if sec < self.fightStartSec or sec >= self.fightEndSec or isBattleset or isGroupIng then
+        return false
+    end
+    return true
+end
+
+---@return boolean, boolean 是否可挑战，是否消耗免费次数
+function ArenaGlobalModel:CheckFightProp()
+    local isFree = self:CheckHasFreeTimes()
+    local sid = _G.ConfigManager.discrete_cfg[127117][1][1]
+    if not isFree then
+        if self.refreshTodayTimes > 0 then
+            if not _G.StorageManager:GetInstance():CheckItem(sid, 1) then
+                return false, false
+            end
+        end
+        return true, false
+    end
+    return true, true
+end
+
+function ArenaGlobalModel:Challenge(data, call)
+    if not self:CheckCanFight() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(1080204)
+        return
+    end
+    local hasTimes, isFree = self:CheckFightProp()
+    if not hasTimes then
+        return
+    end
+    local pbData = { uid = data.uid }
+    ArenaGlobalNet:GetInstance():GetEnemyArray(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+            local team = msg.team or {}
+            local enemy = {}
+            for _, v in pairs(team) do
+                enemy[v.index % 100] = v
+            end
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.ArenaGlobalEmbattleView.Name,
+                _G.handler(self, self.ExitEmbattle),
+                _G.handlerbind(self, self.EnterFight, false, call),
+                data,
+                enemy
+            )
+        end
+    )
+end
+
+---战斗，爽！
+---@param uid number 对手uid
+---@param skip number 1跳过2不跳过
+function ArenaGlobalModel:EnterFight(data, skip, call)
+    if not self:CheckCanFight() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(1080204)
+        self:ExitEmbattle()
+        _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+        if self:GetAutoBattle() then
+            self:CancelAutoBattle()
+        end
+        return
+    end
+    local hasTimes, isFree = self:CheckFightProp()
+    if not hasTimes then
+        if self:GetAutoBattle() then
+            self:CancelAutoBattle()
+        end
+        return
+    end
+    ---c_type 1免费次数2道具 skip and 1 or 2 改为故定发2，有fight_arg
+    local pbData = { uid = data.uid, f_type = 2, c_type = isFree and 1 or 2 }
+    if not skip then --正常布阵战斗
+        local embattleItem = require("EmbattleController"):GetInstance():GetCurEmbattleItem()
+        skip = embattleItem and embattleItem:IsSkipBattle()
+        skip = true --默认跳过
+    else            --外部跳过
+        local cls = _G.EmbattleControllerItemType.ArenaGlobalAttack
+        local danCfg = self:GetCurDanCfg()
+        local num = danCfg.team
+        local tb = {}
+        for i = 1, num do
+            tb[i] = i
+        end
+        local embattleItem = require(cls).New(tb, _G.EmbattleSaveType.server, false)
+        if not embattleItem:CheckBattle() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(140107)
+            return
+        else
+            embattleItem:SaveEmbattle(
+                function()
+                    self.bufferData = {
+                        data = data,
+                        skip = skip,
+                        isFree = isFree,
+                    }
+                    ArenaGlobalNet:GetInstance():Fight(pbData, _G.handlerbind(self, self.BattleInitiated, data, skip, isFree))
+                    if call then
+                        call()
+                    end
+                end
+            )
+            return
+        end
+    end
+    _G.BattleManager:GetInstance():SetInBattle(true)
+    self.isRequestFighting = true
+    self.bufferData = {
+        data = data,
+        skip = skip,
+        isFree = isFree
+    }
+    ArenaGlobalNet:GetInstance():Fight(pbData, _G.handlerbind(self, self.BattleInitiated, data, skip, isFree))
+    if call then
+        call()
+    end
+end
+
+--战斗发起回调
+function ArenaGlobalModel:BattleInitiated(msg, data, isSkip, isFree)
+    if msg and msg.ack ~= 1 then
+        self:ExitEmbattle()
+        _G.BattleManager:GetInstance():SetInBattle(false)
+        if self:GetAutoBattle() then
+            self:CancelAutoBattle()
+        end
+        return
+    end
+    self.timerBattle = _G.DelayDo(60,function()
+        --强制请求战斗结果 针对没收到战斗推送的情况
+        self:GetBattleResults()
+    end)
+end
+
+function ArenaGlobalModel:GetBattleResults()
+    if self.timerBattle then
+        _G.coroutine.stopwaiting(self.timerBattle)
+        self.timerBattle = nil
+    end
+    if self.bufferData == nil then
+        return
+    end
+    ArenaGlobalNet:GetInstance():GetBattleResults(nil, _G.handlerbind(self, self.FightCall, self.bufferData.data, self.bufferData.skip, self.bufferData.isFree))
+end
+
+---@param msg arena_global.s2c_global_fight 战斗完成回调
+function ArenaGlobalModel:FightCall(msg, data, isSkip, isFree)
+    if self.timerBattle then
+        _G.coroutine.stopwaiting(self.timerBattle)
+        self.timerBattle = nil
+    end
+    self.isRequestFighting = false
+    if msg.ack ~= 1 then
+        self:ExitEmbattle()
+        _G.BattleManager:GetInstance():SetInBattle(false)
+        if self:GetAutoBattle() then
+            self:CancelAutoBattle()
+        end
+        return
+    end
+    self.hasNewReport = true
+    if msg.enemy then
+        self.enemyInfo = msg.enemy
+    elseif not msg.report.a_win then
+        for _, v in pairs(self.enemyInfo) do
+            if data.uid == v.uid then
+                v.win_count = v.win_count + 1
+                break
+            end
+        end
+    end
+    self.score = self.score + msg.report.a_score
+    self.totalTimes = self.totalTimes + 1
+    self.todayTimes = self.todayTimes + 1
+    self:UpdateRankData()
+    if isFree then
+        self.fightTimes = self.fightTimes - 1
+        self:RefreshActivityRedPoint(3)
+    else
+        local sid = _G.ConfigManager.discrete_cfg[127117][1][1]
+        _G.StorageManager:GetInstance():ConsumeItem(sid, nil, 1)
+    end
+    for _, v in pairs(self.taskList) do
+        if v.i_task.state ~= _G.TaskEnum.ETaskState.Completed then
+            v.i_task.target[1] = v.i_task.target[1] + 1
+            v:UpdataData()
+        end
+    end
+    self.fightMsg = msg
+    self.fightIndex = 1
+    if self:GetAutoBattle() then
+        local rankNum = self.rankData and self.rankData[1].rank_num or 0
+        self.autoFightNum = self.autoFightNum - 1
+        local time = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+        if self.autoFightNum <= 0 then
+            self:CancelAutoBattle()
+        elseif rankNum == 1 and _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.ArenaGlobalAutoRankOne) ~= time then
+            _G.PlayerPrefsManager.SetInt(_G.PlayerPrefsKey.ArenaGlobalAutoRankOne, time)
+            self:CancelAutoBattle()
+            _G.PopWindowManager:GetInstance():ShowAllTips(1080209)
+        elseif self.stopCon.type == 3 then
+            if rankNum <= self.stopCon.limit then
+                self:CancelAutoBattle()
+            end
+        elseif self.stopCon.type == 2 then
+            if not msg.report.a_win then
+                self.stopCon.limit = self.stopCon.limit - 1
+                if self.stopCon.limit <= 0 then
+                    self:CancelAutoBattle()
+                end
+            end
+        end
+    end
+    self:RefreshActivityRedPoint(5)
+    if isSkip or not msg.fight_arg then
+        self:ExitEmbattle()
+        if _G.AppSetting.DEBUG and (not isSkip and not msg.fight_arg) then
+            _G.LogError("【容错打印】没有战报，对方空阵容或战斗服异常，直接显示结算")
+        end
+        self.fightCount = 0
+        local settleData = { MvpCardSid = self:GetFakeMvpSid(), re_uid = msg.report_uid }
+        self.curBattleController = _G.require(_G.BattleControllerType.ArenaGlobal).New()
+        self.curBattleController.FightResult = msg
+        _G.BattleManager:GetInstance():SetBattleController(self.curBattleController)
+        if msg.fight_arg then
+            _G.BattleManager:GetInstance():SetArgData(msg.fight_arg)
+        end
+        self.curBattleController:StartSettlement(
+            _G.SettlementModel.SettlementType.ArenaGlobal,
+            settleData,
+            nil,
+            msg.fight_arg,
+            data
+        )
+    else
+        self.fightCount = #msg.report.reports
+        _G.BattleManager:GetInstance():SetArgData(msg.fight_arg)
+        _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.ArenaGlobal, msg.fight_arg, data, true)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eArenaGlobal.ArenaGlobalFightEnd)
+end
+
+function ArenaGlobalModel:AutoBattleAll(fightIndex, fightNum, stopCon)
+    self.autoFight = true
+    self.autoFightIndex = fightIndex
+    self.autoFightNum = fightNum
+    self.stopCon = stopCon
+    self.reqFightNum = 0
+    _G.Events:GetInstance():Broadcast(_G.eArenaGlobal.ArenaGlobalSetAuto, true)
+    self:AutoBattle()
+end
+
+function ArenaGlobalModel:AutoBattle()
+    if not self:GetAutoBattle() then
+        return
+    end
+    if self.autoFightNum <= 0 then
+        return
+    end
+    local data = self.enemyInfo[self.autoFightIndex]
+    if data == nil then
+        data = self.enemyInfo[1]
+        if _G.AppSetting.DEBUG then
+            _G.LogError("当前自动选择的位置没有对手，已自动切换其他位置对手")
+        end
+    end
+    if data == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("当前无可挑战对手, 已停止自动战斗")
+        end
+        self:CancelAutoBattle()
+        return
+    end
+    self:EnterFight(data, true)
+end
+
+function ArenaGlobalModel:CancelAutoBattle()
+    self.autoFight = false
+    self.autoFightNum = 0
+    _G.Events:GetInstance():Broadcast(_G.eArenaGlobal.ArenaGlobalSetAuto, false)
+end
+
+function ArenaGlobalModel:OnSettleFail()
+    if self:GetAutoBattle() then
+        if self.stopCon.type == 2 then
+            self.stopCon.limit = self.stopCon.limit - 1
+            if self.stopCon.limit <= 0 then
+                self:CancelAutoBattle()
+            end
+        end
+    end
+end
+
+---获取自动战斗状态
+function ArenaGlobalModel:GetAutoBattle()
+    return self.autoFight
+end
+
+function ArenaGlobalModel:OnSkipOrFightError(msg)
+    self:ExitEmbattle()
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ChatDefultRootView.Name)
+    _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+    local viewName =
+        msg.report.a_win and _G.ConfigManager.ui_cfg.ArenaGlobalSettlementVictoryView.Name or
+        _G.ConfigManager.ui_cfg.ArenaGlobalSettlementFailView.Name
+    return viewName
+end
+
+function ArenaGlobalModel:GetFakeMvpSid()
+    --local array = self:GetAttackGarray(self:GetCurDanCfg().team, 1)
+    local array = self:GetAttackGarray(self.dan, 1)
+    if not array then
+        return
+    end
+    for _, uid in pairs(array.sits or {}) do
+        if uid > 0 then
+            local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+            if card then
+                return card.sid
+            end
+        end
+    end
+end
+
+function ArenaGlobalModel:CheckFightNext()
+    if self.fightIndex >= self.fightCount then
+        return false
+    end
+    return true
+end
+
+function ArenaGlobalModel:FightNext(data, call)
+    local uid = self.fightMsg.report_uid
+    local pbData = { log_uid = uid, r_index = self.fightIndex + 1 }
+    ArenaGlobalNet:GetInstance():ReportFightArgs(
+        pbData,
+        function(msg)
+            if call then
+                call(msg)
+            end
+            if msg.ack ~= 1 then
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("【容错打印】获取后续场次战报异常，直接显示结算")
+                end
+                return
+            end
+            self.fightIndex = self.fightIndex + 1
+            _G.BattleManager:GetInstance():DestroyBattle()
+            _G.BattleManager:GetInstance():SetArgData(msg.fight_arg)
+            _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.ArenaGlobal, msg.fight_arg, data)
+        end
+    )
+end
+
+function ArenaGlobalModel:SaveAttackGarray(num, garrays, call)
+    local pbData = { garrays = { { dan = num, garrays = garrays } }, type = 1 }
+    ArenaGlobalNet:GetInstance():SaveEmbattle(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(-1)
+                end
+                return
+            end
+            self.atkArray[num] = garrays
+            if call then
+                call(0)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eArenaGlobal.ArenaGlobalAtkEmbattleChange)
+        end
+    )
+end
+
+function ArenaGlobalModel:SaveDefendGarray(num, garrays, call)
+    local pbData = { garrays = { { dan = num, garrays = garrays } }, type = 2 }
+    ArenaGlobalNet:GetInstance():SaveEmbattle(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(-1)
+                end
+                return
+            end
+            self.defArray[num] = garrays
+            self:RefreshActivityRedPoint(4)
+            if call then
+                call(0)
+            end
+        end
+    )
+end
+
+function ArenaGlobalModel:GetAttackGarray(num, index)
+    if index == nil then
+        return self.atkArray[num]
+    end
+    return self.atkArray[num] and self.atkArray[num][index] or nil
+end
+
+function ArenaGlobalModel:GetDefendGarray(num, index)
+    if index == nil then
+        return self.defArray[num]
+    end
+    return self.defArray[num] and self.defArray[num][index] or nil
+end
+
+function ArenaGlobalModel:CheckAttackEmpty(num)
+    local flag = true
+    if self.atkArray[num] then
+        for i = 1, num do
+            if self.atkArray[num][i] and self.atkArray[num][i].sits then
+                for j, uid in pairs(self.atkArray[num][i].sits) do
+                    if uid > 0 then
+                        flag = false
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return flag
+end
+
+function ArenaGlobalModel:CheckDefendEmpty(num)
+    local flag = true
+    if self.defArray[num] then
+        for i = 1, num do
+            if self.defArray[num][i] and self.defArray[num][i].sits then
+                for j, uid in pairs(self.defArray[num][i].sits) do
+                    if uid > 0 then
+                        flag = false
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return flag
+end
+
+function ArenaGlobalModel:CalTeamPower()
+    local danCfg = self:GetCurDanCfg()
+    local power = 0
+    local level = 300
+    local card, team, sits
+    for i = 1, danCfg.team do
+        team = self:GetAttackGarray(danCfg.id, i)
+        if team then
+            sits = team.sits
+            for j = 1, #sits do
+                if sits[j] > 0 then
+                    card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, sits[j])
+                    if card then
+                        power = power + card:GetPowerByLevel(level)
+                    end
+                end
+            end
+        end
+    end
+    return power
+end
+
+function ArenaGlobalModel:OpenDefence(num, index, call)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ArenaGlobalEmbattleView.Name,
+        _G.handlerbind(self, self.ExitEmbattle, call),
+        _G.handlerbind(self, self.ExitEmbattle, call),
+        nil,
+        nil,
+        num,
+        true,
+        index
+    )
+end
+
+function ArenaGlobalModel:OpenAttack(num, index, call)
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ArenaGlobalEmbattleView.Name,
+        _G.handlerbind(self, self.ExitEmbattle, call),
+        _G.handlerbind(self, self.ExitEmbattle, call),
+        nil,
+        nil,
+        num,
+        false,
+        index
+    )
+end
+
+function ArenaGlobalModel:OnEmbattleViewOpened(name)
+    if name ~= _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        return
+    end
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ArenaGlobalView.Name)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.ArenaGlobalAutoBattleView.Name)
+end
+
+function ArenaGlobalModel:ExitEmbattle(call)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ArenaGlobalView.Name)
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.ArenaGlobalAutoBattleView.Name)
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleViewOpened, self)
+    if call then
+        call()
+    end
+end
+
+function ArenaGlobalModel:ReturnPanel()
+    _G.Events:GetInstance():Broadcast(_G.eArenaGlobal.ArenaGlobalFightSettleEnd)
+end
+
+function ArenaGlobalModel:CheckHasFreeTimes()
+    return self.fightTimes and self.fightTimes > 0
+end
+
+function ArenaGlobalModel:GetDayAward(call)
+    ArenaGlobalNet:GetInstance():GetDayAward(
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.ungetDayAward = {}
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+--获取未领取段位奖励列表
+function ArenaGlobalModel:GetUngetDayAward()
+    return self.ungetDayAward
+end
+
+function ArenaGlobalModel:CheckRedPointEmbattle()
+    local array, flag
+    local isGroupIng,isBattleset = self:CheckIsSettle()
+    if isBattleset or isGroupIng then
+        return 0
+    end
+    local cfg = self:GetCurDanCfg()
+    -- for t = 1, 5 do
+    for i = 1, cfg.team do
+        array = self:GetDefendGarray(cfg.id, i)
+        if array == nil or array.sits == nil then
+            return 1
+        end
+        flag = true
+        for j = 1, #array.sits do
+            if array.sits[j] > 0 then
+                flag = false
+            end
+        end
+        if flag then
+            return 1
+        end
+    end
+    -- end
+    return 0
+end
+
+function ArenaGlobalModel:CheckRedPointTask()
+    local isGroupIng,isBattleset = self:CheckIsSettle()
+    if isGroupIng or isBattleset then
+        return 0
+    end
+    return #self:GetAllCanFinishTask() > 0 and 1 or 0
+end
+
+function ArenaGlobalModel:CheckRedPointFight()
+    if self:CheckHasFreeTimes() then
+        return self:CheckCanFight() and 1 or 0
+    end
+    return 0
+end
+
+function ArenaGlobalModel:RefreshActivityRedPoint(param)
+    if self.typeClass then
+        self.typeClass:RefreshRedPoint(param)
+    end
+end
+
+function ArenaGlobalModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.timerBattle then
+        _G.coroutine.stopwaiting(self.timerBattle)
+        self.timerBattle = nil
+    end
+    _G.Events:GetInstance():RemoveListener(net_map.p2c_arena_global_def_fight.Cmd, self.SetHasNewReport, self)
+end
+
+return ArenaGlobalModel

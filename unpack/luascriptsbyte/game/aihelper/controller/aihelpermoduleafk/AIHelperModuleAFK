@@ -1,0 +1,340 @@
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleAFK : AIHelperModuleBaseNumberMock	    @AI助手-AFK放置冒险
+---@field index number                  @已执行次数
+---@field enter boolean                 @能否进入战斗
+local AIHelperModuleAFK = _G.BaseClass("AIHelperModuleAFK", base)
+
+---是否满足模块使用条件
+function AIHelperModuleAFK:IsActive()
+    return self.index <= self.number and self.enter
+end
+
+---重置状态
+function AIHelperModuleAFK:Reset()
+    base.Reset(self)
+    self.index = 1
+    self.enter = true
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleAFK:Check(callback)
+    self.index = 1
+    self.enter = false
+    self:CheckEnterState()
+
+    if callback then
+        callback(true)
+    end
+end
+
+---获取当前执行状态
+function AIHelperModuleAFK:GetExecuteState()
+    return {
+        total = self.number,
+        index = self.index,
+        section = require("AfkModel"):GetInstance():GetCurSection()
+    }
+end
+
+---执行逻辑
+function AIHelperModuleAFK:Execute(callback)
+    self.index = self.index + 1
+    --执行状态检测
+    self:CheckEnterState()
+    if not self.enter then
+        if callback then
+            callback(false, nil)
+        end
+        return
+    end
+
+    ---检测是否正在战斗中
+    if _G.MainManager:GetInstance():IsFighting(false) then
+        if callback then
+            callback(false, self:CreateFailureResults(90028010143, _G.GetLangPackValue(self.cfg.name)))
+        end
+        return
+    end
+
+    ---@type AfkModel
+    local afkModel = require("AfkModel"):GetInstance()
+    ---@type AfkBattleManager
+    local afkManager = require("AfkBattleManager"):GetInstance()
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+
+    ---清除缓存数据
+    local function clear()
+        embattleModel:ClearLastAssist()
+        afkManager:ClearStatisticsData()
+        afkModel:ResetPass()
+    end
+    local function response(success, results)
+        clear()
+
+        if not callback then
+            return
+        end
+        callback(success, results)
+    end
+    clear()
+
+    --获取当前怪物组和布阵id
+    local monsterGroups = afkModel:GetSceneID()
+    local embattleIds = afkManager:GetCurEmbattleID()
+    if not monsterGroups or #monsterGroups <= 0 or not embattleIds or #embattleIds <= 0 then
+        response(false, nil)
+        return
+    end
+    --检查每个布阵中是否有角色
+    for _, embattleId in ipairs(embattleIds) do
+        if not embattleModel:CheckBattle(embattleId) then
+            response(false, nil)
+            return
+        end
+    end
+
+    ---多场次战斗时, 顺序打完每一场战斗
+    ---@type fun():void
+    local nextFight
+
+    ---发起关卡结算
+    ---@param sectionId number 关卡ID
+    local function afkResult(sectionId)
+        require("AfkNet"):GetInstance():ChallengeSuc(
+            { sid = sectionId },
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+                afkModel:SetAfkTime(msg.time)
+                afkModel:SetCurFailTime(0)
+
+                --设置(缓存)进入下一关
+                afkModel:SetLastSection(sectionId)
+                afkModel:SetCurPage()
+                afkModel:SetHasShowTips(true)
+                afkModel:UnlockSection()
+
+                --获取奖励
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+                --发起事件广播
+                _G.Events:GetInstance():Broadcast(
+                    _G.ePlayAactionEvent.PlayAaction,
+                    {
+                        _G.ActiveTaskEnum.ConditionEnum.AFK.IsPass,
+                        afkModel:GetLastSection()
+                    },
+                    1
+                )
+                _G.Events:GetInstance():Broadcast(_G.eAFKAactionEnum.AfkSectionPass)
+                _G.Events:GetInstance():Broadcast(_G.eAfkEvents.Pass)
+
+                --刷新红点状态
+                for _, itemId in ipairs({ 253010001 }) do
+                    --afk进度解锁宝箱
+                    local itemData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Prop, itemId)
+                    if itemData then
+                        local progress = itemData.progress or 0
+                        if progress > 0 then
+                            require("RedPointManager"):GetInstance():RefreshNode(
+                                _G.ConfigManager.redpoint_cfg.BackpackItem.id,
+                                itemId
+                            )
+                        end
+                    end
+                end
+                require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstGather.id)
+
+                --重新初始化布阵状态
+                afkManager:InitCurEmbattleSids()
+                --更新界面状态
+                ---@type MainView
+                local mainView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+                if mainView and mainView:IsToggled("afk") then
+                    mainView:UpdateView()
+                end
+
+                response(true, msg)
+            end
+        )
+    end
+    ---发起战斗结算
+    ---@param monsterGroup number 战斗场景
+    ---@param data any  战斗结算参数
+    local function fightResult(monsterGroup, data)
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            data,
+            function(msg)
+                if msg.md5_error == "1" then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                elseif msg.md5_error == "2" then
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                end
+
+                afkModel:SetCurFailTime(msg.fail_time or 0)
+                _G.Events:GetInstance():Broadcast(_G.eSeasonTask.Action, { _G.SeasonTaskID.Akf }, 1)
+
+                --多场次战斗缓存结果
+                --if #afkModel:GetSceneID() > 1 then
+                --    afkManager:SetCurStatisticsData(_G.BattleManager:GetInstance():GetStatistics(), monsterGroup)
+                --end
+                --服务器战斗失败
+                if not msg.winner or not msg.winner[1] then
+                    response(false, nil)
+                    return
+                end
+
+                afkModel:SetMonsterPass()
+
+                if afkModel:CheckCurChallengeIsPass() then
+                    --发起关卡结算请求
+                    afkResult(afkModel:GetCurSection())
+                else
+                    --开始下一关战斗
+                    nextFight()
+                end
+            end
+        )
+    end
+    ---发起战斗请求
+    ---@param monsterGroup number
+    local function fightBegin(monsterGroup)
+        afkModel:SetCurMonsterID(monsterGroup)
+        afkModel:FightBegin(
+            monsterGroup,
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+
+                --多场次战斗缓存结果
+                --if #model:GetSceneID() > 1 then
+                --    manager:SetCurFightArg(msg.fight_arg, msg.fight_arg.sid)
+                --end
+
+                --计算战斗结果
+                -- _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+                -- local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+                -- if not record or not record.result then
+                --     response(false, nil)
+                --     return
+                -- end
+                --如果战斗失败
+                -- local tab = record.result
+                -- if not tab.winner[1] then
+                --     response(false, nil)
+                --     return
+                -- end
+                local tab = nil
+
+                fightResult(monsterGroup, tab)
+            end
+        )
+    end
+    ---更新布阵阵容
+    ---@param embattleId number 布阵id
+    ---@param monsterGroup number
+    ---@param isMultiple booelan  是否为多队战斗
+    local function updateEmbattle(embattleId, monsterGroup, isMultiple)
+        if isMultiple then
+            local array = embattleModel.curEmbattleArray[embattleId] or { 0, 0, 0, 0, 0 }
+            local skills = embattleModel.embattleSkillIndexArray[embattleId] or { 0, 0, 0 }
+            local pets = embattleModel.embattlePetSkillIndexArray[embattleId] or { 0, 0, 0 }
+            require("EmbattleNet"):GetInstance():UpdateEmbattle(
+                { 0 },
+                { array },
+                function(msg)
+                    if not msg or msg.ack ~= 1 then
+                        response(false, nil)
+                        return
+                    end
+                    fightBegin(monsterGroup)
+                end,
+                { skills },
+                { pets }
+            )
+        else
+            embattleModel:SaveEmbattleDataNew(
+                embattleId,
+                function(respCode)
+                    if respCode ~= 0 then
+                        response(false, nil)
+                        return
+                    end
+                    fightBegin(monsterGroup)
+                end,
+                _G.EmbattleSaveType.server,
+                true,
+                nil
+            )
+        end
+    end
+
+    --进入下一次战斗
+    local index = 1
+    nextFight = function()
+        if not monsterGroups or index > #monsterGroups then
+            response(false, nil)
+            return
+        end
+        updateEmbattle(embattleIds[index], monsterGroups[index], #monsterGroups > 1)
+        index = index + 1
+    end
+
+    --清除以前的战斗状态, 然后开始执行战斗
+    require("AfkNet"):GetInstance():LeaveSection(
+        function(msg)
+            nextFight()
+        end
+    )
+end
+
+---显示执行状态
+function AIHelperModuleAFK:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    if not self.mock then
+        item.aortext_tip.text = state and (state.index .. "/" .. state.total) or ""
+    end
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleAFK:ShowExecuteResult(item, success, results)
+    base.ShowExecuteResult(self, item, success, results)
+    if not success then
+        return
+    end
+    self.Util.ShowAwardListOfMsg(item, results)
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleAFK:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+---获取当前执行标题
+function AIHelperModuleAFK:GetExecuteTitle(state)
+    if state and state.section then
+        local cfg = _G.ConfigManager.afk_cfg[state.section]
+        return _G.GetLangPackValue(self.cfg.title, cfg and cfg.chapter or 0, cfg and cfg.section or 0)
+    end
+    return base.GetExecuteTitle(self, state)
+end
+
+---检查关卡状态
+---@return void
+function AIHelperModuleAFK:CheckEnterState()
+    local model = require("AfkModel"):GetInstance()
+
+    --检查是否最后一关, 是否满足进入下一关的条件
+    self.enter = not model:CheckSectionIsEnd(model:GetCurSection()) and model:CheckNextSectionCondition()
+end
+
+return AIHelperModuleAFK

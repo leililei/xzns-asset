@@ -1,0 +1,480 @@
+-----------------------------------------------------------------------
+-- E:.H5_Client.H5_AlphaJt.Client.Assets.Resources.LuaScripts.Game.GuideBookTask.Model.GuideBookTaskSynModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2025/10/21
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "ActivitySynTypeBase"
+local ActivitySynManager = require "ActivitySynManager"
+---@class GuideBookTaskSynModel : ActivitySynTypeBase	中文描述
+local GuideBookTaskSynModel = _G.BaseClass("GuideBookTaskSynModel", base)
+
+---类的构造函数
+function GuideBookTaskSynModel:__init()
+    self.activityId = self.curActivityClass:GetActivityID()
+
+    require("GuideBookTaskNet"):GetInstance():InitListeners()
+    _G.Events:GetInstance():AddListener(_G.eGuideBook.ActivityCollector, self.ActivityCollector, self)
+    self.curActivityClass:AddStateChanged(self.OnActivityStateChanged, self)
+end
+
+function GuideBookTaskSynModel:OnActivityStateChanged(state)
+    self:UpdateRedpoint()
+    if state == ActivitySynManager.State.Close then
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.GuideBookTaskView.Name)
+        if view then
+            view:Close()
+        end
+    end
+end
+
+---@param info activity_stars_goal.i_activity_stars_goal
+function GuideBookTaskSynModel:OnHandleGMData(info)
+    self:ParseData(info)
+end
+
+---解析数据
+function GuideBookTaskSynModel:ParseData(actData)
+    local info = actData.stars_goal
+    ---活跃值
+    self.curActiveGoal = info.active_num or 0
+    ---已领取的活跃进度奖励
+    self.activeAward = info.get_active_award or {}
+    ---已完成的任务
+    self.finishTask = info.finish_task or {}
+    ---已预完成 没领取奖励的任务
+    self.awardTask = info.award_task or {}
+    ---采集值
+    self.collectors = info.collectors or {}
+    ---任务组sid(表mission_group_cfg)
+    self.missionList = info.mission_list or {}
+    ---进度配置
+    self.activeCfg = info.active_cfg or {}
+    ---任务组sid显示天数
+    self.conDay = {}
+    if info.con_day then
+        for i, v in ipairs(info.con_day) do
+            if self.missionList[i] then
+                self.conDay[self.missionList[i]] = v
+            end
+        end
+    end
+    ---美术资源 角色spine#缩放#位置 | 美术字地址|背景图地址
+    local resource = info.resource or ""
+    local resList = _G.string.split(resource, "|")
+    if resList[1] then
+        self.spineTb = _G.string.split(resList[1], "#")
+    end
+    self.txtImgPath, self.bgPath, self.titleKey = resList[2], resList[3], resList[4]
+    ---初始化任务
+    self:InitTaskCfg()
+    self:InitFinishTask()
+    self:InitTaskDatas()
+    ---获得最大活跃值
+    self.maxActiveGoal = 0
+    for _, v in pairs(self.activeCfg) do
+        if v.value_active > self.maxActiveGoal then
+            self.maxActiveGoal = v.value_active
+        end
+    end
+    base.ParseData(self)
+end
+
+---活动开启天数
+function GuideBookTaskSynModel:OpenDay()
+    local actTime = self.curActivityClass:GetActivityDeadLineByCondition(ActivitySynManager.State.Open)
+    return _G.TimeUtil.GetInterValDayByGame(actTime, _G.TimeUtil.GetServerUnixTime()) + 1
+end
+
+function GuideBookTaskSynModel:InitTaskCfg()
+    self.missionCfg = {}
+    for _, id in ipairs(self.missionList) do
+        local cfg = _G.ConfigManager.mission_group_cfg[id]
+        _G.table.insert(self.missionCfg, cfg)
+    end
+
+    ---采集值对应的配置
+    self.collectorCfg = {}
+    for _, value in pairs(_G.ConfigManager.mission_group_cfg) do
+        local k = {}
+        for i = 1, _G.table.count(value.type_mission) - 1 do
+            _G.table.insert(k, value.type_mission[i])
+        end
+
+        self.collectorCfg[k] = value
+    end
+end
+
+---初始化已完成任务的数据
+function GuideBookTaskSynModel:InitFinishTask()
+    self.finishTasks = {}
+    for _, v in pairs(self.finishTask) do
+        self.finishTasks[v] = true
+    end
+end
+
+---初始化任务数据
+function GuideBookTaskSynModel:InitTaskDatas()
+    if not _G.table.isEmptyOrNil(self.taskDataList) then
+        for k, v in pairs(self.taskDataList) do
+            v:Dispose()
+        end
+    end
+
+    local extraCfg = _G.ConfigManager.mission_extra_cfg
+    local cfg = _G.ConfigManager.mission_group_cfg
+
+    ---任务Data table<id, GuideBookTaskData>
+    self.taskDataList = {}
+    ---分组任务
+    self.taskGroupDataList = {}
+    for _, id in pairs(self.missionList) do
+        if cfg[id] then
+            if not self.taskGroupDataList[id] then
+                self.taskGroupDataList[id] = {}
+            end
+            for _, taskId in ipairs(cfg[id].mission_group) do
+                local state = self:GetTaskState(taskId)
+                self.taskDataList[taskId] = require("GuideBookTaskData").New(
+                    { sid = taskId, target = self:GetTargetData(extraCfg[taskId]), state = state, cfg = extraCfg[taskId] },
+                    function(_taskId) end, _G.MarkTaskType.GuideBook, nil, self.curActivityClass
+                )
+
+                if not self:CheckTaskFinished(taskId) then
+                    if state == _G.TaskEnum.ETaskState.Completed or state == _G.TaskEnum.ETaskState.Submited then
+                        self:AddAwardTask(taskId)
+                    end
+                end
+                _G.table.insert(self.taskGroupDataList[id], self.taskDataList[taskId])
+            end
+        end
+    end
+end
+
+---更新任务数据
+function GuideBookTaskSynModel:UpdataTask(task)
+    if not self.taskDataList then
+        return
+    end
+    if not task or not task.sid or not self.taskDataList[task.sid] then
+        return
+    end
+    local mTask = self.taskDataList[task.sid]
+    mTask:UpdataData(task)
+
+    if mTask:CheckIsCanTake() then
+        self:AddAwardTask(task.sid)
+    end
+    local window = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.GuideBookTaskView.Name)
+    if window then
+        window:UpdateTask()
+    end
+    return true
+end
+
+function GuideBookTaskSynModel:GetNumcollectors(id)
+    for key, value in pairs(self.collectorCfg) do
+        if _G.table.sameByCount(id, key) then
+            return value
+        end
+    end
+end
+
+function GuideBookTaskSynModel:GetAllTaskData()
+    return self.taskDataList or {}
+end
+
+---检查是否有可领取的任务
+---@param gid number 分组id，对应表mission_group_cfg中的id
+function GuideBookTaskSynModel:CheckHaveGetTask(gid)
+    if self.taskGroupDataList[gid] then
+        for _, task in ipairs(self.taskGroupDataList[gid]) do
+            if task:CheckIsFinish() then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+---获得跳转页签
+function GuideBookTaskSynModel:GetTitleIndex()
+    if not self.missionCfg or not self.taskGroupDataList then
+        if _G.AppSetting.DEBUG then
+           _G.LogError("missionCfg或taskGroupDataList数据错误！")
+        end
+       return 
+    end
+
+    for i, v in ipairs(self.missionCfg) do
+        if self.taskGroupDataList[v] then
+            for _, task in ipairs(self.taskGroupDataList[v]) do
+                if task:CheckIsFinish() then
+                    return i
+                end
+            end
+        end
+    end
+    return nil
+end
+
+---获取任务目标
+---@param cfg table 条件
+function GuideBookTaskSynModel:GetTargetData(cfg)
+    if not cfg or not cfg.condition then
+        return { [1] = 0 }
+    end
+    local condition = cfg.condition[1]
+
+    local cond = {}
+    for i = 1, #condition - 1 do
+        cond[i] = condition[i]
+    end
+
+    for _, v in pairs(self.collectors) do
+        if _G.table.sameByCount(cond, v.key) then
+            return { [1] = v.value }
+        end
+    end
+
+    return { [1] = 0 }
+end
+
+---判断任务完成状态
+function GuideBookTaskSynModel:GetTaskState(id)
+    local state = _G.TaskEnum.ETaskState.Claimed
+
+    for _, value in pairs(self.awardTask) do
+        if value == id then
+            state = _G.TaskEnum.ETaskState.Submited
+        end
+    end
+    if self.finishTasks[id] then
+        state = _G.TaskEnum.ETaskState.Completed
+    end
+    return state
+end
+
+---检查任务是否完成
+function GuideBookTaskSynModel:CheckTaskFinished(id)
+    return self.finishTasks[id]
+end
+
+---添加预完成任务
+function GuideBookTaskSynModel:AddAwardTask(id)
+    if not _G.table.indexof(self.awardTask, id) then
+        _G.table.insert(self.awardTask, id)
+    end
+end
+
+---移除预完成任务
+function GuideBookTaskSynModel:RemoveAwardTask(id)
+    local index = _G.table.indexof(self.awardTask, id)
+    if index then
+        _G.table.remove(self.awardTask, index)
+    end
+end
+
+---是否已领取进度奖励
+function GuideBookTaskSynModel:GotActiveAward(id)
+    if self.activeAward then
+        return _G.table.indexof(self.activeAward, id)
+    end
+    return false
+end
+
+---是否可以领取进度奖励
+function GuideBookTaskSynModel:CanGetActiveAward(id)
+    if self:GotActiveAward(id) then
+        return false
+    end
+
+    for _, v in pairs(self.activeCfg) do
+        if v.sid == id and v.value_active <= self.curActiveGoal then
+            return true
+        end
+    end
+    return false
+end
+
+---可领取奖励列表
+function GuideBookTaskSynModel:GetActiveAwardList()
+    local list = {}
+    for _, v in pairs(self.activeCfg) do
+        if not self:GotActiveAward(v.sid) and v.value_active <= self.curActiveGoal then
+            _G.table.insert(list, v.sid)
+        end
+    end
+    return list
+end
+
+function GuideBookTaskSynModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(self:OnGetMainViewName(), self.curActivityClass)
+end
+
+function GuideBookTaskSynModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.GuideBookTaskView.Name
+end
+
+---红点
+function GuideBookTaskSynModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.ChenckRedPoint }
+    self.redpointTree = { false }
+end
+
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function GuideBookTaskSynModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---界面页签红点
+function GuideBookTaskSynModel:ChenckTitleRedPoint(id)
+    if not self.taskGroupDataList[id] then
+        return 0
+    end
+
+    for _, v in pairs(self.taskGroupDataList[id]) do
+        if v:CheckIsCanTake() then
+            return 1
+        end
+    end
+    return 0
+end
+
+---完成任务列表
+function GuideBookTaskSynModel:FinishTaskList()
+    local list = {}
+    for _, v in pairs(self.taskDataList) do
+        if v:CheckIsCanTake() then
+            _G.table.insert(list, v.sid)
+        end
+    end
+    return list
+end
+
+---是否有完成的任务
+function GuideBookTaskSynModel:CheckFinisedTask()
+    for _, v in pairs(self.taskDataList) do
+        if v:CheckIsCanTake() then
+            return true
+        end
+    end
+
+    return false
+end
+
+function GuideBookTaskSynModel:ChenckRedPoint()
+    if self.curActivityClass:GetCurActivityState() == ActivitySynManager.State.Close then
+        return 0
+    end
+
+    ---活跃进度任务
+    for _, v in ipairs(self.activeCfg) do
+        if self:CanGetActiveAward(v.sid) then
+            return 1
+        end
+    end
+
+    ---分组任务
+    if self:CheckFinisedTask() then
+        return 1
+    end
+    return 0
+end
+
+--红点
+function GuideBookTaskSynModel:UpdateRedpoint()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+--region 网络协议
+function GuideBookTaskSynModel:GetAward(callback)
+    local list = self:GetActiveAwardList()
+    require("GuideBookTaskNet"):GetInstance():GetAward(
+        { sid = list, activity_id = self.activityId },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            for _, id in ipairs(list) do
+                _G.table.insert(self.activeAward, id)
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            self:UpdateRedpoint()
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---一键领取任务
+function GuideBookTaskSynModel:FinishTask(tb, callback)
+    require("GuideBookTaskNet"):GetInstance():FinishTask(
+        { sid = tb, type = 1, activity_id = self.activityId },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            for _, id in pairs(tb) do
+                self.finishTasks[id] = true
+                if self.taskDataList[id] then
+                    self.taskDataList[id]:CheckTaskState()
+                end
+                self:RemoveAwardTask(id)
+            end
+            if msg.add_active_num then
+                self.curActiveGoal = self.curActiveGoal + msg.add_active_num
+            end
+            self:UpdateRedpoint()
+
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---处理推送
+function GuideBookTaskSynModel:ActivityCollector(msg)
+    if self.activityId == msg.activity_id then
+        for _, v in pairs(msg.collector) do
+            local list = self:GetNumcollectors(v.key)
+            if list then
+                for _, id in pairs(list.mission_group) do
+                    local cfg = _G.ConfigManager.mission_extra_cfg[id]
+                    local state = _G.TaskEnum.ETaskState.Claimed
+                    if cfg.count <= v.value then
+                        state = self:GetTaskState(id)
+                    end
+
+                    local task = { sid = id, state = state, target = { [1] = v.value }, cfg = cfg }
+                    task.id = list
+                    self:UpdataTask(task)
+                end
+            end
+        end
+    end
+end
+
+--endregion
+
+---类的析构函数
+function GuideBookTaskSynModel:Dispose()
+    if self.curActivityClass then
+        self.curActivityClass:RemoveStateChanged(self.OnActivityStateChanged, self)
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eGuideBook.ActivityCollector, self.ActivityCollector, self)
+end
+
+return GuideBookTaskSynModel

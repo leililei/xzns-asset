@@ -1,0 +1,1047 @@
+--------------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.HellRoad.Model.HellRoadModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/10/12
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local HellRoadNet = require "HellRoadNet"
+---@class HellRoadModel : Singleton	地狱道
+---@field hellData hell_title.i_hell_info
+---@field TaskDatas HellRoadTaskData[]
+---@field curHellCfg hell_title_cfg
+---@field nexHellCfg hell_title_cfg
+local HellRoadModel = _G.BaseClass("HellRoadModel", _G.GameDataModelBase)
+
+---@return HellRoadModel HellRoadModel
+function HellRoadModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function HellRoadModel:__init()
+    self.curFunctionOpenID = 40
+    self.MaxHellId = #_G.ConfigManager.hell_title_cfg
+end
+
+function HellRoadModel:GetDataFormServer()
+    self:GetHellInfo()
+end
+
+---获取地狱道信息
+function HellRoadModel:GetHellInfo(callback)
+    HellRoadNet:GetInstance():GetHellInfo(_G.handlerbind(self, self.GetInfoCall, callback))
+end
+
+---获取地狱道信息回调
+---@param msg hell_title.s2c_hell_title_info
+function HellRoadModel:GetInfoCall(msg, callback)
+    if msg.ack == 1 then
+        if self.hellData then
+            self.hellData.daily_award = msg.info.daily_award
+            self.hellData.h_id = _G.math.min(self.hellData.h_id, self.MaxHellId)
+            if callback then
+                callback()
+            end
+            _G.Events:GetInstance():Broadcast(_G.eHellRoad.RefreshPanel)
+        else
+            self.hellData = msg.info
+            self.hellData.h_id = _G.math.min(self.hellData.h_id, self.MaxHellId)
+            self:InitFinshTask()
+            self:InitFinishPromotion()
+            self:InitCfg()
+            self:InitTaskData()
+            self:InitAttribute()
+            if callback then
+                callback()
+            end
+            ---功能开启是更新地狱道任务
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.HellRoad.id,
+                    self:GetNowHellId()
+                },
+                1,
+                false,
+                true
+            )
+        end
+        self.bpInfo = self.bpInfo or {}
+        for k, v in ipairs(_G.ConfigManager.discrete_cfg[118002][1]) do 
+            self.bpInfo[v] = self.bpInfo[v] or {}
+            self.bpInfo[v].free_award = self.bpInfo[v].free_award or {}
+            self.bpInfo[v].pay_award = self.bpInfo[v].pay_award or {}
+        end
+        for k, v in ipairs(msg.info.buy_list or {}) do 
+            self.bpInfo[v].is_buy = 1
+        end 
+        for k, v in ipairs(msg.info.free_award or {}) do
+            if v.award then
+                for k1, v1 in ipairs(v.award) do 
+                    table.insert(self.bpInfo[v.sid].free_award, v1)
+                end
+            end
+        end 
+        for k, v in ipairs(msg.info.pay_award or {}) do
+            if v .award then 
+                for k1, v1 in ipairs(v.award) do 
+                    table.insert(self.bpInfo[v.sid].pay_award, v1)
+                end
+            end
+        end 
+        self:SortData()
+    end
+    self:ShowMainHell()
+    self:ParseData()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MainNaraka.id)
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Hell)
+end
+
+function HellRoadModel:ShowMainHell()
+    local isExit, wind = _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.MainView.Name)
+    if isExit then
+        --wind.View:UpdateHell()
+    end
+    ---更新人物头衔
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    if player and player.TitleTransform then
+        player:UpdateHell()
+    end
+end
+
+function HellRoadModel:InitAttribute()
+    self.attribute = nil
+    self.attribute = self:GetAllAttr(self:GetLastHell())
+    self.attributeChangeType = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(self.attribute)
+end
+
+---初始化已完成任务
+function HellRoadModel:InitFinshTask()
+    self.finishTasks = {}
+    if self.hellData.finish_task then
+        for _, v in pairs(self.hellData.finish_task) do
+            self.finishTasks[v] = true
+        end
+    end
+end
+
+function HellRoadModel:InitFinishPromotion()
+    self.finishPro = {}
+    if self.hellData.up_awards then
+        for _, v in pairs(self.hellData.up_awards) do
+            self.finishPro[v] = true
+        end
+    end
+end
+
+function HellRoadModel:InitCfg()
+    local cfgs = _G.ConfigManager.hell_title_cfg
+    self.curHellCfg = cfgs[self.hellData.h_id]
+    self.nexHellCfg = cfgs[self.hellData.h_id + 1]
+end
+
+---销毁对象时,析构函数
+function HellRoadModel:Dispose()
+    require "PrivilegeManager":GetInstance():Dispose()
+end
+
+---检测任务是否完成
+function HellRoadModel:CheckIsFinish(id)
+    return self.finishTasks[id]
+end
+
+---检测是否完成所有的任务
+---@param id number 地狱道id
+function HellRoadModel:CheckIsFinishAll(id)
+    local cfg = _G.ConfigManager.hell_title_cfg[id]
+    if cfg then
+        for _, v in pairs(cfg.mission_privilege) do
+            if not self:CheckIsFinish(v) then
+                return false
+            end
+        end
+        --mission_phase中的任务也需要处理, mission_phase指到达此军衔阶段后才开始计数
+        for _, v in pairs(cfg.mission_phase) do
+            if not self:CheckIsFinish(v) then
+                return false
+            end
+        end
+        return true
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log(_G.string.format("hell_title_cfg id error,error id =%s", id))
+        end
+    end
+end
+
+---检测是否领取日常任务
+function HellRoadModel:CheckGetDaily()
+    return self.hellData.daily_award == 1
+end
+
+---获取
+function HellRoadModel:GetDaily(callback)
+    HellRoadNet:GetInstance():GetAward(
+        function(msg)
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+
+            self.hellData.daily_award = 1
+            if callback then
+                callback()
+            end
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.MainNaraka.id, 0)
+        end
+    )
+end
+
+function HellRoadModel:InitTaskData()
+    local HellRoadTaskData = require "HellRoadTaskData"
+    local cfgs = _G.ConfigManager.hell_title_cfg
+    local count = #cfgs
+    self.TaskDatas = {}
+    for i = 1, count do
+        self.TaskDatas[i] = {}
+        local count2 = #cfgs[i].mission_privilege
+        for j = 1, count2 do
+            local task = self:GetTaskInfo(cfgs[i].mission_privilege[j])
+            if not task then
+                task = {
+                    sid = cfgs[i].mission_privilege[j],
+                    state = self:GetTaskState(cfgs[i].mission_privilege[j]),
+                    target = {
+                        [1] = 0
+                    }
+                }
+            end
+            _G.table.insert(self.TaskDatas[i], HellRoadTaskData.New(task))
+        end
+        if cfgs[i].id >= self.hellData.h_id then --当前阶段才接取,但是是后台发的，前台只用作显示，就把后续的都初始化了
+            count2 = #cfgs[i].mission_phase
+            for j = 1, count2 do
+                local task = self:GetTaskInfo(cfgs[i].mission_phase[j])
+                if not task then
+                    task = {
+                        sid = cfgs[i].mission_phase[j],
+                        state = self:GetTaskState(cfgs[i].mission_phase[j]),
+                        target = {
+                            [1] = 0
+                        }
+                    }
+                end
+                _G.table.insert(self.TaskDatas[i], HellRoadTaskData.New(task))
+            end
+        end
+    end
+end
+
+---获取任务状态
+function HellRoadModel:GetTaskState(sid)
+    local isFinish = self
+    if not self.hellData.finish_task then
+        return _G.TaskEnum.ETaskState.Invalide
+    end
+    for k, v in pairs(self.hellData.finish_task) do
+        if v == sid then
+            return _G.TaskEnum.ETaskState.Submited
+        end
+    end
+    return _G.TaskEnum.ETaskState.Invalide
+end
+
+---获取任务信息
+function HellRoadModel:GetTaskInfo(sid)
+    if not self.hellData.task_info then
+        return nil
+    end
+    for _, v in pairs(self.hellData.task_info) do
+        if v.sid == sid then
+            return v
+        end
+    end
+    return nil
+end
+
+---获取任务进程
+function HellRoadModel:GetTaskProgress(id)
+    local datas = self.TaskDatas[id]
+    local count = #datas
+    local CompleteCount = 0
+    for i = 1, count do
+        if datas[i].i_task.state == _G.TaskEnum.ETaskState.Submited then
+            CompleteCount = CompleteCount + 1
+        end
+    end
+    return CompleteCount
+end
+
+---获取当前任务名
+function HellRoadModel:GetCurTaskName(id)
+    local datas = self.TaskDatas[id]
+    local count = #datas
+    for i = 1, count do
+        if datas[i].i_task.state ~= _G.TaskEnum.ETaskState.Submited then
+            return _G.GetLangPackValue(datas[i].Cfg.desc)
+        end
+    end
+end
+
+---获取当前显示任务名，可领奖>未完成
+---@return string, boolean 任务名，是否已完成
+function HellRoadModel:GetCurShowTaskName(id)
+    self:SortData()
+    local datas = self.TaskDatas[id]
+    local count = #datas
+    for i = 1, count do
+        if datas[i].i_task.state == _G.TaskEnum.ETaskState.Submited then
+            return _G.GetLangPackValue(datas[i].Cfg.desc), true
+        end
+        if datas[i].i_task.state ~= _G.TaskEnum.ETaskState.Submited then
+            return _G.GetLangPackValue(datas[i].Cfg.desc), false
+        end
+    end
+    return _G.GetLangPackValue(90023900003), true
+end
+
+---完成任务
+---@param data HellRoadTaskData
+function HellRoadModel:FinishTask(data, callback)
+    if self.finishTasks[data.id] then
+        return
+    end
+    self.finishTasks[data.id] = true
+    HellRoadNet:GetInstance():FinishTask(
+        {sid = data.id, finish_type = 2},
+        function(msg)
+            if msg.ack ~= 1 then
+                self.finishTasks[data.id] = nil
+                return
+            end
+            self.FinishCount = self.FinishCount + 1
+            self:ChangeSingleTaskState(data.id, _G.TaskEnum.ETaskState.Submited)
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            require "CommonTipManager".OpenCommonAwardView(
+                msg,
+                function()
+                    if self.FinishCount ~= 0 then
+                        if callback then
+                            callback()
+                        end
+                    end
+                end
+            )
+            if not self:CheckIsFinishAll(self.curHellCfg.id) then
+                self:SortData(self.hellData.h_id)
+            end
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {
+                    _G.ActiveTaskEnum.ConditionEnum.HellRoad.FinishTask
+                },
+                self:GetFinishCount(),
+                false,
+                true
+            )
+        end
+    )
+end
+
+---进行升级操作
+---@param callback function
+function HellRoadModel:Upgrade(callback)
+    HellRoadNet:GetInstance():Upgrade(function(msg)
+        if not msg or msg.ack ~= 1 then
+            if callback then
+                callback()
+            end
+            return
+        end
+        --重置任务进度
+        if self.hellData.h_id ~= self.MaxHellId then
+            self.FinishCount = 0
+        end
+        --重新拉取军衔状态
+        HellRoadNet:GetInstance():GetHellInfo(_G.handlerbind(self, self.UpdateHellInfo, function()
+            require "RedPointManager":GetInstance():RefreshNode(
+                _G.ConfigManager.redpoint_cfg.MainNaraka.id,
+                1
+            )
+            if callback then
+                callback()
+            end
+        end))
+    end)
+end
+
+function HellRoadModel:Promote(index,power)
+    _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.MilitaryRankPromoteView.Name,
+            index,power
+    )
+end
+
+---@param msg hell_title.i_hell_info
+function HellRoadModel:UpdateHellInfo(msg, callback)
+    self.hellData.finish_task = msg.info.finish_task
+    self.hellData.h_id = msg.info.h_id
+    self.hellData.task_info = msg.info.task_info
+    --ZHJH-2943【军衔系统】晋升下士，无可操作内容时，红点无法消除
+    --已经没有每日奖励了, daily_award是nil
+    --self.hellData.daily_award = 0
+    self:UpdateTaskData()
+    --self:ChangeAllTaskState(_G.TaskEnum.ETaskState.Claimed)
+    self:InitCfg()
+    self:SortData(self.hellData.h_id)
+    self:InitAttribute()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.HellBattlePass.id)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.HellBattlePass.id)
+    --region --------------------------------------地狱道等级任务广播--------
+
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.HellRoad.id,
+            self:GetNowHellId()
+        },
+        1,
+        false,
+        true
+    )
+
+    --endregion------------------------------------地狱道等级任务广播--------
+
+    if callback then
+        callback()
+    end
+    ---刷新卡牌战力
+    _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.Hell)
+    self:ShowMainHell()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MainNaraka.id)
+end
+
+---获取当前地狱道id
+function HellRoadModel:GetNowHellId()
+    local id = 0
+    if self.curHellCfg then
+        id = self.curHellCfg.id
+    end
+    return id
+end
+
+---更新任务
+function HellRoadModel:UpdateTaskData()
+    if not self.hellData.task_info then
+        return
+    end
+    for _3, v3 in pairs(self.hellData.task_info) do
+        for _, v in pairs(self.TaskDatas[self.hellData.h_id]) do
+            if v3.sid == v.id then
+                v:ParseData(v3)
+                v:AddListener()
+            end
+        end
+    end
+end
+
+---更新任务状态
+function HellRoadModel:ChangeSingleTaskState(sid, state)
+    for _, v in pairs(self.TaskDatas[self.hellData.h_id]) do
+        if v.id == sid then
+            v.i_task.state = state
+            v:CheckTaskState()
+            break
+        end
+    end
+end
+
+---更新任务状态
+function HellRoadModel:ChangeAllTaskState(state)
+    for _, v in pairs(self.TaskDatas[self.hellData.h_id]) do
+        v.i_task.state = state
+        v:CheckTaskState()
+        v:AddListener()
+    end
+end
+
+---检测是否已经完成所有阶段的任务
+function HellRoadModel:CheckIsPass()
+    return self.hellData.h_id >= self.MaxHellId
+end
+
+---@param Data table
+function HellRoadModel:GetNumber(Data)
+    local PrivilegeManager = require "PrivilegeManager":GetInstance()
+    if not PrivilegeManager.Privilege then
+        return 0
+    end
+    if PrivilegeManager.Privilege[Data[1]] then
+        local count = #Data + 1
+        for _, v in pairs(PrivilegeManager.Privilege[Data[1]]) do
+            for i = 1, count do
+                if i == count then
+                    return v[i]
+                end
+                if i < count and v[i] ~= Data[i] then
+                    break
+                end
+            end
+        end
+    end
+    return 0
+end
+
+---@param parent UnityEngine.Transform RankName的父节点
+---@param index number Rank等级
+function HellRoadModel:ShowRank(parent, index)
+    local transForm = parent:GetChildE(parent:GetChildCountE() - 1)
+    if transForm == nil then
+        return
+    end
+    transForm:SetActiveE(1)
+    local image = transForm:GetComponentE(_G.typeof(_G.CS.AorImage))
+    image.SpriteName = _G.ConfigManager.hell_title_cfg[index].icon
+    image:SetNativeSize()
+
+end
+
+function HellRoadModel:Dispose()
+    _G.Events:GetInstance():RemoveListenerByType(_G.eHellRoadPrivilegeEvent.HellRoadPrivilege)
+end
+
+---更新任务数据
+function HellRoadModel:UpdataTask(task)
+    if not self.hellData then
+        return
+    end
+    local isUpdata = false
+    if task == nil or task.sid == nil then
+        return isUpdata
+    end
+    local mTask = self:GetTaskByTaskid(task.sid)
+    if mTask == nil then
+        return isUpdata
+    end
+    mTask:UpdataData(task)
+    return true
+end
+
+---@return HellRoadTaskData
+function HellRoadModel:GetTaskByTaskid(taskid)
+    for _, v in pairs(self.TaskDatas[self.curHellCfg.id]) do
+        if v.i_task.sid == taskid then
+            return v
+        end
+    end
+    return nil
+end
+
+---检测任务是否可以领取
+function HellRoadModel:CheckTaskCanTake(sid)
+    if not self.TaskDatas then
+        return false
+    end
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(40) then
+        return false
+    end
+    if sid == 0 then
+        return self.hellData.daily_award == 0
+    end
+    if self:CheckIsFinish(sid) then
+        return false
+    end
+    local data = self:GetTaskByTaskid(sid)
+    if data then
+        return data:CheckIsCanTake()
+    else
+        return false
+    end
+end
+
+---获取完成任务数
+function HellRoadModel:GetFinishCount()
+    if not self.hellData then
+        return 0
+    end
+    if not self.FinishCount then
+        self.FinishCount = 0
+        for _, v in pairs(self.curHellCfg.mission_privilege) do
+            if self:CheckIsFinish(v) then
+                self.FinishCount = self.FinishCount + 1
+            end
+        end
+        for _, v in pairs(self.curHellCfg.mission_phase) do
+            if self:CheckIsFinish(v) then
+                self.FinishCount = self.FinishCount + 1
+            end
+        end
+    end
+    return self.FinishCount
+end
+
+--#region  晋升奖励
+function HellRoadModel:GetPromotion(id, callback)
+    require "HellRoadNet":GetInstance():FinishUpAward(
+        {sid = id},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            require "CommonTipManager".OpenCommonAwardView(msg)
+            self.finishPro[id] = true
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.MainNaraka.id, 1)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---检测是否已领取晋升奖励
+function HellRoadModel:CheckIsGetPromotion(id)
+    return self.finishPro[id]
+end
+
+---检测是否已领取晋升奖励
+function HellRoadModel:CheckCanTaskPromotion(id)
+    if id <= 0 or id > self.MaxHellId then
+        return false
+    end
+    if self.hellData.h_id == self.MaxHellId then
+        return self:CheckIsFinishAll(self.hellData.h_id) and not self:CheckIsGetPromotion(id)
+    else
+        return id < self.hellData.h_id and not self:CheckIsGetPromotion(id)
+    end
+end
+
+---检测是否有晋升奖励
+function HellRoadModel:CheckHavePromotion()
+    for _, v in pairs(_G.ConfigManager.hell_title_cfg) do
+        if self:CheckCanTaskPromotion(v.id) then
+            return true
+        end
+    end
+    return false
+end
+
+-- 检测是否有完成没有领取的军衔奖励
+function HellRoadModel:CheckAwardCanGet()
+    for _, v in pairs(_G.ConfigManager.hell_title_cfg) do
+        for _2, v2 in pairs(v.mission_privilege) do
+            if self:CheckTaskCanTake(v2) then
+                return true
+            end
+        end
+        for _2, v2 in pairs(v.mission_phase) do
+            if self:CheckTaskCanTake(v2) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+---任务排序
+function HellRoadModel:SortData(id)
+    if not id then
+        id = self.hellData.h_id
+    end
+    if not self.TaskDatas or not self.TaskDatas[id] then
+        return
+    end
+
+    local sort = {}
+    for i, v in pairs(_G.ConfigManager.hell_title_cfg[id].mission_sort) do
+        sort[v] = i
+    end
+    _G.table.sort(
+        self.TaskDatas[id],
+        function(a, b)
+            if a.i_task.state == b.i_task.state then
+                if (a:CheckIsCanTake() and b:CheckIsCanTake()) or (not a:CheckIsCanTake() and not b:CheckIsCanTake()) then
+                    if sort[a.id] and sort[b.id] then
+                        return sort[a.id] < sort[b.id]
+                    end
+                    return sort[a.id] ~= nil
+                else
+                    return a:CheckIsCanTake()
+                end
+            else
+                if a:CheckIsCanTake() or b:CheckIsCanTake() then
+                    return a:CheckIsCanTake()
+                elseif
+                    a.i_task.state == _G.TaskEnum.ETaskState.Claimed or b.i_task.state == _G.TaskEnum.ETaskState.Claimed
+                 then
+                    return a.i_task.state == _G.TaskEnum.ETaskState.Claimed
+                else
+                    return a:CheckIsGet()
+                end
+            end
+        end
+    )
+end
+
+---初始化特权显示
+function HellRoadModel:InitPrivilegeShow()
+    local tb = {}
+    self.showPrivilege = {}
+    for _, v in ipairs(_G.ConfigManager.hell_title_cfg) do
+        if not tb[v.id] then
+            tb[v.id] = {}
+            self.showPrivilege[v.id] = {}
+        end
+        for _2, v2 in pairs(v.privilege_extra) do
+            local cfg = _G.ConfigManager.privilege_cfg[v2]
+            if cfg then
+                tb[v.id][cfg.privilege[1][1]] = require "HellRoadPriviegeShowData".New()
+                tb[v.id][cfg.privilege[1][1]]:ParseData(v2)
+            end
+        end
+    end
+    for i, v in ipairs(tb) do
+        for i2, v2 in ipairs(tb) do
+            if i2 == i then
+                for _, v3 in pairs(v2) do
+                    if not self.showPrivilege[i][v3.type] then
+                        self.showPrivilege[i][v3.type] = v3
+                        v3:ChangeState(3)
+                    else
+                        if v3.type == 5 then
+                            if self.showPrivilege[i][v3.type].other == v3.other then
+                                v3:ChangeState(2)
+                            else
+                                v3:ChangeState(3)
+                            end
+                        else
+                            v3:ChangeState(2)
+                        end
+                        self.showPrivilege[i][v3.type] = v3
+                    end
+                end
+            elseif i2 < i then
+                for _, v3 in pairs(v2) do
+                    self.showPrivilege[i][v3.type] = require "HellRoadPriviegeShowData".New()
+                    self.showPrivilege[i][v3.type]:ParseData(v3.id)
+                end
+            end
+        end
+    end
+
+    for i, v in ipairs(self.showPrivilege) do
+        local tb = _G.table.toArray(v)
+        _G.table.sort(
+            tb,
+            function(a, b)
+                if a.state == b.state then
+                    return a.id < b.id
+                else
+                    return a.state > b.state
+                end
+            end
+        )
+        self.showPrivilege[i] = tb
+    end
+end
+
+---获取属性加成
+function HellRoadModel:GetAllAttr(id)
+    if not id and self.attribute then
+        return self.attribute, self.attributeChangeType
+    end
+    local attributeManager = _G.AttributeClassManager:GetInstance()
+    local attribute = attributeManager:GetAttribtueClass()
+    local cfg = self.curHellCfg
+    if id then
+        cfg = _G.ConfigManager.hell_title_cfg[id]
+    end
+    local changeType = {}
+    if self.hellData then
+        for _, v in pairs(cfg.attribute) do
+            table.insert(changeType, _G.AttrType[v[1]])
+            attribute:AddValueByName(
+                v[1],
+                attributeManager:GetValueWithName(v[1], v[3], _G.tonumber(v[2])),
+                nil,
+                _G.tonumber(v[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+            )
+        end
+    end
+    return attribute, changeType
+end
+
+---获取最后一次完成的id
+function HellRoadModel:GetLastHell()
+    if not self.hellData then
+        return 0
+    else
+        return self.hellData.h_id
+    end
+end
+
+function HellRoadModel:InitFunction()
+    ---功能开启是更新地狱道任务
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.HellRoad.id,
+            self:GetNowHellId()
+        },
+        1,
+        false,
+        true
+    )
+end
+
+---
+function HellRoadModel:GetIsBuy(id)
+    return self.bpInfo[id].is_buy == 1
+end
+
+function HellRoadModel:GetRedpointIDByIndex(id)
+
+end
+
+function HellRoadModel:GetLvAndCurLvExp(id)
+    return self.hellData.h_id
+    -- local cfg = _G.ConfigManager.store_season_battle_cfg[id]
+    -- for k, v in ipairs(cfg.content) do
+    --     if _G.ConfigManager.store_season_battlecon_cfg[v].conditions[2] == self.hellData.h_id then 
+    --         return k
+    --     end
+    -- end
+    -- return #cfg.content
+end
+
+function HellRoadModel:GetBattlePassAwardByID(id)
+    local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+    local awardLis = {}
+    local bpId
+    local content, cfg
+    local flag = false
+    for _, _id in pairs(_G.ConfigManager.discrete_cfg[118002][1]) do
+        content = _G.ConfigManager.store_season_battle_cfg[_id].content
+        for _, v in pairs(content) do
+            cfg = store_season_battlecon_cfg[v]
+            if id == cfg.level then
+                bpId = _id
+                _G.table.insertto(awardLis, cfg.rewards_normal)
+                _G.table.insertto(awardLis, cfg.rewards_pay)
+                flag = true
+                break
+            end
+        end
+        if flag then
+            break
+        end
+    end
+    return awardLis, bpId
+end
+
+---第一个有可领取奖励的战令下标，或者当前等级战令
+function HellRoadModel:GetBattlePassJumpID()
+    local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+    local curId = self.hellData.h_id
+    local content, cfg, isBuy, free, pay
+    for index, _id in ipairs(_G.ConfigManager.discrete_cfg[118002][1]) do
+        content = _G.ConfigManager.store_season_battle_cfg[_id].content
+        isBuy = self:GetIsBuy(_id)
+        for _, v in ipairs(content) do
+            cfg = store_season_battlecon_cfg[v]
+            if curId <= cfg.level then
+                return index
+            end
+            free = not self:CheckAwardIsGet(_id, v, true)
+            if free then
+                return index
+            elseif isBuy then
+                pay = not self:CheckAwardIsGet(_id, v, false)
+                if pay then
+                    return index
+                end
+            end
+        end
+    end
+    return 1
+end
+
+---当前显示的战令数量
+function HellRoadModel:GetBattlePassNum()
+    local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+    local curId = self.hellData.h_id
+    local content, cfg
+    for index, _id in ipairs(_G.ConfigManager.discrete_cfg[118002][1]) do
+        content = _G.ConfigManager.store_season_battle_cfg[_id].content
+        content = content[#content]
+        cfg = store_season_battlecon_cfg[content]
+        if curId <= cfg.level then
+            return index
+        end
+    end
+    return #_G.ConfigManager.discrete_cfg[118002][1]
+end
+
+---购买高级战令
+---@param id number 用于服务器交互的战令id
+---@param price_id number 价格档位id
+function HellRoadModel:BuyBP(id, price_id)
+    require "MallManager":GetInstance():BuyActiveGift(price_id, nil, id)
+end
+
+---获取所有已解锁（可领取）奖励
+---@param id number 用于服务器交互的战令id
+---@param lv number 战令等级
+---@return cycle_battle.i_battle_award[]
+function HellRoadModel:GetAllUnlockAwards(id, lv)
+    local awardLis = {}
+    local content = _G.ConfigManager.store_season_battle_cfg[id].content
+    local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+    local isBuy = self:GetIsBuy(id)
+    ---@type store_season_battlecon_cfg
+    local cfg, free, pay
+    for _, v in pairs(content) do
+        cfg = store_season_battlecon_cfg[v]
+        if lv >= cfg.level then
+            free = not self:CheckAwardIsGet(id, v, true)
+            pay = isBuy and not self:CheckAwardIsGet(id, v, false)
+            if free and pay then
+                _G.table.insert(awardLis, {sid = v, type = 3})
+            elseif free then
+                _G.table.insert(awardLis, {sid = v, type = 1})
+            elseif pay then
+                _G.table.insert(awardLis, {sid = v, type = 2})
+            end
+        end
+    end
+    return awardLis
+end
+
+---检查奖励是否已领取
+---@param id number 用于服务器交互的战令id
+---@param awardId number 奖励id
+---@param isFree boolean 是否是免费奖励
+---@return boolean
+function HellRoadModel:CheckAwardIsGet(id, awardId, isFree)
+    if isFree then
+        return _G.table.ContainsValue(self.bpInfo[id].free_award, awardId)
+    else
+        return _G.table.ContainsValue(self.bpInfo[id].pay_award, awardId)
+    end
+end
+
+function HellRoadModel:CheckBPCanTake(id)
+    if id then 
+        for k1, v1 in ipairs(_G.ConfigManager.store_season_battle_cfg[id].content) do 
+            if _G.ConfigManager.store_season_battlecon_cfg[v1].conditions[2] <= self.hellData.h_id then 
+                if not self:CheckAwardIsGet(id, v1, true) then 
+                    return true
+                end
+                if self:GetIsBuy(id) and not self:CheckAwardIsGet(id, v1) then 
+                    return true 
+                end
+            end
+        end
+    else 
+        for k, v in ipairs(_G.ConfigManager.discrete_cfg[118002][1]) do 
+            for k1, v1 in ipairs(_G.ConfigManager.store_season_battle_cfg[v].content) do 
+                if _G.ConfigManager.store_season_battlecon_cfg[v1].conditions[2] <= self.hellData.h_id then 
+                    if not self:CheckAwardIsGet(v, v1, true) then 
+                        return true
+                    end
+                    if self:GetIsBuy(v) and not self:CheckAwardIsGet(v, v1) then 
+                        return true 
+                    end
+                end
+            end
+        end
+    end
+    return false 
+end
+
+---返回本级和下一级战令条目ID,第三个返回值是对应的战令sid（store_season_battle_cfg）
+function HellRoadModel:GetNowBPCfgId()
+    for k, v in ipairs(_G.ConfigManager.discrete_cfg[118002][1]) do 
+        for k1, v1 in ipairs(_G.ConfigManager.store_season_battle_cfg[v].content) do 
+            if _G.ConfigManager.store_season_battlecon_cfg[v1].conditions[2] == self.hellData.h_id then 
+                if not _G.ConfigManager.store_season_battle_cfg[v].content[k1 + 1] then 
+                    local index = _G.ConfigManager.discrete_cfg[118002][1][k + 1]
+                    if index then 
+                        return v1, _G.ConfigManager.store_season_battle_cfg[index].content[1], index 
+                    end
+                end
+                return v1, _G.ConfigManager.store_season_battle_cfg[v].content[k1 + 1], v
+            end
+        end
+    end
+end
+
+---领取奖励
+---@param id number 用于服务器交互的战令id
+---@param awardLis cycle_battle.i_battle_award[] 奖励列表
+function HellRoadModel:GetBPAward(id, awardLis, callback)
+    local sidT = {}
+    for k, v in ipairs(awardLis) do 
+        table.insert(sidT, v.sid)
+    end 
+    local pbData = {type = awardLis[1].type, sid = id, award_ids = sidT}
+    HellRoadNet:GetInstance():GetBPAward(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                for _, v in pairs(sidT) do
+                    if awardLis[1].type == 1 then
+                        _G.table.insert(self.bpInfo[id].free_award, v)
+                    elseif awardLis[1].type == 2 then
+                        _G.table.insert(self.bpInfo[id].pay_award, v)
+                    elseif awardLis[1].type == 3 then
+                        _G.table.insert(self.bpInfo[id].free_award, v)
+                        _G.table.insert(self.bpInfo[id].pay_award, v)
+                    end
+                end
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.HellBattlePass.id)
+                _G.Events:GetInstance():Broadcast(_G.eHellRoad.HellGetAwardEnd)
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+---一键领取奖励
+---@param id number 用于服务器交互的战令id
+---@param awardLis cycle_battle.i_battle_award[] 奖励列表
+function HellRoadModel:GetAllBPAward(id, awardLis, callback)
+    local sidT = {}
+    for k, v in ipairs(awardLis) do 
+        table.insert(sidT, v.sid)
+    end 
+    local pbData = {type = 3, sid = id}
+    HellRoadNet:GetInstance():GetBPAward(
+        pbData,
+        function(msg)
+            if msg.ack == 1 then
+                local isBuy = self:GetIsBuy(id)
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                for _, v in pairs(awardLis) do
+                    _G.table.insert(self.bpInfo[id].free_award, v.sid)
+                    if isBuy then
+                        _G.table.insert(self.bpInfo[id].pay_award, v.sid)
+                    end
+                end
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.HellBattlePass.id)
+                _G.Events:GetInstance():Broadcast(_G.eHellRoad.HellGetAwardEnd)
+                if callback then
+                    callback()
+                end
+            end
+        end
+    )
+end
+
+--#endregion
+
+return HellRoadModel

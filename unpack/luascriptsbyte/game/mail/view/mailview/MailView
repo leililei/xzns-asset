@@ -1,0 +1,395 @@
+--------------------------------------------------------------------------
+-- F:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Mail.View.MailView	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/02/24
+-- 生命周期Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+require "MailItem"
+require "MailModel"
+require "BaseAwardItem"
+---@class MailView : UIBaseView
+---@field go_table MailView_GoTable
+---@field mails  mail.i_mail_brief[] 所有邮件的数据
+---@field scrollViewRect UnityEngine.RectTransform 邮件正文所在的RectTransform
+---@field AffixData award.i_award_item 当前选中邮件的附件数据
+---@field AffixItems BaseAwardItem[] 所有附件的物体
+---@field curItem MailItem 当前选中的邮件
+---@field curMail mail.i_mail_brief 当前选中邮件的附件数据
+---@field mailList MailItem[] 所有的邮件物体
+local MailView = _G.BaseClass("MailView", _G.UIBaseView)
+local GetLangPackValue = _G.GetLangPackValue
+function MailView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self.clickFunction = {
+        ["@_aorbtn_btnClose"] = self.CloseView,
+        ["@_aorbtn_btnGetAll"] = self.ReceiveAll,
+        ["@_aorbtn_btnDeleteAll"] = self.DelAllReadMail
+    }
+    self:AddListener(_G.eMail.ExpireMail, self.RemoveMail)
+    _G.AudioManager.PlayAudio(_G.AudioType.PlaySound, _G.AudioClipTypeEnum.openPanel)
+    _G.GameUtil.SetActiveByCondition(self.gameObject, false)
+end
+
+---界面的入口函数
+
+---@param mails mail.s2c_get_mails 邮件数据
+function MailView:OnCreate(data)
+    require "MailModel":GetInstance():GetMailsData(
+        function(data)
+            _G.GameUtil.SetActiveByCondition(self.gameObject, true)
+            self.isInited = false
+            self:InitData(data)
+            self.isInited = true
+            self:AddComponent(
+                self.go_table.obj_playerInfo,
+                require("PlayerComponent").New(self.go_table.obj_playerInfo)
+            )
+            self:AddComponent(
+                self.go_table.obj_resource,
+                require("ResourceCompont").New(
+                    self.go_table.obj_resource,
+                    _G.ConfigManager.ui_cfg.MailView.resources
+                )
+            )
+        end
+    )
+end
+
+---初始化邮件
+function MailView:InitData(data)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MailList.id)
+    self.mails = data
+    self.mailList = {}
+
+    self.isInitAward = false
+    self.go_table.aorlooplist_MailList:StartUpdataDragInfo(0, _G.handler(self, self.RefreshItem))
+    if self.mails == nil or #data == 0 then
+        self:DisplayMail(false)
+        return
+    end
+    self:RefreshAllMails(#data)
+    self:DisplayMail(true)
+    self:ShowGetAllBtn()
+    self.inited = true
+end
+
+function MailView:Dispose()
+    for _, value in pairs(self.mailList) do
+        value:Dispose()
+    end
+    self.mailList = nil
+end
+
+---刷新邮件
+---@param trans Transform 邮件的transform
+---@param index tonumber 邮件的下标
+function MailView:RefreshItem(trans, index)
+    local tbIndex = index + 1
+    local data = self.mails[tbIndex]
+    local instance = trans:GetInstanceIDE()
+    if self.mailList[instance] == nil then
+        --TODO  判断有无附件 若有附件则产生附件的，若无附件则产生无附件的 
+        self.mailList[instance] = require("MailItem").Create(
+            trans,
+            _G.handler(self, self.SetCurMail),
+            _G.handler(self, self.ShowGetAllBtn),
+            _G.handler(self, self.OnGetCallBack)
+        )
+    end
+    self.mailList[instance]:UpdateData(data, self.curMail)
+    if (not self.curMail and tbIndex == 1) or (self.curMail and self.curMail.uid == data.uid) then
+        self.curItem = self.mailList[instance]
+    end
+end
+
+function MailView:OnGetCallBack()
+    require("MailModel"):GetInstance():GetMailDataAndSort()
+    self:SetMailsRefresh()
+end
+
+---显示是否有邮件
+---@param isShow boolean 是否显示邮件
+function MailView:DisplayMail(isShow)
+    self.go_table.obj_NoMail:SetActiveE((not isShow) and 1 or 0)
+    -- if self.isInited then
+    --     self.go_table.obj_MailInfoPanel:SetActiveE(isShow and 1 or 0)
+    -- end
+
+    -- self.go_table.obj_Mail:SetActiveE(isShow and 1 or 0)
+end
+
+---设置当前显示的邮件
+---@param data mail.i_mail_brief 邮件的数据
+---@param isRead boolean 当前有件是否为新的已读邮件
+function MailView:SetCurMail(item, isRead)
+    if item.data == nil or (self.curMail ~= nil and item.data.uid == self.curMail.uid) then
+        return
+    end
+    self.curItem = item
+    self.curMail = item.data
+    require("MailModel"):GetInstance():SetCurMail(item.data)
+    if isRead then
+        require("MailModel"):GetInstance():GetMailDataAndSort()
+        self:SetMailsRefresh()
+    end
+end
+
+--一键领取
+function MailView:ReceiveAll()
+    if not self.canGet then
+        _G.PopWindowManager:GetInstance():ShowAllTips(330101)
+        return
+    end
+    local isHave = false
+    for _, v in pairs(self.mails) do
+        if v.annex and v.state < 2 then
+            isHave = true
+            break
+        end
+    end
+    if isHave then
+        local uids = self:GetAwardUids(self.mails)
+        if #uids > 0 then
+            require("MailModel"):GetInstance():GetAllAffix(uids, _G.handler(self, self.ReceiveAllCall))
+        else
+            _G.PopWindowManager:GetInstance():ShowAllTips(380104) --背包满了
+        end
+    end
+end
+
+---获取可以领取的邮件uid
+function MailView:GetAwardUids(datas)
+    local uids = {}
+    local awardData = {}
+    local count = #datas
+    for i = 1, count do
+        if datas[i].annex and datas[i].state < 2 then
+            local tb = {}
+            for j = 1, #datas[i].annex do
+                local data = datas[i].annex[j].type
+                local sid, num = data[1], data[2]
+                if sid == 0 and #data >= 5 then
+                    sid = data[4]
+                    num = data[5]
+                end
+                local _, ID = _G.StorageManager:GetInstance():CheckSidType(sid)
+                if ID == _G.StorageID.Equipment then
+                    if data[3] and not data[4] then
+                        if
+                            not _G.StorageManager:GetInstance():GetItemDataByID(
+                                _G.StorageID.Equipment,
+                                sid * 10 + data[3]
+                            )
+                        then
+                            if awardData[sid] then
+                                awardData[sid] = num + awardData[sid]
+                            else
+                                awardData[sid] = num
+                            end
+                        end
+                    else
+                        local cfg = _G.ConfigManager.equipment_cfg[sid]
+                        if cfg and cfg.addition > 0 then
+                            if awardData[sid] then
+                                awardData[sid] = num + awardData[sid]
+                            else
+                                awardData[sid] = num
+                            end
+                        end
+                    end
+                else
+                    if awardData[sid] then
+                        awardData[sid] = num + awardData[sid]
+                    else
+                        awardData[sid] = num
+                    end
+                end
+                if awardData[sid] then
+                    tb[#tb + 1] = { sid, awardData[sid] }
+                end
+            end
+            if _G.table.isEmptyOrNil(awardData) or _G.StorageManager:GetInstance():IsCheckAddGetItem(tb) then
+                _G.table.insert(uids, datas[i].uid)
+            else
+                for j = 1, #tb do
+                    if awardData[datas[i].annex[j].type[1]] then
+                        awardData[datas[i].annex[j].type[1]] = awardData[datas[i].annex[j].type[1]] - tb[j][2]
+                        if awardData[datas[i].annex[j].type[1]] == 0 then
+                            awardData[datas[i].annex[j].type[1]] = nil
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return uids, awardData
+end
+
+---一键领取的回调
+---@param msg mail.s2c_mail_all 邮件相关数据
+function MailView:ReceiveAllCall(msg)
+    -- self:RefreshAllMails()
+    -- self.go_table.aorbtn_btnGet:SetActiveE(0)
+    -- --self.go_table.aorbtn_btnDelete:SetActiveE(1)
+    -- self.go_table.aorimage_Over:SetActiveE(1)
+    if msg.award then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+            msg,
+            _G.handler(
+                self,
+                function()
+                    if msg.ack ~= 1 then
+                        return
+                    end
+                end
+            )
+        )
+    end
+    self:ShowGetAllBtn()
+    self:RefreshAllMails()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MailList.id)
+end
+
+---刷新邮件显示
+---@param count tonumber 刷新邮件的数量
+function MailView:RefreshAllMails(count)
+    if count == nil then
+        self.go_table.aorlooplist_MailList:RefreshAllShowItem()
+    else
+        self.go_table.aorlooplist_MailList:RefreshAllShowItem(count)
+    end
+end
+
+function MailView:RemoveMail(uid)
+    for k, v in pairs(self.mails) do
+        if type(v) == "table" then
+            if v.uid == uid then
+                _G.table.remove(self.mails, k)
+                break
+            end
+        end
+    end
+    if #(self.mails) <= 0 then
+        self:DisplayMail(false)
+        self.curItem = nil
+        self.curMail = nil
+        self.go_table.aorlooplist_MailList:RefreshAllShowItem(0)
+        return
+    end
+    if uid == self.curMail.uid then
+        self.curItem = nil
+        self.curMail = nil
+    end
+    self:RefreshAllMails(#(self.mails))
+    self:ShowGetAllBtn()
+end
+
+-- 一键删除已读带附件的邮件
+function MailView:DelAllReadMail()
+    if not self.canDel then
+        _G.PopWindowManager:GetInstance():ShowAllTips(330102) --当前没有可删除
+        return
+    end
+    _G.PopWindowManager:GetInstance():ShowAllTips(
+        330301,
+        nil,
+        function()
+            require("MailModel"):GetInstance():DelAllMails(_G.handler(self, self.DelAllReadMailCall))
+        end
+    )
+end
+
+---一键删除邮件回调
+---@param data mail.s2c_get_mails 删除所有已读邮件后的邮件数据
+function MailView:DelAllReadMailCall(data)
+    self.mails = data
+
+    local isHave = false
+    for _, v in pairs(self.mails) do
+        if (not v.annex) or (v.annex and v.state < 2) then
+            isHave = true
+            break
+        end
+    end
+    if isHave then
+        self.curItem = nil
+        self.curMail = nil
+    else
+        self:DisplayMail(false)
+        self.curItem = nil
+        self.curMail = nil
+    end
+    self.go_table.aorlooplist_MailList:RefreshAllShowItem(#self.mails)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.MailList.id)
+    self:ShowGetAllBtn()
+end
+
+---更新邮件数据并刷新界面
+---@param data s2c_get_mails 所有邮件的数据
+function MailView:SetMailsRefresh()
+    self.mails = require "MailModel":GetInstance().data
+    if self.go_table.obj_NoMail:GetActiveSelf() == 1 then
+        self:DisplayMail(true)
+    end
+    self:RefreshAllMails(#self.mails)
+    self:ShowGetAllBtn()
+end
+
+---更新邮件数据
+------@param data mail.s2c_get_mails 所有邮件的数据
+function MailView:SetMailsData(data)
+    self.mails = data
+end
+
+---按钮点击事件在这里派发
+function MailView:OnClickBtn(go, isOn)
+    local name = go:GetName()
+    -- _G.AudioManager.PlayAudioByAudioCfgID(_G.AudioClipTypeEnum.clickAuido)
+    if self.clickFunction[name] then
+        self.clickFunction[name](self, go, isOn)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log("MailView", "<color=red>" .. "方法不存在" .. "</color>")
+        end
+    end
+end
+
+---关闭界面
+function MailView:CloseView()
+    require("MailModel"):GetInstance():SetCurMail(nil)
+    self:Close()
+end
+
+---点击附件
+---@param item BaseAwardItem 点击附件的BaseAwardItem
+function MailView:ClickAffix(item)
+    require("CommonTipManager"):GetInstance():OpenTip(item.gameObject, item.data.sid)
+end
+
+---一键领取按钮显示
+function MailView:ShowGetAllBtn()
+    self.canGet = false
+    self.canDel = false
+    if self.mails then
+        for _, v in pairs(self.mails) do
+            if not self.canGet and v.annex and v.state < 2 then
+                self.canGet = true
+            end
+            if not self.canDel and (not v.annex and v.state == 1) or (v.state == 2 and v.annex) then
+                self.canDel = true
+            end
+            if self.canGet and self.canDel then
+                break
+            end
+        end
+    end
+    -- self.go_table.aorbtn_btnDeleteAll:SetGray(not self.canDel)
+    -- self.go_table.aortext_deleteLabel.color =
+    --     self.canDel and _G.ColorTools.FormatColorByString("284B8C") or _G.ColorTools.FormatColorByString("414141")
+    -- self.go_table.aorbtn_btnGetAll:SetGray(not self.canGet)
+    -- self.go_table.aortext_getAll.color =
+    --     self.canGet and _G.ColorTools.FormatColorByString("914801") or _G.ColorTools.FormatColorByString("414141")
+end
+
+return MailView

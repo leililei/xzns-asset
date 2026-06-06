@@ -1,0 +1,368 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Arena.ArenaManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/12/16
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "GameDataModelBase"
+---@class ArenaManager:GameDataModelBase	竞技场数据管理类
+---@field GetInstance fun():ArenaManager
+local ArenaManager = _G.BaseClass("ArenaManager", base)
+
+---@class ArenaManager.State 竞技场状态
+---@field close number 关闭(功能未开放)
+---@field open number 打开(正常开放)
+---@field settle number 结算(处于赛季休赛期，发放奖励，暂停挑战)
+ArenaManager.State = {
+    settle = 0,
+    open = 1,
+    close = 2
+}
+
+local arenaClass = {
+    "ArenaSingleClassNormal",
+    -- "ArenaSingleClassSenior",
+    false,
+    "ArenaSingleClassFair"
+    -- "ArenaSingleClassElement"
+}
+ArenaManager.arenaType = {
+    normal = 1,
+    senior = 2,
+    fair = 3,
+    element = 4
+}
+---类的构造函数
+function ArenaManager:__init()
+    self.arenaClass = {}
+    self.functionOpenDic = {}
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.attacked.Cmd, self.OnReportCall, self)
+end
+
+---类的析构函数
+function ArenaManager:Dispose()
+    if self.updateTimer then
+        self.updateTimer:Stop()
+    end
+    self.updateTimer = nil
+    for _, arena in pairs(self.arenaClass) do
+        arena:Dispose()
+    end
+    self.arenaClass = nil
+    self.functionOpenDic = nil
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.attacked.Cmd, self.OnReportCall, self)
+end
+
+function ArenaManager:GetDataFormServer()
+    local index = 0
+    local function callback(success, sid)
+        if not success then
+            self.functionOpenDic[_G.ConfigManager.arena_info_cfg[sid].function_open] = sid
+        end
+        index = index - 1
+        if index <= 0 then
+            self:ParseData()
+        end
+    end
+    for sid, cfg in pairs(_G.ConfigManager.arena_info_cfg) do
+        if not self.arenaClass[sid] then
+            if arenaClass[sid] then
+                index = index + 1
+                self.arenaClass[sid] = require(arenaClass[sid]).New(sid, cfg)
+                if sid ~= ArenaManager.arenaType.fair then
+                    self.arenaClass[sid]:InitInfo(callback)
+                else
+                    index = index - 1
+                end
+            end
+        end
+        --self.arenaClass[sid]:InitInfo(callback)
+    end
+    require("ArenaController"):GetInstance():ResetLoginFirstTable()
+    ---每次登录刷新高级竞技场红点
+    _G.PlayerPrefsManager.SetInt(tostring(_G.PlayerModel:GetInstance().role_uid) .. "RedPointSeniorChallenge", 1)
+end
+
+function ArenaManager:ParseData()
+    base.ParseData(self)
+    self.updateTimer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false, true)
+    self.updateTimer:Start()
+    if not _G.IsNil(self.functionOpenDic) then
+        _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnFunctionOpenCall, self)
+    end
+end
+
+function ArenaManager:OnFunctionOpenCall(id)
+    for funcid, arenasid in pairs(self.functionOpenDic) do
+        if id == funcid then
+            self.arenaClass[arenasid]:InitInfo(
+                _G.handler(self.arenaClass[arenasid], self.arenaClass[arenasid].OnRefreshRedpoint)
+            )
+            self.functionOpenDic[funcid] = nil
+            if _G.IsNil(self.functionOpenDic) then
+                _G.Events:GetInstance():RemoveListener(
+                    _G.eFunctionsStatus.OpenCfgFunctionId,
+                    self.OnFunctionOpenCall,
+                    self
+                )
+            end
+            break
+        end
+    end
+end
+
+---重连成功调用
+---@param endcall function 完成回调
+function ArenaManager:ReConnect(endcall)
+    self.onReConnectCall = endcall
+    self.onReConnectCount = 0
+    for _, _ in pairs(self.arenaClass) do
+        self.onReConnectCount = self.onReConnectCount + 1
+    end
+    local handler = _G.handler(self, self.OnArenaReConnect)
+    local callTag = false
+    for sid, arena in pairs(self.arenaClass) do
+        if self.functionOpenDic then
+            callTag = false
+            for foid, arenasid in pairs(self.functionOpenDic) do
+                if arenasid == sid then
+                    self:OnArenaReConnect()
+                    callTag = true
+                    break
+                end
+            end
+        end
+        if not callTag then
+            arena:ReConnect(handler)
+        end
+    end
+end
+function ArenaManager:UpdateTime()
+    for _, value in pairs(self.arenaClass) do
+        value:UpdateTime()
+    end
+end
+---回放战报
+function ArenaManager:ReplayReport(sid, uid, callback)
+    self.arenaClass[sid]:ReplayReport(uid, callback)
+end
+---当有新的战报推送
+---@param 变量名 变量类型 中文描述
+---@return 变量类型 中文描述
+function ArenaManager:OnReportCall(data)
+    self:SetNewReport(data.sid, true)
+    self.arenaClass[data.sid]:OnAttack()
+end
+function ArenaManager:OnArenaReConnect()
+    self.onReConnectCount = self.onReConnectCount - 1
+    if self.onReConnectCount <= 0 then
+        if self.onReConnectCall then
+            self.onReConnectCall(self.__cname)
+        end
+    end
+end
+--region 对外接口
+
+--region数据接口
+---获取竞技场对象
+---@param sid number 竞技场sid
+---@return 变量类型 中文描述
+function ArenaManager:GetArenaClass(sid)
+    return self.arenaClass[sid]
+end
+---获取竞技场状态
+---@return number 竞技场状态，1开启，2关闭
+function ArenaManager:GetArenaState(sid)
+    return self.arenaClass[sid]:GetCurArenaState()
+end
+---获取竞技场信息
+---@return table 竞技场信息({id=true or false})
+function ArenaManager:GetArenaInfo()
+    local info = {}
+    for i = 1, #_G.ConfigManager.arena_info_cfg do
+        _G.table.insert(
+            info,
+            {
+                id = i,
+                isOpen = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(
+                    _G.ConfigManager.arena_info_cfg[i].function_open
+                )
+            }
+        )
+    end
+    return info
+end
+---获取单个竞技场信息
+---@param sid number 竞技场id
+---@param callback function 异步回调
+---@param fresh boolean 是否强制刷新(重新从服务器拿数据)
+function ArenaManager:GetArenaSingle(sid, callback, fresh)
+    if fresh then
+        self.arenaClass[sid]:InitInfo(callback, fresh)
+    else
+        callback()
+    end
+end
+---获取对战列表
+---@param sid number 竞技场id
+---@param callback function 异步回调
+---@param force boolean 是否强制获取
+function ArenaManager:GetEnemyArray(sid, callback, force)
+    self.arenaClass[sid]:GetEnemyInfo(callback, force)
+end
+---获取刷新倒计时
+---@param sid number 竞技场id
+---@param callback function 异步回调GetEnemyInfo
+function ArenaManager:GetFreshTime(sid, callback)
+    self.arenaClass[sid]:GetFreshTime(callback)
+end
+---获取敌人基本数据
+---@param sid number 竞技场sid
+---@param uid number 敌人uid
+---@return table 基本数据
+function ArenaManager:GetEnemyDataByUid(sid, uid)
+    return self.arenaClass[sid]:GetEnemyDataByUid(uid)
+end
+---获取对战玩家具体布阵数据
+---@param sid number 竞技场id
+---@param uid number 玩家id
+---@param callback function 异步回调
+---@param force boolean 是否强制刷新数据
+function ArenaManager:GetEnemyEmbattleArray(sid, uid, callback, force)
+    self.arenaClass[sid]:GetEnemyEmbattleArray(uid, callback, force)
+end
+---获取免费挑战次数
+---@param sid number 竞技场id
+---@return number 挑战次数
+function ArenaManager:GetFreeFightTimes(sid)
+    return self.arenaClass[sid]:GetFreeFightTimes()
+end
+---获取排行榜数据
+---@param callback function 数据获取回调(因为是异步请求,所以不直接返回)
+function ArenaManager:GetRankList(sid, callback)
+    self.arenaClass[sid]:GetRankList(callback)
+end
+---获取是否有新战报
+---@param sid number 竞技场sid
+---@return boolean 是否有新战报
+function ArenaManager:GetNewReport(sid)
+    return self.arenaClass[sid]:GetNewReport()
+end
+---设置新战报状态
+---@param sid number 竞技场sid
+---@return boolean 是否有新战报
+function ArenaManager:SetNewReport(sid, new)
+    self.arenaClass[sid]:SetNewReport(new)
+end
+---获取战报
+---@param sid number 竞技场sid
+---@param callback function 数据获取回调(因为是异步请求,所以不直接返回)
+function ArenaManager:GetBattleReport(sid, callback)
+    self.arenaClass[sid]:GetBattleReport(callback)
+end
+---刷新战报
+---@param sid number 竞技场sid
+---@param callback function 数据获取回调(因为是异步请求,所以不直接返回)
+function ArenaManager:RefreshReport(sid, callback)
+    self.arenaClass[sid]:RefreshReport(callback)
+end
+---删除战报
+---@param sid number 竞技场sid
+---@param callback function 删除完回调(boolean true 则成功 false 则失败 并返回错误代码)
+function ArenaManager:DeleteBattleReport(sid, callback)
+end
+---获取排名
+---@param sid number 竞技场sid
+---@return number 当前赛季排名
+function ArenaManager:GetRank(sid)
+    return self.arenaClass[sid]:GetRank()
+end
+---获取赛季最高排名
+---@param sid number 竞技场sid
+---@return number 当前赛季最高排名
+function ArenaManager:GetMaxRank(sid)
+    return self.arenaClass[sid]:GetMaxRank()
+end
+---获取段位奖励领取标志
+---@param sid number 竞技场id
+---@param id number 段位ID
+---@return boolean 是否已领取
+function ArenaManager:GetRankAwardState(sid, id)
+    return self.arenaClass[sid]:GetRankAwardState(id)
+end
+
+---获取段位奖励列表
+---@param cfg arena_rank_cfg
+function ArenaManager:AddEffectAward(cfg)
+    local awards = {}
+    local type, sid
+    for _, a in pairs(cfg.reward_daily) do
+        _G.table.insert(awards, a)
+    end
+    if not _G.table.isEmptyOrNil(cfg.reward_appearance) then
+        for _, eff in pairs(cfg.reward_appearance) do
+            type = eff[1]
+            sid = _G.tostring(eff[2])
+            for k, item in pairs(_G.ConfigManager.item_cfg) do
+                if item.UseType == type and item.UseParameter[1][1] == sid then
+                    _G.table.insert(awards, {item.ID, 1})
+                    break
+                end
+            end
+        end
+    end
+    return awards
+end
+--endregion
+
+--region功能接口
+---刷新竞技场信息
+---@param sid number 竞技场id
+---@param callback function 异步回调
+function ArenaManager:RefreshArenaInfo(sid, callback)
+    self.arenaClass[sid]:InitInfo(callback, true)
+end
+---刷新挑战列表
+---@param sid number 竞技场id
+---@param callback function 异步回调
+---@param timeCall function 时间刷新回调
+function ArenaManager:RefreshEnemy(sid, callback)
+    self.arenaClass[sid]:RefreshEnemy(callback)
+end
+---清理刷新时间
+function ArenaManager:ClearFreshTimeCall(sid)
+    self.arenaClass[sid]:ClearFreshTimeCall()
+end
+---清除倒计时监听
+---@param sid number 竞技场sid
+function ArenaManager:ClearEndTimeCall(sid)
+    self.arenaClass[sid]:ClearEndTimeCall()
+end
+---领取胜场奖励
+---@param callback function 领取完回调(boolean true 则成功 false 则失败 并返回错误代码)
+function ArenaManager:GetAwardByWin(sid, win_num, callback)
+    self.arenaClass[sid]:GetAwardByWin(win_num, callback)
+end
+---获取段位奖励
+---@param sid number 竞技场id
+---@param id number 段位ID
+---@param callback function 数据获取回调
+function ArenaManager:GetRankAward(sid, id, callback)
+    self.arenaClass[sid]:GetRankAward(id, callback)
+end
+---购买门票
+---@param sid number 竞技场id
+---@param callback function 数据获取回调
+function ArenaManager:BuyTicket(sid, callback)
+    self.arenaClass[sid]:BuyTicket(callback)
+end
+---设置刷新回调
+---@param sid number 竞技场id
+---@param callback function 刷新回调
+function ArenaManager:SetRefreshCall(sid, callback)
+    self.arenaClass[sid]:SetListenerRefresh(callback)
+end
+--endregion
+
+--endregion
+return ArenaManager

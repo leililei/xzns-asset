@@ -1,0 +1,218 @@
+local base = require("AIHelperModuleBaseSelect")
+
+---@class AIHelperModuleSociatyDonate : AIHelperModuleBaseSelect	    @AI助手-公会捐献
+---@field types number[]                            @捐献目标类型: 1魂币捐献(魂币), 2魂玉捐献(魂玉), 3至尊捐献(魂玉)
+---@field canDonate boolean                         @是否可以捐献
+local AIHelperModuleSociatyDonate = _G.BaseClass("AIHelperModuleSociatyDonate", base)
+
+function AIHelperModuleSociatyDonate:__init()
+    self.types = self.cfg.script_parameter
+    --默认不要开启魂玉消耗
+    if #self.types > 0 then
+        local cfg = _G.ConfigManager.guild_donate_cfg[self.types[1]]
+        if cfg and cfg.consume[1] == _G.ResPropID.Diamond then
+            if self:ReadSettings(false) == false then
+                self.selected = false
+            end
+        end
+    end
+end
+
+---是否显示此模块(功能是否开启)
+function AIHelperModuleSociatyDonate:IsEnabled()
+    if not base.IsEnabled(self) then
+        return false
+    end
+    --检查是否加入了公会
+    if not require("SociatyManager"):GetInstance():HasSociaty() then
+        return false
+    end
+    return true
+end
+
+---是否满足模块使用条件
+function AIHelperModuleSociatyDonate:IsActive()
+    return self.canDonate
+end
+
+---重置状态
+---@return void
+function AIHelperModuleSociatyDonate:Reset()
+    base.Reset(self)
+    self.canDonate = true
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleSociatyDonate:Check(callback)
+    self.canDonate = false
+
+    ---重新拉取公会数据
+    local model = require("SociatyModel"):GetInstance()
+    if model.SociatyRoleSelf then
+        self:CheckDonate()
+        if callback then
+            callback(true)
+        end
+    else
+        model:InitData(function()
+            self:CheckDonate()
+            if callback then
+                callback(true)
+            end
+        end)
+    end
+end
+
+---执行逻辑
+function AIHelperModuleSociatyDonate:Execute(callback)
+    if not self.canDonate then
+        if callback then
+            callback(false, self:CreateFailureResults(self.cfg.fail_tip))
+        end
+        return
+    end
+    self.canDonate = false --不要再继续执行
+
+    local model = require("SociatyModel"):GetInstance()
+    ---@type SociatyDonateData
+    local data = require("SociatyModel"):GetInstance().donateData
+
+    --获取的奖励列表
+    ---@type any[]
+    local lstAward = {}
+
+    ---执行捐献逻辑
+    ---@param index number
+    local function donate(index)
+        if index > #self.types then
+            if callback then
+                if #lstAward > 0 then
+                    callback(true, { award = { item = lstAward } })
+                else
+                    callback(false, self:CreateFailureResults(self.cfg.fail_tip))
+                end
+            end
+            return
+        end
+
+        local type = self.types[index]
+        if data:CheckIsDonate(type) then
+            donate(index + 1)
+            return
+        end
+        --检查物资消耗是否充足
+        local cfg = _G.ConfigManager.guild_donate_cfg[type]
+        if not cfg then
+            donate(index + 1)
+            return
+        end
+        if not _G.StorageManager:GetInstance():CheckItem(cfg.consume[1], cfg.consume[2]) then
+            donate(index + 1)
+            return
+        end
+
+        ---执行捐献
+        model:Donate(type, function(msg)
+            if not msg or msg.ack ~= 1 then
+                donate(index + 1)
+                return
+            end
+
+            --更新缓存状态
+            model.donateData:AddDonateId(type)
+            local mineData = require("SociatyData").GetMemberModule():GetSelfMember()
+            mineData.donate = mineData.donate + 1
+
+            --缓存奖励数据
+            if msg.award and msg.award.item then
+                for _, d in ipairs(msg.award.item) do
+                    table.insert(lstAward, d)
+                end
+            end
+            donate(index + 1)
+        end)
+    end
+    donate(1)
+end
+
+---执行前的设置UI状态
+function AIHelperModuleSociatyDonate:ShowSettings(item)
+    base.ShowSettings(self, item)
+
+    self:SetSettingsType(item, self.Types.Select|self.Types.Tip)
+    self:ShowSettingsSelected(item)
+end
+
+---监听设置点击事件
+function AIHelperModuleSociatyDonate:OnSettingsBtn(item, go, isOn)
+    base.OnSettingsBtn(self, item, go, isOn)
+    if not isOn then
+        return
+    end
+    self:ShowSettingsSelected(item)
+end
+
+---通知开关状态发生变化
+---@param item AIHelperView._obj_listItem_GoTable
+function AIHelperModuleSociatyDonate:ShowSettingsSelected(item)
+    --显示消耗信息
+    ---@type string,number
+    local consumeIcon, consumeNum = nil, 0
+
+    if #self.types > 0 then
+        local cfg = _G.ConfigManager.guild_donate_cfg[self.types[1]]
+        consumeIcon = cfg and _G.StorageManager:GetInstance():GetItemIcon(cfg.consume[1]) or nil
+    end
+    if self.selected then
+        ---检查捐献状态
+        ---@type SociatyDonateData
+        local data = require("SociatyModel"):GetInstance().donateData
+        for _, type in pairs(self.types) do
+            local cfg = _G.ConfigManager.guild_donate_cfg[type]
+            if cfg and not data:CheckIsDonate(type) then
+                consumeNum = consumeNum + cfg.consume[2]
+            end
+        end
+    end
+
+    item.aortext_tipPrefix.text = _G.GetLangPackValue(90000011391)
+    item.aortext_tipSuffix.text = _G.UIUtils.NumberToUnitStr(consumeNum)
+    if consumeIcon then
+        item.aorrawimage_tipIcon:LoadImage(consumeIcon)
+    end
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleSociatyDonate:ShowExecuteResult(item, success, results)
+    base.ShowExecuteResult(self, item, success, results)
+    if not success then
+        return
+    end
+    self.Util.ShowAwardListOfMsg(item, results)
+end
+
+---隐藏执行结束UI状态(此时可以回收一些外部节点)
+function AIHelperModuleSociatyDonate:HideExecuteResult(item, results)
+    base.HideExecuteResult(self, item.resutls)
+    self.Util.HideAwardListOfMsg(item, results)
+end
+
+---检查当前是否可捐献
+---@return void
+function AIHelperModuleSociatyDonate:CheckDonate()
+    self.canDonate = false
+    ---检查捐献状态
+    ---@type SociatyDonateData
+    local data = require("SociatyModel"):GetInstance().donateData
+    if data then
+        for _, type in pairs(self.types) do
+            if not data:CheckIsDonate(type) then
+                self.canDonate = true
+                break
+            end
+        end
+    end
+end
+
+return AIHelperModuleSociatyDonate

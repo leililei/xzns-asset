@@ -1,0 +1,542 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.RedPoint.Model.RedPointManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/10/08
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local Time = require("Time")
+local Messenger = require("Messenger")
+local CSRedPointManager = _G.CS.RedPointManager.Instance
+---@class RedPointManager : Singleton	中文描述
+---@field  nodeTable RedPointItemBase[] 节点数据{id=RedPointItemBase}
+local RedPointManager = _G.BaseClass("RedPointManager", _G.Singleton)
+
+---无参数代替值
+local NoneParamValue = -1
+
+---@return RedPointManager RedPointManager
+function RedPointManager:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function RedPointManager:__init()
+    self.message = Messenger.New()
+    self.nodeTable = {}
+    self.isInit = false
+    self.refreshParent = false
+    self.parentTable = {}
+end
+
+--region -------------Events-------------
+
+---AddListener 添加事件
+---@param event string 事件key值
+---@param func function 响应函数
+---@param obj table 包含响应函数的Lua对象，参数2必须为为参数3的成员方法
+function RedPointManager:AddListener(event, func, obj)
+    _G.Guard.NotNull(obj, "参数错误： self 为必传项")
+    assert(func, "func为空")
+    assert(type(func) == "function", "func不为 function类型")
+    --(self.message, "sdk监听事件")
+    if self.message then
+        --(event, "sdk监听了一个事件")
+        --(func, "sdk监听了一个事件")
+        --(obj, "sdk监听了一个事件")
+        self.message:AddListener(event, func, obj)
+    end
+end
+
+---Broadcast 派发事件
+---@param event string 事件key值
+---@param ... Object[] 参数数组
+function RedPointManager:Broadcast(event, ...)
+    --(self.message, "sdk派发事件")
+    if self.message then
+        --(event, "sdk派发了一个事件")
+        self.message:Broadcast(event, ...)
+    end
+end
+
+---RemoveListener 移除事件
+---@param event string 事件key值
+---@param func function 响应函数
+---@param obj table 包含响应函数的Lua对象，参数2必须为为参数3的成员方法
+function RedPointManager:RemoveListener(event, func, obj)
+    _G.Guard.NotNull(obj, "参数错误： self 为必传项")
+    if self.message then
+        self.message:RemoveListener(event, func, obj)
+    end
+end
+
+---销毁对象时,析构函数
+function RedPointManager:Dispose()
+    if self.message then
+        self.message:Dispose()
+        self.message = nil
+    end
+    for _, value in pairs(self.nodeTable) do
+        value:Dispose()
+    end
+    self.nodeTable = nil
+    self.isInit = nil
+    self.refreshParent = nil
+    self.parentTable = nil
+end
+
+--region内部方法
+---创建节点
+---@param cfg redpoint_cfg 红点配置
+---@param id number ID
+---@param lua string 脚本名
+---@param child table 子节点
+---@param parent number 父节点
+function RedPointManager:__CreatNode(cfg)
+    if not self.nodeTable[cfg.id] then
+        local lua = _G.string.IsNullOrEmpty(cfg.lua) and "RedPointItemBase" or cfg.lua
+        self.nodeTable[cfg.id] = require(lua).New(cfg.id, cfg.child, cfg.functionopenid)
+    end
+end
+
+---刷新父节点列表
+function RedPointManager:RefreshParentTable()
+    for id, params in pairs(self.parentTable) do
+        for param, _ in pairs(params) do
+            self:RefreshParentNode(id, param >= 0 and param or nil)
+        end
+    end
+    self.parentTable = {}
+    self.refreshParent = false
+end
+
+---递归刷新节点以及父节点
+---@param id number 红点ID
+function RedPointManager:RefreshParentNode(id, param, isparent)
+    local node = self.nodeTable[id]
+    if not node then
+        return
+    end
+
+    local num, change
+    if param and param >= 0 then
+        if isparent then
+            node:UpdateData(param)
+            num = node:GetRedPointNum(param)
+            if not node.paramStates then
+                node.paramStates = {}
+            end
+            if node.paramStates[param] ~= (num > 0) then
+                change = true
+                node.paramStates[param] = (num > 0)
+                CSRedPointManager:SetRedpointState(id, num, param)
+            end
+        else
+            --如果是param发起刷新的节点, 强制向上刷新
+            change = true
+        end
+    end
+    node:UpdateData()
+    num = node:GetRedPointNum()
+    if change or node.state ~= (num > 0) then
+        change = true
+        node.state = (num > 0)
+        CSRedPointManager:SetRedpointState(id, num)
+    end
+    --红点状态是否被改变, 改变时才刷新父节点
+    if change then
+        local parent = node:GetParent()
+        if parent and parent > 0 then
+            local parentParams = param and param >= 0 and node:ParseParamForParent(param)
+            if parentParams then
+                for _, v in pairs(parentParams) do
+                    self:RefreshParentNode(parent, v, true)
+                end
+            else
+                self:RefreshParentNode(parent)
+            end
+        end
+    end
+    self:Broadcast(_G.eRedPoint.RedPointRefresh, id, num)
+end
+
+--endregion
+
+--region对外接口
+--region 初始化
+---初始化红点树(游戏启动时调用)
+function RedPointManager:InitNodeTree()
+    local cfg = _G.ConfigManager.redpoint_cfg
+    local child_parent_dic = {}
+    for _, value in pairs(cfg) do
+        self:__CreatNode(value)
+        for i = 1, #value.child do
+            child_parent_dic[value.child[i]] = value.id
+        end
+    end
+    for child, parent in pairs(child_parent_dic) do
+        if self.nodeTable[child] then
+            self.nodeTable[child]:SetParent(parent)
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" redpoint_cfg   parent:" .. tostring(parent) .. " 未找到节点 id:" .. tostring(child))
+            end
+        end
+    end
+end
+
+---初始化所有的红点数据(登录拿到所有模块数据后调用)
+function RedPointManager:InitAllNodeData()
+    for _, node in pairs(self.nodeTable) do
+        node:InitData()
+    end
+    --local CSRedPointManager = _G.CS.RedPointManager.Instance
+    for id, node in pairs(self.nodeTable) do
+        CSRedPointManager:SetRedpointState(id, node:GetRedPointNum())
+        local params = node:GetAllParamsNum()
+        for param, num in pairs(params) do
+            CSRedPointManager:SetRedpointState(id, node:GetRedPointNum(param), param)
+        end
+    end
+    self.isInit = true
+end
+
+--endregion
+---刷新节点
+---@param id number 节点ID
+---@param param number 参数
+function RedPointManager:RefreshNode(id, param)
+    if not self.isInit then
+        return
+    end
+    local node = self.nodeTable[id]
+    if node then
+        node:UpdateData(param)
+        local num = node:GetRedPointNum(param)
+        --local CSRedPointManager = _G.CS.RedPointManager.Instance
+        if param then
+            CSRedPointManager:SetRedpointState(id, num, param)
+        else
+            CSRedPointManager:SetRedpointState(id, num)
+            param = NoneParamValue
+        end
+        if not self.parentTable[id] then
+            self.parentTable[id] = {}
+        end
+        self.parentTable[id][param] = true
+        if self.refreshParent then
+            return
+        end
+        self.refreshParent = true
+        _G.TimerManager:GetInstance():GetTimer(1, self.RefreshParentTable, self, true, true):Start()
+        self:Broadcast(_G.eRedPoint.RedPointRefresh, id, num)
+    end
+end
+
+---刷新所有的参数红点
+---@param id number 红点ID
+function RedPointManager:RefreshNodeByAllParams(id)
+    if not self.isInit then
+        return
+    end
+    local node = self.nodeTable[id]
+    if node then
+        local params = node:GetAllParams()
+        local num
+        --local CSRedPointManager = _G.CS.RedPointManager.Instance
+        if not self.parentTable[id] then
+            self.parentTable[id] = {}
+        end
+        if params then
+            for i = 1, #params do
+                node:UpdateData(params[i])
+                num = node:GetRedPointNum(params[i])
+                CSRedPointManager:SetRedpointState(id, num, params[i])
+                self.parentTable[id][params[i]] = true
+            end
+        end
+        if self.refreshParent then
+            return
+        end
+        self.refreshParent = true
+        _G.TimerManager:GetInstance():GetTimer(1, self.RefreshParentTable, self, true, true):Start()
+        ---刷新主界面特效显示
+        self:Broadcast(_G.eRedPoint.RedPointRefresh, id, num)
+    end
+end
+
+---获取节点红点显示数量
+---@param id number 红点ID
+---@param param number 参数
+---@param isparentparam boolean 是否为父节点参数
+---@return number 红点显示数量
+function RedPointManager:GetNodeNum(id, param, isparentparam)
+    if self.nodeTable[id] then
+        return self.nodeTable[id]:GetRedPointNum(param, isparentparam)
+    end
+    return 0
+end
+
+---动态新增红点参数
+---@param id number number
+---@param param number 参数
+function RedPointManager:AddRedPointParam(id, param)
+    if not self.isInit then
+        return
+    end
+    if not param then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("动态增加的红点都需要带参数.")
+        end
+        return
+    end
+    local node = self.nodeTable[id]
+    if node then
+        node:AddParam(param)
+        --local CSRedPointManager = _G.CS.RedPointManager.Instance
+        CSRedPointManager:SetRedpointState(id, node:GetRedPointNum(param), param)
+        if not self.parentTable[id] then
+            self.parentTable[id] = {}
+        end
+        self.parentTable[id][param] = true
+        if self.refreshParent then
+            return
+        end
+        self.refreshParent = true
+        _G.TimerManager:GetInstance():GetTimer(1, self.RefreshParentTable, self, true, true):Start()
+        self:Broadcast(_G.eRedPoint.RedPointRefresh, id, node:GetRedPointNum(param))
+    end
+end
+
+---动态移除红点参数
+---@param id number number
+---@param param number 参数
+function RedPointManager:RemoveRedPointParam(id, param)
+    if not self.isInit then
+        return
+    end
+    if not param then
+        if _G.AppSetting.DEBUG then
+            _G.LogWarning("动态删除的红点都需要带参数.")
+        end
+        return
+    end
+    local node = self.nodeTable[id]
+    if node then
+        node:RemoveParam(param)
+        --local CSRedPointManager = _G.CS.RedPointManager.Instance
+        CSRedPointManager:RemoveRedPointState(id, param)
+        if not self.parentTable[id] then
+            self.parentTable[id] = {}
+        end
+        self.parentTable[id][NoneParamValue] = true
+        if self.refreshParent then
+            return
+        end
+        self.refreshParent = true
+        _G.TimerManager:GetInstance():GetTimer(1, self.RefreshParentTable, self, true, true):Start()
+    end
+end
+
+---动态创建红点
+---@param id number 红点ID
+---@param lua string 脚本名
+---@param child table 子节点{{id,lua}}
+---@param funcID number 功能开放ID
+---@param ... any 其他动态参数
+function RedPointManager:AddRedPointSyn(id, lua, child, funcID, init, ...)
+    local node, childTab, script
+    if not _G.table.isEmptyOrNil(child) then
+        childTab = {}
+        for i = 1, #child do
+            node = self.nodeTable[child[i][1]]
+            if not node then
+                script = child[i][2] or "RedPointItemBase"
+                node = require(child[i][2]).New(child[i][1], nil, funcID, ...)
+                if init then
+                    node:InitData()
+                end
+                self.nodeTable[child[i][1]] = node
+            end
+            childTab[#childTab + 1] = child[i][1]
+            node:SetParent(id)
+        end
+    end
+    node = self.nodeTable[id]
+    if not node then
+        lua = lua or "RedPointItemBase"
+        node = require(lua).New(id, nil, funcID, ...)
+        self.nodeTable[id] = node
+        if init then
+            node:InitData()
+        end
+    end
+    node:SetChild(childTab)
+    if not init then
+        --local CSRedPointManager = _G.CS.RedPointManager.Instance
+        CSRedPointManager:SetRedpointState(id, node:GetRedPointNum())
+        local params = node:GetAllParamsNum()
+        for param, num in pairs(params) do
+            CSRedPointManager:SetRedpointState(id, node:GetRedPointNum(param), param)
+        end
+        if childTab then
+            for i = 1, #childTab do
+                node = self.nodeTable[childTab[i]]
+                CSRedPointManager:SetRedpointState(childTab[i], node:GetRedPointNum())
+                local params = node:GetAllParamsNum()
+                for param, num in pairs(params) do
+                    CSRedPointManager:SetRedpointState(childTab[i], node:GetRedPointNum(param), param)
+                end
+            end
+        end
+    end
+end
+
+---动态移除红点
+---@param 变量名 变量类型 中文描述
+function RedPointManager:RemoveRedPointSyn(id)
+    local node = self.nodeTable[id]
+    if not node then
+        return
+    end
+    --local CSRedPointManager = _G.CS.RedPointManager.Instance
+    CSRedPointManager:RemoveRedPointState(id)
+    self.nodeTable[id] = nil
+    local child = node:GetChild()
+    if not _G.table.isEmptyOrNil(child) then
+        for i = 1, #child do
+            if self.nodeTable[child[i]] then
+                self.nodeTable[child[i]]:SetParent()
+            end
+        end
+    end
+    node = self.nodeTable[node:GetParent()]
+    if node then
+        node:RemoveChild(id)
+        CSRedPointManager:SetRedpointState(node.id, node:GetRedPointNum())
+    end
+end
+
+---动态添加节点
+---@param cfgs redpoint_cfg[] 添加的节点
+function RedPointManager:AddSyncNodes(cfgs, init)
+    local tb = {}
+    local child_parent_dic = {}
+    for _, value in pairs(cfgs) do
+        self:__CreatNode(value)
+        tb[value.id] = self.nodeTable[value.id]
+        for i = 1, #value.child do
+            child_parent_dic[value.child[i]] = value.id
+        end
+    end
+    for child, parent in pairs(child_parent_dic) do
+        if self.nodeTable[child] then
+            self.nodeTable[child]:SetParent(parent)
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" redpoint_cfg   parent:" .. tostring(parent) .. " 未找到节点 id:" .. tostring(child))
+            end
+        end
+    end
+    if init then
+        for _, node in pairs(tb) do
+            node:InitData()
+        end
+        --local CSRedPointManager = _G.CS.RedPointManager.Instance
+        for id, node in pairs(tb) do
+            CSRedPointManager:SetRedpointState(id, node:GetRedPointNum())
+            local params = node:GetAllParamsNum()
+            for param, num in pairs(params) do
+                CSRedPointManager:SetRedpointState(id, node:GetRedPointNum(param), param)
+            end
+        end
+    end
+end
+
+---动态移除节点（非redpoint_cfg中配置的节点）
+---@param ids number[] 移除红点id列表
+function RedPointManager:RemoveSyncNodes(ids)
+    if not _G.table.isEmptyOrNil(ids) then
+        return
+    end
+    local cfgs = _G.ConfigManager.redpoint_cfg
+    --local CSRedPointManager = _G.CS.RedPointManager.Instance
+    local node
+    for _, v in pairs(ids) do
+        node = self.nodeTable[v]
+        if not cfgs[v] and node then
+            CSRedPointManager:RemoveRedPointState(v)
+            self.nodeTable[v] = nil
+            local child = node:GetChild()
+            if not _G.table.isEmptyOrNil(child) then
+                for i = 1, #child do
+                    self.nodeTable[child[i]]:SetParent()
+                end
+            end
+            node = self.nodeTable[node:GetParent()]
+            if node then
+                node:RemoveChild(v)
+                CSRedPointManager:SetRedpointState(node.id, node:GetRedPointNum())
+            end
+        end
+    end
+end
+
+---给红点新增子节点
+---@param parent number 父节点ID
+---@param child number 子节点ID
+function RedPointManager:AddRedPointChild(parent, child)
+    local node = self.nodeTable[parent]
+    if node then
+        node:AddChild(child)
+        node = self.nodeTable[child]
+        if node then
+            node:SetParent(parent)
+        end
+        self:RefreshNode(child)
+    end
+end
+
+---给红点移除子节点
+---@param parent number 父节点ID
+---@param child number 子节点ID
+function RedPointManager:RemoveRedPointChild(parent, child)
+    local node = self.nodeTable[parent]
+    if node then
+        node:RemoveChild(child)
+        self:RefreshNode(parent)
+    end
+end
+
+---获取红点数据
+function RedPointManager:GetRedpointItem(id)
+    return self.nodeTable[id]
+end
+
+--region 本地测试代码
+---获取重复节点
+function RedPointManager:GetRepeatNode()
+    local nodeList = {}
+    for _, cfg in pairs( _G.ConfigManager.redpoint_cfg) do
+        if not _G.table.isEmptyOrNil(cfg.child) then
+            for _, id in pairs(cfg.child) do
+                if not nodeList[id] then
+                    nodeList[id] = {}
+                end
+                _G.table.insert(nodeList[id], cfg.id)
+            end
+        end
+    end
+
+    local repeatNodeList = {}
+    for childId, v in pairs(nodeList) do
+        if _G.table.count(v) > 1 then
+           _G.LogError(v, childId .. "节点存在多个父节点：")
+           repeatNodeList[childId] = v
+        end
+    end
+    _G.LogError(repeatNodeList)
+end
+--endregion
+
+--endregion
+return RedPointManager

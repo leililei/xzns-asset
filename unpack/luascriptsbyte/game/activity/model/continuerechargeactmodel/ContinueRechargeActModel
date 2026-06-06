@@ -1,0 +1,193 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.Activity.Model.ContinueRechargeActModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/08/29
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ContinueRechargeNet = require("ContinueRechargeNet")
+---@class ContinueRechargeActModel : GameDataModelBase	中文描述
+local ContinueRechargeActModel = _G.BaseClass("ContinueRechargeActModel", _G.GameDataModelBase)
+_G.ContinueRechargeActModel = ContinueRechargeActModel
+
+---创建对象时,入口构造函数
+function ContinueRechargeActModel:__init()
+    _G.Events:GetInstance():AddListener(_G.eRechargeEvent.DayCash, self.OnCash, self)
+end
+
+function ContinueRechargeActModel:OnCash()
+    self:GetCashInfo()
+end
+
+function ContinueRechargeActModel:GetCashInfo(activityId, callBack)
+    if activityId then
+        self.activityId = activityId
+        self.actCfg = _G.ConfigManager.activity_info_cfg[activityId]
+    end
+    ContinueRechargeNet:GetInstance():GetCashInfo(_G.handlerbind(self, self.ParseData, callBack))
+end
+
+---检测活动是否该循环到下一轮
+function ContinueRechargeActModel:CheckActivityLoop(startTime)
+    if startTime > 0 and self.actCfg and startTime + self.actCfg.time_duration <= _G.TimeUtil.GetServerUnixTime() then
+        return true
+    end
+    return false
+end
+
+---@param data day_cash.s2c_day_cash_info
+function ContinueRechargeActModel:ParseData(data, callBack)
+    if data.s_time == 0 or self:CheckActivityLoop(data.s_time) then
+        ---时间为0表示未解锁功能
+        self:UnlockDayCash(callBack)
+    else
+        ---开始时间
+        self.s_time = data.s_time
+        ---当前的档位,等于0时代表已完成所有档位
+        self.cash_sid = data.cash_sid
+        ---已领取的ID
+        self.get_sids = data.get_sids or {}
+        ---累计充值金额({sid，充值金额})
+        self.cash_info = data.cash_info or {}
+        local cfg = _G.ConfigManager.continued_recharge_cfg
+        self.rechargeData = {}
+        for _, v in pairs(cfg) do
+            local finalPrice = require "MallManager":GetInstance():GetFinalPrice(v.price_id)
+            local _data = {}
+            _data.id = v.id
+            _data.price = finalPrice
+            _data.rewards = v.rewards
+            _data.day = v.id - 100
+            ---已充值金额
+            _data.cashNum = 0
+            for _, info in pairs(self.cash_info) do
+                if info.k == v.id then
+                    _data.cashNum = info.v
+                    break
+                end
+            end
+            _data.state = self:GetAwardState(_data)
+            _G.table.insert(self.rechargeData, _data)
+        end
+        if callBack then
+            callBack()
+        end
+        if self.RefreshRedPointCall then
+            self.RefreshRedPointCall()
+        end
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ContinueRechargeActView.Name)
+        if view then
+            view:InitView()
+        end
+    end
+end
+
+---获取当前奖励状态,0未完成，1已领取，2可领取
+function ContinueRechargeActModel:GetAwardState(data)
+    if self.cash_sid == 0 or _G.table.indexof(self.get_sids, data.id) then
+        return 1
+    end
+
+    return data.cashNum >= data.price and 2 or 0
+end
+
+---获取充值数据
+function ContinueRechargeActModel:GetRechargeData()
+    return self.rechargeData
+end
+
+---获取连续充值天数
+function ContinueRechargeActModel:GetContinuedDay()
+    local day = 0
+    for k, v in pairs(self.rechargeData) do
+        if v.state > 0 then
+            day = day + 1
+        end
+    end
+    return day
+end
+
+---领取奖励
+---@param idList table id列表
+function ContinueRechargeActModel:GetAward(idList, callBack)
+    ContinueRechargeNet:GetInstance():GetAward(
+        { index = idList },
+        function(msg)
+            if msg.ack == 1 then
+                ---更新数据
+                for _, v in pairs(idList) do
+                    _G.table.insert(self.get_sids, v)
+                end
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                if callBack then
+                    callBack()
+                end
+                if self.RefreshRedPointCall then
+                    self.RefreshRedPointCall()
+                end
+            end
+        end
+    )
+end
+
+---解锁每日充值功能
+function ContinueRechargeActModel:UnlockDayCash(callBack)
+    ContinueRechargeNet:GetInstance():UnlockDayCash(function(msg)
+        if msg.ack == 1 then
+            local startTime = _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime())
+            local data = { s_time = startTime, cash_sid = 101 }
+            self:ParseData(data, callBack)
+        end
+    end)
+end
+
+function ContinueRechargeActModel:GetTodaySid()
+    return self.cash_sid
+end
+
+---设置红点刷新
+function ContinueRechargeActModel:SetFreshRedPoint(RefreshRedPointCall)
+    self.RefreshRedPointCall = RefreshRedPointCall
+end
+
+---设置活动id
+function ContinueRechargeActModel:SetActivityId(id)
+    self.activityId = id
+end
+
+---获取活动开始时间和结束时间
+function ContinueRechargeActModel:GetActTime()
+    local cfg = _G.ConfigManager.activity_info_cfg[self.activityId]
+    if cfg then
+        return self.s_time, self.s_time + cfg.time_duration
+    end
+
+    return self.s_time, self.s_time + 86400
+end
+
+---刷新红点
+function ContinueRechargeActModel:RefreshRedPoint()
+    if self.RefreshRedPointCall then
+        self.RefreshRedPointCall()
+    end
+end
+
+---检测红点
+function ContinueRechargeActModel:CheckRedPoint()
+    if not _G.table.isEmptyOrNil(self.rechargeData) then
+        for _, v in pairs(self.rechargeData) do
+            if v.state == 2 then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+---销毁对象时,析构函数
+function ContinueRechargeActModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eRechargeEvent.DayCash, self.OnCash, self)
+    self.rechargeData = {}
+end
+
+return ContinueRechargeActModel

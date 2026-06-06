@@ -1,0 +1,534 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Cycle.View.IntegrateBpFdView	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/05/22
+-- Description: 三环战令通用页面
+-----------------------------------------------------------------------
+local BaseAwardNewItem = require("BaseAwardNewItem")
+
+---@class IntegrateBpFdView : UIBaseView    中文描述
+---@field public go_table IntegrateBpFdView_GoTable GoTable
+---@field ctrl IntegrateBpFdControllerBase
+local IntegrateBpFdView = _G.BaseClass("IntegrateBpFdView", _G.UIBaseView)
+
+local ItemState = {
+    Lock = 1, --未解锁
+    Unlock = 2, --可领取
+    Received = 3 --已领取
+}
+
+local effectShowSids = _G.ConfigManager.discrete_cfg[114113][1]
+
+function IntegrateBpFdView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+---界面的入口函数
+---@param activity IntegrateBpFdControllerBase
+function IntegrateBpFdView:OnCreate(ctrl)
+    if _G.AppSetting.IsXzns then
+        _G.GameUtil.SetUiHeXieMask(self.go_table)
+    end
+    _G.UIUtils.IsNeedChangeUI(_G.IsNeedChangeUI.BattlePassView, self.go_table)
+    self.ctrl = ctrl
+    self:AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener)
+    self:AddListener(_G.BattlePassExpEvents.BPUnlock, self.OnBPUnlock)
+    --更新视图
+    self.ctrl:InitData()
+    self:InitView()
+    self.ctrl:OnViewOpened()
+    _G.GameUtil.AddDouYinIcon(self.go_table.aorbtn_buy, true)
+    self:OnAniEnd()
+    UIUtils.SetUIModel(self.go_table.obj_extra,nil,self.go_table.obj_extra2)
+end
+
+---初始化窗口，涉及特效，需要activity设置完根节点OrderInLayer后再执行，否则特效层级概率计算错误
+function IntegrateBpFdView:InitView()
+    self.showItemExp = self.ctrl:IsShowItemExp()
+    local countDown, size = self.ctrl:GetRemainingTime()
+    if countDown then
+        local rType = self.ctrl:GetRemainingType()
+        self.go_table.obj_countDown1:SetActiveE(rType == 1 and 1 or 0)
+        self.go_table.obj_countDown2:SetActiveE(rType == 2 and 1 or 0)
+        _G.UIUtils.ChangeUIByName(_G.IsNeedChangeUI.BattlePassView .. "Time", "aortext_countDown", self.go_table["aortext_countDown" .. rType])
+        if rType == 2 then
+            self.countDownTb = self.go_table.aortext_countDown2
+            self.go_table.aorbtn_add:SetAnchorPosition(-44, -197, 0)
+        else
+            self.countDownTb = self.go_table.aortext_countDown1
+            self.go_table.aorbtn_add:SetAnchorPosition(77, -189, 0)
+        end
+        self.countDownTb.fontSize = size
+        self.countDown = countDown
+        self:UpdateTime(0)
+        if self.timer == nil then
+            self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false, true)
+            self.timer:Start()
+        end
+    else
+        _G.UIUtils.ChangeUIByName(_G.IsNeedChangeUI.BattlePassView .. "Time", "aortext_countDown", self.go_table.aortext_countDown1)
+        local des
+        des, size = self.ctrl:GetProgressDes()
+        self.countDownTb = self.go_table.aortext_countDown1
+        self.countDownTb.text = des
+        self.countDownTb.fontSize = size
+    end
+    self.go_table.aortext_title.text = self.ctrl:GetName()
+    self.go_table.aortext_rebate.text = self.ctrl:GetRebateNum()
+    self.go_table.aortext_des.text = self.ctrl:GetRebateDes()
+    self.go_table.aorbtn_getExp:SetActiveE(self.ctrl:IsShowBtnGetExp() and 1 or 0)
+    self.go_table.aortext_lisTitle1.text = self.ctrl:GetLvTitle()
+    self.go_table.aorrawimage_topBg:LoadImage(self.ctrl:GetIcon())
+    self.go_table.aorbtn_help:SetActiveE(self.ctrl:GetHelpId() and 1 or 0)
+    self.go_table.obj_level:SetActiveE(self.ctrl:ShowCurLevel() and 1 or 0)
+    self:InitToggle()
+    self:UpdateView()
+end
+
+function IntegrateBpFdView:InitToggle()
+    if not self.ctrl:ShowTask() then
+        self.go_table.toggle_battlePass:SetActiveE(0)
+        self.go_table.toggle_task:SetActiveE(0)
+        return
+    end
+    self.toggles = {
+        battlePass = _G.GetAutoGoTable(
+            self.go_table.toggle_battlePass,
+            _G.handlerbind(self, self.OnClickToggle, "battlePass", _G.handler(self, self.OnBattlePass))
+        ),
+        task = _G.GetAutoGoTable(
+            self.go_table.toggle_task,
+            _G.handlerbind(self, self.OnClickToggle, "task", _G.handler(self, self.OnTask))
+        )
+    }
+    self.toggles["battlePass"].obj_redpointBp:UpdateRedPointItemIDAndParam(self.ctrl:GetBattlePassRedPointId())
+    self.toggles["task"].obj_redpointTask:UpdateRedPointItemIDAndParam(self.ctrl:GetTaskRedPointId())
+end
+
+function IntegrateBpFdView:OnClickToggle(go, isOn, key, call)
+    local tb = self.toggles[key]
+    tb.aorimage_isOn:SetActiveE(isOn and 1 or 0)
+    tb.aorimage_isOff:SetActiveE(isOn and 0 or 1)
+    if call then
+        call(isOn)
+    end
+end
+
+---刷新界面
+function IntegrateBpFdView:UpdateView()
+    self.lv, self.curExp, self.curMaxExp = self.ctrl:GetLvAndCurLvExp()
+    self.ctrl:PrePrecess(_G.handler(self, self.OnPrePrecessEnd))
+    require("RedPointManager"):GetInstance():RefreshNode(self.ctrl:GetBattlePassRedPointId())
+    require("RedPointManager"):GetInstance():RefreshNode(self.ctrl:GetTaskRedPointId())
+end
+
+function IntegrateBpFdView:OnBattlePass(isOn)
+    self.go_table.obj_bpPanel:SetActiveE(isOn and 1 or 0)
+end
+
+function IntegrateBpFdView:OnTask(isOn)
+    self.go_table.obj_taskPanel:SetActiveE(isOn and 1 or 0)
+    if not isOn then
+        return
+    end
+    if not self.taskInit then
+        self.taskInit = true
+        _G.PoolsManager:GetInstance():Spawn(
+            "UIH5/IntegrateBpFd/$_obj_IntegrateBpFdTask",
+            _G.ePoolType.UIItem,
+            self.go_table.obj_taskPanel,
+            function(trans)
+                if self:IsNil() then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                self.taskLua = self:AddComponent(trans, require("IntegrateBpFdTaskPanel").New(trans, self.ctrl, self))
+            end
+        )
+    end
+end
+
+---显示选线or战令
+function IntegrateBpFdView:ShowByPath()
+    -- self.go_table.obj_choosePath:SetActiveE(self.path == 0 and 1 or 0)
+    -- self.go_table.obj_battlePass:SetActiveE(self.path == 0 and 0 or 1)
+    self:UpdateAddBtnShow()
+end
+
+---刷新加速按钮
+function IntegrateBpFdView:UpdateAddBtnShow()
+    self.go_table.aorbtn_add:SetActiveE(self.ctrl:IsShowBtnBuyExp() and 1 or 0)
+end
+
+---刷新战令
+function IntegrateBpFdView:UpdateBattlePass()
+    self:UpdateLevel()
+    self.go_table.aortext_des.text = self.ctrl:GetRebateDes()
+    self.isBuy = self.ctrl:CheckIsBuy()
+    self.go_table.scrollloopvectical_items:SetRectTransformOffset(15, self.isBuy and 14 or 110, -15, -57)
+    self.go_table.obj_senior:SetActiveE(self.isBuy and 0 or 1)
+    _G.GameUtil.SetPriceByChannel(self.ctrl:GetPrice(), self.go_table.aortext_money)
+
+    self.awardCfgArray = self.ctrl:GetAwardList()
+
+    self.awardLis = self.ctrl:GetAllUnlockAwards(self.lv)
+    -- self.go_table.aorbtn_oneKey:SetActiveE(#self.awardLis > 1 and 1 or 0)
+    local jumpIndex = self:FindFirstAwardIndex()
+    if not self.bpInit then
+        self.go_table.scrollloopvectical_items:InitItemData(
+            #self.awardCfgArray,
+            _G.handler(self, self.RefreshList),
+            jumpIndex
+        )
+        self.bpInit = true
+    else
+        self.go_table.scrollloopvectical_items:UpdateCount(#self.awardCfgArray, jumpIndex)
+    end
+
+    if not self.isBuy then
+        if not self.seniorInit then
+            self.seniorInit = true
+            self.seniorAwards = self.ctrl:GetSeniorAwardList()
+            self.go_table.scrollloophorizontal_seniorAward:InitItemData(
+                #self.seniorAwards,
+                _G.handler(self, self.RefreshSeniorItem)
+            )
+        end
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(self.ctrl:GetBattlePassRedPointId())
+    require("RedPointManager"):GetInstance():RefreshNode(self.ctrl:GetTaskRedPointId())
+    if _G.AppSetting.IsXzns then
+        self.go_table.aortext_money.color = _G.ColorTools.FormatColorByString(self.isBuy and "DDE2E6" or "50341D")
+        local image = self.go_table.aorbtn_buy:GetComponentE(_G.typeof(_G.CS.AorImage))
+        image.SpriteName = self.isBuy and "ui_zssd_lan_btn" or "ui_zssd_cheng_btn"
+    end
+end
+
+function IntegrateBpFdView:UpdateLevel()
+    if not self.ctrl:ShowCurLevel() then
+        return
+    end
+    self.go_table.aortext_lv.text = self.lv
+    self.go_table.slider_exp.value = self.curMaxExp == 0 and 1 or self.curExp / self.curMaxExp
+    self.go_table.aortext_exp.text =
+        self.curMaxExp == 0 and _G.GetLangPackValue(9002050021) or self.curExp .. "/" .. self.curMaxExp
+end
+
+function IntegrateBpFdView:RefreshList(index, obj)
+    if index < 0 then
+        return
+    end
+    index = index + 1
+    local cfg = self.awardCfgArray[index]
+    local id = cfg.id
+    local tb = _G.GetAutoGoTable(obj, _G.handlerbind(self, self.OnClickItem, cfg))
+
+    local freeState, payState
+    local lvEnough = self.ctrl:CheckItemCondition(cfg)
+    freeState = lvEnough and ItemState.Unlock or ItemState.Lock
+    payState = (lvEnough and self.isBuy) and ItemState.Unlock or ItemState.Lock
+    tb.freeState = self.ctrl:CheckAwardIsGet(id, true) and ItemState.Received or freeState
+    tb.payState = self.ctrl:CheckAwardIsGet(id, false) and ItemState.Received or payState
+
+    local rewards = cfg.rewards_normal
+    if not tb.item1 then
+        tb.item1 = BaseAwardNewItem.New(tb.obj_item1, nil, 88, tb.obj_item1)
+    end
+    tb.item1:ShowWithID(rewards[1], nil, _G.handlerbind(self, self.itemLoadedCall, tb, false, 1, rewards[1]))
+
+    rewards = cfg.rewards_pay[1]
+    tb.obj_item21:SetActiveE(rewards and 1 or 0)
+    if rewards then
+        if not tb.item2 then
+            tb.item2 = BaseAwardNewItem.New(tb.obj_item21, nil, 88, tb.obj_item21)
+        end
+        tb.item2:ShowWithID(rewards, nil, _G.handlerbind(self, self.itemLoadedCall, tb, true, 21, rewards[1]))
+    end
+    rewards = cfg.rewards_pay[2]
+    tb.obj_item22:SetActiveE(rewards and 1 or 0)
+    if rewards then
+        if not tb.item3 then
+            tb.item3 = BaseAwardNewItem.New(tb.obj_item22, nil, 88, tb.obj_item22)
+        end
+        tb.item3:ShowWithID(rewards, nil, _G.handlerbind(self, self.itemLoadedCall, tb, true, 22, rewards[1]))
+    end
+
+    ---是否显示第二个
+    tb.obj_gou22:SetActiveE(rewards and 1 or 0)
+    --tb.obj_suo22:SetActiveE(rewards and 1 or 0)
+
+    ---已领打勾
+    tb.obj_gou1:SetActiveE(tb.freeState == ItemState.Received and 1 or 0)
+    tb.obj_gou2:SetActiveE(tb.payState == ItemState.Received and 1 or 0)
+    ---可领
+    tb.aorbtn_get:SetActiveE((tb.freeState == ItemState.Unlock or tb.payState == ItemState.Unlock) and 1 or 0)
+    tb.aorbtn_notAchieved:SetActiveE(lvEnough and 0 or 1)
+    tb.aorbtn_notAchieved:SetGray(not lvEnough)
+    tb.aorbtn_buySenior:SetActiveE((tb.freeState == ItemState.Received and tb.payState == ItemState.Lock) and 1 or 0)
+    tb.aorimage_hasGetAll:SetActiveE(
+        (tb.freeState == ItemState.Received and tb.payState == ItemState.Received) and 1 or 0
+    )
+    if _G.AppSetting.IsXzns then
+        local getImage = tb.aorbtn_get:GetComponentE(_G.typeof(_G.CS.AorImage))
+        local notImage = tb.aorbtn_notAchieved:GetComponentE(_G.typeof(_G.CS.AorImage))
+        local buyImage = tb.aorbtn_buySenior:GetComponentE(_G.typeof(_G.CS.AorImage))
+        getImage.SpriteName = "ui_zssd_cheng_btn"
+        notImage.SpriteName = "ui_zssd_lan_btn"
+        buyImage.SpriteName = "ui_zssd_cheng_btn"
+        tb.aorbtn_notAchieved:SetGray(false)
+        notImage.color = _G.ColorTools.FormatColorByString("FFFFFF")
+        tb.aortext_getText.color = _G.ColorTools.FormatColorByString("91522E")
+        tb.aortext_notText.color = _G.ColorTools.FormatColorByString("DDE2E6")
+        tb.aortext_buyText.color = _G.ColorTools.FormatColorByString("91522E")
+    end
+    ---未解锁上锁
+    --tb.obj_suo1:SetActiveE(tb.freeState == ItemState.Lock and 1 or 0)
+    --tb.obj_suo2:SetActiveE(tb.payState == ItemState.Lock and 1 or 0)
+
+    tb.aortext_lv.text = self.ctrl:GetItemLvContent(index, cfg)
+    --等级经验
+    if self.showItemExp then
+        local exp = self.ctrl:GetLvExpByLv(cfg)
+        tb.aortext_exp.text = exp
+        tb.obj_itemExp:SetActiveE(1)
+    else
+        tb.obj_itemExp:SetActiveE(0)
+    end
+
+    --进度条
+    tb.aorimage_DayBar:SetActiveE(index == 1 and 0 or 1)
+    tb.aorimage_DayBar:SetRectTransformSize(22, self.showItemExp and 78 or 85)
+    if index - 1 < self.lv then
+        tb.aorimage_dayBar:SetLocalScale(1, 1, 1)
+    elseif index - 1 == self.lv then
+        local scale = self.curExp / self.curMaxExp
+        tb.aorimage_dayBar:SetLocalScale(1, scale, 1)
+    else
+        tb.aorimage_dayBar:SetLocalScale(1, 0, 1)
+    end
+    return obj
+end
+
+function IntegrateBpFdView:RefreshSeniorItem(index, obj)
+    index = index + 1
+    local tb = _G.GetAutoGoTable(obj)
+    local data = self.seniorAwards[index]
+    tb.obj_item:ClearChildren()
+    _G.StorageManager:GetInstance():GetItemBaseViewNew(data, tb.obj_item, _G.handler(self, self.SeniorItemCall))
+end
+
+function IntegrateBpFdView:FindFirstAwardIndex()
+    local maxIndex = self.isBuy and #self.awardCfgArray - 4 or #self.awardCfgArray - 3
+    local index = self.ctrl:GetFirstAwardIndex(self.lv, self.awardCfgArray)
+    return index > maxIndex and maxIndex - 1 or index - 1
+end
+
+---@param isBuy boolean true是豪华奖励
+---@param itemLua BaseAwardNewItem 奖励脚本
+function IntegrateBpFdView:itemLoadedCall(itemLua, tb, isBuy, suf, sid)
+    ---@type ItemViewBase
+    local lua = itemLua.item
+    if itemLua.type ~= _G.StorageType.Card then
+        lua:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+    end
+
+    local state = isBuy and tb.payState or tb.freeState
+    local isShowEffect = state == ItemState.Unlock and self.loadEff
+
+    if itemLua.type ~= _G.StorageType.Card then
+        local needShow = _G.table.ContainsValue(effectShowSids, sid)
+        itemLua:ShowEffect(needShow)
+        if isShowEffect then
+            lua:ShowEffect(needShow)
+        else
+            lua:ShowOrHideEffect(false)
+        end
+    else
+        itemLua:ShowEffect(isShowEffect)
+    end
+    tb["obj_Eff" .. suf]:ClearChildren()
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.ef_kelingqukuang,
+        tb["obj_Eff" .. suf],
+        function(tran)
+            if _G.IsNil(self.go_table.gameObject) then
+                tran:DestroyObject()
+                return
+            end
+            tran:SetActiveE(isShowEffect and 1 or 0)
+        end
+    )
+    -- local effNode = "eff" .. suf
+    -- if tb[effNode] == nil then
+    --     if isShowEffect then
+    --         tb[effNode] = true
+    --         _G.UIUtils.LoadEffectByCfg(
+    --             _G.ConfigManager.ui_effect_cfg.ef_kelingqukuang,
+    --                 tb["obj_Eff" .. suf],
+    --             function(tran)
+    --                 if _G.IsNil(self.go_table.gameObject) then
+    --                     tran:DestroyObject()
+    --                     return
+    --                 end
+    --                 tran:SetActiveE(isShowEffect and 1 or 0)
+    --                 tb[effNode] = tran
+    --             end
+    --         )
+    --     end
+    -- elseif tb[effNode] ~= true then
+    --     tb[effNode]:SetActiveE(isShowEffect and 1 or 0)
+    -- end
+end
+
+function IntegrateBpFdView:SeniorItemCall(itemLua)
+    if self:IsNil() then
+        _G.DestroyObject(itemLua.gameObject)
+        return
+    end
+    itemLua:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+    _G.DelayDo(
+        0.35,
+        function()
+            if self:IsNil() then
+               return 
+            end
+            itemLua:ShowEffectOrder(true)
+        end
+    )
+end
+
+function IntegrateBpFdView:UpdateTime(elapsed)
+    self.countDown = self.countDown - elapsed
+    if self.countDown < 0 then
+        self.countDown = 0
+        _G.PopWindowManager:GetInstance():ShowAllTips(930101)
+        self:Close()
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.IntegrateBpFdEnterView.Name)
+        if view then
+            view:Close()
+        end
+        return
+    end
+    if self:IsNil() then
+        return
+    end
+    local time = _G.Mathf.RoundToInt(self.countDown)
+    time = _G.string.AddColor(_G.TimeUtil.TransDayHourMineMiao(time), "96ce51")
+    self.countDownTb.text = _G.GetLangPackValue(90025500007, time)
+    self:UpdateAddBtnShow()
+end
+
+function IntegrateBpFdView:OnAniEnd()
+    --ZHJH-7257 动画缩放导致遮罩对特效的遮挡效果更新异常，延迟加载道具特效
+    _G.DelayDo(
+        0.5,
+        function()
+            self.loadEff = true
+            self:UpdateBattlePass()
+        end
+    )
+end
+
+---充值成功监听
+function IntegrateBpFdView:OnMallCashListener(msg)
+    self:UpdateView()
+end
+
+---选线后刷新
+function IntegrateBpFdView:OnPrePrecessEnd()
+    self:ShowByPath()
+    self:UpdateBattlePass()
+end
+
+function IntegrateBpFdView:OnGetAwardEnd()
+    self.ctrl:InitData()
+    self.lv, self.curExp, self.curMaxExp = self.ctrl:GetLvAndCurLvExp()
+    self:UpdateBattlePass()
+end
+
+function IntegrateBpFdView:OnBPUnlock(id)
+    if id == self.ctrl.type then
+        self:InitView()
+    end
+end
+
+function IntegrateBpFdView:OnClickItem(go, isOn, cfg)
+    local name = go:GetName()
+    if name == "@_aorbtn_get" then
+        if not self.ctrl:CheckItemCondition(cfg) then
+            return
+        end
+        if self.isBuy then
+            self.ctrl:GetAwardOneKey(self.awardLis, _G.handler(self, self.OnGetAwardEnd))
+        elseif self.ctrl:CheckAwardIsGet(cfg.id, true) then --弹出购买
+            self.ctrl:Buy(self)
+        else
+            -- self.ctrl:GetAward(cfg.id, true)
+            self.ctrl:GetAwardOneKey(self.awardLis, _G.handler(self, self.OnGetAwardEnd))
+        end
+    elseif name == "@_aorbtn_buySenior" then
+        self.ctrl:Buy(self)
+    end
+end
+
+---按钮点击事件在这里派发
+function IntegrateBpFdView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_close then
+        self:Close()
+    elseif go == self.go_table.aorbtn_add then
+        local maxLv = self.ctrl:GetMaxLevel()
+        if self.lv == maxLv then
+            _G.PopWindowManager:GetInstance():ShowAllTips(420102)
+            return
+        end
+        if self.lua_AddExp == nil then
+            self.lua_AddExp = true
+            _G.PoolsManager:GetInstance():Spawn(
+                "UIH5/DrawUp/SeasonLvView_AddExp",
+                _G.ePoolType.UIItem,
+                self.go_table.obj_view,
+                function(trans)
+                    if self:IsNil() then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    self.lua_AddExp =
+                        self:AddComponent(trans, require("IntegrateBpFdView_AddExp").New(trans, self.ctrl, self))
+                    self.lua_AddExp:Show(self.lv, maxLv, self.curExp)
+                end
+            )
+        elseif self.lua_AddExp ~= true then
+            self.lua_AddExp:Show(self.lv, maxLv, self.curExp)
+        end
+    elseif go == self.go_table.aorbtn_getExp then
+        self.ctrl:JumpGetExp()
+    elseif go == self.go_table.aorbtn_buy then
+        self:ClickBuy()
+    elseif go == self.go_table.aorbtn_oneKey then
+        self.ctrl:GetAwardOneKey(self.awardLis, _G.handler(self, self.OnGetAwardEnd))
+    elseif go == self.go_table.aorbtn_switch then
+        if not self.canSwitch then
+            return
+        end
+        self.go_table.obj_choosePath:SetActiveE(1)
+        self.go_table.obj_battlePass:SetActiveE(0)
+        self.go_table.aorbtn_add:SetActiveE(0)
+    elseif go == self.go_table.aorbtn_help then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, self.ctrl:GetHelpId())
+    end
+end
+
+function IntegrateBpFdView:ClickBuy()
+    self.ctrl:Buy(self)
+end
+
+function IntegrateBpFdView:OnDestroy()
+    self:RemoveAllListener()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.ctrl:OnUIClosed()
+end
+
+return IntegrateBpFdView

@@ -1,0 +1,1668 @@
+-----------------------------------------------------------------------
+-- F:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.SociatyBattle.Model.SociatyBattleModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/01/22
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local SociatyBattleNet = require "SociatyBattleNet"
+---@class SociatyBattleModel :GameDataModelBase
+---@field Times SociatyBattleModel_Times 时间
+---@field state SociatyBattleState 当前公会战状态
+---@field normalCfg guild_battle_normal_cfg 公会战配置
+---@field curDay number 战斗阶段
+---@field sociatyUid number 公会uid
+---@field startTime number 当前阶段起始时间
+---@field endTime number 当前阶段终止时间
+---@field challengeNum number 挑战次数
+---@field score number 贡献积分
+---@field seasonCfg guild_battle_season_cfg 赛季配置
+---@field IsMatched boolean 是否匹配成功
+local SociatyBattleModel = _G.BaseClass("SociatyBattleModel", _G.GameDataModelBase)
+local StateType = _G.SociatyBattleState
+local Key = "SociatyBattleModelChallengeNum"
+local ApplyKey = "SociatyBattleModelApply"
+local DiscreteIDs = {
+    ---两天交替状态条件
+    Time = {
+        101626,
+        101625
+    },
+    ---挑战次数
+    ChallengeNum = 101631,
+    ---报名条件
+    ApplyCondition = 101629,
+    ---战斗配置
+    BattleCD = 101630,
+    ---活跃条件
+    ActivityCondition = 101634
+}
+local ArrayNum = 5
+local RedPointKey = {
+    GuildBattleFirst = "GuildBattleFirst",
+    GuildBattleDefend = "GuildBattleDefend",
+    GuildBattleRewards = "GuildBattleRewards",
+    GuildBattleContribute = "GuildBattleContribute"
+}
+---@return SociatyBattleModel SociatyBattleModel
+function SociatyBattleModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SociatyBattleModel:__init()
+    self.curFunctionOpenID = 147
+    self.maxChallengeNum = _G.ConfigManager.discrete_cfg[DiscreteIDs.ChallengeNum][1][1]
+    self.attackCD = _G.ConfigManager.discrete_cfg[DiscreteIDs.BattleCD][1][1]
+    self.IsMatched = false
+end
+
+---销毁对象时,析构函数
+function SociatyBattleModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.defendTimer then
+        self.defendTimer:Stop()
+        self.defendTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eCard.CardUpStar, self.RefreshDefendRed, self)
+    _G.Events:GetInstance():RemoveListener(_G.eCard.CardDelCard, self.RefreshDefendRed, self)
+end
+
+--region 子类重写
+---从服务器拉取数据
+function SociatyBattleModel:GetDataFormServer()
+    self:GetInfo()
+    if not self.add then
+        self.add = true
+        _G.Events:GetInstance():AddListener(_G.eCard.CardUpStar, self.RefreshDefendRed, self)
+        _G.Events:GetInstance():AddListener(_G.eCard.CardDelCard, self.RefreshDefendRed, self)
+    end
+end
+
+---获取数据
+function SociatyBattleModel:GetInfo(call)
+    if _G.PlayerModel:GetInstance().main_open_time == 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("<color=red><size=20>" .. "未分配赛区，公会战不能打开，分配赛区后再试（本条为提示日志非报错）" .. "</size></color>")
+        end
+        return
+    end
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        self.super.ParseData(self)
+        self:RefreshEnterRedPoint()
+        require "RedPointManager":GetInstance():RefreshNode(
+            _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleRewards].id
+        )
+        require "RedPointManager":GetInstance():RefreshNode(
+            _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleContribute].id
+        )
+        return
+    end
+
+    local sbot = require("SociatyBattleManager"):GetInstance():GetSociatyBattleOpenTime()
+    local residue = sbot - _G.TimeUtil.GetServerUnixTime()
+    residue = math.ceil(residue / 86400) - 1
+    if residue > 0 then
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=red><size=20>" .. "公会战未开始，不能拿数据" .. "</size></color>")
+        end
+        return
+    end
+    SociatyBattleNet:GetInstance():GetInfo(
+        {uid = require "SociatyManager":GetInstance():GetGuildUid()},
+        _G.handlerbind(self, self.GetInfoCall, call)
+    )
+end
+
+---获取信息回调
+---@param msg guild_fight.s2c_guild_fight_info
+function SociatyBattleModel:GetInfoCall(msg, call)
+    self:ParseData(msg)
+    if call then
+        call()
+    end
+end
+
+---解析数据
+---@param msg guild_fight.s2c_guild_fight_info
+function SociatyBattleModel:ParseData(msg)
+    if msg.is_open == 1 or not msg.season_info then
+        ---事件未到不能初始化
+        self.state = StateType.None
+        self:InitTime(true)
+        return
+    end
+    self.sociatyUid = require "SociatyManager":GetInstance():GetGuildUid()
+    self:InitSeason(msg.season_info)
+    self:InitRoleFightInfo(msg.role_guild_fight_info)
+    --self:InitApply(msg.fight_info)
+    if self.state == StateType.Settlement then
+        self.IsMatched = false
+        msg.math_info = nil
+    end
+    self:InitMatchInfo(msg.math_info)
+    self:InitLog()
+    self:InitBattleAward()
+    if msg.math_info then
+        self:GetDefendGarrayData(
+            function()
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleDefend].id
+                )
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleFirst].id
+                )
+                require "RedPointManager":GetInstance():RefreshNode(
+                    _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleRewards].id
+                )
+                require "RedPointManager":GetInstance():RefreshNode(
+                    _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleContribute].id
+                )
+            end
+        )
+    else
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+            _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleDefend].id
+        )
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+            _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleFirst].id
+        )
+        require "RedPointManager":GetInstance():RefreshNode(
+            _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleRewards].id
+        )
+        require "RedPointManager":GetInstance():RefreshNode(
+            _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleContribute].id
+        )
+    end
+
+    _G.SystemSettingManager:GetInstance():GetOtherPlayerData(
+        _G.PlayerModel:GetInstance():GetPlayerUid(),
+        function(msg2)
+            self.background_id = msg2.background_id
+        end
+    )
+    _G.Events:GetInstance():Broadcast(_G.eSociatyBattle.ScoiatyBattleChallengeNum)
+    _G.Events:GetInstance():Broadcast(_G.eSociatyBattle.SociatyBattleState)
+    self.super.ParseData(self)
+end
+
+---初始化功能逻辑
+
+function SociatyBattleModel:InitFunction()
+end
+
+---获取奥山之战是否开启，如果没有开启，则返回提示字符串
+---@return boolean,string|nil
+function SociatyBattleModel:GetFuncIsOpen()
+    local isOpen,str = true,""
+    local funcCfg = _G.ConfigManager.function_open_cfg[self.curFunctionOpenID]
+    local type, params
+    for _, v in pairs(funcCfg.condition_type) do
+        if v[1] == 4 then
+            type = v[1]
+            params = v[2]
+        end
+    end
+    if not _G.GlobalConditionManager.CheckMainEventCondition(type,params) then
+        str = _G.FunctionManager:GetInstance():GetStrWithType(type, params)
+        isOpen = false
+    end
+    local time =
+        require("SociatyBattleManager"):GetInstance():GetSociatyBattleOpenTime()
+        - _G.TimeUtil.GetServerUnixTime()
+    if time > 0 then
+        if str ~= "" then
+            str = str .. _G.GetLangPackValue(9002010024)
+                .. _G.GetLangPackValue(90028300082, _G.TimeUtil.TranslateSecondForStr(time))
+        else
+            str = _G.GetLangPackValue(90028300082, _G.TimeUtil.TranslateSecondForStr(time))
+        end
+            isOpen = false
+    end
+    return isOpen, str
+end
+
+--region 玩家战场信息
+
+---初始化玩家战场信息
+---@param msg guild_fight.i_role_guild_fight
+function SociatyBattleModel:InitRoleFightInfo(msg)
+    if not msg then
+        return
+    end
+    self.challengeNum = self.maxChallengeNum - msg.fight_times
+    self.score = msg.guild_score
+    self.getAwardList = {}
+    if msg.award_list then
+        for _, v in pairs(msg.award_list) do
+            self.getAwardList[v] = true
+        end
+    end
+    self.AwardBoxList = {}
+    if msg.award_boxs then
+        for _, v in pairs(msg.award_boxs) do
+            self.AwardBoxList[v] = true
+        end
+    end
+end
+
+---检测是否领取攻破奖励
+function SociatyBattleModel:CheckBoxAward(id)
+    if not self.AwardBoxList then
+        return false
+    end
+    return self.AwardBoxList[id]
+end
+
+---获取积分
+function SociatyBattleModel:GetSorce()
+    return self.score or 0
+end
+
+---获取赛佳积分
+function SociatyBattleModel:GetSeasonSorce()
+    return self.guild_season_score or 0
+end
+
+---检测是否领取战令奖励
+function SociatyBattleModel:CheckGetAward(id)
+    if not self.getAwardList then
+        return false
+    end
+    return self.getAwardList[id]
+end
+
+---领取战令
+function SociatyBattleModel:GetAward(id, call)
+    SociatyBattleNet:GetInstance():GetAward(
+        {id = {id}},
+        function(msg)
+            if msg.ack == 1 then
+                self.getAwardList[id] = true
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                require "CommonTipManager".OpenCommonAwardView(msg)
+                if call then
+                    call()
+                end
+                require "RedPointManager":GetInstance():RefreshNode(
+                    _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleRewards].id
+                )
+                require "RedPointManager":GetInstance():RefreshNode(
+                    _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleContribute].id
+                )
+            end
+        end
+    )
+end
+
+--endregion
+
+--region 赛季
+---@param msg guild_fight.i_guild_season
+function SociatyBattleModel:InitSeason(msg)
+    self.seasonId = msg.season_id
+    self.seasonStartTime = msg.season_start_time
+    self.seasonCfg = _G.ConfigManager.guild_battle_season_cfg[self.seasonId]
+    self:InitTime()
+end
+
+---初始化时间
+function SociatyBattleModel:InitTime(isInit)
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local startTime = _G.TimeUtil.GetDayBegin(time)
+    ---判断
+    local jo = require "SociatyBattleManager":GetInstance():GetBasePair()
+
+    if not isInit then
+        self.state = StateType.None
+        self.nexTime = 0
+        local id = DiscreteIDs.Time[jo]
+        local timeParams = _G.ConfigManager.discrete_cfg[id]
+        ---0点开始算差值时间，用来判断是否在阶段范围内
+        local czTime = time - startTime
+        local isCur = false
+        for k, v in ipairs(timeParams) do
+            if v[2] * 3600 <= czTime and v[3] * 3600 > czTime then
+                self.state = v[1]
+                if timeParams[k + 1] then
+                    self.nexTime = startTime + timeParams[k + 1][2] * 3600
+                end
+                self.startTime = startTime + v[2] * 3600
+                break
+            end
+            if v[3] * 3600 > czTime then
+                isCur = true
+            end
+        end
+        if self.nexTime <= 0 then
+            if isCur then
+                timeParams = _G.ConfigManager.discrete_cfg[DiscreteIDs.Time[jo]]
+                self.nexTime = startTime + timeParams[1][2] * 3600
+                self.startTime = startTime
+            else
+                local newJdId
+                if jo == 1 then
+                    newJdId = 2
+                elseif jo == 2 then
+                    newJdId = 1
+                end
+                timeParams = _G.ConfigManager.discrete_cfg[DiscreteIDs.Time[newJdId]]
+                self.nexTime = startTime + 86400 + timeParams[1][2] * 3600
+                self.startTime = startTime + 86400
+            end
+        end
+        if self.state == StateType.None then
+            self.state = StateType.Match
+        end
+    else
+        self.nexTime = startTime + 86400
+    end
+    --self.realState = self.state
+    self.timer = _G.TimerManager:GetInstance():GetTimer(self.nexTime - time + 1, self.OnTimerOver, self, true)
+    self.timer:Start()
+end
+
+---获取所有时间
+function SociatyBattleModel:GetTimes()
+    if not self.Times then
+        self:InitTime()
+    end
+    return self.Times
+end
+
+---获取所有时间
+function SociatyBattleModel:GetEndTime()
+    return self.nexTime or 0
+end
+
+---获取当前状态起始时间
+function SociatyBattleModel:GetStartTime()
+    return self.startTime
+end
+
+---计时结束,进入下一个状态
+function SociatyBattleModel:OnTimerOver()
+    self:GetInfo()
+end
+
+---获取当前公会战状态
+function SociatyBattleModel:GetState()
+    return self.state or StateType.None
+end
+
+---获取战斗阶段
+function SociatyBattleModel:GetCurDay()
+    return self.curDay
+end
+
+-- function SociatyBattleModel:GetWeek()
+--     return self.week
+-- end
+
+---是否是赛季第一天
+function SociatyBattleModel:IsSeasonFirstDay(time)
+    local sameDay = _G.TimeUtil.CheckTheSameDay(time, self.seasonStartTime)
+    return sameDay
+end
+
+---获取当前赛季id
+---@return number
+function SociatyBattleModel:GetSeasonId()
+    return self.seasonId
+end
+
+-- 获取周匹配时间
+-- function SociatyBattleModel:InitWeekTime()
+--     local weeklangFlag = 0
+--     local time = _G.TimeUtil.GetServerUnixTime()
+--     local dayBeginTime = _G.TimeUtil.GetDayBegin(time)
+--     for i = 1, 7 do
+--         local weekParam = _G.ConfigManager.discrete_cfg[DiscreteIDs.Time[i]]
+--         for k, v in ipairs(weekParam) do
+--             if weekParam then
+--                 if v[1] == _G.SociatyBattleState.Match then
+--                     weeklangFlag = weeklangFlag + 1
+--                     if i > self.week then
+--                         return weeklangFlag, dayBeginTime + 86400
+--                     elseif i == self.week and time < dayBeginTime + v[3] * 3600 then
+--                         return 0, dayBeginTime + v[3] * 3600
+--                     end
+--                 end
+--             end
+--         end
+--     end
+
+--     return 1, dayBeginTime + 86400
+-- end
+
+---获取下一个战斗阶段的时间
+function SociatyBattleModel:GetNextBattleBeginTime()
+    local day = 0
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local dayBeginTime = _G.TimeUtil.GetDayBegin(time)
+    local battleBeginTime = 0
+    for i = 1, 2 do
+        local weekParam = _G.ConfigManager.discrete_cfg[DiscreteIDs.Time[i]]
+        if weekParam then
+            for k, v in ipairs(weekParam) do
+                if v[1] == _G.SociatyBattleState.Battle then
+                    if time < dayBeginTime + v[2] * 3600 + day * 86400 then
+                        battleBeginTime = v[2] * 3600
+                        break
+                    end
+                end
+            end
+            if battleBeginTime > 0 then
+                break
+            else
+                day = day + 1
+            end
+        end
+    end
+    local ret = dayBeginTime + day * 86400 + battleBeginTime
+    return ret
+end
+
+---获取下一个结算的时间
+function SociatyBattleModel:GetNextSettlementTime()
+    local day = 0
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local dayBeginTime = _G.TimeUtil.GetDayBegin(time)
+    local settlementTime = 0
+    for i = 1, 2 do
+        local weekParam = _G.ConfigManager.discrete_cfg[DiscreteIDs.Time[i]]
+        if weekParam then
+            for k, v in ipairs(weekParam) do
+                if v[1] == _G.SociatyBattleState.Settlement then
+                    if time < dayBeginTime + v[2] * 3600 + day * 86400 then
+                        settlementTime = v[2] * 3600
+                        break
+                    end
+                end
+            end
+            if settlementTime > 0 then
+                break
+            else
+                day = day + 1
+            end
+        end
+    end
+    local ret = dayBeginTime + day * 86400 + settlementTime
+    return ret
+end
+
+--是否在匹配上了等待进入战斗
+function SociatyBattleModel:CheckTimeMatch()
+    if self.enemySociatyBattleData and self.mySociatyBattleData and self:GetState() ~= _G.SociatyBattleState.Battle then
+        return true
+    end
+    return false
+end
+
+---获取下一次可以报名的时间
+-- function SociatyBattleModel:GetNextSignUpTime()
+--     local day = 0
+--     local time = _G.TimeUtil.GetServerUnixTime()
+--     local dayBeginTime = _G.TimeUtil.GetDayBegin(time)
+--     local signUpBeginTime = 0
+--     for i = 1, 7 do
+--         local weekParam = _G.ConfigManager.discrete_cfg[DiscreteIDs.Time[i]]
+--         if weekParam then
+--             for k, v in ipairs(weekParam) do
+--                 if v[1] == _G.SociatyBattleState.Apply then
+--                     signUpBeginTime = v[2] * 3600
+--                     break
+--                 end
+--             end
+--             if signUpBeginTime > 0 then
+--                 break
+--             else
+--                 day = day + 1
+--             end
+--         end
+--     end
+--     day = day + 7 - self.week + 1
+--     local ret = dayBeginTime + day * 86400 + signUpBeginTime
+--     return ret
+-- end
+
+---获取赛季结束时间
+function SociatyBattleModel:GetSeasonEndTime()
+    if self.seasonStartTime then
+        ---每个赛季有几周
+        local turn = _G.ConfigManager.discrete_cfg[101633][1][1]
+        local ret = self.seasonStartTime + turn * 2 * 86400
+        return ret
+    else
+        return _G.TimeUtil.GetServerUnixTime()
+    end
+end
+
+-- ---获取报名条件
+-- ---@return number sociatyLv
+-- ---@return number sociatyMemberNumber
+-- function SociatyBattleModel:GetApplyCondition()
+--     local params = _G.ConfigManager.discrete_cfg[DiscreteIDs.ApplyCondition][1]
+--     return params[1], params[2]
+-- end
+--endregion
+
+--region 报名
+
+---初始化报名
+---@param msg guild_fight.i_fight
+-- function SociatyBattleModel:InitApply(msg)
+--     if not msg then
+--         self.isFirst = nil
+--         return
+--     end
+--     self.isApply = msg.is_application == 1
+--     if msg.is_first_application == nil then
+--         self.isFirst = false
+--     else
+--         self.isFirst = msg.is_first_application == false
+--     end
+--     if self.isFirst or not self.isApply then
+--         self.state = StateType.Apply
+--     end
+--     if self:CheckCanApply() then
+--         self.isAutoApply = msg.is_auto == 1
+--     else
+--         self.isAutoApply = false
+--     end
+-- end
+
+---报名
+-- function SociatyBattleModel:Apply(call)
+--     if self.isApply then
+--         return
+--     end
+--     if not self:CheckCanApply() then
+--         _G.PopWindowManager:GetInstance():ShowAllTips(250125)
+--         return
+--     end
+--     if self:GetState() ~= StateType.Apply and not self.isApply then
+--         _G.PopWindowManager:GetInstance():ShowAllTips(250128)
+--         return
+--     end
+--     if self.realState == StateType.Settlement then
+--         _G.PopWindowManager:GetInstance():ShowAllTips(250131)
+--         return
+--     end
+--     if self.realState == StateType.Match then
+--         _G.PopWindowManager:GetInstance():ShowAllTips(250134)
+--         return
+--     end
+--     SociatyBattleNet:GetInstance():Apply({uid = self.sociatyUid}, _G.handlerbind(self, self.ApplyCall, call))
+-- end
+
+---申请回调
+-- function SociatyBattleModel:ApplyCall(msg, call)
+--     if msg.ack ~= 1 then
+--         return
+--     end
+--     self.isApply = true
+--     if self.isFirst then
+--         self:InitData()
+--     else
+--         if call then
+--             call()
+--         end
+--     end
+-- end
+
+---检测是否可以报名
+-- function SociatyBattleModel:CheckCanApply()
+--     local sociatyData = require "SociatyModel":GetInstance().SociatySelf
+--     local params = _G.ConfigManager.discrete_cfg[DiscreteIDs.ApplyCondition][1]
+--     --local conditionParams = _G.ConfigManager.discrete_cfg[DiscreteIDs.ActivityCondition][1][1]
+--     return sociatyData.Level >= params[1] and sociatyData.SevenDayLive >= params[2]
+--     --#sociatyData.GetMemberModule():GetActivityMember(conditionParams * 86400) >= params[2]
+-- end
+
+---是否开启自动报名
+-- function SociatyBattleModel:GetIsAutoApply()
+--     return self.isAutoApply
+-- end
+
+-- ---获取是否报名
+-- function SociatyBattleModel:GetIsApply()
+--     return self.isApply
+-- end
+
+-- ---设置自动报名
+-- function SociatyBattleModel:SetAutoApply(call)
+--     if not self:CheckCanApply() then
+--         _G.PopWindowManager:GetInstance():ShowAllTips(250132)
+--         return
+--     end
+--     local guild = require "SociatyModel":GetInstance().SociatySelf
+--     local pbData = {uid = guild.Uid}
+--     self.tempAutoApply = not self.isAutoApply
+--     SociatyBattleNet:GetInstance():SetAutoApply(pbData, _G.handlerbind(self, self.SetAutoApplyCall, call))
+-- end
+
+-- ---设置自动报名
+-- function SociatyBattleModel:SetAutoApplyCall(msg, call)
+--     if msg.ack ~= 1 then
+--         return
+--     end
+--     self.isAutoApply = self.tempAutoApply
+--     if call then
+--         call()
+--     end
+-- end
+
+--endregion
+
+--region 匹配
+
+---初始化匹配信息
+---@param msg guild_fight.i_guild_match_info
+function SociatyBattleModel:InitMatchInfo(msg)
+    if not msg then
+        self.curDay = 0
+        return
+    end
+    self.IsMatched = true
+    --self.isApply = true
+    for _, v in ipairs(msg.guild) do
+        if v.guild_uid ~= self.sociatyUid then
+            if not self.enemySociatyBattleData then
+                self.enemySociatyBattleData = require "SociatyBattleData".New()
+            end
+            self.enemySociatyBattleData:ParseSociatyData(v)
+        else
+            if not self.mySociatyBattleData then
+                self.mySociatyBattleData = require "SociatyBattleData".New()
+            end
+            self.mySociatyBattleData:ParseSociatyData(v)
+        end
+    end
+    self.battleTime = msg.start_time or 0
+    self.curDay = math.min(_G.TimeUtil.GetIntervalDay(self.battleTime, _G.TimeUtil.GetServerUnixTime()) + 1, 3)
+    self:InitNormalCfg(msg)
+end
+--endregion
+
+--region 战斗配置
+
+---初始化战斗配置
+---@param msg guild_fight.i_guild_match_info
+function SociatyBattleModel:InitNormalCfg(msg)
+    if not msg then
+        return
+    end
+    local max = msg.max_score
+    for _, v in ipairs(_G.ConfigManager.guild_battle_normal_cfg) do
+        if max >= v.min and max <= v.max then
+            self.normalCfg = v
+            break
+        end
+    end
+    --self:InitBoost()
+end
+
+---获取战斗配置
+function SociatyBattleModel:GetNormalCfg()
+    return self.normalCfg
+end
+
+---初始化系数加成
+-- function SociatyBattleModel:InitBoost()
+--     self.boost = 1
+--     if self.normalCfg then
+--         for _, v in ipairs(self.normalCfg.boost) do
+--             if v[1] == self.curDay then
+--                 self.boost = v[2] / 10000
+--                 break
+--             end
+--         end
+--     end
+-- end
+
+---获取系数加成
+-- function SociatyBattleModel:GetBoost()
+--     return self.boost
+-- end
+
+--endregion
+
+--region 布阵调整
+
+--endregion
+
+--region 据点数据
+
+---获取所有战场数据
+function SociatyBattleModel:GetAllBattleData(call)
+    if self:GetState() ~= StateType.Battle then
+        _G.PopWindowManager:GetInstance():ShowAllTips(250126)
+        return
+    end
+    --镇魂街ZHJ-30823 争霸天下-优化汇总2.0ZHJ-32044
+    --【公会战】开服8天后新建的公会无法进入功能，点击入口有报错
+    if nil == self.mySociatyBattleData or nil == self.enemySociatyBattleData then
+        --_G.PopWindowManager:GetInstance():ShowAllTips(250126)
+        call()
+        return
+    end
+    self:GetBattleData(
+        {
+            self_uid = self.mySociatyBattleData.sociatyData.guild_uid,
+            uid = self.enemySociatyBattleData.sociatyData.guild_uid
+        },
+        function()
+            call()
+        end
+    )
+end
+
+---获取战场数据
+function SociatyBattleModel:GetBattleData(msg, call)
+    require "SociatyBattleNet":GetInstance():GetBattleInfo(msg, _G.handlerbind(self, self.GetBattleDataCall, call))
+end
+
+---获取战场数据回调
+function SociatyBattleModel:GetBattleDataCall(msg, call)
+    for _, v in ipairs(msg.battlefields) do
+        if v.guild == self.sociatyUid then
+            self.mySociatyBattleData:ParseBattleData(v)
+            self.markid = v.sign_station_id
+        else
+            self.enemySociatyBattleData:ParseBattleData(v)
+        end
+    end
+
+    if call then
+        call()
+    end
+end
+
+---获取据点数据
+---@param uid number 公会uid
+---@param id number 驻地uid
+---@param roleUid number 玩家uid
+function SociatyBattleModel:GetCampsiteData(uid, id, roleUid, call)
+    local sociatybattleData = self:GetSelfScoaityData()
+    if uid ~= self.sociatyUid then
+        sociatybattleData = self:GetEnemySociatyData()
+    end
+    local campsiteData = sociatybattleData:GetCampsiteData(id)
+    local role = campsiteData:GetRoleInfo()
+    if role.uid < 1000000000 then
+        ---@type guild_fight.s2c_guild_fight_array
+        local msg2 = {}
+        msg2.array_list = {}
+        ---@type guild_battle_robot_cfg
+        local cfg = _G.ConfigManager.guild_battle_robot_cfg[role.uid]
+        ---@type att_equity_cfg
+        local attEquity = _G.ConfigManager.att_equity_cfg[7]
+        if cfg then
+            ---@type guild_fight.i_array
+            local tb
+            for i, v in ipairs(cfg.monsters_id) do
+                tb = {}
+                tb.arr_index = i
+                tb.card_list = {}
+                local power = 0
+                for i2, v2 in ipairs(v) do
+                    ---@type guild_fight i_array_card
+                    local card = {}
+                    local cardCfg = _G.ConfigManager.card_cfg[v2]
+                    card.index = i2
+                    card.card_sid = v2
+                    tb.card_list[i2] = card
+                    if cardCfg then
+                        card.card_lv = attEquity.level
+                        card.star = attEquity.star
+                        card.soul_lv = attEquity.card_exclusive_lv
+                        card.born_skill_num = attEquity.talent
+                        card.soul_state = attEquity.card_exclusive
+                        local data = _G.CardData.New()
+                        local open_inborn = {}
+                        if cardCfg and card.born_skill_num > 0 then
+                            local index = 0
+                            for k = 1, #cardCfg.talent do
+                                for j = 1, #cardCfg.talent[k] do
+                                    index = index + 1
+                                    open_inborn[index] = cardCfg.talent[k][j]
+                                    if index >= card.born_skill_num then
+                                        break
+                                    end
+                                end
+                                if index >= card.born_skill_num then
+                                    break
+                                end
+                            end
+                        end
+                        local equipment
+                        if attEquity.equip_grade > 0 then
+                            equipment = {}
+                            local count = _G.table.count(_G.EquipmentPart)
+                            for e = 1, count do
+                                if e ~= 3 then
+                                    ---@type prop.i_equipment
+                                    local data2 = {}
+                                    data2.sid =
+                                        201000000 + attEquity.equip_grade + cardCfg.EquipmentType * 1000 + e * 100
+                                    data2.uid = 0
+                                    data2.streng = attEquity.equip_stren
+                                    data2.exp = 0
+                                    if attEquity.equip_ele > 0 then
+                                        data2.element = cardCfg.Elements
+                                    else
+                                        data2.element = 0
+                                    end
+
+                                    data2.reset_element = 0
+                                    _G.table.insert(equipment, data2)
+                                end
+                            end
+                        end
+                        local artifactList = {}
+                        if attEquity.artifact_grade > 0 then
+                            local artifact = {}
+                            artifact.sid = 255000100 + 100000 * attEquity.artifact_grade + 10000 * cardCfg.Professional
+                            artifact.uid = 0
+                            artifact.num = 1
+                            artifact.level = attEquity.artifact_level
+                            artifact.star = attEquity.artifact_star
+                            artifact.awaken = 0
+                            artifactList[1] = artifact
+                        end
+
+                        ---觉醒等级
+                        local tempawaken_lv =
+                            require "CardInfoManager":GetInstance():GetAttPotential(attEquity.potential_lv)
+
+                        data:Parse(
+                            {
+                                uid = v2,
+                                sid = v2,
+                                star = card.star,
+                                soul_chain_lv = card.soul_lv,
+                                soul_state = card.soul_state,
+                                lv = card.card_lv,
+                                open_inborn = open_inborn,
+                                equipments = equipment,
+                                artifact = artifactList,
+                                awaken_lv = tempawaken_lv
+                            }
+                        )
+                        data:OnInitMutuallyData(true)
+                        data:CalcNowSumProp()
+                        power = power + data:GetPower()
+                    end
+                end
+                tb.skill_index = cfg.combine[i] or {0, 0, 0}
+
+                tb.power = power
+                msg2.array_list[i] = tb
+            end
+        end
+        campsiteData:SetEmbattle(msg2)
+        if call then
+            call(campsiteData)
+        end
+    else
+        local msg = {
+            role_uid = roleUid,
+            guild_uid = uid
+        }
+        SociatyBattleNet:GetInstance():GetCampsiteInfo(
+            msg,
+            function(msg2)
+                campsiteData:SetEmbattle(msg2)
+                if call then
+                    call(campsiteData)
+                end
+            end
+        )
+    end
+end
+---获取布阵阵容数据
+---@param uid number 玩家uid
+---@param guildUid number 公会Uid
+function SociatyBattleModel:GetEmbattleCampsiteInfo(uid, guildUid, call)
+    local msg = {
+        role_uid = uid,
+        guild_uid = guildUid
+    }
+    SociatyBattleNet:GetInstance():GetCampsiteInfo(
+        msg,
+        function(msg2)
+            if call then
+                call(msg2)
+            end
+        end
+    )
+end
+
+--endregion
+
+--region 标记
+
+---标记
+
+---标记
+---@param uid number 公会uid
+---@param id number 驻地id
+function SociatyBattleModel:OnMark(uid, id, call)
+    self.tempMark = self.markid
+    SociatyBattleNet:GetInstance():Mark(
+        {
+            guild_uid = uid,
+            b_id = id
+        },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self:SetMark(id, true)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---检测是否被标记
+---@param id number 驻地id
+function SociatyBattleModel:CheckIsMark(id)
+    return self.markid == id
+end
+
+---集火推送
+---@param id number 驻地id
+---@param isSelf boolean 是否是自己操作
+function SociatyBattleModel:SetMark(id, isSelf)
+    local last = self.markid or -1
+    if self.tempMark == id then
+        self.markid = -1
+    else
+        self.markid = id
+    end
+    self.tempMark = nil
+    if not isSelf then
+        _G.Events:GetInstance():Broadcast(_G.eSociatyBattle.SociatyBattleMark, self.markid, last)
+    else
+        _G.Events:GetInstance():Broadcast(_G.eSociatyBattle.SociatyBattleMarkSelf, self.markid, last)
+    end
+end
+
+--endregion
+
+--region 战报
+
+---初始战报
+function SociatyBattleModel:InitLog(call)
+    ---@param msg guild_fight.s2c_guild_fight_log
+    SociatyBattleNet:GetInstance():GetLog(
+        function(msg)
+            self.LogList = msg.log_list or {}
+            -- if _G.table.isEmptyOrNil(self.newLog) then
+            --     self.newLog = {}
+            -- end
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---增加战报数量
+---@param msg guild_fight.p2c_guild_fight_send_log
+function SociatyBattleModel:AddLog(msg)
+    for _, v in pairs(msg.log) do
+        _G.table.insert(self.LogList, v)
+        --_G.table.insert(self.newLog, v)
+        _G.Events:GetInstance():Broadcast(_G.eSociatyBattle.SociatyBattleLog, v)
+        --- 跑马灯
+        local tab = self:FormatLogChat(v)
+        _G.PopWindowManager:GetInstance():ShowAllTips(33, tab.n_content)
+    end
+end
+---获取日志
+function SociatyBattleModel:GetLog()
+    return self.LogList or {}
+end
+
+--- 获取主界面聊天格式日志
+function SociatyBattleModel:GetChatLog()
+    local chat = {}
+    if not self.LogList then
+        return chat
+    end
+    for i = 1, #self.LogList do
+        chat[i] = self:FormatLogChat(_G.DeepCopy(self.LogList[i]))
+    end
+    return chat
+end
+function SociatyBattleModel:FormatLogChat(log)
+    local tab = {}
+    tab.time = log.time
+    tab.reportid = log.id
+    tab.role_info = {uid = 0}
+    tab.union_id = log.guild_uid
+    tab.args = log.args
+    tab.type = _G.ChatInfoType.system
+    local titleLang = log.guild_uid == self.sociatyUid and 90021800336 or 90021800337
+    tab.unionbattle = _G.LangUtil.GetLangPackValue(titleLang)
+    local content, color = require "SociatyBattleManager".GetLogContent(log)
+    tab.n_content = _G.string.AddColor(content, color)
+    return tab
+end
+
+---获取登陆后的新日志
+-- function SociatyBattleModel:GetNewLog()
+--     return self.newLog or {}
+-- end
+
+--endregion
+
+--region 其他
+
+---获取自己公会数据
+---@return SociatyBattleData
+function SociatyBattleModel:GetSelfScoaityData()
+    return self.mySociatyBattleData
+end
+
+---获取地方公会数据
+---@return SociatyBattleData
+function SociatyBattleModel:GetEnemySociatyData()
+    return self.enemySociatyBattleData
+end
+
+---获取挑战次数
+function SociatyBattleModel:GetChallengeNum()
+    return self.challengeNum or self.maxChallengeNum
+end
+
+--endregion
+
+function SociatyBattleModel:ReConnect(call)
+    self:InitData(call)
+end
+
+--region 阵容
+
+---获取进攻阵容
+function SociatyBattleModel:GetAttackArray(call)
+    SociatyBattleNet:GetInstance():GetGarray({type = 1}, _G.handlerbind(self, self.GetAttackArrayCall, call))
+end
+
+---获取进攻阵容
+---@param msg guild_fight.s2c_guild_fight_attack_array
+function SociatyBattleModel:GetAttackArrayCall(msg, call)
+    self.attackGrrayDic = {}
+    if msg.array_list then
+        for _, v in ipairs(msg.array_list) do
+            if _G.AppSetting.IsXzns then
+                self.attackGrrayDic[v.index] = {array = {}, skills = v.skill_list, pet = v.pet, beast = v.beast}
+            else
+                self.attackGrrayDic[v.index] = {array = {}, skills = v.skill_list, pet = v.pet}
+            end
+            for i = 1, ArrayNum do
+                self.attackGrrayDic[v.index].array[i] = 0
+            end
+            if v.card_list then
+                for _, v2 in ipairs(v.card_list) do
+                    self.attackGrrayDic[v.index].array[v2.card_index] = v2.card_uid
+                end
+            end
+        end
+    end
+    if call then
+        call()
+    end
+end
+
+---获取防守阵容
+function SociatyBattleModel:GetDefendGarrayData(call)
+    SociatyBattleNet:GetInstance():GetGarray({type = 0}, _G.handlerbind(self, self.GetDefendGrrayCall, call))
+end
+---获取防守阵容回调
+function SociatyBattleModel:GetDefendGrrayCall(msg, call)
+    self.defendGrrayDic = {}
+    if msg.array_list then
+        for _, v in ipairs(msg.array_list) do
+            if _G.AppSetting.IsXzns then
+                self.defendGrrayDic[v.index] = {array = {}, skills = v.skill_list, pet = v.pet, beast = v.beast}
+            else
+                self.defendGrrayDic[v.index] = {array = {}, skills = v.skill_list, pet = v.pet}
+            end
+            for i = 1, ArrayNum do
+                self.defendGrrayDic[v.index].array[i] = 0
+            end
+            if v.card_list then
+                for _, v2 in ipairs(v.card_list) do
+                    self.defendGrrayDic[v.index].array[v2.card_index] = v2.card_uid
+                end
+            end
+        end
+    end
+
+    if call then
+        call()
+    end
+end
+
+---保存防守阵容
+---@param garray number[] 布阵ID
+---@param skill number[] 合击技
+---@param pets number[][] 宠物
+---@param call function 回调
+function SociatyBattleModel:SaveDefendGarray(garray, skill, pets, call, beasts)
+    local snedMsg = {update_array_list = {}}
+    local isAdd
+    local tb
+    for i, v in ipairs(garray) do
+        isAdd = false
+        tb = {}
+        tb.arr_index = i
+        tb.card_list = {}
+        tb.pet = pets[i] or {0, 0, 0}
+        if _G.AppSetting.IsXzns then
+            tb.beast = beasts[i] or {0, 0, 0}
+        end
+        tb.skill_index = skill[i] or {0, 0, 0}
+        for k, v2 in ipairs(v) do
+            if v2 > 0 then
+                isAdd = true
+                _G.table.insert(tb.card_list, {index = k, card_uid = v2})
+            end
+        end
+        if isAdd then
+            _G.table.insert(snedMsg.update_array_list, tb)
+        end
+    end
+    SociatyBattleNet:GetInstance():SetDefendGarray(
+        snedMsg,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(-1)
+                end
+                return
+            end
+            if call then
+                call(0)
+            end
+            _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+            self:GetDefendGarrayData(
+                function()
+                    self:RefreshDefendRed()
+                end
+            )
+        end
+    )
+end
+
+function SociatyBattleModel:GetDefendGarray(index)
+    if not self.defendGrrayDic or not self.defendGrrayDic[index] then
+        return {0, 0, 0, 0, 0}
+    end
+    return self.defendGrrayDic[index] or {0, 0, 0, 0, 0}
+end
+
+---保存防守阵容
+---@param garray number[] 布阵ID
+---@param skill number[] 合击技
+---@param pets number[][] 宠物
+---@param call function 回调
+---@param beasts number[][] 圣兽(星座)
+function SociatyBattleModel:SaveAttackGarray(garray, skill, pets, call, beasts)
+    local snedMsg = {array_list = {}}
+    local isAdd
+    local tb
+    for i, v in ipairs(garray) do
+        isAdd = false
+        tb = {}
+        tb.index = i
+        tb.card_list = {}
+        tb.pet = pets[i] or {0, 0, 0}
+        if _G.AppSetting.IsXzns then
+            tb.beast = beasts[i] or {0, 0, 0}
+        end
+        tb.skill_list = skill[i] or {0, 0, 0}
+        for k, v2 in ipairs(v) do
+            if v2 > 0 then
+                isAdd = true
+                _G.table.insert(tb.card_list, {card_index = k, card_uid = v2})
+            end
+        end
+        if isAdd then
+            _G.table.insert(snedMsg.array_list, tb)
+        end
+    end
+    SociatyBattleNet:GetInstance():SetAttackGarray(
+        snedMsg,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(-1)
+                end
+                return
+            end
+            if call then
+                call(0)
+            end
+        end
+    )
+end
+
+---获取进攻阵容
+function SociatyBattleModel:GetAttackGarray(index)
+    if not self.attackGrrayDic or not self.attackGrrayDic[index] then
+        return {0, 0, 0, 0, 0}
+    end
+    return self.attackGrrayDic[index]
+end
+
+---获取地方布阵数据
+---@param uid number 公会uid
+---@param id number 据点id
+---@return guild_fight.s2c_guild_fight_array[]
+function SociatyBattleModel:GetEnemyData(uid, id)
+    local sociatybattleData = uid == self.sociatyUid and self:GetSelfScoaityData() or self:GetEnemySociatyData()
+    self.fightCampsiteId = id
+    return sociatybattleData:GetCampsiteData(id):GetEmbattleDatas()
+end
+---战斗结束
+---@param result boolean 结果
+function SociatyBattleModel:BattleEnd()
+    local result = require "SociatyBattleManager":GetInstance().fightMsg.winner
+    self.challengeNum = self.challengeNum - 1
+    local campsiteData = self:GetEnemySociatyData():GetCampsiteData(self.fightCampsiteId)
+    local soicaty = require "SociatyModel":GetInstance().SociatySelf
+
+    --local JoinTime = soicaty.GetMemberModule():GetSelfMember().JoinTime
+
+    self.score = self.score + campsiteData.cfg.contribute[1]
+    local time = _G.TimeUtil.GetServerUnixTime()
+    if time - soicaty.CreateTime >= 86400 then --or time - JoinTime >= 86400 then
+        self.changeScore = 0
+        local isAllZero = require("SociatyBattleManager"):GetInstance():CheckCampsiteZero()
+        if not isAllZero then
+            self.changeScore = self:GetSelfScoaityData():SetAttackResult(self.fightCampsiteId, result)
+        else
+            self.changeScore = self:GetSelfScoaityData():SetAttackResult(self.fightCampsiteId, result, true)
+        end
+        self.isZero = campsiteData:GetHp() <= 0 --进攻空驻地
+
+        self.changeHp, self.changeBaseHp =
+            self:GetEnemySociatyData():SetDefendResult(self.fightCampsiteId, result, not isAllZero)
+    else
+        self.changeHp = 0
+        self.changeBaseHp = 0
+        self.changeScore = 0
+    end
+    _G.Events:GetInstance():Broadcast(_G.eSociatyBattle.SociatyBattleBattle)
+    require "RedPointManager":GetInstance():RefreshNode(
+        _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleRewards].id
+    )
+    require "RedPointManager":GetInstance():RefreshNode(
+        _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleContribute].id
+    )
+end
+
+---增加赛季效果(次数)
+function SociatyBattleModel:AddExtraFightTimes()
+    local times = 0
+    local isOpen = require "SociatyBattleLeagueModel":GetInstance():GetLeagueIsOpen()
+    if self.ExtraFightTimes == nil and isOpen == true then
+        local cfg = require "SociatyBattleLeagueModel":GetInstance():GetSeasonCfg()
+        for k, v in ipairs(cfg.store_battle_pass) do
+            local data = cfg.UseParameter[k]
+            if v == 2 then
+                for _, v in pairs(_G.ConfigManager.guild_battle_campsite_cfg) do
+                    if v.type >= 2 then
+                        local dataCampsite = self:GetSelfScoaityData():GetCampsiteData(v.id)
+                        if dataCampsite.role.uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                            if data[1] == 1 then
+                                times = times + data[2]
+                            elseif data[1] == 2 then
+                                times = times - data[2]
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        self.maxChallengeNum = self.maxChallengeNum + times
+        self.ExtraFightTimes = true
+    end
+    return times
+end
+
+---增加赛季效果（积分）
+function SociatyBattleModel:AddExtraSorce()
+    local score = self.changeScore
+    local isOpen = require "SociatyBattleLeagueModel":GetInstance():GetLeagueIsOpen()
+    if isOpen == true then
+        local cfg = require "SociatyBattleLeagueModel":GetInstance():GetSeasonCfg()
+        local num = 0
+        for k, v in ipairs(cfg.store_battle_pass) do
+            local data = cfg.UseParameter[k]
+            if v == 1 then
+                local fightTimes = self.maxChallengeNum - self.challengeNum
+                if fightTimes <= data[1] then
+                    score = score * data[2] / 10000
+                end
+            elseif v == 2 then
+                for _, v in pairs(_G.ConfigManager.guild_battle_campsite_cfg) do
+                    if v.type >= 2 then
+                        local dataCampsite = self:GetSelfScoaityData():GetCampsiteData(v.id)
+                        if dataCampsite.role.uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                            score = score * data[3] / 10000
+                            break
+                        end
+                    end
+                end
+            elseif v == 4 and self.isZero == false then
+                for _, v in pairs(_G.ConfigManager.guild_battle_campsite_cfg) do
+                    if v.type == data[2] then
+                        local dataCampsite = self:GetEnemySociatyData():GetCampsiteData(v.id)
+                        if dataCampsite:GetHp() <= 0 then
+                            num = num + 1
+                        end
+                    end
+                end
+                local campsiteData = self:GetEnemySociatyData():GetCampsiteData(self.fightCampsiteId)
+                if
+                    num >= data[1] and _G.ConfigManager.guild_battle_campsite_cfg[self.fightCampsiteId].type ~= 2 and
+                        campsiteData:GetHp() <= 0
+                 then
+                    score = score + data[3]
+                end
+            elseif v == 6 then
+                --镇魂街ZHJ-38762 【主任务】”SP夏铃“主题天下联赛赛季ZHJ-38770
+                --【后端】天下联赛赛季新增赛季效果”6“
+                --按少上阵人头数积分页分比增加
+                local sr = 0
+                for i = 1, 5 do
+                    local array = self:GetAttackGarray(i).array
+
+                    local sra = 3
+                    for j = 1, #array do
+                        if array[j] > 0 then
+                            sra = sra - 1
+                        end
+                    end
+                    if sra < 0 then
+                        sra = 0
+                    end
+                    sr = sr + sra
+                end
+
+                if sr > 0 then
+                    score = score + sr * data[1] / 10000 * score
+                end
+            end
+        end
+    end
+    return score - self.changeScore
+end
+
+---重连成功调用
+---@param endcall function 完成回调
+function SociatyBattleModel:ReConnect(endcall)
+    self:InitData(endcall)
+end
+
+---检测驻地是否能被进攻
+---@param uid number 公会uid
+---@param id number 驻地id
+---@return boolean 是否能被进攻
+function SociatyBattleModel:CheckCampsiteCanAttack(uid, id)
+    local sociatybattleData = uid == self.sociatyUid and self:GetSelfScoaityData() or self:GetEnemySociatyData()
+    local campsiteData = sociatybattleData:GetCampsiteData(id)
+    if campsiteData then
+        return _G.TimeUtil.GetServerUnixTime() - campsiteData.attackTime > self.attackCD
+    end
+    return false
+end
+--endregion
+
+--region self:InitBattleAward 对决奖励
+---初始化对决奖励
+function SociatyBattleModel:InitBattleAward()
+    ---@param msg guild_fight.s2c_guild_fight_fight_award_info
+    SociatyBattleNet:GetInstance():GetBattleAwardInfo(
+        function(msg)
+            self.battleAwardList = msg.fight_award_list or {}
+            require "RedPointManager":GetInstance():RefreshNode(
+                _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleRewards].id
+            )
+            require "RedPointManager":GetInstance():RefreshNode(
+                _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleContribute].id
+            )
+        end
+    )
+end
+---获取对决奖励
+function SociatyBattleModel:GetBattleAwardList()
+    return self.battleAwardList or {}
+end
+
+--endregion
+
+---贡献奖励
+function SociatyBattleModel:CheckRedPointMatch()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return false
+    end
+    if self.seasonCfg == nil then
+        return false
+    end
+    local cfgs = _G.ConfigManager.guild_battle_reward_cfg
+    local cfg
+    local score = self:GetSorce()
+    if nil ~= self.seasonCfg then
+        for _, v in ipairs(self.seasonCfg.reward_season) do
+            cfg = cfgs[v]
+            if cfg.conditions[1] <= score and not self:CheckGetAward(v) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---对战奖励
+function SociatyBattleModel:CheckRedPointAward()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return false
+    end
+    if self.battleAwardList then
+        for _, v in ipairs(self.battleAwardList) do
+            if v.state == 0 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---检测首次进红点
+function SociatyBattleModel:CheckRedPointFirst()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return false
+    end
+    if self.state == StateType.Battle then
+        if _G.PlayerPrefsManager.HasKey(Key) then
+            local time = _G.PlayerPrefsManager.GetFloat(Key)
+            return _G.TimeUtil.GetInterValDayByGame(time, _G.TimeUtil.GetServerUnixTime()) > 0
+        else
+            return true
+        end
+    end
+end
+
+---检测防守阵容
+---@param type number 红点类型
+function SociatyBattleModel:CheckRedPointTeam()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return false
+    end
+
+    local total = _G.StorageManager:GetInstance():CheckCanEmbattleCardCount()
+    local isok = false
+    local isemnum = 0
+    if self.defendGrrayDic then
+        for _, v in pairs(self.defendGrrayDic) do
+            local isHaveNum = 0
+            if v.array then
+                for _, v2 in pairs(v.array) do
+                    if _G.IsNumber(v2) then
+                        if v2 > 0 then
+                            isHaveNum = isHaveNum + 1
+                            isemnum = isemnum + 1
+                        end
+                    else
+                        if v2.uid > 0 then
+                            isHaveNum = isHaveNum + 1
+                            isemnum = isemnum + 1
+                        end
+                    end
+                end
+                if isHaveNum < 3 then
+                    isok = true
+                end
+            else
+                isok = true
+            end
+        end
+    end
+    return isok and total > isemnum
+end
+
+---刷新挑战红点
+function SociatyBattleModel:RefreshEnterRedPoint()
+    local key = self.state == StateType.Battle and Key or ApplyKey
+    _G.PlayerPrefsManager.SetFloat(key, _G.TimeUtil.GetServerUnixTime())
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleFirst].id
+    )
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleDefend].id
+    )
+    require "RedPointManager":GetInstance():RefreshNode(
+        _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleRewards].id
+    )
+    require "RedPointManager":GetInstance():RefreshNode(
+        _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleContribute].id
+    )
+end
+---设置攻击事件
+function SociatyBattleModel:SetAttackTime(time)
+    self:GetEnemySociatyData():GetCampsiteData(self.fightCampsiteId).attackTime = time
+end
+---驻地变化
+---@params msg guild_fight.p2c_guild_fight_send_station
+function SociatyBattleModel:OnCampsiteChangeData(msg)
+    local sociatyData =
+        msg.station.guild_uid == self.sociatyUid and self:GetSelfScoaityData() or self:GetEnemySociatyData()
+    sociatyData:SetP2CCampsiteChange(msg)
+    sociatyData = msg.station.guild_uid ~= self.sociatyUid and self:GetSelfScoaityData() or self:GetEnemySociatyData()
+    sociatyData:SetAttackResult(msg.station.b_id, msg.station.winner)
+    _G.Events:GetInstance():Broadcast(_G.eSociatyBattle.RefreshSociatyBattleCampsite, msg.station.b_id)
+end
+
+--region 编队
+
+---获取编队数据
+function SociatyBattleModel:GetEmbattleData(call)
+    SociatyBattleNet:GetInstance():SignEmbattlData(
+        {type = 1},
+        function(msg)
+            if msg.role_uid ~= _G.PlayerModel:GetInstance():GetPlayerUid() then
+                _G.PopWindowManager:GetInstance():ShowAllTips(250121)
+                return
+            end
+            SociatyBattleNet:GetInstance():GetEmbattlData(
+                {guild_uid = self.sociatyUid},
+                function(msg)
+                    self.mySociatyBattleData:InitEmbattle(msg)
+                    if call then
+                        call()
+                    end
+                end
+            )
+        end
+    )
+end
+---刷新防守红点
+function SociatyBattleModel:RefreshDefendRed()
+    if self.defendTimer then
+        return
+    end
+    self.defendTimer = _G.TimerManager:GetInstance():GetTimer(1, self.RefreshDefendRed2, self, true, true, true)
+    self.defendTimer:Start()
+end
+
+function SociatyBattleModel:RefreshDefendRed2()
+    self.defendTimer = nil
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg[RedPointKey.GuildBattleDefend].id
+    )
+end
+
+---保存编队阵容
+function SociatyBattleModel:SaveEmbattleData(data, call)
+    local msg = {guild_uid = self.sociatyUid, battlefield_list = data}
+    SociatyBattleNet:GetInstance():SaveEmbattlData(
+        msg,
+        function(msg2)
+            if msg2.ack ~= 1 then
+                return
+            end
+
+            if call then
+                call()
+            end
+            SociatyBattleNet:GetInstance():SignEmbattlData({type = 0})
+        end
+    )
+end
+--endregion
+
+---获取玩家战绩（公会成员or敌方驻地）
+---@param attack_guild number 进攻方工会id
+---@param defence_guild boolean 防守方工会id
+---@param id boolean 进攻日志为role_uid；防守日志为驻地id
+function SociatyBattleModel:GetFightRecord(attack_guild, defence_guild, id, call)
+    local pbData = {attack_guild = attack_guild, defence_guild = defence_guild, id = id}
+    SociatyBattleNet:GetInstance():GetFightRecord(pbData, call)
+end
+
+---获取战绩详情
+---@param id number 战绩id
+function SociatyBattleModel:GetRecordDetail(id, call)
+    local pbData = {id = id}
+    SociatyBattleNet:GetInstance():GetRecordDetail(pbData, call)
+end
+
+---获取当期公会成员排行
+function SociatyBattleModel:GetRoleRank(call)
+    SociatyBattleNet:GetInstance():GetRoleRank(call)
+end
+
+---获取公会排行榜
+---@param id number 赛季id
+function SociatyBattleModel:GetRank(call, id)
+    local pbData = {season_id = id or self.seasonId}
+    SociatyBattleNet:GetInstance():GetRank(pbData, call)
+end
+
+return SociatyBattleModel

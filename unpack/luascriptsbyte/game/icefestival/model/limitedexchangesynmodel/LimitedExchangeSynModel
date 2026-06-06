@@ -1,0 +1,494 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.IceFestival.Model.LimitedExchangeSynModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2024/12/13
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local ActivitySynManager = require "ActivitySynManager"
+local base = require "ActivitySynTypeBase"
+---@class LimitedExchangeSynModel : ActivitySynTypeBase    新限时兑换
+local LimitedExchangeSynModel = _G.BaseClass("LimitedExchangeSynModel", base)
+
+---创建对象时,入口构造函数
+function LimitedExchangeSynModel:__init()
+    self.activityId = self.curActivityClass:GetActivityID()
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    _G.Events:GetInstance():AddListener(_G.eIceFestival.RefreshCumulativeAward, self.OnCumulativeAwardChanged, self)
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.SixUpdate, self)
+    self.curActivityClass:AddStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+end
+
+function LimitedExchangeSynModel:OnActivityStateChanged(state)
+    self:RefreshRedPointExchange()
+    self:StateChanged(state)
+end
+
+function LimitedExchangeSynModel:OnCumulativeAwardChanged(isChange)
+    if isChange then
+        self:RefreshRedPointExchange()
+    end
+end
+
+function LimitedExchangeSynModel:StateChanged(state)
+    if state == ActivitySynManager.State.Close then
+        if self.precast and self.precast[1] and self.precast[1] == "BlackMarketExchangeView" then
+            self:RefreshRedPointExchange()
+            for k, v in ipairs(self.curActivityClass.cfg.info.front.con) do
+                --如果开启条件里面有每天重置的，跨天关闭入口先
+                if _G.table.ContainsValue(_G.FunctionOpenDailyCheckID, v.type) then
+                    --require("ActivitySynEnterManager"):GetInstance():RemoveActivityBtn(self.curActivityClass)
+                    _G.Events:GetInstance():Broadcast(_G.eBlackMarketExchange.BlackMarketExchangeOpen)
+                    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(self.precast[1])
+                    if ctrl then
+                        ctrl:Close()
+                    end
+                    return
+                end
+            end
+        end
+    elseif state == ActivitySynManager.State.Open then
+        if self.precast and self.precast[1] and self.precast[1] == "BlackMarketExchangeView" then
+            _G.Events:GetInstance():Broadcast(_G.eBlackMarketExchange.BlackMarketExchangeOpen)
+        end
+    end
+end
+
+function LimitedExchangeSynModel:SixUpdate()
+    if self.precast and self.precast[1] and self.precast[1] == "BlackMarketExchangeView" then
+        self:RefreshRedPointExchange()
+        for k, v in ipairs(self.curActivityClass.cfg.info.front.con) do
+            --如果开启条件里面有每天重置的，跨天关闭入口先
+            if _G.table.ContainsValue(_G.FunctionOpenDailyCheckID, v.type) then
+                --require("ActivitySynEnterManager"):GetInstance():RemoveActivityBtn(self.curActivityClass)
+                local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(self.precast[1])
+                if ctrl then
+                    ctrl:Close()
+                end
+                return
+            end
+        end
+    end
+end
+
+function LimitedExchangeSynModel:OnHandleGMData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+
+---@param info msg
+function LimitedExchangeSynModel:SetSelfData(info)
+    self.precast = self.curActivityClass.cfg.info.front.precast ~= nil and _G.string.split(self.curActivityClass.cfg.info.front.precast, "#") or nil
+    self.needMoneyType = {}
+    ---@type activity_new_exchange.i_activity_new_exchange
+    local exchange = info.new_exchange or {}
+    self.boughtTimes = exchange.bought_times or {}
+    self.itemData = exchange.items or {}
+    for _, v in pairs(self.itemData) do
+        for _, consume in pairs(v.consumes) do
+            if consume.type[1] == 0 then
+                ---代币[0, 活动类型, 活动子类型， 代币id, 数量]
+                self.needMoneyType[consume.type[4]] = consume.type[4]
+            else
+                ---普通物品[物品id, 数量]
+                self.needMoneyType[consume.type[1]] = consume.type[1]
+            end
+        end
+        v.exchangeTimes = 0
+        v.state = 1
+        for _, a in pairs(self.boughtTimes) do
+            if a.sid == v.item_sid then
+                v.exchangeTimes = a.times
+                v.state = a.times < v.count_limit and 1 or 0
+            end
+        end
+        local isGou = _G.PlayerPrefsManager.GetInt(
+            "LimitTimeExchangeModelGou" .. self.activityId .. v.item_sid, -1)
+        if isGou == -1 and v.remind then
+            if v.remind == 2 then
+                isGou = 1
+            end
+        end
+        if isGou == -1 then
+            isGou = 0
+        end
+        v.isGou = isGou
+        v.showGou = true
+        if v.remind then
+            v.showGou = v.remind ~= 1
+        end
+        if v.description then
+            v.description = tonumber(v.description) or 0
+        end
+    end
+    local exchangeShow = self.curActivityClass.cfg.info.front.exchange_show
+    if exchangeShow then
+        self.lhPath = exchangeShow.pos
+        self.lhSpine = exchangeShow.spe
+        self.mainType = exchangeShow.main_type
+    end
+    if exchangeShow and exchangeShow.dev then
+        local dev = _G.string.split(exchangeShow.dev, "#")
+        self.lhPos = { _G.tonumber(dev[1] or 0), _G.tonumber(dev[2] or 0), _G.tonumber(dev[3] or 0) }
+        self.lhScale = _G.tonumber(dev[4] or 1)
+    end
+    if exchangeShow and exchangeShow.description then
+        self.showType = exchangeShow.description.type
+        if exchangeShow.description.spine then
+            local strT = _G.string.split(exchangeShow.description.spine, "?")
+            self.roleStr = strT[1]
+            self.rolePos = _G.string.split(strT[2], "#")
+            self.bubbleStr = _G.string.split(strT[3], "#") or {}
+            for k, v in pairs(self.bubbleStr) do
+                self.bubbleStr[k] = _G.tonumber(v) or 0
+            end
+            self.bubbleTime1 = _G.tonumber(strT[4]) or 1
+            self.bubbleSwitchStr = _G.string.split(strT[5], "#") or {}
+            for k, v in pairs(self.bubbleSwitchStr) do
+                self.bubbleSwitchStr[k] = _G.tonumber(v) or 0
+            end
+            self.bubbleTime2 = _G.tonumber(strT[6]) or 1
+        end
+    end
+    if self.precast and self.precast[1] and self.precast[1] == "BlackMarketExchangeView" then
+        _G.Events:GetInstance():Broadcast(_G.eBlackMarketExchange.BlackMarketExchangeOpen)
+    end
+    self:RefreshRedPointExchange()
+end
+
+---主活动类型
+function LimitedExchangeSynModel:GetMainType()
+    return self.mainType
+end
+
+---获取立绘资源路径
+function LimitedExchangeSynModel:GetLiHuiPath()
+    return (self.lhPath or self.lhSpine), self.lhPath ~= nil
+end
+
+---获取立绘资源坐标
+function LimitedExchangeSynModel:GetLiHuiPos()
+    return self.lhPos
+end
+
+---获取立绘资源缩放
+function LimitedExchangeSynModel:GetLiHuiScale()
+    return self.lhScale
+end
+
+---获取资源货币
+function LimitedExchangeSynModel:GetResources()
+    local resources = {}
+    for _, v in pairs(self.needMoneyType) do
+        _G.table.insert(resources, v)
+    end
+    return resources
+end
+
+---
+---@protected
+function LimitedExchangeSynModel:CheckItemGou()
+    if self.precast and self.precast[1] and (self.precast[1] == "MTExchangeView" or self.precast[1] == "SpringExchangeView")  then
+        return true
+    end
+    local main_type = self.curActivityClass.cfg.info.front.main_type
+    if main_type and main_type == 2 then
+        return true
+    end
+    return false
+end
+
+---资源变更
+function LimitedExchangeSynModel:ResUpdata(data)
+    for _, value in pairs(data) do
+        local sid = value.type[1]
+        if self.needMoneyType[sid] then
+            self:RefreshRedPointExchange()
+        end
+    end
+end
+
+function LimitedExchangeSynModel:GetCurActivitySelfData()
+    local selfData = {}
+    local checkArray
+    for _, v in ipairs(self.itemData) do
+        if v.con then
+            checkArray = {}
+            for _, value in ipairs(v.con) do
+                _G.table.insert(checkArray, value.condition)
+            end
+            if _G.GlobalConditionManager.CheckConditionByArray(checkArray) then
+                _G.table.insert(selfData, v)
+            end
+        else
+            _G.table.insert(selfData, v)
+        end
+    end
+    return selfData
+end
+
+---获取道具数量
+---@param type number 活动类型
+function LimitedExchangeSynModel:GetCoinNum(type, subType, sid)
+    subType = subType or self.curActivityClass:GetJumpType()
+    local activity = require("ActivitySynManager"):GetInstance():GetChildAcitivity(type, subType)
+    if activity then
+        if activity.typeClass.GetCoinNum then
+            return activity.typeClass:GetCoinNum(sid)
+        elseif activity.typeClass.GetCoin then
+            return activity.typeClass:GetCoin(sid)
+        end
+    end
+
+    return 0
+end
+
+function LimitedExchangeSynModel:IsShowBtn()
+    --local main_type = self.curActivityClass.cfg.info.front.main_type
+    --if main_type and main_type == 2 then
+    --    return true
+    --end
+    local sub_type = self.curActivityClass:GetJumpType()
+    if sub_type == 100209 then
+        return true
+    end
+    return false
+end
+
+function LimitedExchangeSynModel:GetItemSidAndNum(data)
+    if data.type[1] == 0 then
+        return data.type[4], data.type[5]
+    end
+    return data.type[1], data.type[2]
+end
+
+function LimitedExchangeSynModel:Exchange(data, call, cost)
+    local itemSid = self:GetItemSidAndNum(data.consumes[1])
+    require "ExchangeNet":GetInstance():Exchange(
+        data.item_sid,
+        cost.num,
+        self.activityId,
+        function(_data)
+            if _data.ack == 1 then
+                if data.consumes[1].type[1] == 0 then
+                    _G.Events:GetInstance():Broadcast(_G.eArena.SetDrawUp, { itemSid, -cost.count })
+                    --暂时不改变_G.eArena.SetDrawUp事件发送, 此次活动对应model已声明JointActivitySuperSynModel:SetCoin, 这里就直接走StorageManager处理了
+                    local consume = _G.DeepCopy(data.consumes[1])
+                    consume.type[5] = consume.type[5] * cost.num
+                    _G.StorageManager:GetInstance():Consume(consume)
+                else
+                    _G.StorageManager:GetInstance():ConsumeItem(itemSid, 0, cost.count)
+                end
+                data.exchangeTimes = data.exchangeTimes + cost.num
+                if data.exchangeTimes >= data.count_limit then
+                    data.exchangeTimes = data.count_limit
+                    data.state = 0
+                end
+                local otherAward = { award = { item = {} } }
+                local newAward = { award = { item = {} } }
+                if _data.award then
+                    for _, v in pairs(_data.award.item) do
+                        if v.type[1] == 0 then
+                            _G.Events:GetInstance():Broadcast(_G.eArena.SetDrawUp, { v.type[3], v.type[4] })
+                            local tb = _G.StorageManager:GetInstance():SimulationAward(
+                                v.type[3],
+                                v.type[4]
+                            )
+                            _G.table.insert(newAward.award.item, { type = tb })
+                        else
+                            _G.table.insert(newAward.award.item, v)
+                            _G.table.insert(otherAward.award.item, v)
+                        end
+                    end
+                end
+                if not _G.table.isEmptyOrNil(otherAward.award.item) then
+                    _G.StorageManager:GetInstance():ReceiveAwardData(otherAward)
+                end
+                require "CommonTipManager".OpenCommonAwardView(newAward)
+                self:RefreshRedPointExchange()
+                if call then
+                    call(_data)
+                end
+            end
+        end
+    )
+    -- self:RefreshRedPointExchange()
+end
+
+---新兑换方法，代币直接走五参绑定活动逻辑
+function LimitedExchangeSynModel:ExchangeNew(data, call, num)
+    require "ExchangeNet":GetInstance():Exchange(
+        data.item_sid,
+        num,
+        self.activityId,
+        function(_data)
+            if _data.ack == 1 then
+                local T = _G.DeepCopy(data.consumes)
+                for k, v in pairs(T) do
+                    if v.type[1] == 0 then
+                        v.type[5] = v.type[5] * num
+                    else
+                        v.type[2] = v.type[2] * num
+                    end
+                    _G.StorageManager:GetInstance():Consume(v)
+                end
+                data.exchangeTimes = data.exchangeTimes + num
+                if data.exchangeTimes >= data.count_limit then
+                    data.exchangeTimes = data.count_limit
+                    data.state = 0
+                end
+                -- if _data.award then
+                --     _G.StorageManager:GetInstance():ReceiveAwardData(_data)
+                --     require "CommonTipManager".OpenCommonAwardView(_data)
+                -- end
+                -- self:RefreshRedPointExchange()
+                if call then
+                    call(true, _data)
+                end
+            end
+        end
+    )
+end
+
+---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function LimitedExchangeSynModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckHaveExchangeItem }
+    self.redpointTree = { false }
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function LimitedExchangeSynModel:CheckRedPointNumChild(index)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+function LimitedExchangeSynModel:CheckCondition(data)
+    if not data.con then
+        return true
+    end
+    local checkArray = {}
+    for _, value in ipairs(data.con) do
+        _G.table.insert(checkArray, value.condition)
+    end
+    if _G.GlobalConditionManager.CheckConditionByArray(checkArray) then
+        return true
+    end
+    return false
+end
+
+---是否有可以足够兑换次数可以兑换的item
+function LimitedExchangeSynModel:CheckHaveExchangeItem()
+    if self.curActivityClass:GetCurActivityState() ~= require "ActivitySynManager".State.Open then
+        return 0
+    else
+        if self.precast and self.precast[1] and self.precast[1] == "BlackMarketExchangeView" then
+            local time = _G.PlayerPrefsManager.GetInt("BlackMarketExchangeViewRedPoint" .. self.curActivityClass:GetActivityID(), 0)
+            if time == 0 then
+                return 1
+            end
+            return time < _G.TimeUtil.GetDayBegin(_G.GetNowUnixTime()) and 1 or 0
+        end
+        local check = self:CheckItemGou()
+        local CloseRedPoint = _G.PlayerPrefsManager.GetInt("LimitTimeExchangeCloseRedPoint" .. self.curActivityClass:GetActivityID(), 0)
+        if CloseRedPoint == 1 and check == false then
+            return 0
+        end
+        if self.showType ~= 2 then
+            local serverTime = _G.TimeUtil.GetServerUnixTime()
+            local locationTime = _G.PlayerPrefsManager.GetInt("LimitTimeExchangeModelDaily" .. self.curActivityClass:GetActivityID())
+            if locationTime == 0 then
+                return 1
+            else
+                if _G.TimeUtil.GetInterValDayByGame(serverTime, locationTime) >= 1 then
+                    return 1
+                end
+            end
+        end
+        if not _G.table.isEmptyOrNil(self.itemData) then
+            for _, v in pairs(self.itemData) do
+                local haveBol = true
+                if (check == true and v.isGou == 1 and self:CheckCondition(v)) or check == false then
+                    for key, value in ipairs(v.consumes) do
+                        local needItem = value and value.type or {}
+                        local haveCount
+                        local needCount
+                        if self.curActivityClass:GetJumpType() and needItem[1] == 0 then
+                            haveCount = self:GetCoinNum(needItem[2], needItem[3], needItem[4])
+                            needCount = needItem[5]
+                        else
+                            local _, storageId = _G.StorageManager:GetInstance():CheckSidType(needItem[1])
+                            haveCount = _G.StorageManager:GetInstance():GetItemCountByID(storageId, needItem[1])
+                            needCount = needItem[2]
+                        end
+                        if not haveCount or haveCount == 0 then
+                            haveCount = _G.StorageManager:GetInstance():GetOtherItemCountBySid(needItem[4]) or 0
+                        end
+
+                        if haveCount < needCount then
+                            haveBol = false
+                        end
+                    end
+                    if haveBol and v.exchangeTimes < v.count_limit and v.isGou > 0 then
+                        return 1
+                    end
+                end
+            end
+        end
+        return 0
+    end
+end
+
+---获取红点树结构
+---@return table 结构数组
+function LimitedExchangeSynModel:GetRedPointTree()
+    if self.precast and self.precast[1] and self.precast[1] == "BlackMarketExchangeView" then
+        _G.Events:GetInstance():Broadcast(_G.eBlackMarketExchange.BlackMarketExchangeOpen)
+    end
+    return self.redpointTree
+end
+
+---刷新奖励红点
+function LimitedExchangeSynModel:RefreshRedPointExchange()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+function LimitedExchangeSynModel:OnEnterActivity()
+    local main_type = self.curActivityClass.cfg.info.front.main_type
+    local subtype = self.curActivityClass:GetJumpType()
+    if self.showType and self.showType == 2 then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MTLimitedExchangeView.Name, self.curActivityClass)
+    elseif subtype == 100156 then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.NationalDayExchangeView.Name, self.curActivityClass)
+    elseif subtype == 100209 then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LabourDayExchangeView.Name, self.curActivityClass)
+    elseif self.precast and self.precast[1] then
+        _G.UIManager:GetInstance():OpenWindow(self.precast[1], self.curActivityClass)
+    elseif main_type and main_type == 2 then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.WinterExchangeView.Name, self.curActivityClass)
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LimitedExchangeView.Name, self.curActivityClass)
+    end
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+
+function LimitedExchangeSynModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.LimitedExchangeView.Name
+end
+
+---销毁对象时,析构函数
+function LimitedExchangeSynModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    _G.Events:GetInstance():RemoveListener(_G.eIceFestival.RefreshCumulativeAward, self.OnCumulativeAwardChanged, self)
+    if self.curActivityClass then
+        self.curActivityClass:RemoveStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+    end
+end
+
+return LimitedExchangeSynModel

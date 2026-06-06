@@ -1,0 +1,358 @@
+-----------------------------------------------------------------------
+-- E:.01.zhj.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Storage.Data.DecorationData	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/06/30
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "BaseItemData"
+---@class DecorationData	中文描述
+---@field cfg decoration_cfg
+local DecorationData = _G.BaseClass("DecorationData", base)
+_G.DecorationData = DecorationData
+local GetLangPackValue = _G.GetLangPackValue
+local decMainAttribute = {
+    atk = 90010200101,
+    bre = 90010200201,
+    def = 90010200301,
+    max_hp = 90010200401
+}
+local atttypes = {
+    atk = 2,
+    bre = 2,
+    def = 2,
+    max_hp = 2,
+    hit_rate = 1,
+    avd_rate = 1,
+    cri_rate = 1,
+    cri_r_rate = 1,
+    cri_dmg = 1,
+    cri_dmg_r = 1,
+    dmg_inc = 1,
+    psy_d_r = 1,
+    mag_d_r = 1
+}
+
+---类的构造函数
+function DecorationData:__init()
+end
+
+---类的析构函数
+function DecorationData:Dispose()
+end
+
+--region 子类重写
+---物品数据解析(类重写数据解析)所有符文都在仓库(穿戴后也在仓库，所以穿戴/卸下等操作直接修改数据类即可)，卡牌身上的符文只是用于卡牌计算属性
+---@param msg prop.i_decoration 数据
+function DecorationData:ParseInitMsg(data)
+    self.sid = data.sid
+    self.uid = data.uid or data.sid
+    self.level = data.level or 1
+    self.attr = data.attr_add or {}
+    self.cardUid = data.card_uid or 0
+    self.lock = data.lock
+    self.resetNum=data.reset_num
+    self.attr_cache = data.attr_cache
+    ---符文配置decoration_cfg
+    self.cfg = _G.ConfigManager.decoration_cfg[self.sid]
+    if not self.cfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("decoration_cfg中找不到对应的符文配置，sid: " .. _G.tostring(self.sid))
+        end
+    end
+    self.Grade = self.cfg.grade
+    self.Icon = self.cfg.icon
+    self.parts = self.cfg.parts
+    self.Professional = self.cfg.Professional
+    self.suit = self.cfg.suit
+
+    ---评分：没有槽位等级的加成
+    self.activeAttr = {}
+    self:InitScoreProp()
+    self:InitPropKey()
+end
+
+--endregion
+
+---解析奖励消息
+---@param msg table 服务器下发奖励消息
+function DecorationData:ParseAward(msg)
+    local data = {}
+    data.sid = msg[1]
+    data.uid = msg[2]
+    data.level = msg[3]
+    data.attr_add = {}
+    for i = 4, #msg, 3 do
+        _G.table.insert(data.attr_add, {index=msg[i], attr_sid = msg[i+1], attr_value = msg[i + 2] ,is_lock=0})
+    end
+    data.reset_num=0
+    self:ParseInitMsg(data)
+end
+
+--region 对外接口
+---额外数据解析(类重写数据解析)
+function DecorationData:ParseExtend(extend)
+    if not extend then
+        return
+    end
+    self.level = extend[1]
+end
+
+---属性加成倍率
+function DecorationData:GetPropRate(strengLv)
+    local cfg
+    if self.level then
+        cfg = _G.ConfigManager.decoration_level_cfg[self.level]
+    end
+    local percent = 1
+    if cfg then
+        ---符文本身的等级加成
+        percent = percent + cfg.att_growth * 0.0001
+    end
+    if strengLv then
+        cfg = _G.ConfigManager.decoration_stren_cfg[strengLv]
+        if cfg then
+            ---槽位强化等级加成
+            percent = percent + cfg.att_growth * 0.0001
+        end
+    end
+    return percent
+end
+
+---用于筛选卡
+function DecorationData:InitPropKey()
+    self.propKeyList = {}
+
+    if not _G.table.isEmptyOrNil(self.attr) then
+        local cfg = _G.ConfigManager.decoration_add_cfg
+        for i = 1, table.count(self.attr) do
+            self.propKeyList[cfg[self.attr[i].attr_sid].type_attribute] = true
+        end
+    end
+end
+
+---检测是否拥有该副属性
+---@param key string 属性类型
+---@param isCheckActive boolean 是否进行激活检测
+function DecorationData:CheckHasPropType(key, isCheckActive)
+    if isCheckActive then
+        return self.propKeyList[key] and self.activeAttr[key]
+    else
+        return self.propKeyList[key]
+    end
+end
+
+---基础属性 * 倍率 + 词条属性
+function DecorationData:GetPropList(strengLv)
+    ---基础属性
+    local baseProp = {}
+    --词条属性
+    local entryProp = {}
+    local rate = self:GetPropRate(strengLv)
+    ---基础属性
+    for key, name in pairs(decMainAttribute) do
+        local tempValue = self.cfg[key]
+        if tempValue and tempValue > 0 then
+            baseProp[key] = {
+                value = _G.Mathf.RoundToInt(tempValue * rate),
+                name = name
+            }
+        end
+    end
+    ---词条属性
+    if not _G.table.isEmptyOrNil(self.attr) then
+        local cfg = _G.ConfigManager.decoration_add_cfg
+        for i = 1, table.count(self.attr) do
+            local key = cfg[self.attr[i].attr_sid].type_attribute
+            local value = self.attr[i].attr_value
+            entryProp[key] = {
+                value = value * 0.0001,
+                value_type = cfg[self.attr[i].attr_sid].value_type,
+                name = cfg[self.attr[i].attr_sid].name
+            }
+        end
+    end
+    return baseProp, entryProp
+end
+
+---获取饰品基础属性
+---@return AttributeClass
+function DecorationData:GetBasePropAttr(percent)
+    local attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    for key, value in pairs(decMainAttribute) do
+        local tempValue = self.cfg[key]
+        if tempValue and tempValue > 0 then
+            attribute:SetValueByName(key, tempValue * percent, false, _G.AttCountType.other)
+        end
+    end
+    return attribute
+end
+
+---评分属性-用于计算评分
+function DecorationData:InitScoreProp()
+    self.scoreAttribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    local cfg = _G.ConfigManager.decoration_add_cfg
+    --思维属性的 百分比  其他属性的增加
+    if not _G.table.isEmptyOrNil(self.attr) and cfg then
+        for i = 1, table.count(self.attr) do
+            local attdata=self.attr[i]
+            local type = cfg[attdata.attr_sid].type_attribute
+            if atttypes[type] == 2 then
+                self.scoreAttribute:SetValueByName(type, attdata.attr_value * 0.0001, false, _G.AttCountType.basePercent)
+            else
+                self.scoreAttribute:SetValueByName(type, attdata.attr_value * 0.0001, false, _G.AttCountType.base)
+            end
+        end
+    end
+
+    local percent = self:GetPropRate()
+    for key, value in pairs(decMainAttribute) do
+        local tempValue = self.cfg[key]
+        if tempValue and tempValue > 0 then
+            self.scoreAttribute:SetValueByName(key, tempValue * percent, false)
+        end
+    end
+
+    return self.scoreAttribute
+end
+
+---获取饰品最终属性  or not all
+---@return AttributeClass
+function DecorationData:GetProp(strengLv)
+    self.attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    local cfg = _G.ConfigManager.decoration_add_cfg
+    --思维属性的 百分比  其他属性的增加
+    if not _G.table.isEmptyOrNil(self.attr) and cfg then
+        for i = 1, table.count(self.attr) do
+            local attdata=self.attr[i]
+            local type = cfg[attdata.attr_sid].type_attribute
+            self.activeAttr[type] =attdata.attr_value
+            if atttypes[type] == 2 then
+                self.attribute:SetValueByName(type, attdata.attr_value * 0.0001, false, _G.AttCountType.basePercent)
+            else
+                self.attribute:SetValueByName(type, attdata.attr_value * 0.0001, false, _G.AttCountType.base)
+            end
+        end
+    end
+
+    local percent = self:GetPropRate(strengLv)
+    local baseAttribute = self:GetBasePropAttr(percent)
+    _G.AttributeClassManager:GetInstance():AddAttribute(self.attribute, baseAttribute)
+
+    --- 对最终属性 四舍五入  防止小数位太多
+    for i, v in pairs(self.attribute.attriOther) do
+        if v > 0 then
+            self.attribute:SetValueByName(i, _G.Mathf.RoundToInt(v), nil, _G.AttCountType.other)
+        end
+    end
+
+    return self.attribute
+end
+
+---穿戴卡牌
+---@param uid number 卡牌uid
+function DecorationData:PutCard(uid)
+    self.cardUid = uid
+end
+
+function DecorationData:GetTxtParts()
+    local parts_array = {
+        [1] = GetLangPackValue(90022500427),
+        [2] = GetLangPackValue(90022500428),
+        [3] = GetLangPackValue(90022500429),
+        [4] = GetLangPackValue(90022500430)
+    }
+    return parts_array[self.cfg.parts]
+end
+
+---获取套装效果
+function DecorationData:GetTxtDes()
+    local des2 = ""
+    local cfg = _G.ConfigManager.decoration_suit_cfg[self.cfg.suit]
+    local attCfg = _G.ConfigManager.attribute_cfg
+    if cfg then
+        local attid = require "DecorationModel":GetInstance():GetGradeToValue(self.cfg.grade, cfg.att_suit2)
+        des2 = attCfg[attid].describe
+        des2 = GetLangPackValue(des2)
+    end
+    return des2
+end
+
+function DecorationData:GetSuitName()
+    local cfg = _G.ConfigManager.decoration_suit_cfg[self.cfg.suit]
+    if cfg then
+        return GetLangPackValue(cfg.name)
+    end
+    return ""
+end
+
+function DecorationData:GetSuitBg()
+    if self.Grade == 3 then
+        return "ImagesH5/hCardShow/ui_js_fw_fazhenlan"
+    elseif self.Grade == 4 then
+        return "ImagesH5/hCardShow/ui_js_fw_fazhenzi"
+    elseif self.Grade == 5 then
+        return "ImagesH5/hCardShow/ui_js_fw_fazhencheng"
+    elseif self.Grade == 6 then
+        return "ImagesH5/hCardShow/ui_js_fw_fazhenhong"
+    elseif self.Grade == 7 then
+        return "ImagesH5/hCardShow/ui_js_fw_fazhencai"
+    end
+    return "ImagesH5/hCardShow/ui_js_fw_fazhenlan"
+end
+
+---获取套装效果,预览区间
+function DecorationData:GetTxtArea(index)
+    local info = self.attr[index]
+    local sid
+    local name, num, max = "", 0, 0
+    if info then
+        sid = info.attr_sid
+        num = info.attr_value
+    end
+    ---@type decoration_add_cfg
+    local decoration_add_cfgItem = _G.ConfigManager.decoration_add_cfg[sid]
+    if decoration_add_cfgItem ~= nil then
+        name = decoration_add_cfgItem.name
+        local nums = decoration_add_cfgItem.value
+        max = nums[#nums]
+    end
+    return name, num, max
+end
+
+---获取分解后的材料
+function DecorationData:GetDecomposition()
+    local cfg = _G.ConfigManager.decoration_cfg[self.sid]
+    return cfg.giveback
+end
+
+function DecorationData:GetGrade()
+    return self.Grade
+end
+
+function DecorationData:GetPower()
+    if not self.score then
+        self.score = self.scoreAttribute:CalculateArtifactPower()
+    end
+    return self.score
+end
+
+---获取槽位强化等级
+function DecorationData:GetSlotStrenLv()
+    if self.cardUid ~= 0 then
+        local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, self.cardUid)
+        if cardData and cardData.DecorationBar then
+            for _, v in pairs(cardData.DecorationBar) do
+                if v.index == self.parts and v.decoration and v.decoration.uid == self.uid then
+                    return v.slotLevel or 0
+                end
+            end
+        end
+    end
+    return 0
+end
+
+function DecorationData:GetName()
+    return _G.GetLangPackValue(self.cfg.name)
+end
+
+return DecorationData

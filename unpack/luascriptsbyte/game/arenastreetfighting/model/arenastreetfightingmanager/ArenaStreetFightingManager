@@ -1,0 +1,1130 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha_ft.Client.Assets.Resources.LuaScripts.Game.ArenaStreetFighting.Model.ArenaStreetFightingManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2023/05/30
+-- Description 街机乱斗管理类
+-----------------------------------------------------------------------
+
+---@class ArenaStreetFightingManager : GameDataModelBase	中文描述
+local ArenaStreetFightingManager = _G.BaseClass("ArenaStreetFightingManager", _G.GameDataModelBase)
+local ActivitySynManager = require "ActivitySynManager"
+_G.ArenaStreetFightingManager = ArenaStreetFightingManager
+local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+local store_season_battle_cfg = _G.ConfigManager.store_season_battle_cfg
+---@return ArenaStreetFightingManager ArenaStreetFightingManager
+function ArenaStreetFightingManager:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function ArenaStreetFightingManager:__init()
+    local EventsIns = _G.Events:GetInstance()
+    local net_map = _G.ConfigManager.net_map
+    self.id = 703001
+    self.coin = 0
+    self.CardData = {}
+    self.arcade_match = {}
+    EventsIns:AddListener(net_map.arcade_interact.Cmd, self.OnChatCall, self)
+    EventsIns:AddListener(net_map.arcade_garry.Cmd, self.OnMatchSuccessCall, self)
+    EventsIns:AddListener(net_map.store_cash.Cmd, self.OnMallCashListener, self)
+
+    EventsIns:AddListener(net_map.arcade_match.Cmd, self.P2C_Friendinfos, self)
+
+    -- _G.Events:GetInstance():AddListener(_G.eArena.SetFairCoin, self.AddCoin, self)
+end
+
+---销毁对象时,析构函数
+function ArenaStreetFightingManager:Dispose()
+    local EventsIns = _G.Events:GetInstance()
+    local net_map = _G.ConfigManager.net_map
+
+    EventsIns:RemoveListener(net_map.arcade_interact.Cmd, self.OnChatCall, self)
+    EventsIns:RemoveListener(net_map.arcade_garry.Cmd, self.OnMatchSuccessCall, self)
+    EventsIns:RemoveListener(net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    EventsIns:RemoveListener(net_map.arcade_match.Cmd, self.P2C_Friendinfos, self)
+end
+
+---后端主动推送的匹配到对手,推送
+function ArenaStreetFightingManager:P2C_Friendinfos(data)
+    self:P2C_Friendinfo(data)
+end
+
+function ArenaStreetFightingManager:OnMallCashListener(data)
+    -- local cfg = _G.ConfigManager.store_season_battle_cfg[data.sid]
+    if data.sid == self.id then
+        self:ButPut()
+        self:RefreshRedPointTemple()
+
+        if self.call then
+            self.call()
+        end
+        -- require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FirstStore.id)
+    end
+end
+
+---设置活动
+function ArenaStreetFightingManager:SetActivity(activity, info)
+    self.enemyRoleInfo = {}
+    ---当前可选卡牌最大数
+    self.Count = 8
+    self.activity = activity
+    self.curEmbattleTimes = nil
+    --总胜利次数
+    self.all_win = info.arcade_chaos.all_win or 0
+    --当前奖励以领取次数
+    self.award_list = info.arcade_chaos.award_list or {}
+    --本轮胜利次数
+    self.win_times = info.arcade_chaos.win_times or 0
+    --本轮失败次数
+    self.fail_times = info.arcade_chaos.fail_times or 0
+    --本轮所选卡牌sid
+    self.card_list = info.arcade_chaos.card_list or {}
+    --任务配置
+    self.task_cfg = info.arcade_chaos.task_cfg or {}
+    --战令信息
+    self.battle_info = info.arcade_chaos.battle_info or {}
+    for key, value in pairs(self.card_list) do
+        self:SetCoins(value)
+    end
+    --合击技
+    self.combine = info.arcade_chaos.combine or {}
+    --随机生成卡牌sid
+    self.random_cards = info.arcade_chaos.random_cards or {}
+
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ArenaBrawlEnterView.Name)
+    local ArenaSeasonView = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.ArenaSeasonView.Name)
+    if ArenaSeasonView then
+        ArenaSeasonView:UpdataNew()
+    end
+    if view then
+        view:Award_list()
+    end
+    --断线重连：正在进行的战斗信息
+    local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ArenaEmbattleView.Name)
+
+    if view == nil then
+        --TODO:已经在匹配中的处理
+        self.curr_info = info.arcade_chaos.is_reconnect or 0
+        if self.curr_info == 1 then
+            local ArenaMainView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ArenaMainView.Name)
+            if ArenaMainView then
+                self:CurrInfo()
+                _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArenaMainView.Name)
+                _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArenaBrawlMateView.Name)
+            else
+                self.onLoadingWorld = true
+                _G.Events:GetInstance():AddListener(_G.eScene.EnterWorldOver, self.OnWorldLoadOver, self)
+            end
+        end
+    end
+    self.onSixInitInfoTag = true
+end
+
+--region 战令信息返回
+--是(1|0)否购买付费奖励
+function ArenaStreetFightingManager:IsBut()
+    if self.battle_info == nil then
+        return 0
+    end
+    return self.battle_info.is_buy or 0
+end
+
+--是(1|0)否购买付费奖励
+function ArenaStreetFightingManager:ButPut()
+    self.battle_info.is_buy = 1
+end
+
+--战令等级
+function ArenaStreetFightingManager:Islv()
+    if self.battle_info == nil then
+        return 0
+    end
+    return self.battle_info.lv or 0
+end
+
+---经验加
+function ArenaStreetFightingManager:AddExp(Exp)
+    self.battle_info.exp = self.battle_info.exp + Exp
+    for key, value in pairs(store_season_battle_cfg[self.id].content) do
+        local lv = self:expIsId(self.battle_info.lv)
+
+        if
+            store_season_battlecon_cfg[value].level == self.battle_info.lv and
+            self.battle_info.exp >= store_season_battlecon_cfg[value].conditions[2]
+        then
+            self.battle_info.lv = store_season_battlecon_cfg[value].level + 1
+            self.battle_info.exp = self.battle_info.exp - lv.conditions[2]
+        elseif
+            store_season_battlecon_cfg[value].level > self.battle_info.lv and
+            self.battle_info.exp >= store_season_battlecon_cfg[value].conditions[2]
+        then
+            self.battle_info.lv = store_season_battlecon_cfg[value].level
+            self.battle_info.exp = self.battle_info.exp - lv.conditions[2]
+        end
+        if
+            key >= _G.table.count(store_season_battle_cfg[self.id].content) and
+            store_season_battlecon_cfg[value].level <= self.battle_info.lv
+        then
+            self.battle_info.lv = store_season_battlecon_cfg[value].level
+            self.battle_info.exp = store_season_battlecon_cfg[value].conditions[2]
+            return
+        end
+    end
+end
+
+--当前等级经验
+function ArenaStreetFightingManager:Expslider()
+    if self.battle_info == nil then
+        return 0
+    end
+    local data = self:expIsId(self:Islv())
+    local zhi = self.battle_info.exp / data.conditions[2]
+    if zhi > 1 then
+        zhi = 1
+    end
+    return zhi, self.battle_info.exp, data.conditions[2]
+end
+
+--战令等级
+function ArenaStreetFightingManager:exp()
+    if self.battle_info == nil then
+        return 0
+    end
+    return self.battle_info.exp or 0
+end
+
+--根据等级获取当前任务信息
+function ArenaStreetFightingManager:expIsId(lv)
+    for key, value in pairs(store_season_battle_cfg[self.id].content) do
+        if key == 1 and lv <= store_season_battlecon_cfg[value].level then
+            return store_season_battlecon_cfg[value]
+        end
+        if store_season_battlecon_cfg[value].level == lv then
+            return store_season_battlecon_cfg[value]
+        elseif key == _G.table.count(store_season_battle_cfg[self.id].content) then
+            return store_season_battlecon_cfg[value]
+        end
+    end
+end
+
+---已领取免费奖励sid
+function ArenaStreetFightingManager:free_award(id)
+    if self.battle_info.free_award == nil then
+        self.battle_info.free_award = {}
+    end
+    for key, value in pairs(self.battle_info.free_award) do
+        if value == id then
+            return 1
+        end
+    end
+    return 0
+end
+
+---已领取付费奖励sid
+function ArenaStreetFightingManager:pay_award(id)
+    if self.battle_info.pay_award == nil then
+        self.battle_info.pay_award = {}
+    end
+    for key, value in pairs(self.battle_info.pay_award) do
+        if value == id then
+            return 1
+        end
+    end
+    return 0
+end
+
+---领取所有可领奖励
+function ArenaStreetFightingManager:BattleAward(call)
+    local free_award, pay_award = self:Award()
+    if _G.table.count(free_award) > 0 or _G.table.count(pay_award) > 0 then
+        local Select_cards = {}
+        Select_cards.activity_id = self.activity.curActivityClass:GetActivityID()
+        Select_cards.free_sids = free_award
+        Select_cards.pay_sids = pay_award
+        require "ArenaStreetFightingNet":GetInstance():arcade_battle_award(
+            Select_cards,
+            function(msg)
+                if msg.ack == 1 then
+                    --_G.table.insert(self.card_list, sid)
+                    --self.random_cards = msg.cards
+                    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                    for key, value in pairs(free_award) do
+                        _G.table.insert(self.battle_info.free_award, value)
+                    end
+                    for key, value in pairs(pay_award) do
+                        _G.table.insert(self.battle_info.pay_award, value)
+                    end
+                    self:RefreshRedPointTemple()
+
+                    if call ~= nil then
+                        call()
+                    end
+                end
+            end
+        )
+    end
+end
+
+---购买战令等级
+function ArenaStreetFightingManager:BattleBuyLevel(add_lv, call)
+    local Select_cards = {}
+    Select_cards.activity_id = self.activity.curActivityClass:GetActivityID()
+    Select_cards.add_lv = add_lv
+    require "ArenaStreetFightingNet":GetInstance():arcade_battle_buy_level(
+        Select_cards,
+        function(msg)
+            if msg.ack == 1 then
+                self.battle_info.lv = self.battle_info.lv + add_lv
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+             
+                self:RefreshRedPointTemple()
+
+                if call ~= nil then
+                    call()
+                end
+            end
+        end
+    )
+end
+
+---查询当前可以领的免费和充值奖励
+function ArenaStreetFightingManager:Award()
+    local free_award, pay_award = {}, {}
+    local lv = self:Islv()
+    for key, value in pairs(store_season_battle_cfg[self.id].content) do
+        local data = store_season_battlecon_cfg[value]
+        if lv >= data.level then
+            local is = self:IsBut()
+            if self:free_award(value) == 0 then
+                _G.table.insert(free_award, value)
+            end
+            if is == 1 then
+                if self:pay_award(value) == 0 then
+                    _G.table.insert(pay_award, value)
+                end
+            end
+        end
+    end
+
+    return free_award, pay_award
+end
+
+---购买豪华
+function ArenaStreetFightingManager:BuyUp(call)
+    local cfg = _G.ConfigManager.store_season_battle_cfg[self.id]
+    local activity_id = self.activity.curActivityClass:GetActivityID()
+    self.call = call
+    if cfg ~= nil then
+        require("MallManager"):GetInstance():BuyActiveGift(
+            cfg.price_id,
+            activity_id,
+            self.id
+        -- ,
+        -- function(a, b, c, d)
+        --     if call then
+        --         call()
+
+        --         require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        --             _G.ConfigManager.redpoint_cfg.FirstStore.id
+        --         )
+        --     end
+        -- end
+        )
+    end
+end
+
+--endregion
+
+---刷新红点
+function ArenaStreetFightingManager:RefreshRedPointTemple()
+    self.activity:RefreshRedPointTemple()
+end
+
+--当场景加载完毕
+function ArenaStreetFightingManager:OnWorldLoadOver()
+    _G.Events:GetInstance():RemoveListener(_G.eScene.EnterWorldOver, self.OnWorldLoadOver, self)
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.LoadingView.Name)
+    if ctrl then
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed, self)
+    else
+        self:CurrInfo()
+    end
+end
+
+function ArenaStreetFightingManager:OnUIClosed(name)
+    if name == _G.ConfigManager.ui_cfg.LoadingView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnUIClosed, self)
+        local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+        if ctrl then
+            self:CurrInfo()
+        else
+            _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnUIOpened, self)
+        end
+    end
+end
+
+function ArenaStreetFightingManager:OnUIOpened(name)
+    if name == _G.ConfigManager.ui_cfg.MainView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnUIOpened, self)
+        self:CurrInfo()
+    end
+end
+
+function ArenaStreetFightingManager:CurrInfo(call)
+    self.onLoadingWorld = false
+    local Select_cards = {}
+    Select_cards.activity_id = self.activity.curActivityClass:GetActivityID()
+
+    require "ArenaStreetFightingNet":GetInstance():Curr_info(
+        Select_cards,
+        function(msg)
+            if msg.ack == 1 then
+                -- body
+                --TODO:计算当前所在阶段
+                self:P2C_Friendinfo(msg)
+                local enter = false
+                if self.curEmbattleTimes > 0 then
+                    --TODO:判定当前是否还在布阵阶段
+                    local time = _G.TimeUtil.GetServerUnixTime()
+                    if time < msg.pub_info.end_time then --当前阶段
+                        enter = true
+                    else                                 --已经进入下一阶段
+                        self.curEmbattleTimes = self.curEmbattleTimes + 1
+                        if self.curEmbattleTimes <= 6 then
+                            enter = true
+                        end
+                    end
+                end
+                if enter then
+                    self:EnterEmbattle(
+                        nil,
+                        function()
+                            self.curEmbattleTimes = msg.pub_info.round
+                            self.enemyRoleInfo = msg.roles
+                            self.enemyRoleInfo.score = msg.pub_info
+
+                            self.curEmbattleEndTime = msg.pub_info.end_time
+                            self.curEmbattleTimes = self.curEmbattleTimes + 1
+                            local embattleItem = require("EmbattleController"):GetInstance():GetCurEmbattleItem()
+                            if embattleItem then
+                                local my_garry, tar_garry
+                                if self.matchPlayerData.pub_info.uid_a == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                                    my_garry = self.matchPlayerData.pub_info.array_a
+                                    tar_garry = self.matchPlayerData.pub_info.array_b
+                                else
+                                    my_garry = self.matchPlayerData.pub_info.array_b
+
+                                    tar_garry = self.matchPlayerData.pub_info.array_a
+                                end
+                                embattleItem:InitEnemyEmbattleData(tar_garry)
+                                embattleItem:InitEmbattleData(my_garry)
+                            end
+                            --self.curr_info = nil
+                        end
+                    )
+                else
+                    self.curr_info = nil
+                end
+            else
+                if msg.winner then
+                    if msg.winner == 1 then
+                        self:AddFail_times()
+                    else
+                        self:AddWin_times()
+                    end
+                end
+                if call ~= nil then
+                    call()
+                end
+            end
+        end
+    )
+end
+
+--region 对外接口
+---获取可选卡牌最大数
+function ArenaStreetFightingManager:GetCount()
+    return self.Count
+end
+
+---获取总胜利次数
+function ArenaStreetFightingManager:GetAll_win()
+    return self.all_win
+end
+
+---当前奖励以领取次数
+function ArenaStreetFightingManager:GetAward_list()
+    return self.award_list
+end
+
+---增加奖励以领取次数
+function ArenaStreetFightingManager:AddAward_list(num)
+    local coin = self.task_cfg[num].battle_exp
+    self:AddExp(coin)
+    _G.table.insert(self.award_list, num)
+    self:RefreshRedPointTemple()
+end
+
+---判断当前id是否已经领取奖励
+function ArenaStreetFightingManager:GetAward_listBool(num)
+    for key, value in pairs(self.award_list) do
+        if num == value then
+            return true
+        end
+    end
+    return false
+end
+
+---获取本轮胜利次数
+function ArenaStreetFightingManager:GetWin_times()
+    return self.win_times
+end
+
+---增加本轮胜利次数
+function ArenaStreetFightingManager:AddWin_times()
+    self:RefreshRedPointTemple()
+    self.win_times = self.win_times + 1
+    self.all_win = self.all_win + 1
+end
+
+---获取本轮失败次数
+function ArenaStreetFightingManager:GetFail_times()
+    return self.fail_times
+end
+
+---增加本轮失败次数
+function ArenaStreetFightingManager:AddFail_times()
+    self.fail_times = self.fail_times + 1
+end
+
+---获取本轮所选卡牌sid
+function ArenaStreetFightingManager:GetCard_list()
+    return self.card_list
+end
+
+---获取合击技
+function ArenaStreetFightingManager:GetCombine()
+    return self.combine
+end
+
+---获取随机生成卡牌sid
+function ArenaStreetFightingManager:GetRandom_cards()
+    return self.random_cards
+end
+
+---奖励领取
+function ArenaStreetFightingManager:GetAward(coin, call)
+    self.activity:GetActivityAward(
+        { coin },
+        function(msg)
+            local datas = {}
+            datas.award = {}
+            datas.award.item = {}
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            for key, value in pairs(self.task_cfg[coin].award) do
+                local item = {
+                    type = {
+                        value.sid,
+                        value.num
+                    }
+                }
+                _G.table.insert(datas.award.item, item)
+            end
+            -- for key, value in pairs(msg.Cfg.reward) do
+            local item1 = {
+                type = {
+                    107,
+                    self.task_cfg[coin].battle_exp
+                }
+            }
+            _G.table.insert(datas.award.item, item1)
+
+            --end
+            require "CommonTipManager".OpenCommonAwardView(datas)
+            --_G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            self:AddAward_list(coin)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---奖励领取
+function ArenaStreetFightingManager:GetAwardMax(call)
+    local coin = {}
+
+    for key, value in pairs(self.task_cfg) do
+        if self.all_win >= value.condition then
+            if not self:GetAward_listBool(value.sid) then
+                _G.table.insert(coin, value.sid)
+            end
+        end
+    end
+
+    self.activity:GetActivityAward(
+        coin,
+        function(msg)
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            -- _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            local datas = {}
+            datas.award = {}
+            datas.award.item = {}
+            -- _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+
+            --end
+
+            for key, value in pairs(coin) do
+                self:AddAward_list(value)
+                for _, v in pairs(self.task_cfg[value].award) do
+                    local item = {
+                        type = {
+                            v.sid,
+                            v.num
+                        }
+                    }
+                    _G.table.insert(datas.award.item, item)
+                end
+                -- for key, value in pairs(msg.Cfg.reward) do
+                local item1 = {
+                    type = {
+                        107,
+                        self.task_cfg[value].battle_exp
+                    }
+                }
+                _G.table.insert(datas.award.item, item1)
+            end
+            require "CommonTipManager".OpenCommonAwardView(datas)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---卡牌选择
+function ArenaStreetFightingManager:SelectCards(sid, call)
+    local Select_cards = {}
+    Select_cards.activity_id = self.activity.curActivityClass:GetActivityID()
+    Select_cards.sid = sid
+    require "ArenaStreetFightingNet":GetInstance():SelectCards(
+        Select_cards,
+        function(msg)
+            if msg.ack == 1 then
+                _G.table.insert(self.card_list, sid)
+                self.random_cards = msg.cards
+                self:SetCoins(sid)
+                if call ~= nil then
+                    call()
+                end
+            end
+        end
+    )
+end
+
+---数据重置
+function ArenaStreetFightingManager:DateClose()
+    --总胜利次数
+    --self.all_win = 0
+    --当前奖励以领取次数
+    --self.award_list = {}
+    --本轮胜利次数
+    self.win_times = 0
+    --本轮失败次数
+    self.fail_times = 0
+    --本轮所选卡牌sid
+    self.card_list = {}
+    --合击技
+    -- self.combine = {}
+    --随机生成卡牌sid
+    self.random_cards = {}
+    self.CardData = {}
+end
+
+function ArenaStreetFightingManager:IS_All_win()
+    -- if _G.table.count(self.award_list) > 5 then
+    --     return false
+    -- end
+    -- if self.all_win > _G.table.count(self.award_list) and self.all_win <= 5 then
+    --     return true
+    -- end
+    -- return false
+
+    for key, value in pairs(self.task_cfg) do
+        if self.all_win >= value.condition then
+            if not self:GetAward_listBool(value.sid) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function ArenaStreetFightingManager:IS_All_Task()
+    -- if _G.table.count(self.award_list) > 5 then
+    --     return false
+    -- end
+    -- if self.all_win > _G.table.count(self.award_list) and self.all_win <= 5 then
+    --     return true
+    -- end
+    -- return false
+
+    local free_award, pay_award = self:Award()
+    if _G.table.count(free_award) > 0 or _G.table.count(pay_award) > 0 then
+        return true
+    end
+    return false
+end
+
+--放弃当前轮次
+function ArenaStreetFightingManager:Arcade_give_up(call)
+    local Select_cards = { activity_id = self.activity.curActivityClass:GetActivityID() }
+
+    require "ArenaStreetFightingNet":GetInstance():Arcade_give_up(
+        Select_cards,
+        function(msg)
+            if msg.ack == 1 then
+                self:DateClose()
+                self.random_cards = msg.cards
+                if call ~= nil then
+                    call()
+                end
+            end
+        end
+    )
+end
+
+--开始匹配
+function ArenaStreetFightingManager:Arcade_queue_in(call)
+    local Select_cards = { activity_id = self.activity.curActivityClass:GetActivityID() }
+
+    require "ArenaStreetFightingNet":GetInstance():Arcade_queue_in(
+        Select_cards,
+        function(msg)
+            if call ~= nil then
+                call()
+            end
+        end
+    )
+end
+
+--停止匹配
+function ArenaStreetFightingManager:Arcade_queue_abort(call)
+    local Select_cards = { activity_id = self.activity.curActivityClass:GetActivityID() }
+
+    require "ArenaStreetFightingNet":GetInstance():Arcade_queue_abort(
+        Select_cards,
+        function(msg)
+            if call ~= nil then
+                call()
+            end
+        end
+    )
+end
+
+--endregion
+---@param CardData CardData
+function ArenaStreetFightingManager:SetCoins(id, CardData)
+    local data = require "CardCommentManager":GetInstance():CardData(id)
+    local att_equity_cfg = _G.ConfigManager.att_equity_cfg[3]
+    ---@type  prop.i_card 数据
+    local msg = {}
+    msg.sid = data.id
+    msg.lv = att_equity_cfg.level
+    msg.awaken = 0
+    msg.unlock = 1
+    msg.uid = data.id
+    msg.attr_add = {}
+
+    msg.soul_chain_lv = att_equity_cfg.card_exclusive_lv
+
+    msg.soul_state = 1
+    msg.star = att_equity_cfg.star
+
+    msg.open_inborn = {}
+    for i = 1, #data.talent do
+        local tt = data.talent[i]
+        for j = 1, #tt do
+            table.insert(msg.open_inborn, tt[j])
+        end
+    end
+    local artifactCfgs = _G.ConfigManager.artifact_cfg
+    local artifactSid = 0
+    for _, v in pairs(artifactCfgs) do
+        if v.Professional == data.Professional and v.Order == att_equity_cfg.artifact_grade then
+            artifactSid = v.id
+            break
+        end
+    end
+    msg.artifact = {
+        {
+            sid = artifactSid,
+            uid = artifactSid,
+            num = 1,
+            level = att_equity_cfg.artifact_level,
+            star = att_equity_cfg.artifact_star,
+            awaken = 0,
+        }
+    }
+    self:ChuShiHua(msg, CardData, data)
+end
+
+function ArenaStreetFightingManager:ChuShiHua(msg, cardData, data)
+    self.CardData[msg.sid] = cardData
+
+    ---@type CardData
+    self.CardData[msg.sid] = _G.CardData.New()
+    self.CardData[msg.sid]:ParseInitMsg(msg)
+    self.CardData[msg.sid]:UpdateAttr()
+    self.CardData[msg.sid].NowSumProp:OnInit(data.Elements)
+    local attributeManager = _G.AttributeClassManager:GetInstance()
+    local attr = attributeManager:GetAttribtueClass(data.Elements)
+    ---职业树属性
+
+    attributeManager:AddAttribute(attr, self.CardData[msg.sid].BaseProp)
+    --attributeManager:AddAttribute(attr, TreeAttr)
+    --魂链 是否激活
+    if data.Order >= 3 then
+        if self.CardData[msg.sid].soulLink_IsActivate == 1 then
+            --require("CardHunLianModel"):GetInstance():InitCfgData(self.sid)
+
+            local hunlian_exclusive =
+                require("CardHunLianManger"):GetInstance():CalAttributeBase(
+                    self.CardData[msg.sid].sid,
+                    self.CardData[msg.sid].soulLink_lv
+                )
+            attributeManager:AddAttribute(attr, hunlian_exclusive)
+            local hunlian_attribute =
+                require("CardHunLianManger"):GetInstance():CalAttribute(
+                    self.CardData[msg.sid].sid,
+                    self.CardData[msg.sid].soulLink_lv
+                )
+            if not _G.table.isEmptyOrNil(hunlian_attribute) then
+                attributeManager:AddAttribute(attr, hunlian_attribute)
+            end
+        end
+    end
+
+    --天赋
+    local talentAttr = self.CardData[msg.sid]:GetTalentAttribute()
+    attributeManager:AddAttribute(attr, talentAttr)
+
+    --attributeManager:AddAttribute(attr, self.CardData:GetDecorationProp())
+    attributeManager:AddAttribute(self.CardData[msg.sid].NowSumProp, attr)
+    attributeManager:PutAttribtueClass(attr)
+    self.CardData[msg.sid]:CalculateRole()
+    self.CardData[msg.sid]:CalculatePower()
+end
+
+--region 布阵界面
+---进入布阵
+---@param call function 打开布阵界面回调
+---@param fairCall function 创建布阵item对象回调
+function ArenaStreetFightingManager:EnterEmbattle(call, fairCall)
+    if not self:CheckIsOpen() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(730101)
+
+        return
+    end
+    local onOpenEmbattleView
+    onOpenEmbattleView = function(_, name)
+        if name == _G.ConfigManager.ui_cfg.EmbattleView.Name then
+            _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, onOpenEmbattleView, self)
+            if call then
+                call()
+            end
+        end
+    end
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, onOpenEmbattleView, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.ArenaEmbattleView.Name,
+        self.matchPlayerDatas,
+        fairCall
+    )
+end
+
+---检测活动是否开放
+function ArenaStreetFightingManager:CheckIsOpen()
+    return self.activity.curActivityClass:GetCurActivityState() == ActivitySynManager.State.Open
+end
+
+---注册聊天监听
+---@param call function 监听方法
+function ArenaStreetFightingManager:RegiestChatCall(call)
+    self.onChatCall = call
+end
+
+function ArenaStreetFightingManager:RegiestEmbattleUpdateCall(call)
+    self.onEmbattleCall = call
+end
+
+function ArenaStreetFightingManager:OnReConnectData()
+    if self.onReConnectCall then
+        for _, call in pairs(self.onReConnectCall) do
+            call(true)
+        end
+    end
+end
+
+---注册断线重连监听
+---@param viewName string 界面名称
+---@param call function 监听方法
+function ArenaStreetFightingManager:RegiestReConnectCall(viewName, call)
+    if not self.onReConnectCall then
+        self.onReConnectCall = { [viewName] = call }
+    else
+        self.onReConnectCall[viewName] = call
+    end
+end
+
+---反注册断线重连监听
+---@param viewName string 界面名称
+function ArenaStreetFightingManager:UnRegiestReConnectCall(viewName)
+    self.onReConnectCall[viewName] = nil
+end
+
+---获取当前的轮次
+---@return number 当前轮次
+function ArenaStreetFightingManager:GetCurEmbattleTimes()
+    return self.curEmbattleTimes
+end
+
+function ArenaStreetFightingManager:OnChatCall(msg)
+    if self.onChatCall then
+        self.onChatCall(msg.type, msg.sid)
+    end
+end
+
+---匹配成功推送
+function ArenaStreetFightingManager:P2C_Friendinfo(data)
+    self.curEmbattleTimes = data.pub_info.round
+    self.matchPlayerData = data
+    self.matchPlayerDatas = data
+    if self.enemyRoleInfo and #self.enemyRoleInfo > 0 then
+        self.enemyRoleInfo = data.roles
+    end
+    self.enemyRoleInfo.score = data.pub_info
+    self.curEmbattleEndTime = data.pub_info.end_time
+    local view = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.ArenaBrawlMateView.Name)
+
+    if view ~= nil then
+        view.View.Arcade_queue = 2
+        view.View:InitView()
+        view.View:FuWuQiGuanBi()
+    end
+end
+
+function ArenaStreetFightingManager:OnMatchSuccessCall(msg)
+    self.curEmbattleTimes = msg.pub_info.round
+    self.matchPlayerData = msg
+    self.matchPlayerDatas = msg
+
+    if msg.roles then
+        self.enemyRoleInfo = msg.roles
+    end
+    self.enemyRoleInfo.score = msg.pub_info
+    self.curEmbattleEndTime = msg.pub_info.end_time
+
+    -- self.curEmbattleTimes = self.curEmbattleTimes + 1
+    local embattleItem = require("EmbattleController"):GetInstance():GetCurEmbattleItem()
+    if embattleItem then
+        local my_garry, tar_garry
+        if self.matchPlayerData.pub_info.uid_a == _G.PlayerModel:GetInstance():GetPlayerUid() then
+            my_garry = self.matchPlayerData.pub_info.array_a
+            tar_garry = self.matchPlayerData.pub_info.array_b
+        else
+            my_garry = self.matchPlayerData.pub_info.array_b
+
+            tar_garry = self.matchPlayerData.pub_info.array_a
+        end
+        embattleItem:InitEnemyEmbattleData(tar_garry)
+        embattleItem:InitEmbattleData(my_garry)
+    else
+        if not self.onLoadingWorld then
+            self:EnterEmbattle(
+                function()
+                    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArenaMainView.Name)
+                    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArenaBrawlMateView.Name)
+                end
+            )
+            _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.ArenaBrawlMateView.Name)
+        end
+    end
+    if self.onEmbattleCall then
+        self.onEmbattleCall()
+    end
+end
+
+---确认布阵
+---@param 变量名 变量类型 中文描述
+function ArenaStreetFightingManager:SureEmbattleData(sits, call)
+    local Select_cards = { activity_id = self.activity.curActivityClass:GetActivityID(), sits = sits }
+    --TODO:处理布阵数据，发送给服务器
+    require "ArenaStreetFightingNet":GetInstance():UpdateEmbattleFair(Select_cards, call)
+end
+
+---发送聊天消息
+---@param type number 消息类型
+---@param id number 消息内容ID  文本为 多语言ID 表情为表情ID
+function ArenaStreetFightingManager:SendChatMsg(types, id)
+    local Select_cards = { activity_id = self.activity.curActivityClass:GetActivityID(), type = types, sid = id }
+    require "ArenaStreetFightingNet":GetInstance():SendChatFair(Select_cards)
+end
+
+function ArenaStreetFightingManager:GetCurEmbattleEndTime()
+    return self.curEmbattleEndTime
+end
+
+---判断当前是否是可备战轮次
+function ArenaStreetFightingManager:BoolCurEmb()
+    local CurEmbattle = false
+    if self.matchPlayerData.pub_info.uid_a == _G.PlayerModel:GetInstance():GetPlayerUid() then
+        CurEmbattle = true
+    end
+    if CurEmbattle then
+        if
+            self.matchPlayerData.pub_info.round == 0 or self.matchPlayerData.pub_info.round == 2 or
+            self.matchPlayerData.pub_info.round == 4 or
+            self.matchPlayerData.pub_info.round == 6 or
+            self.matchPlayerData.pub_info.round == 8
+        then
+            CurEmbattle = false
+        end
+    else
+        if
+            self.matchPlayerData.pub_info.round == 0 or self.matchPlayerData.pub_info.round == 1 or
+            self.matchPlayerData.pub_info.round == 3 or
+            self.matchPlayerData.pub_info.round == 5 or
+            self.matchPlayerData.pub_info.round == 7
+        then
+            CurEmbattle = false
+        else
+            CurEmbattle = true
+        end
+    end
+    return CurEmbattle
+end
+
+---判断当前是否先手和可备战人数
+function ArenaStreetFightingManager:UnCheck()
+    local NumList = _G.ConfigManager.discrete_cfg[107908]
+    local CurEmbattle = 2
+    if self.matchPlayerData.pub_info.uid_a == _G.PlayerModel:GetInstance():GetPlayerUid() then
+        CurEmbattle = 1
+    else
+    end
+    local OKBool = false
+    local oleNume, MaxNum, jian = 0, 0, 0
+    if CurEmbattle == 1 then
+        jian = 1
+    else
+        jian = 0
+    end
+    for key, value in pairs(NumList[CurEmbattle]) do
+        local num = key * 2 - jian
+        if self.curEmbattleTimes >= num then
+            oleNume = value
+            MaxNum = MaxNum + value
+        end
+        if self.curEmbattleTimes == num then
+            OKBool = true
+        end
+    end
+    return OKBool, oleNume, MaxNum
+end
+
+---开始战斗
+---@param callback function 进入战斗返回
+function ArenaStreetFightingManager:StartBattle(callback)
+    -- if not self:CheckIsOpen() then
+    --     _G.PopWindowManager:GetInstance():ShowAllTips(730101)
+    --     return
+    -- end
+    local BattleManagerIns = _G.BattleManager:GetInstance()
+    local Select_cards = { activity_id = self.activity.curActivityClass:GetActivityID() }
+
+    local port =
+        require "ArenaStreetFightingNet":GetInstance():FightFair(
+            Select_cards,
+            function(msg)
+                if msg.ack == 1 then
+                    if callback then
+                        callback(true, msg)
+                    end
+                    if msg then
+                        msg.fight_arg.winner = msg.winner
+
+                        if msg.winner == 1 then
+                            self:AddFail_times()
+                        else
+                            self:AddWin_times()
+                        end
+                    end
+                    BattleManagerIns:EnterFight(
+                        _G.BattleControllerType.BattleControllerArenaEmbattle,
+                        msg,
+                        self.matchPlayerData
+                    )
+                else
+                    _G.BaseBattleManager:GetInstance():ClearView(true)
+                    _G.WorldManager:GetInstance():SetCurrentWorldVisible(true, true)
+                    _G.WorldManager:GetInstance():GetCurWorld():ChangeCameraBattle()
+                    _G.WorldManager:GetInstance():DespawnRoleParent()
+
+                    local UIManagerIns = _G.UIManager:GetInstance()
+                    local ui_cfg = _G.ConfigManager.ui_cfg
+                    UIManagerIns:CloseWindow(ui_cfg.ArenaEmbattleView.Name)
+                    UIManagerIns:OpenWindow(ui_cfg.MainView.Name)
+                    if callback then
+                        callback(false)
+                    end
+                end
+            end
+        )
+    BattleManagerIns:AddLuaNetEvent(port)
+end
+
+--是否处于开放时间
+function ArenaStreetFightingManager:IsTime()
+    local endTime = 0
+    local countdown = 0
+    if self.activity ~= nil and self.activity.info ~= nil and self.activity.info.end_time ~= nil then
+        endTime = self.activity.info.end_time
+        countdown = self.activity.info.end_time - _G.TimeUtil:GetServerUnixTime()
+    end
+
+    if countdown < 0 then
+        countdown = 0
+    end
+    --local countdown = self.activity.curActivityClass:GetActivityDeadLineByCondition(ActivitySynManager.State.Close)
+    return endTime, countdown
+end
+
+---获取活动开始时间
+function ArenaStreetFightingManager:GetOpenTime()
+    return self.activity.info.open_time
+end
+
+---清理战报
+function ArenaStreetFightingManager:ClearReport()
+    self.reportList = nil
+end
+
+---返回显示时间，最小值为一小时
+function ArenaStreetFightingManager:TranslateSecondForStrMiaoHui(Time)
+    local timeStr
+    local t = _G.TimeUtil.TranslateSecond(Time)
+    if t.day > 0 then
+        timeStr = _G.GetLangPackValue(90022100001, t.day, t.hour)
+    elseif t.hour > 0 then
+        timeStr = _G.GetLangPackValue(90022100001, 0, t.hour)
+    else
+        timeStr = _G.GetLangPackValue(90022100001, 0, 1)
+    end
+    return timeStr
+end
+
+--endregion
+return ArenaStreetFightingManager

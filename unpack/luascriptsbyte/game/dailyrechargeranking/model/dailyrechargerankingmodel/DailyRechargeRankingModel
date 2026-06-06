@@ -1,0 +1,258 @@
+-----------------------------------------------------------------------
+-- E:01.zhj.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.DailyRechargeRanking.Model.DailyRechargeRankingModel
+--	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2025/03/05
+-- Description 管理器
+-----------------------------------------------------------------------
+local DailyRechargeRankingNet = require "DailyRechargeRankingNet"
+
+local base = require("ActivitySynTypeBase")
+local ActivitySynManager = require("ActivitySynManager")
+local PlayerPrefsManager = _G.PlayerPrefsManager
+---@class DailyRechargeRankingModel : ActivitySynTypeBase 充值排行
+local DailyRechargeRankingModel = _G.BaseClass("DailyRechargeRankingModel", base)
+
+---入口构造函数
+function DailyRechargeRankingModel:__init(activity)
+    self.ActivitySid = activity.activityID
+    --活动状态改变
+    self.curActivityClass:AddStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+    self.curActivityState = false
+    base.__init(self, activity)
+    -- 红点初始不显示
+    self.showRedDot = false
+    -- 监听充值事件
+    _G.Events:GetInstance():AddListener(_G.eRechargeEvent.TotalCash, self.OnRechargeTotalCash, self)
+end
+
+---初始化时解析数据
+function DailyRechargeRankingModel:OnHandleGMData(info)
+    self:SetSelfData(info)
+    base.ParseData(self)
+end
+
+function DailyRechargeRankingModel:GetInfo(call)
+    self.infoCall = call
+    require("ActivitySynNet"):GetInstance():InitActivity(
+        self.curActivityClass:GetActivityID(),
+        _G.handler(self, self.UpdateInitData)
+    )
+end
+
+function DailyRechargeRankingModel:UpdateInitData(msg)
+    if msg.ack == 1 then
+        self:OnHandleGMData(msg.activity[1].self_info)
+        if self.infoCall then
+            self.infoCall()
+        end
+    end
+end
+
+---解析数据,更新/初始化数据/重连调用
+function DailyRechargeRankingModel:InitFunction()
+    if not self.curActivityState then
+        return
+    end
+
+    self:RefreshRedPointExchange()
+end
+
+---活动本身数据处理
+---@param info activity.i_activity_self_info
+function DailyRechargeRankingModel:SetSelfData(info)
+    if info.store_day == nil or info.store_day.rank_cfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.Log("配置信息为空", "每日充值排行")
+        end
+        return
+    end
+
+    ---排行奖励信息
+    self.rank_list = {}
+    for _, v in ipairs(info.store_day.rank_cfg) do
+        -- ZHJH-11051 GM活动的多语言调整需求
+        local cfg = _G.ConfigManager.store_gear_cfg[v.value_rank]
+        v.value_rank = cfg and cfg.price or v.value_rank
+
+        local new_entry = v
+        --LogError(v.value_rank) 
+        --LogError(_G.GameUtil.RatioControlNumber(v.value_rank))
+        --local formattedNumber = string.format("%.2f", v.value_rank / 100)
+        new_entry.value_rank = _G.GameUtil.RatioControlNumber(v.value_rank)
+       
+        table.insert(self.rank_list, new_entry)
+    end
+    --自己匿名情况
+    self.anonymous = info.store_day.anonymous
+    self.myNum = info.store_day.cash_num or 0
+    ---红点
+    self:CheckRed()
+    self:RefreshServerAnonymous()
+end
+
+---状态改变时
+function DailyRechargeRankingModel:OnActivityStateChanged(state)
+    self:RefreshRedPointExchange()
+end
+
+function DailyRechargeRankingModel:RefreshRedPointExchange()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+---View从Net获取排行榜数据
+function DailyRechargeRankingModel:AccessAfkList(call)
+    DailyRechargeRankingNet:GetInstance():AccessAfk(self.ActivitySid, call)
+end
+
+---获取玩家在排行榜上的名次
+function DailyRechargeRankingModel:GetPlayerRank(call)
+    DailyRechargeRankingNet:GetInstance():GetPlayerRank(self.ActivitySid, call)
+end
+
+---获取排行奖励信息
+function DailyRechargeRankingModel:GetGiftsList()
+    return self.rank_list
+end
+
+---获取玩家自己是否匿名  是(1|0)否
+function DailyRechargeRankingModel:GetPlayerAnonymous()
+    return self.anonymous
+end
+
+---获取玩家自己充值金额
+function DailyRechargeRankingModel:GetPlayerCash_num()
+    return self.myNum
+end
+
+---设置是否玩家自己匿名 是(1|0)否
+function DailyRechargeRankingModel:SaveAnonymousCondition(call)
+    require("DailyRechargeRankingNet"):GetInstance():SetPlayerAnonymous(
+        self.ActivitySid,
+        function()
+            self.anonymous = 1 - self.anonymous
+            if call then
+                call()
+            end
+            self:CachingAnonymous()
+        end
+    )
+end
+
+function DailyRechargeRankingModel:CachingAnonymous()
+    _G.PlayerPrefsManager.SetInt("AnonymousState", self.anonymous)
+end
+
+function DailyRechargeRankingModel:CachingActiveID()
+    _G.PlayerPrefsManager.SetString("ActiveIDTopRanking", tostring(self.ActivitySid))
+end
+
+function DailyRechargeRankingModel:GetCachingActiveID()
+    return _G.PlayerPrefsManager.GetString("ActiveIDTopRanking")
+end
+
+function DailyRechargeRankingModel:GetCachingAnonymous()
+    return _G.PlayerPrefsManager.GetInt("AnonymousState", self.anonymous)
+end
+
+function DailyRechargeRankingModel:RefreshServerAnonymous()
+    local CachingActiveID = self:GetCachingActiveID()
+    local isRefresh = false
+    if CachingActiveID ~= tostring(self.ActivitySid) then
+        isRefresh = true
+        self:CachingActiveID()
+    end
+    if isRefresh and self:GetCachingAnonymous() ~= self.anonymous then
+        self:SaveAnonymousCondition()
+    end
+end
+
+---获取活动时间倒计时
+function DailyRechargeRankingModel:GetEndTime()
+    return self.curActivityClass.cfg.time.start_time + self.curActivityClass.cfg.time.run_time
+end
+
+--region ------------------------------------------------ 红点 ------------------------------------------------
+
+--- 初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function DailyRechargeRankingModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckRedPointStatus }
+    self.redpointTree = { false }
+end
+
+--- 六点（每轮结束）刷新红点可刷新的本地值
+function DailyRechargeRankingModel:OnSixClockUpdate(endcall)
+    base.OnSixClockUpdate(self, endcall)
+    local playerUID = tostring(_G.PlayerModel:GetInstance().role_uid)
+    PlayerPrefsManager.SetInt(playerUID .. "DailyRechargeHasReadRedDot", 0)
+end
+
+--- 监听充值事件的回调
+function DailyRechargeRankingModel:OnRechargeTotalCash()
+    self:GetInfo(_G.handler(self, self.CheckRed))
+end
+
+function DailyRechargeRankingModel:CheckRed()
+    local PlayerMoney = math.floor(self.myNum / 100)
+    local playerUID = tostring(_G.PlayerModel:GetInstance().role_uid)
+
+    -- 玩家是否已经点击进入页面过（读取后本轮不再激活红点）
+    local hasReadRedDot = PlayerPrefsManager.GetInt(playerUID .. "DailyRechargeHasReadRedDot", 0) == 1
+
+    if PlayerMoney >= self.rank_list[#self.rank_list].value_rank and not hasReadRedDot then
+        self.showRedDot = true
+    else
+        self.showRedDot = false
+    end
+
+    -- 刷新红点状态
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+--- 红点检测函数，根据内部状态返回红点数量（0 或 1）
+function DailyRechargeRankingModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+--- 具体的红点检测函数
+function DailyRechargeRankingModel:CheckRedPointStatus()
+    if self.curActivityClass:GetCurActivityState() ~= ActivitySynManager.State.Open then
+        return 0
+    end
+    if self.showRedDot then
+        return 1
+    else
+        return 0
+    end
+end
+
+--- 当玩家点击进入活动页面时调用该方法
+function DailyRechargeRankingModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DailyRechargeRankingView.Name, self.curActivityClass)
+    -- 标记红点已读
+    self.showRedDot = false
+    local playerUID = tostring(_G.PlayerModel:GetInstance().role_uid)
+    local redBol = require "RedPointManager":GetInstance():GetNodeNum(self:GetRedpointIDByIndex(1))
+    if redBol > 0 then
+        PlayerPrefsManager.SetInt(playerUID .. "DailyRechargeHasReadRedDot", 1)
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+
+    base.OnEnterActivity(self)
+end
+
+--endregion ------------------------------------------------ 红点 ------------------------------------------------
+
+-- 清理资源
+function DailyRechargeRankingModel:Dispose()
+    if self.curActivityClass then
+        self.curActivityClass:RemoveStateChanged(_G.handler(self, self.OnActivityStateChanged), self)
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eRechargeEvent.TotalCash, self.OnRechargeTotalCash, self)
+    base.Dispose(self)
+end
+
+return DailyRechargeRankingModel

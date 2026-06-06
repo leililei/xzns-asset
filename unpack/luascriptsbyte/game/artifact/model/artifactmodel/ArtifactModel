@@ -1,0 +1,797 @@
+-------------------------------------------------------------------------
+-- D:.ClientTrunk.Assets.Resources.LuaScripts.Game.Artifact.Model.ArtifactModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2023/11/09
+-- Description 神器管理类
+-----------------------------------------------------------------------
+local ArtifactNet = require("ArtifactNet")
+local ArtifactData = require("ArtifactData")
+local RedPointManager = require("RedPointManager")
+
+---数值大小比较
+---@param x number
+---@param y number
+---@return number   -1: x小于y, 0: x等于y, 1:x大于y
+local function compareNumber(x, y)
+    return x == y and 0 or x < y and -1 or 1
+end
+
+---@class ArtifactModel : Singleton	中文描述
+local ArtifactModel = _G.BaseClass("ArtifactModel", _G.Singleton)
+
+local LvUpMaterial = {
+    202090100,
+    202090200
+}
+
+----@return ArtifactModel ArtifactModel
+--function ArtifactModel:GetInstance()
+--    return self.super.GetInstance(self)
+--end
+
+---创建对象时,入口构造函数
+function ArtifactModel:__init()
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+--region ------------- 养成相关网络请求 -------------
+
+---神器穿戴
+---@param cardUid number 卡牌Uid
+---@param artUid number 神器Uid
+function ArtifactModel:PutOn(cardUid, artUid, callback)
+    local pbData = { card_uid = cardUid, artifact_uid = artUid }
+    ArtifactNet:GetInstance():PutOn(
+        pbData,
+        function(msg)
+            --TODO
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---神器脱下
+---@param cardUid number 卡牌Uid
+function ArtifactModel:TakeOff(cardUid, callback)
+    local pbData = { card_uids = { cardUid } }
+    ArtifactNet:GetInstance():TakeOffArtifact(
+        pbData,
+        function(msg)
+            --TODO
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---神器一键脱下
+---@param cardUidList number[] 卡牌Uid数组
+function ArtifactModel:OneKeyTakeOff(cardUidList, callback)
+    local pbData = { card_uids = cardUidList }
+    ArtifactNet:GetInstance():TakeOffArtifact(
+        pbData,
+        function(msg)
+            --TODO
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---神器升级
+---@param cardUid number 穿戴的卡牌Uid
+---@param artifactUid number 神器uid
+---@param level number 提升星级
+---@param isUnstack boolean 是否独立（不堆叠）
+function ArtifactModel:LevelUp(artifactUid, cardUid, level, isUnstack, callback)
+    if not isUnstack and not _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Artifact, 1) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(270801)
+        return
+    end
+    local pbData = { card_uid = cardUid, up_level = level, artifact_uid = cardUid == 0 and artifactUid or 0 }
+    ArtifactNet:GetInstance():LevelUp(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            ---@type ArtifactData
+            local data = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Artifact, artifactUid)
+            if isUnstack then
+                --TODO
+                --if data.cfg.Order == 3 then
+                require "PopUpGiftBagModel":GetInstance():CheckArtifactsLevel(data:GetLevel(), data:GetLevel() + level)
+                --end
+
+                data:UpLevel(data:GetLevel() + level)
+                if data.cardUid ~= 0 then
+                    ---@type CardData
+                    local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, data.cardUid)
+                    if not _G.table.isEmptyOrNil(cardData) then
+                        cardData:CalcNowSumProp()
+                    end
+                end
+            else
+                local newMsg = data.GetMsg(data)
+                newMsg.uid = msg.uid
+                local newData = _G.ArtifactData.New()
+                newData:Parse(newMsg)
+                newData:UpLevel(newData:GetLevel() + level)
+                _G.StorageManager:GetInstance():AddItemByArtifactData(newData)
+                _G.StorageManager:GetInstance():ConsumeItem(data.sid, data.uid, 1)
+            end
+            _G.Events:GetInstance():Broadcast(_G.ArtifactShow.ArtifactLevel)
+            if callback then
+                callback(msg)
+            end
+
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.ArtifactUpgrade.id)
+        end
+    )
+end
+
+
+---获取可用于升星的材料
+---@param data ArtifactData 升星神器data
+---@param list table[] 已选择饰品
+---@param needCount number 需要的材料数量
+function ArtifactModel:GetStarUpMaterial(data, list, needCount)
+    local ArtifactDic = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Artifact)
+    local ArtifactList = {}
+    local SelectList = {}
+    local isNotWear = data.cardUid == 0
+    local isUnstack = data.uid ~= data.sid
+    local excludeSelf = false
+    for _, v in pairs(ArtifactDic) do
+        if v.cfg.id == data.cfg.id then
+            if v.star == 0 then
+                if (v.cardUid ~= 0 and v.cardUid == data.cardUid) or
+                        (isNotWear and not excludeSelf and isUnstack and data.uid == v.uid) or
+                        (isNotWear and not excludeSelf and not isUnstack and v.uid == v.sid)
+                then
+                    if isNotWear then
+                        excludeSelf = true
+                        if not isUnstack then
+                            for i = 1, v.count - 1 do
+                                _G.table.insert(ArtifactList, v)
+                            end
+                        end
+                    end
+                else
+                    for i = 1, v.count do
+                        _G.table.insert(ArtifactList, v)
+                    end
+                end
+            end
+        end
+    end
+    _G.SortList(
+            ArtifactList,
+            function(a)
+                return -a.cardUid, a.star, a.lv
+            end
+    )
+    for k, v in pairs(ArtifactList) do
+        if v.cardUid == 0 then
+            if #SelectList < needCount then
+                _G.table.insert(SelectList, { k, ArtifactList[k].uid, ArtifactList[k] })
+            end
+        end
+    end
+    return {
+        material = ArtifactList,
+        select = SelectList
+    }
+end
+
+---神器升星
+---@param cardUid number 穿戴的卡牌Uid
+---@param items artifact.i_cs_artifact[] 消耗的神器列表
+---@param isUnstack boolean 是否独立（不堆叠）
+function ArtifactModel:StarUp(artifactUid, cardUid, items, isUnstack, callback)
+    if not isUnstack and not _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Artifact, 1) then
+        _G.PopWindowManager:GetInstance():ShowAllTips(270801)
+        return
+    end
+    local pbData = { card_uid = cardUid, items = items, artifact_uid = cardUid == 0 and artifactUid or 0 }
+    ArtifactNet:GetInstance():StarUp(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            ---@type ArtifactData
+            local data = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Artifact, artifactUid)
+            if isUnstack then
+                data:UpStar()
+                if data.cardUid ~= 0 then
+                    ---@type CardData
+                    local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, data.cardUid)
+                    if not _G.table.isEmptyOrNil(cardData) then
+                        cardData:CalcNowSumProp()
+                    end
+                end
+                require "ArtifactIllustrationModel":GetInstance():ChangeMaxStar(data.sid, data:GetStar())
+            else
+                local newMsg = data.GetMsg(data)
+                newMsg.uid = msg.uid
+                local newData = _G.ArtifactData.New()
+                newData:Parse(newMsg)
+                newData:UpStar()
+                _G.StorageManager:GetInstance():AddItemByArtifactData(newData)
+                _G.StorageManager:GetInstance():ConsumeItem(data.sid, data.uid, 1)
+                require "ArtifactIllustrationModel":GetInstance():ChangeMaxStar(newData.sid, newData:GetStar())
+            end
+            if msg.award then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            end
+            _G.Events:GetInstance():Broadcast(_G.ArtifactShow.ArtifactStar)
+            if callback then
+                callback(msg)
+            end
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.ArtifactUpgrade.id)
+        end
+    )
+end
+
+---神器觉醒
+---@param artifactUid number 神器uid
+---@param cardUid number 穿戴的卡牌Uid
+---@param items artifact.i_cs_artifact[] 消耗的神器列表
+function ArtifactModel:Awaken(artifactUid, cardUid, items, callback)
+    local pbData = { card_uid = cardUid, items = items, artifact_uid = artifactUid}
+    ArtifactNet:GetInstance():Awaken(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local data = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Artifact, artifactUid)
+            data:Awaken()
+            if data.cardUid ~= 0 then
+                ---@type CardData
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, data.cardUid)
+                if not _G.table.isEmptyOrNil(cardData) then
+                    cardData:CalcNowSumProp()
+                end
+            end
+            if msg.award then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            end
+            _G.Events:GetInstance():Broadcast(_G.ArtifactShow.ArtifactAwaken)
+            if callback then
+                callback(msg)
+            end
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.ArtifactUpgrade.id)
+        end
+    )
+end
+
+---神器设置觉醒技能
+---@param cardUid number 穿戴的卡牌Uid
+---@param artifactUid number 神器uid
+---@param public.i_kv_64 a_i = 3; //属性选择k:等级，V:技能ID
+function ArtifactModel:SetAwakenSkill(artifactUid, cardUid, a_i, k, v, callback)
+    local pbData = { card_uid = cardUid, a_i = a_i, artifact_uid = artifactUid}
+    ArtifactNet:GetInstance():SetAwakenSkill(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            local data = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Artifact, artifactUid)
+            data:SetAwakeSkill(k,v)
+            if data.cardUid ~= 0 then
+                ---@type CardData
+                local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, data.cardUid)
+                if not _G.table.isEmptyOrNil(cardData) then
+                    cardData:CalcNowSumProp()
+                end
+            end
+            
+            _G.Events:GetInstance():Broadcast(_G.ArtifactShow.ArtifactSetSkill, k, v)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---神器分解
+---@param items artifact.i_cs_artifact[] 要分解的神器列表
+function ArtifactModel:Decompose(items, callback)
+    local pbData = { artifact_list = items }
+    ArtifactNet:GetInstance():Decompose(
+        pbData,
+        function(msg)
+            --TODO
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            --奖励
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---重置神器
+function ArtifactModel:ResetArtifact(artifactData, callback)
+    local pbData = { artifact_uid = artifactData.uid }
+    ArtifactNet:GetInstance():ResetArtifact(
+        pbData,
+        function (msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            local StorageManager = _G.StorageManager:GetInstance()
+            local costNum = _G.ConfigManager.discrete_cfg[101208][1][1]
+            StorageManager:ConsumeItem(_G.ResPropID.Diamond, 0, costNum)
+            artifactData:Reset()
+            StorageManager:ReceiveAwardData(msg)
+
+            ---神器>道具>货币 品质>ID
+            if msg.award.item then
+                _G.SortList(
+                    msg.award.item,
+                    function(a)
+                        local sid = a.type[1]
+                        local aStorageType = StorageManager:CheckSidType(sid)
+                        local type = 0
+                        if aStorageType == _G.StorageType.Artifact then
+                            type = 2
+                        elseif aStorageType == _G.StorageType.Prop then
+                            type = 1
+                        end
+
+                        return type, StorageManager:GetItemQuality(sid), sid
+                    end
+                )
+            end
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.CommonAwardView.Name,
+                {award = msg.award},
+                nil,
+                true,
+                nil,
+                nil,
+                nil,
+                nil,
+                true
+            )
+
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+--endregion ----------- 养成相关网络请求 end -----------
+
+--region ------------- 仓库处理 -------------
+
+---穿上神器
+---@param cardData CardData
+---@param artifactData ArtifactData
+function ArtifactModel:PutOnArtifact(cardData, artifactData, call)
+    if artifactData.type == _G.ArtifactDataType.Normal then
+        self:PutOn(
+            cardData.uid,
+            artifactData.uid,
+            function(msg)
+                if msg.ack == 1 then
+                    local StorageManager = _G.StorageManager:GetInstance()
+                    if not _G.table.isEmptyOrNil(cardData.ArtifactBar) then
+                        StorageManager:TakeOffArtifact(cardData.ArtifactBar)
+                    end
+                    if artifactData.uid == artifactData.sid then
+                        local newMsg = artifactData.GetMsg(artifactData)
+                        newMsg.uid = msg.uid
+                        newMsg.cardUid = cardData.uid
+                        cardData:SaveArtifactData({ artifact = { newMsg } })
+                        StorageManager:PutOnArtifact(cardData.ArtifactBar)
+                        StorageManager:ConsumeItem(artifactData.sid, artifactData.uid, 1)
+                    else
+                        artifactData:BindCard(cardData.uid)
+                        cardData:PutOnArtifact(artifactData)
+                        StorageManager:PutOnArtifact(artifactData)
+                    end
+                    cardData:CalcNowSumProp()
+                    if call then
+                        call()
+                    end
+                    -- local key = "ArtifactUpgradeRedPoint_" .. cardData.uid
+                    -- if not _G.PlayerPrefsManager.HasKey(key) then
+                    --     _G.PlayerPrefsManager.SetInt(key, 1)
+                    -- end
+                    RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifact.id)
+                    RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+                    RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.ArtifactUpgrade.id)
+                end
+            end
+        )
+    else
+        require("ArtifactDemoModel"):GetInstance():PutOnDemoArtifact(cardData, artifactData, call)
+    end
+end
+
+---脱下神器
+---@param cardData CardData
+function ArtifactModel:TakeOffArtifact(cardData, call)
+    local artifactData = cardData.ArtifactBar
+    if artifactData.type == _G.ArtifactDataType.Normal then
+        if _G.table.isEmptyOrNil(artifactData) then
+            if call then
+                call()
+            end
+            return
+        end
+        self:TakeOff(
+            cardData.uid,
+            function(msg)
+                if msg.ack == 1 then
+                    _G.StorageManager:GetInstance():TakeOffArtifact(artifactData)
+                    cardData.ArtifactBar = {}
+                    cardData:CalcNowSumProp()
+                    if call then
+                        call()
+                    end
+                    -- local key = "ArtifactUpgradeRedPoint_" .. cardData.uid
+                    -- if _G.PlayerPrefsManager.HasKey(key) then
+                    --     _G.PlayerPrefsManager.DeleteKey(key)
+                    -- end
+                    RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifact.id)
+                    RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+                end
+            end
+        )
+    else
+        require("ArtifactDemoModel"):GetInstance():TakeOffDemoArtifact(cardData, call)
+    end
+end
+
+---一键脱下指定卡牌的神器
+---@param cardDataList CardData[]
+function ArtifactModel:OneKeyTakeOffArtifact(cardDataList, call)
+    local cardUidList = {}
+    for _, v in pairs(cardDataList) do
+        local artifactData = v.ArtifactBar
+        if not _G.table.isEmptyOrNil(artifactData) then
+            if artifactData.type == _G.ArtifactDataType.Normal then
+                _G.table.insert(cardUidList, v.uid)
+            end
+        end
+    end
+    self:OneKeyTakeOff(cardUidList, function(msg)
+        if msg.ack == 1 then
+            for _, v in pairs(cardDataList) do
+                local artifactData = v.ArtifactBar
+                if not _G.table.isEmptyOrNil(artifactData) then
+                    if artifactData.type == _G.ArtifactDataType.Normal then
+                        _G.StorageManager:GetInstance():TakeOffArtifact(artifactData)
+                        v.ArtifactBar = {}
+                        v:CalcNowSumProp()
+                        RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifact.id)
+                        RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+                    end
+                end
+            end
+            if call then
+                call()
+            end
+        end
+    end)
+end
+
+---批量脱下
+---@param uidList number[] uid列表
+function ArtifactModel:MultiTakeOffArtifact(uidList, index, call)
+    index = index or #uidList
+    if index <= 0 then
+        if call then
+            call()
+        end
+        return
+    end
+    local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uidList[index])
+    if cardData ~= nil and not _G.table.isEmptyOrNil(cardData.ArtifactBar) then
+        self:TakeOffArtifact(cardData, _G.handlerbind(self, self.MultiTakeOffArtifact, uidList, index - 1, call))
+    else
+        self:MultiTakeOffArtifact(uidList, index - 1, call) --递归脱下
+    end
+end
+
+---检测背包是否有位置并弹tips
+---@param CardDataList CardData[]
+---@param showTip boolean 是否弹tips
+function ArtifactModel:CheckEnoughStorageToTakeOffArtifact(CardDataList, showTip)
+    local num = 0
+    for _, v in pairs(CardDataList) do
+        if not _G.table.isEmptyOrNil(v.ArtifactBar) then ---身上没穿，所以等价于背包空间足够
+            num = num + 1
+        end
+    end
+    if num == 0 then
+        return true
+    elseif num > 0 and _G.StorageManager:GetInstance():CheckSize(_G.StorageID.Artifact, num) then
+        return true
+    else
+        if showTip then
+            _G.PopWindowManager:GetInstance():ShowAllTips(270801)
+        end
+        return false
+    end
+end
+
+---获取穿戴指定sid神器的角色中星级最高的神器
+---@param artifactSid number 神器sid
+---@return ArtifactData 返回穿戴的最高星级的神器数据没有就为nil
+function ArtifactModel:GetMaxStarArtifactBySid(artifactSid)
+    local list = _G.StorageManager:GetInstance():GetDatasBySid(_G.StorageID.Artifact, artifactSid)
+    if _G.TableIsEmpty(list) then
+        return nil
+    end
+    local outArtifact = nil
+
+    local GetCardSidByUid = function(cardUid)
+        if not cardUid  or cardUid == 0 then
+            return 0
+        end
+        local cardData = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, cardUid)
+        if cardData and cardData.sid then
+            return cardData.sid
+        end
+        return 0
+    end
+
+    for k, v in pairs(list) do
+        if v.cfg.card_id ~= 0 and v.cfg.card_id == GetCardSidByUid(v.cardUid) then
+            if not outArtifact or outArtifact.star < v.star then
+                outArtifact = v
+            end
+        end
+    end
+    return outArtifact
+end
+
+---获取指定sid神器的星级最高的神器
+---@param artifactSid number 神器sid
+---@return ArtifactData 返回穿戴的最高星级的神器数据没有就为nil
+function ArtifactModel:GetMaxStarArtifactBySidNoCard(artifactSid)
+    local list = _G.StorageManager:GetInstance():GetDatasBySid(_G.StorageID.Artifact, artifactSid)
+    if _G.TableIsEmpty(list) then
+        return nil
+    end
+    local outArtifact = nil
+
+    for k, v in pairs(list) do
+        if not outArtifact or outArtifact.star < v.star then
+            outArtifact = v
+        end
+    end
+    return outArtifact
+end
+
+--endregion ----------- 仓库处理 end -----------
+
+function ArtifactModel:OnUpData(data)
+    local sid
+    local gainArtifact = false
+    for _, value in pairs(data) do
+        sid = value.type[1]
+        if _G.table.ContainsValue(LvUpMaterial, sid) then
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.ArtifactUpgrade.id)
+            break
+        elseif _G.StorageManager:GetInstance():CheckSidType(sid) == _G.StorageType.Artifact then
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifact.id)
+            RedPointManager:GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RoleArtifactUpgrade.id)
+            gainArtifact = true
+            break
+        end
+    end
+    if gainArtifact then
+        _G.Events:GetInstance():Broadcast(_G.ArtifactShow.GainArtifact)
+    end
+end
+
+--region ------------- 红点相关 -------------
+
+---是否可穿戴神器
+---@param uid number 卡牌uid
+function ArtifactModel:CheckCardNeedArtifact(uid)
+    local StorageManager = _G.StorageManager:GetInstance()
+    ---@type CardData
+    local card = StorageManager:GetDatasByUid(_G.StorageID.Card, uid)
+    if _G.table.isEmptyOrNil(card) then
+        return false
+    elseif card.star < _G.ConfigManager.discrete_cfg[101204][1][1] then
+        return false
+    else
+        ---@type ArtifactData[]
+        local artifacts = StorageManager:GetDataByID(_G.StorageID.Artifact, _G.ArtifactType.NoWear, true)
+        if _G.table.isEmptyOrNil(card.ArtifactBar) and not _G.table.isEmptyOrNil(artifacts) then
+            return true
+        end
+    end
+    return false
+end
+
+---是否有更好的可穿戴神器
+---@param uid number 卡牌uid
+function ArtifactModel:CheckCardCanPutOnArtifact(uid)
+    local bwearArtifact = self:GetCardCanPutOnArtifact(uid, false, true)
+    if bwearArtifact then
+        return true
+    end
+    return false
+end
+
+---获取卡牌可穿戴的更优神器
+---@param uid number 卡牌uid
+---@param bestArtifact boolean 当卡牌未穿戴神器时, 是否获取最优神器实例
+---@param ignoreCompare boolean 是否忽略可替换
+---@return ArtifactData
+function ArtifactModel:GetCardCanPutOnArtifact(uid, bestArtifact, ignoreCompare)
+    local storageManager = _G.StorageManager:GetInstance()
+    ---@type CardData
+    local card = storageManager:GetDatasByUid(_G.StorageID.Card, uid)
+    if _G.table.isEmptyOrNil(card) then
+        return nil
+    end
+
+    ---星级要求
+    local cfg = _G.ConfigManager.discrete_cfg[101204]
+    if not cfg or card.star < cfg[1][1] then
+        return nil
+    end
+
+    ---获取神器实例
+    ---@type ArtifactData[]
+    local artifacts = storageManager:GetDataByID(_G.StorageID.Artifact, _G.ArtifactType.NoWear, true)
+    if not artifacts or #artifacts == 0 then
+        return nil
+    end
+    ---@type ArtifactData
+    local artifact = card.ArtifactBar
+    if _G.table.isEmptyOrNil(artifact) then
+        artifact = nil
+        if not bestArtifact then
+            return artifacts[1]
+        end
+    elseif ignoreCompare then
+        return nil
+    end
+
+    --已穿戴专属神器则不进行替换
+    if artifact and artifact.cfg.card_id == card.sid then
+        return nil
+    end
+
+    --比较神器: 专属>品质>星级>等级
+    for _, v in pairs(artifacts) do
+        if v.cfg.card_id == card.sid then
+            artifact = v
+            break
+        end
+        if not artifact then
+            artifact = v
+        else
+            local compare = compareNumber(v:GetOrder(), artifact:GetOrder())
+            if compare == 0 then
+                compare = compareNumber(v:GetStar(), artifact:GetStar())
+            end
+            if compare == 0 then
+                compare = compareNumber(v:GetLevel(), artifact:GetLevel())
+            end
+            if compare > 0 then
+                if not bestArtifact then
+                    return v
+                end
+                artifact = v
+            end
+        end
+    end
+    if artifact and artifact ~= card.ArtifactBar then
+        return artifact
+    end
+    return nil
+end
+
+---卡牌所穿戴的神器是否可以升级
+---@param uid number 卡牌uid
+function ArtifactModel:CheckCardArtifactCanUpgrade(uid)
+    local StorageManager = _G.StorageManager:GetInstance()
+    ---@type CardData
+    local card = StorageManager:GetDatasByUid(_G.StorageID.Card, uid)
+    if _G.table.isEmptyOrNil(card) then
+        return false
+    else
+        local artifactData = card.ArtifactBar
+        if _G.table.isEmptyOrNil(artifactData) then
+            return false
+        end
+        local cLv, cStar, cAwaken = artifactData:CanDevelop()
+        ---ZHJH-7235 取消升级
+        if cStar or cAwaken then
+            return true
+        end
+    end
+    return false
+end
+
+--- 检查神器能否向战力高的替换
+function ArtifactModel:CheckCardArtifactCanReplace(uid)
+    local card = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, uid)
+    if _G.table.isEmptyOrNil(card) then
+        return false
+    end
+    local artifactData = card.ArtifactBar
+    if _G.table.isEmptyOrNil(artifactData) then --没装备的时候归红点管
+        return false
+    end
+    local order = artifactData:GetOrder()
+    if order == 3 then --最高品质彩
+        return false
+    end
+    local artifacts = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Artifact, _G.ArtifactType.NoWear, true)
+    if _G.table.isEmptyOrNil(artifacts) then
+        return false
+    end
+    for _, v in pairs(artifacts) do
+        if v:GetOrder() > order then
+            return true
+        end
+    end
+    return false
+end
+
+function ArtifactModel.GetStarSkillDes(sid, star)
+    ---@type artifact_cfg
+    local cfg = _G.ConfigManager.artifact_cfg[sid]
+    if star == nil or star == 0 then
+        if cfg.skill_3_id[1] and cfg.skill_3_id[1] > 0 then
+            return _G.GetLangPackValue(_G.ConfigManager.card_skills_cfg[cfg.skill_3_id[1]].describe1)
+        elseif cfg.skill_id[1] > 0 then
+            ---@type attribute_cfg
+            local attCfg = _G.ConfigManager.attribute_cfg[cfg.skill_id[1]]
+            if attCfg.skill > 0 then
+                return _G.GetLangPackValue(_G.ConfigManager.card_skills_cfg[attCfg.skill].describe1)
+            else
+                return _G.AttributeClassManager:GetInstance().GetAttrbuteDes(attCfg.attribute)
+            end
+        end
+    else
+        if cfg.skill_3_id[star + 1] and cfg.skill_3_id[star + 1] ~= cfg.skill_3_id[star] then
+            return _G.GetLangPackValue(_G.ConfigManager.card_skills_cfg[cfg.skill_3_id[star + 1]].describe1)
+        else
+            local isSkill, data = _G.AttributeClassManager:GetInstance().CalAddedAttribute(cfg.skill_id[star + 1], cfg.skill_id[star])
+            if isSkill then
+                return _G.GetLangPackValue(_G.ConfigManager.card_skills_cfg[data].describe1)
+            else
+                return _G.AttributeClassManager:GetInstance().GetAttrbuteDes(data)
+            end
+        end
+    end
+end
+
+--endregion ----------- 红点相关 end -----------
+
+---销毁对象时,析构函数
+function ArtifactModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.OnUpData, self)
+end
+
+return ArtifactModel

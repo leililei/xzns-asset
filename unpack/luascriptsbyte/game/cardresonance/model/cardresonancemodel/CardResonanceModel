@@ -1,0 +1,1413 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.CardResonance.Model.CardResonanceModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/03/06
+-- Description: 界限突破数据类
+-----------------------------------------------------------------------
+local CardResonanceNet = require("CardResonanceNet")
+
+local base = _G.GameDataModelBase
+---@class CardResonanceModel : GameDataModelBase
+---@field posData card.i_field[]
+local CardResonanceModel = _G.BaseClass("CardResonanceModel", base)
+
+---@return CardResonanceModel CardResonanceModel
+function CardResonanceModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function CardResonanceModel:__init()
+    self.curFunctionOpenID = _G.FunctionID.Stone
+    local discrete_cfg = _G.ConfigManager.discrete_cfg
+    self.limitStarCon = discrete_cfg[102501][1][1]
+    self.limitPerAdd = discrete_cfg[102501][1][2]
+    self.maxLevel = discrete_cfg[102505][1][1]
+    self.limitLvEnable = discrete_cfg[102509][1][1] --额外等级上限生效的等级
+    self.posNum = 5 ---核心槽位数量
+    self.posUid = {}
+    self.posData = {}
+    self.needCheckReset = true
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+end
+
+---从服务器拉取数据
+function CardResonanceModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+function CardResonanceModel:GetInfo()
+    CardResonanceNet:GetInstance():GetInfo(_G.handler(self, self.ParseData))
+end
+
+---@param msg card.s2c_get_stone
+function CardResonanceModel:ParseData(msg)
+    self.posData = {}
+    self.posUid = {}
+    if msg.core_uid == nil then ---刷号清背包可能会导致这里为空
+        msg.core_uid = {}
+        for i = 1, self.posNum do
+            _G.table.insert(msg.core_uid, {index = i, uid = 0, level = 1})
+        end
+    end
+    for _, v in pairs(msg.core_uid) do
+        self.posData[v.index] = v
+        if v.uid > 0 then
+            self.posUid[v.uid] = v.index
+            self:SetCardPosType(v.uid, _G.StonePosType.PosTwo)
+        end
+    end
+    for i = 1, self.posNum do
+        if not self.posData[i] then
+            self.posData[i] = {index = i, uid = 0, level = 1}
+        end
+    end
+    self.maxSids = msg.max_sids or {}
+    self.stageLv = msg.up_stage or 0
+    self.upNum = msg.up_num or 0
+    self:UpdateLevelLimit()
+    self:UpdateMinPosLevel()
+    self:SetInitLevel()
+    self:UpdateAllPosCard()
+    self.super.ParseData(self)
+end
+
+function CardResonanceModel:SetCardPosType(uid, type)
+    local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+    if card then
+        card.shenshiPosType = type
+        return card
+    end
+    return nil
+end
+
+function CardResonanceModel:SetInitLevel()
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    for _, card in pairs(cards) do
+        if self.posUid[card.uid] ~= nil then
+            card:SetLevel(self.posData[self.posUid[card.uid]].level)
+        else
+            card:SetLevel(self.minLv)
+        end
+        card:AddCardLv(0, nil, true)
+    end
+end
+
+---设置神石第二阶段 等级上限 （升星时调用） 达到星级 增加等级
+---@param sid number 卡牌的sid
+---@param star number 卡牌的星级
+function CardResonanceModel:AddMaxSids(sid, star)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return
+    end
+    
+    --卡牌星级 小于限制的条件
+    if star < self.limitStarCon then
+        return
+    end
+    if _G.table.ContainsValue(self.maxSids, sid) then
+        return
+    end
+    _G.table.insert(self.maxSids, sid)
+    self:UpdateLevelLimit()
+end
+
+---设置神石等级的 额外上限
+function CardResonanceModel:UpdateLevelLimit()
+    self.limitTotalAdd = #self.maxSids * self.limitPerAdd
+end
+
+---更新最小槽位的等级
+function CardResonanceModel:UpdateMinPosLevel()
+    local level
+    for _, v in pairs(self.posData) do
+        if level == nil or level >= v.level then
+            level = v.level
+        end
+    end
+    self.minLv = level or 1
+    self:UpdateMinPosIndex()
+end
+
+---更新最小槽位的位置
+function CardResonanceModel:UpdateMinPosIndex()
+    local sortData = {}
+    local len = 0
+    for _, v in pairs(self.posData) do
+        if v.uid > 0 and v.level == self.minLv then
+            _G.table.insert(sortData, v)
+            len = len + 1
+        end
+    end
+    local StorageManager = _G.StorageManager:GetInstance()
+    if len == 0 then
+        self.minIndex = 1
+        return
+    end
+    _G.SortList(
+        sortData,
+        function(a)
+            local card = StorageManager:GetItemDataByID(_G.StorageID.Card, a.uid)
+            if card == nil then
+                return 0, 0, 0, 0
+            end
+            return card.star, card.Grade, card.sid, card.uid
+        end
+    )
+    self.minIndex = sortData[len].index
+end
+
+---更新槽位卡牌(升级/升星后调用)
+---@param notChange boolean 仅筛选（可选）
+---@param posData table 临时数据（可选）
+---@param posUid table 临时数据（可选）
+---@param force boolean 强制更新最低槽（可选）
+function CardResonanceModel:UpdateAllPosCard(notChange, posData, posUid, force, call)
+    posData = posData or self.posData
+    posUid = posUid or self.posUid
+    local StorageManager = _G.StorageManager:GetInstance()
+
+    local minList = {} ---需要更新的槽位
+    local minUids = {} ---缓存需更新的槽位中的uid
+    local minCards = {} ---缓存需更新的槽位中的卡
+    local num = 0
+    local minStar = 100 --过滤仓库低星卡，减少不必要的排序
+    local data
+    for _, v in pairs(posData) do
+        --空槽位/所有最低槽位/槽位内卡牌星级不足以支撑当前等级
+        -- if v.level == self.minLv or v.uid == 0 or self:GetLevelLimitByPos(v.index) < v.level then
+        --ZHJH-4194仅空槽位
+        if v.uid == 0 or (force and (v.level == self.minLv and self:GetLevelLimitByPos(v.index) <= v.level)) then
+            _G.table.insert(minList, v)
+            minUids[v.uid] = v.index
+            num = num + 1
+            if v.uid > 0 then
+                data = StorageManager:GetItemDataByID(_G.StorageID.Card, v.uid)
+                if data then
+                    minCards[v.index] = data
+                    if data.star < minStar then
+                        minStar = data.star
+                    end
+                else
+                    posUid[v.uid] = nil --某些情况卡牌被移除，修正数据
+                    v.uid = 0
+                    minStar = 0
+                end
+            else
+                minStar = 0
+            end
+        end
+    end
+
+    if num == 0 then
+        if call then
+            call()
+        end
+        return {}
+    end
+
+    local preCards = {}
+    local cards = StorageManager:GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    for _, card in pairs(cards) do
+        if card.star >= minStar and (posUid[card.uid] == nil or minUids[card.uid]) then --不在槽位或者属于最小槽位
+            _G.table.insert(preCards, card)
+        end
+    end
+
+    local alikeSidNum = {}
+
+    -- for k, v in pairs(minList) do
+    --     if v.uid ~= 0 then
+    --         if not alikeSidNum[cards[v.uid].sid] then
+    --             alikeSidNum[cards[v.uid].sid] = 0
+    --         end
+    --         alikeSidNum[cards[v.uid].sid] = alikeSidNum[cards[v.uid].sid] + 1
+    --     end
+    -- end
+
+    _G.SortList(
+        minList,
+        function(pos)
+            local count = 1
+            if pos.uid ~= 0 then
+                if not alikeSidNum[cards[pos.uid].sid] then
+                    alikeSidNum[cards[pos.uid].sid] = 0
+                end
+                alikeSidNum[cards[pos.uid].sid] = alikeSidNum[cards[pos.uid].sid] + 1
+                count = alikeSidNum[cards[pos.uid].sid]
+            end
+            return -count, pos.level
+        end
+    )
+    alikeSidNum = {}
+    _G.SortList(
+        preCards,
+        function(card)
+            local count = 1
+            if not alikeSidNum[cards[card.uid].sid] then
+                alikeSidNum[cards[card.uid].sid] = 0
+            end
+            alikeSidNum[cards[card.uid].sid] = alikeSidNum[cards[card.uid].sid] + 1
+            count = alikeSidNum[cards[card.uid].sid]
+
+            return -count, card.star, card.Grade, card.sid, card.uid
+        end
+    )
+
+    local indexLock = {} --已在槽位上
+    local topCards = {}
+    local realNum = num
+    for i = 1, self.posNum do
+        data = preCards[i]
+        if data then
+            if minUids[data.uid] then ---需求量-1
+                realNum = realNum - 1
+            end
+            if self.posUid[data.uid] then ---已经在槽位上且并非5个槽位均替换
+                _G.table.insert(indexLock, self.posUid[data.uid])
+            else
+                _G.table.insert(topCards, data)
+                if #topCards >= realNum then
+                    break
+                end
+            end
+        end
+    end
+
+    local field = {}
+    local card
+    for i = 1, num do
+        if not _G.table.ContainsValue(indexLock, minList[i].index) then
+            data = _G.table.remove(topCards)
+            if data == nil then
+                if minList[i].uid > 0 then --下阵
+                    _G.table.insert(field, {index = minList[i].index, uid = 0, level = 1})
+                end
+            else --上阵
+                card = minCards[minList[i].index]
+                if card == nil or data:GetStar() > card:GetStar() then
+                    _G.table.insert(
+                        field,
+                        {index = minList[i].index, uid = data.uid, level = posData[minList[i].index].level}
+                    )
+                end
+            end
+        end
+    end
+
+    if notChange then
+        return field
+    end
+    if #field > 0 then
+        self:SetCardMulti(field, call)
+    elseif call then
+        call()
+    end
+end
+
+---添加/移除卡牌
+function CardResonanceModel:AddOrRemoveCard(add, rem, change)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return
+    end
+    if rem then
+        for uid, sid in pairs(rem) do
+            if self.posUid[uid] then
+                self.posData[self.posUid[uid]].uid = 0
+                self.posUid[uid] = nil
+            end
+        end
+    end
+    self:UpdateAllPosCard()
+end
+
+---先检测最低槽位是否达到上限
+function CardResonanceModel:CheckPosLimitAndLevelUp(uid, num, call)
+    local index, inPos = self:GetIndexByUid(uid)
+    if inPos then
+        self:LevelUp(uid, num, call)
+        return
+    end
+    local isLimit = self:CheckPosIsLevelLimit(index, num)
+    if not isLimit then
+        self:LevelUp(uid, num, call)
+        return
+    end
+    self:SetCardSingle(
+        uid,
+        index,
+        self.posData[index].level,
+        function(msg1)
+            if msg1.ack ~= 1 then
+                return
+            end
+            self:LevelUp(uid, num, call)
+        end
+    )
+end
+
+---槽位升级（卡牌升级）
+function CardResonanceModel:LevelUp(uid, num, call)
+    local index, inPos = self:GetIndexByUid(uid)
+    if not inPos then
+        index = self:GetSuitableUpIndex() or index
+    end
+    local pbData = {lv_num = num, index = index}
+    if self.posData[index].uid == 0 then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("槽位为空，无法升级：" .. index)
+            _G.LogError(self.posData)
+        end
+        return
+    end
+    CardResonanceNet:GetInstance():LevelUp(
+        pbData,
+        function(msg)
+            local StorageManager = _G.StorageManager:GetInstance()
+            if msg.ack ~= 1 then
+                local card = StorageManager:GetItemDataByID(_G.StorageID.Card, uid)
+                card:SetLevel(self.posData[index].level)
+                card:AddCardLv(0, nil, true)
+                return
+            end
+            local isMin = index == self.minIndex or not inPos
+            self.posData[index].level = self.posData[index].level + num
+            if isMin and self:CheckPosFull() then
+                -- local newUid = uid
+                -- local levelLimit = self:GetLevelLimitByPos(index)
+                -- if nowIsMin and levelLimit <= self.posData[index].level then ---达到了等级上限，检测有无星级更高的卡替换
+                --     newUid = self:FindHigherLevelLimitCard(uid, levelLimit)
+                --     if newUid ~= uid then
+                --         self:SetCardSingle(
+                --             newUid,
+                --             index,
+                --             self.posData[index].level,
+                --             function(msg1)
+                --                 if call then
+                --                     call(not inPos, msg)
+                --                 end
+                --             end
+                --         )
+                --     end
+                -- end
+                self:UpdateMinPosLevel()
+                local cards = StorageManager:GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+                for _, card in pairs(cards) do
+                    if self.posUid[card.uid] == nil then
+                        card:SetLevel(self.minLv)
+                        card:AddCardLv(0, nil, true)
+                    end
+                end
+                local card = StorageManager:GetItemDataByID(_G.StorageID.Card, uid)
+                local nowIsMin = self.posData[index].level <= self.minLv
+                -- if self.posData[index].level > self.minLv and not inPos then ---最小槽位已改变，此卡荣升进槽位
+                if not inPos then ---ZHJH-4194升谁谁进槽
+                    local cardPos = StorageManager:GetItemDataByID(_G.StorageID.Card, self.posData[index].uid)
+                    cardPos:SetLevel(self.minLv)
+                    cardPos:AddCardLv(0, nil, true)
+                    if self.posData[index].level > self:GetCardSelfLevelLimit(uid) then --超过等级上限不进槽（观感很怪）
+                        self:OnLevelUpEnd(call, inPos, msg)
+                        return
+                    end
+                    if not nowIsMin then --最小槽位改变
+                        -- self:SetCardSingle(
+                        --     uid,
+                        --     index,
+                        --     self.posData[index].level,
+                        --     function(msg1)
+                        --         if msg1.ack ~= 1 then --以防万一回滚
+                        --             card:SetLevel(self.minLv)
+                        --             card:AddCardLv(0)
+                        --             cardPos:SetLevel(self.posData[index].level)
+                        --             cardPos:AddCardLv(0)
+                        --         end
+                        --         if call then
+                        --             call(not inPos, msg)
+                        --         end
+                        --     end
+                        -- )
+                        card:SetLevel(self.posData[index].level)
+                        local posDataTemp = _G.DeepCopy(self.posData)
+                        local posUidTemp = _G.DeepCopy(self.posUid)
+                        posDataTemp[index].uid = uid
+                        posUidTemp[self.posData[index].uid] = nil
+                        posUidTemp[uid] = index
+                        local field = self:UpdateAllPosCard(true, posDataTemp, posUidTemp, true)
+                        _G.table.insert(field, {index = index, uid = uid, level = self.posData[index].level})
+                        self:SetCardMulti(
+                            field,
+                            function(msg1)
+                                if msg1.ack ~= 1 then --以防万一回滚
+                                    card:SetLevel(self.minLv)
+                                    card:AddCardLv(0)
+                                    cardPos:SetLevel(self.posData[index].level)
+                                    cardPos:AddCardLv(0)
+                                end
+                                self:OnLevelUpEnd(call, inPos, msg)
+                            end
+                        )
+                        return
+                    else --进槽
+                        local newUid = uid
+                        local levelLimit = self:GetLevelLimitByPos(index)
+                        if levelLimit <= self.posData[index].level then --达到等级上限
+                            newUid = self:FindHigherLevelLimitCard(uid, levelLimit)
+                        end
+                        self:SetCardSingle(
+                            newUid,
+                            index,
+                            self.posData[index].level,
+                            function(msg1)
+                                self:OnLevelUpEnd(call, inPos, msg)
+                            end
+                        )
+                        return
+                    end
+                -- else
+                -- if not inPos then ---依旧是最低等级的槽位
+                --     local cardPos = StorageManager:GetItemDataByID(_G.StorageID.Card, self.posData[index].uid)
+                --     cardPos:SetLevel(self.minLv)
+                --     cardPos:AddCardLv(0, nil, true)
+                -- end
+                end
+                card:SetLevel(self.posData[index].level)
+                card:AddCardLv(0, nil, true)
+                StorageManager:DelayUpdateAllCardProp()
+                self:UpdateAllPosCard(
+                    false,
+                    nil,
+                    nil,
+                    true,
+                    function(msg1)
+                        self:OnLevelUpEnd(call, inPos, msg)
+                    end
+                )
+                return
+            else
+                -- local levelLimit = self:GetLevelLimitByPos(index)
+                -- if levelLimit <= self.posData[index].level then ---达到了等级上限，检测有无星级更高的卡替换
+                --     local field = self:UpdateAllPosCard(true, nil, nil, true)
+                --     self:SetCardMulti(
+                --         field,
+                --         function(msg1)
+                --             if call then
+                --                 call(not inPos, msg)
+                --             end
+                --         end
+                --     )
+                -- else
+                --      self:UpdateAllPosCard()
+                -- end
+                local card = StorageManager:GetItemDataByID(_G.StorageID.Card, uid)
+                card:SetLevel(self.posData[index].level)
+                card:AddCardLv(0)
+                self:UpdateMinPosLevel()
+                self:UpdateAllPosCard(
+                    false,
+                    nil,
+                    nil,
+                    true,
+                    function(msg1)
+                        self:OnLevelUpEnd(call, inPos, msg)
+                    end
+                )
+                return
+            end
+            self:OnLevelUpEnd(call, inPos, msg)
+        end
+    )
+end
+
+function CardResonanceModel:OnLevelUpEnd(call, inPos, msg)
+    _G.Events:GetInstance():Broadcast(_G.eCardResonance.CRLevelUp)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Cardconmonlevelup.id)
+    if call then
+        call(not inPos, msg)
+    end
+end
+
+---卡牌下阵，如果有多余的卡牌，则代替上阵
+function CardResonanceModel:CardDownarray(cardUidList, blackList)
+    local posUid = self.posUid
+    local posData = self.posData
+    --- 没在阵上的卡牌列表
+    local tempList = {}
+    --- 卡牌数量不够上阵，剩下没有下阵的卡牌
+    local overList = {}
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    cards = _G.table.toArray(cards)
+    _G.SortList(
+        cards,
+        function(card)
+            return card.star, card.Grade, card.sid, card.uid
+        end
+    )
+    for k, v in pairs(cards) do
+        if not posUid[v.uid] and not blackList[v.uid] then
+            _G.table.insert(tempList, v)
+        end
+    end
+
+    local count = _G.table.count(tempList)
+    for k, v in pairs(cardUidList) do
+        if count > 0 then
+            local card = _G.table.remove(tempList, 1)
+            local index = posUid[v]
+            count = count - 1
+
+            card:SetLevel(posData[index].level)
+            card:AddCardLv(0, nil, true)
+
+            self:SetCardSingle(
+                card.uid,
+                index,
+                posData[index].level
+            )
+        else
+            _G.table.insert(overList, v)
+        end
+    end
+    return overList
+end
+
+---槽位等级重置
+function CardResonanceModel:LevelReset(uid, call)
+    local index, inPos = self:GetIndexByUid(uid)
+    local pbData = {index = index, card_uid = uid}
+    CardResonanceNet:GetInstance():LevelReset(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(msg)
+                end
+                return
+            end
+            self.posData[index].level = 1
+            self:UpdateMinPosLevel()
+            local data = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, self.posData[index].uid)
+            data:SetLevel(1)
+            data:AddCardLv(0, nil, true)
+            data:CalcNowSumProp()
+            local decoration = {--重生后刻印等级重置，前端需要更新状态
+                decoration_slot =
+                {
+                    { index = 1, slotLevel = 0 },
+                    { index = 2, slotLevel = 0 },
+                    { index = 3, slotLevel = 0 },
+                    { index = 4, slotLevel = 0 },
+                }
+            }
+            data:SaveDecorationData(decoration)
+            local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+            for _, card in pairs(cards) do
+                if self.posUid[card.uid] == nil then
+                    card:SetLevel(self.minLv)
+                    card:AddCardLv(0, nil, true)
+                end
+            end
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(nil, true)
+            self:UpdateAllPosCard()
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Cardconmonlevelup.id)
+            if call then
+                call(msg)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eCardResonance.CRLevelReset)
+        end
+    )
+end
+
+---重置卡牌，重置后不自动上阵
+function CardResonanceModel:LevelResetNoUpdatePosCard(uid, call)
+    local index, inPos = self:GetIndexByUid(uid)
+    local pbData = {index = index, card_uid = uid}
+    CardResonanceNet:GetInstance():LevelReset(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(msg)
+                end
+                return
+            end
+            self.posData[index].level = 1
+            self:UpdateMinPosLevel()
+            local data = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, self.posData[index].uid)
+            data:SetLevel(1)
+            data:AddCardLv(0, nil, true)
+            local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+            for _, card in pairs(cards) do
+                if self.posUid[card.uid] == nil then
+                    card:SetLevel(self.minLv)
+                    card:AddCardLv(0, nil, true)
+                end
+            end
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp()
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Cardconmonlevelup.id)
+            if call then
+                call(msg)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eCardResonance.CRLevelReset)
+            _G.Events:GetInstance():Broadcast(
+                _G.ePlayAactionEvent.PlayAaction,
+                {_G.ActiveTaskEnum.ConditionEnum.CardResonance.PosLevelNum},
+                1
+            )
+        end
+    )
+end
+
+function CardResonanceModel:InnerCardReset(uidLis, idx, call)
+    if idx > #uidLis then
+        -- local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+        -- for _, card in pairs(cards) do
+        --     if self.posUid[card.uid] == nil then
+        --         card:SetLevel(self.minLv)
+        --         card:AddCardLv(0, nil, true)
+        --     end
+        -- end
+        -- _G.StorageManager:GetInstance():DelayUpdateAllCardProp()
+        require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Cardconmonlevelup.id)
+        _G.Events:GetInstance():Broadcast(_G.eCardResonance.CRLevelReset)
+        _G.Events:GetInstance():Broadcast(
+            _G.ePlayAactionEvent.PlayAaction,
+            {_G.ActiveTaskEnum.ConditionEnum.CardResonance.PosLevelNum},
+            1
+        )
+        call()
+    else
+        -- local index, inPos = self:GetIndexByUid(uidLis[idx])
+        -- if self.posData[index].level <= 1 then --无需重置
+        --     return
+        -- end
+        -- local pbData = {index = index}
+        -- CardResonanceNet:GetInstance():LevelReset(
+        --     pbData,
+        --     function(msg)
+        --         if msg.ack ~= 1 then
+        --             if idx > 1 then
+        --                 local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+        --                 for _, card in pairs(cards) do
+        --                     if self.posUid[card.uid] == nil then
+        --                         card:SetLevel(self.minLv)
+        --                         card:AddCardLv(0, nil, true)
+        --                     end
+        --                 end
+        --                 _G.StorageManager:GetInstance():DelayUpdateAllCardProp()
+        --                 require "RedPointManager":GetInstance():RefreshNode(
+        --                     _G.ConfigManager.redpoint_cfg.Cardconmonlevelup.id
+        --                 )
+        --                 _G.Events:GetInstance():Broadcast(_G.eCardResonance.CRLevelReset)
+        --                 _G.Events:GetInstance():Broadcast(
+        --                     _G.ePlayAactionEvent.PlayAaction,
+        --                     {_G.ActiveTaskEnum.ConditionEnum.CardResonance.PosLevelNum},
+        --                     1
+        --                 )
+        --             end
+        --             if _G.AppSetting.DEBUG then
+        --                 _G.LogError("卡牌等级回退失败！")
+        --             end
+        --             return
+        --         end
+        --         self.posData[index].level = 1
+        --         self:UpdateMinPosLevel()
+        --         local data = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, self.posData[index].uid)
+        --         data:SetLevel(1)
+        --         data:AddCardLv(0, nil, true)
+        --         _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        --         self:InnerCardReset(uidLis, idx + 1, call)
+        --     end
+        -- )
+        --ZHJH-3315 在升星后不进行重置
+        self:InnerCardReset(uidLis, idx + 1, call)
+    end
+end
+
+---批量回退，不重新检测上阵槽位
+function CardResonanceModel:MultiPosLevelResetAndNoUpdatePos(uidLis, call)
+    local posUidLis =
+        _G.table.chooseToArray(
+        uidLis,
+        function(_, uid)
+            return self:CheckCardIsInPos(uid)
+        end
+    )
+    if #posUidLis == 0 then
+        call()
+        return
+    end
+    self:InnerCardReset(posUidLis, 1, call)
+end
+
+---卡牌回退
+function CardResonanceModel:CardReset(uid, call)
+    local rUid = 0
+    local rCard
+    --取消用高星卡顶上来
+    -- if self:CheckCardIsInPos(uid) then
+    --     rCard = self:FindTopCard(uid)
+    --     if rCard and rCard.uid ~= uid then
+    --         rUid = rCard.uid
+    --     end
+    -- end
+    local pbData = {uid = uid, r_uid = rUid}
+    require("CardInfoNet"):GetInstance():CardReset(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(msg)
+                end
+                return
+            end
+            self.needCheckReset = true
+            if rUid > 0 then
+                local posData = self.posData[self.posUid[uid]]
+                posData.uid = rUid
+                rCard:SetLevel(posData.level)
+                rCard:AddCardLv(0)
+                local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+                card:SetLevel(self.minLv)
+                card:AddCardLv(0)
+                self.posUid[rUid] = posData.index
+                self.posUid[uid] = nil
+            end
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.CardPotential.id
+            )
+            if call then
+                call(msg, rUid > 0 and rUid or uid)
+            end
+        end
+    )
+end
+
+---位面之子升级
+function CardResonanceModel:StageLevelUp(num, call)
+    local pbData = {num = num}
+    CardResonanceNet:GetInstance():StageLevelUp(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.stageLv = self.stageLv + num
+            _G.StorageManager:GetInstance():DelayUpdateAllCardProp(_G.AttrFunType.GodStone)
+            _G.Events:GetInstance():Broadcast(_G.eCardResonance.CRStageUp)
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.Cardconmonlevelup.id)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---槽位上阵卡牌(单张)
+function CardResonanceModel:SetCardSingle(uid, index, level, call)
+    local pbData = {index = {{index = index, uid = uid, level = level}}}
+    CardResonanceNet:GetInstance():SetCard(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(msg)
+                end
+                return
+            end
+            self:SetCardPosType(uid, _G.StonePosType.PosTwo)
+            self:SetCardPosType(self.posData[index].uid, _G.StonePosType.PosZero)
+            local card
+            if uid > 0 then
+                card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+                local limitLevel = self:GetCardSelfLevelLimit(uid)
+                if limitLevel < level then
+                    -- 上阵的角色品质的最低等级小于当前槽位的等级
+                    -- 服务器自动重置
+                    level = 1
+                    self.minLv = 1
+                    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+                    for _, card0 in pairs(cards) do
+                        if self.posUid[card0.uid] == nil then
+                            card0:SetLevel(self.minLv)
+                            card0:AddCardLv(0, nil, true)
+                        end
+                    end
+                    _G.StorageManager:GetInstance():DelayUpdateAllCardProp()
+                end
+                card:SetLevel(level)
+                card:AddCardLv(0)
+            end
+            if self.posData[index].uid > 0 then
+                card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, self.posData[index].uid)
+                if card then
+                    card:SetLevel(self.minLv)
+                    card:AddCardLv(0)
+                end
+            end
+            self.posUid[self.posData[index].uid] = nil
+            self.posUid[uid] = index
+            self.posData[index].uid = uid
+            self.posData[index].level = level
+            self:UpdateMinPosLevel()
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if call then
+                call(msg)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eCardResonance.CRUpdatePosData)
+        end
+    )
+end
+
+---槽位上阵卡牌（批量）
+function CardResonanceModel:SetCardMulti(field, call)
+    local pbData = {index = field}
+    CardResonanceNet:GetInstance():SetCard(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call(msg)
+                end
+                return
+            end
+            local card1, card2
+            local card0
+            local flag = false
+            -- 提前遍历一次，将槽位等级不符合角色品质的角色重置
+            for _, v in pairs(field) do
+                if v.uid > 0 then
+                    card0 = self:SetCardPosType(v.uid, _G.StonePosType.PosTwo)
+                    local limitLevel = self:GetCardSelfLevelLimit(v.uid)
+                    if limitLevel < v.level then
+                        -- 上阵的角色品质的最低等级小于当前槽位的等级
+                        -- 服务器自动重置
+                        v.level = 1
+                        self.minLv = 1
+                        flag = true
+                    end
+                end
+            end
+            if flag then
+                local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+                for _, card in pairs(cards) do
+                    if self.posUid[card.uid] == nil then
+                        card:SetLevel(self.minLv)
+                        card:AddCardLv(0, nil, true)
+                    end
+                end
+                _G.StorageManager:GetInstance():DelayUpdateAllCardProp()
+            end
+            for _, v in pairs(field) do
+                if v.uid > 0 then
+                    card1 = self:SetCardPosType(v.uid, _G.StonePosType.PosTwo)
+                    card1:SetLevel(v.level)
+                    card1:AddCardLv(0)
+                end
+                if self.posData[v.index].uid > 0 then
+                    card2 = self:SetCardPosType(self.posData[v.index].uid, _G.StonePosType.PosZero)
+                    card2:SetLevel(self.minLv)
+                    card2:AddCardLv(0)
+                end
+                self.posUid[self.posData[v.index].uid] = nil
+                self.posUid[v.uid] = v.index
+                self.posData[v.index].uid = v.uid
+                self.posData[v.index].level = v.level
+            end
+            self:UpdateMinPosLevel()
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if call then
+                call(msg)
+            end
+            _G.Events:GetInstance():Broadcast(_G.eCardResonance.CRUpdatePosData)
+        end
+    )
+end
+
+---@param uid number 参与排序的槽位卡
+function CardResonanceModel:FindTopCard(uid)
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    cards =
+        _G.table.chooseToArray(
+        cards,
+        function(_, v)
+            return self.posUid[v.uid] == nil or v.uid == uid
+        end
+    )
+    _G.SortList(
+        cards,
+        function(card)
+            return card.star, card.Grade, card.sid, card.uid
+        end
+    )
+    if #cards > 1 and cards[1].uid == uid and cards[2].star > 6 then ---考虑回退后星级会降为6，若第二张卡星级更高则取第二张
+        return cards[2]
+    end
+    return cards[1]
+end
+
+---查找等级上限更高的卡
+function CardResonanceModel:FindHigherLevelLimitCard(uid, levelLimit)
+    ---@type CardData
+    local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+    local maxStar = card:GetStar()
+    local noRepeatMaxStar = maxStar
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local sidDic = {}
+    local sid
+    for _, v in pairs(self.posData) do
+        if v.uid > 0 then
+            sid = cards[v.uid].sid
+            if sidDic[sid] == nil then
+                sidDic[sid] = 1
+            else
+                sidDic[sid] = sidDic[sid] + 1
+            end
+        end
+    end
+
+    local newCard, newNoRepeatCard
+    for _, v in pairs(cards) do
+        if self.posUid[v.uid] == nil then
+            if v:GetStar() > maxStar then
+                maxStar = v:GetStar()
+                newCard = v
+            end
+            if sidDic[v.sid] == nil and v:GetStar() > noRepeatMaxStar then
+                noRepeatMaxStar = v:GetStar()
+                newNoRepeatCard = v
+            end
+        end
+    end
+    local newLevelLimit
+    if newNoRepeatCard then
+        newLevelLimit = self:GetCardLevelLimit(newNoRepeatCard)
+        if newLevelLimit > levelLimit then
+            return newNoRepeatCard.uid
+        end
+        if newCard then
+            newLevelLimit = self:GetCardLevelLimit(newCard)
+            if newLevelLimit > levelLimit then
+                return newCard.uid
+            end
+        end
+    elseif newCard then
+        newLevelLimit = self:GetCardLevelLimit(newCard)
+        if newLevelLimit > levelLimit then
+            return newCard.uid
+        end
+    end
+    return uid
+end
+
+function CardResonanceModel:GetCardLevelLimit(card)
+    local limitLevel = 0
+    local cfgId = require("CardInfoManager"):GetInstance():GetStarCfgId(card.cfg.Elements_new,card.star)
+    local cfg = _G.ConfigManager.card_star_cfg[cfgId]
+    if cfg ~= nil then
+        if cfg.level_limit >= self.limitLvEnable and self.posData[self:GetIndexByUid(card.uid)].level >= self.limitLvEnable then
+            limitLevel = self.limitTotalAdd
+        end
+        limitLevel = limitLevel + cfg.level_limit
+    end
+    return limitLevel
+end
+
+---获取最适合下阵的槽位，最低等级>卡槽中存在sid卡>星级>品质
+function CardResonanceModel:GetSuitableUpIndex()
+    local num
+    local alikeSidNum = {}
+    local minList = {}
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    -- 遍历槽位上的卡牌，取出最低等级的卡，并将其他的卡做记录，用于后面检测重复sid
+    for k, v in pairs(self.posData) do
+        if v.level == self.minLv then
+            _G.table.insert(minList, v)
+        else
+            if v.uid ~= 0 then
+                alikeSidNum[cards[v.uid].sid] = 1
+            end
+        end
+    end
+    --
+    _G.SortList(
+        minList,
+        function(min)
+            if min.uid ~= 0 then
+                local count = alikeSidNum[cards[min.uid].sid] or 0
+                -- 重新赋值，防止minList中也有重复的sid
+                alikeSidNum[cards[min.uid].sid] = 1
+                return count, -cards[min.uid].star, -cards[min.uid].Grade, cards[min.uid].sid, min.uid
+            end
+            return 99, 99, 99, 99, 99
+        end
+    )
+    num = minList[1].index or nil
+    return num
+end
+
+---根据uid判断卡牌所属槽位
+---@param uid number 卡牌uid
+---@return number, boolean 槽位下标，是否为槽位中的卡
+function CardResonanceModel:GetIndexByUid(uid)
+    if self.posUid[uid] then
+        return self.posUid[uid], true
+    else
+        return self.minIndex, false
+    end
+end
+
+---获取最低槽位等级
+function CardResonanceModel:GetMinLevel()
+    return self.minLv or 1
+end
+
+---槽位平均等级
+function CardResonanceModel:GetAverageLevel()
+    local level = 0
+    local count = 0
+    for _, v in pairs(self.posData) do
+        count = count + 1
+        level = level + v.level
+    end
+    return count > 0 and _G.Mathf.RoundToInt(level / count) or 1
+end
+
+---达到指定等级的槽位数量
+function CardResonanceModel:CheckTargetLevelNum(lv)
+    local num = 0
+    for _, v in pairs(self.posData) do
+        if v.level >= lv then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+---获取槽位数据
+function CardResonanceModel:GetPosData(index)
+    return self.posData[index]
+end
+
+---获取所有槽位上的卡
+function CardResonanceModel:GetAllPosCards()
+    local cards = {}
+    local data
+    for _, v in pairs(self.posData) do
+        if v.uid > 0 then
+            data = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, v.uid)
+            _G.table.insert(cards, data)
+        end
+    end
+    return cards
+end
+
+---获取所有槽位上的卡的Uid
+function CardResonanceModel:GetAllPosCardsUids()
+    local uids = {}
+    for _, v in pairs(self.posData) do
+        if v.uid > 0 then
+            _G.table.insert(uids, v.uid)
+        end
+    end
+    return uids
+end
+
+---检测自身是否开启
+function CardResonanceModel:CheckSelfOpen()
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        return not _G.table.isEmptyOrNil(self.posData)
+    end
+    return false
+end
+
+---获取排序后的槽位卡
+function CardResonanceModel:GetSortPosCardData()
+    local sortCards = self:GetAllPosCards()
+    _G.SortList(
+        sortCards,
+        function(a)
+            return a:GetLevel(), a.star, a.Grade, a.sid, a.uid
+        end
+    )
+    return sortCards
+end
+
+---获取当前uid卡牌可提升上限
+function CardResonanceModel:GetLevelLimitByUid(uid)
+    local index, inPos = self:GetIndexByUid(uid)
+    return self:GetLevelLimitByPos(index)
+end
+
+---获取槽位当前等级上限
+function CardResonanceModel:GetLevelLimitByPos(index)
+    local posData = self.posData[index]
+    local limitLevel = 0
+    if posData.uid > 0 then
+        local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, posData.uid)
+        if card then
+            local cfgId = require("CardInfoManager"):GetInstance():GetStarCfgId(card.cfg.Elements_new,card.star)
+            local cfg = _G.ConfigManager.card_star_cfg[cfgId]
+            if cfg ~= nil then
+                if cfg.level_limit >= self.limitLvEnable and posData.level >= self.limitLvEnable then
+                    limitLevel = self.limitTotalAdd
+                end
+                limitLevel = limitLevel + cfg.level_limit
+            end
+        end
+    end
+    if limitLevel > self.maxLevel then
+        limitLevel = self.maxLevel
+    end
+    return limitLevel
+end
+
+---获取卡牌自身可升级上限
+function CardResonanceModel:GetCardSelfLevelLimit(uid, star)
+    local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, uid)
+    local limitLevel = 0
+    if card then
+        star = star or card.star
+        local cfgId = require("CardInfoManager"):GetInstance():GetStarCfgId(card.cfg.Elements_new, star)
+        local cfg = _G.ConfigManager.card_star_cfg[cfgId]
+        if cfg ~= nil then
+            if cfg.level_limit >= self.limitLvEnable and self.posData[self:GetIndexByUid(card.uid)].level >= self.limitLvEnable then
+                limitLevel = self.limitTotalAdd
+            end
+            limitLevel = limitLevel + cfg.level_limit
+        end
+    end
+    if limitLevel > self.maxLevel then
+        limitLevel = self.maxLevel
+    end
+    return limitLevel
+end
+
+---检测槽位是否达到或升级后超过等级上限
+function CardResonanceModel:CheckPosIsLevelLimit(index, num)
+    num = num or 0
+    local limit = self:GetLevelLimitByPos(index)
+    return limit <= self.posData[index].level or limit < self.posData[index].level + num
+end
+
+---槽位是否上满(5人满)
+function CardResonanceModel:CheckPosFull()
+    return _G.table.count(self.posUid) >= self.posNum
+end
+
+---槽位上了几人
+function CardResonanceModel:GetPosCardNum()
+    return _G.table.count(self.posUid)
+end
+
+function CardResonanceModel:CheckCardIsInPos(uid)
+    return self.posUid[uid] ~= nil
+end
+
+---判断卡牌的共鸣类型
+function CardResonanceModel:GetCardPosType(uid)
+    return self:CheckCardIsInPos(uid) and _G.StonePosType.PoseTwo or _G.StonePosType.PosZero
+end
+
+---检测重置星级是否需要重置槽位等级
+function CardResonanceModel:CheckReplaceNeedResetLv(uid)
+    local rUid = uid
+    if self:CheckCardIsInPos(uid) then
+        local rCard = self:FindTopCard(uid)
+        if rCard and rCard.uid ~= uid then
+            rUid = rCard.uid
+        end
+        local index = self:GetIndexByUid(uid)
+        local posData = self:GetPosData(index)
+        if posData.level == self.minLv then
+            local limit
+            if rUid == uid then
+                limit = self:GetCardSelfLevelLimit(rUid, 6)
+            else
+                limit = self:GetCardSelfLevelLimit(rUid)
+            end
+            if posData.level > limit then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---检测最低等级槽位上的卡星级是否过低
+function CardResonanceModel:CheckLvUpNeedResetLv()
+    for _, v in pairs(self.posData) do
+        if v.level == self.minLv and v.uid > 0 then
+            if v.level > self:GetLevelLimitByPos(v.index) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--region 位面之子
+
+function CardResonanceModel:GetStageLevel()
+    return self.stageLv or 0
+end
+
+function CardResonanceModel:GetStageMaxLevel()
+    if not self.stageMaxLv then
+        self.stageMaxLv = 0
+        for _, v in pairs(_G.ConfigManager.card_level_resonance_cfg) do
+            if v.id > self.stageMaxLv then
+                self.stageMaxLv = v.id
+            end
+        end
+    end
+    return self.stageMaxLv
+end
+
+function CardResonanceModel:CheckStageIsMax()
+    return self:GetStageLevel() >= self:GetStageMaxLevel()
+end
+
+function CardResonanceModel:GetStageCanUpLevel()
+    if self:CheckStageIsMax() then
+        return false
+    end
+    local nextCfg = _G.ConfigManager.card_level_resonance_cfg[self:GetStageLevel() + 1]
+    if nextCfg == nil then
+        return false
+    end
+    return self.minLv >= nextCfg.level, nextCfg
+end
+
+---获取位面之子升阶满足等级要求的槽位数量
+function CardResonanceModel:GetStageUpMeetPosNum()
+    if self:CheckStageIsMax() then
+        return self.posNum
+    end
+    local nextCfg = _G.ConfigManager.card_level_resonance_cfg[self:GetStageLevel() + 1]
+    if nextCfg == nil then
+        return 0
+    end
+    local num = 0
+    for _, v in pairs(self.posData) do
+        if v.level >= nextCfg.level then
+            num = num + 1
+        end
+    end
+    return num
+end
+
+---获取神石属性
+function CardResonanceModel:GetAllAttribute()
+    local AttributeClassManager = _G.AttributeClassManager:GetInstance()
+    local attribute = AttributeClassManager:GetAttribtueClass()
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(self.curFunctionOpenID) then
+        local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute)
+        return attribute, changeAttrTypes
+    end
+    local tonumber = _G.tonumber
+    local cfg = _G.ConfigManager.card_level_resonance_cfg[self:GetStageLevel()]
+    local name, value, aType
+
+    for _, v in pairs(cfg.att) do
+        value = tonumber(v[3])
+        name = v[1]
+        aType = v[2] == "1" and _G.AttCountType.other or tonumber(v[2])
+        attribute:AddValueByName(name, AttributeClassManager:GetValueWithName(name, value, aType), false, aType)
+    end
+    local changeAttrTypes = _G.AttributeClassManager:GetInstance():GetChangeAttrTypes(attribute)
+    return attribute, changeAttrTypes
+end
+
+--endregion
+
+---神石充能
+---@param num number 充能次数
+function CardResonanceModel:DevelopStone(num, callback)
+    local pbData = {num = num}
+    require("CardResonanceNet"):GetInstance():DevelopStone(
+        pbData,
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+
+            self:AddStoneUpNum(num)
+            self:RefreshAttribute()
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+function CardResonanceModel:GetRechargeLevel()
+    return self.upNum or 0
+end
+
+function CardResonanceModel:GetRechargeCanUpLevel()
+    return _G.StorageManager:GetInstance():CheckItemNew(
+        _G.ConfigManager.discrete_cfg[102514][1][1],
+        _G.ConfigManager.discrete_cfg[102514][1][2]
+    )
+end
+
+---神石充能加成属性
+---@param 是否刷新战力
+function CardResonanceModel:RefreshAttribute()
+    local attributeManager = _G.AttributeClassManager:GetInstance()
+    if not self.attribute then
+        self.attribute = attributeManager:GetAttribtueClass()
+    end
+
+    local propKeyList = {"atk", "bre", "def", "max_hp"}
+    local basePropConfig = _G.ConfigManager.discrete_cfg[102515][1]
+    for index, v in pairs(propKeyList) do
+        local addNum = basePropConfig[index] or 0
+        self.attribute:SetValueByName(v, addNum * self.upNum, false)
+    end
+    self.attributeChangeType = attributeManager:GetChangeAttrTypes(self.attribute)
+
+    return self.attribute
+end
+
+function CardResonanceModel:GetAllRechargeAttribute()
+    if not self.attribute then
+        self:RefreshAttribute()
+    end
+
+    local attr = self.attribute:Clone()
+    attr:AttributeToOther()
+    return attr, self.attributeChangeType
+end
+
+---增加神石养成次数
+function CardResonanceModel:AddStoneUpNum(addNum)
+    self.upNum = self.upNum + addNum
+end
+
+---获取神石养成次数
+function CardResonanceModel:GetStoneUpNum()
+    return self.upNum
+end
+
+function CardResonanceModel:ResUpdata(data)
+    for _, v in pairs(data) do
+        if v.type[1] == _G.ConfigManager.discrete_cfg[102514][1][1] then
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.CardconmonDevelop.id)
+        end
+    end
+end
+
+---刷新红点
+function CardResonanceModel:RefreshRedPoint()
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.CardconmonDevelop.id)
+end
+
+---销毁对象时,析构函数
+function CardResonanceModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+end
+
+return CardResonanceModel

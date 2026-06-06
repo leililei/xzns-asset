@@ -1,0 +1,763 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Season.Model.SeasonModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/05/16
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+---@class SeasonModel	中文描述
+---@field cfg season_cfg
+---@field state SeasonState 赛季状态
+---@field timeData SeasonTimeData
+---@field super GameDataModelBase
+local SeasonModel = _G.BaseClass("SeasonModel", _G.GameDataModelBase)
+---@type SeasonBaseModel[]
+local modelInstance = {
+    [_G.FunctionID.SeasonBoss] = require "FirstTestBossModel":GetInstance(),
+    [_G.FunctionID.WheelOfFortune] = require "WheelOfFortuneModel":GetInstance(),
+    [_G.FunctionID.HeroesGathering] = require "HeroesGatheringModel":GetInstance(),
+    --[_G.FunctionID.PingDingLingYu] = require "PingDingLingYuModel":GetInstance(),
+    [_G.FunctionID.SeasonTable] = require "SeasonTurntableModel":GetInstance(),
+    [_G.FunctionID.AllHeroesBattle] = require "AllHeroesBattleManager":GetInstance(),
+    [_G.FunctionID.SeasonShop] = require "SeasonShopModel":GetInstance(),
+    [_G.FunctionID.IceGift] = require "SeasonIceGiftModel":GetInstance(),
+    [_G.FunctionID.SeasonLv] = require "SeasonLvModel":GetInstance(),
+    [_G.FunctionID.SeasonSGift] = require "SeasonSGiftModel":GetInstance(),
+    [_G.FunctionID.SeasonRecordRecharge] = require "SeasonRecordRechargeModel":GetInstance(),
+    [_G.FunctionID.SeasonTask] = require "SeasonTaskModel":GetInstance(),
+    [_G.FunctionID.SuperValuGift] = require "SuperValuGiftModel":GetInstance(),
+    --[_G.FunctionID.Temple] = require "TempleModel":GetInstance(),
+    [_G.FunctionID.SeasonWarPrinted] = require "SeasonWarPrintedManager":GetInstance(),
+    [_G.FunctionID.SeasonTower] = require "SeasonTowerModel":GetInstance(),
+    [_G.FunctionID.SeasonHeroGiftPack] = require "SeasonHeroGiftPackModel":GetInstance(),
+    [_G.FunctionID.SeasonLogin] = require "SeasonLoginModel":GetInstance(),
+    [_G.FunctionID.SeasonTaskActivity] = require "SeasonTaskActivityModel":GetInstance(),
+    [_G.FunctionID.SeasonMaterialGift] = require "SeasonMaterialGiftModel":GetInstance()
+    --[_G.FunctionID.SixVsSixPVP] = require "SixVsSixPVPModel":GetInstance()
+}
+---@return SeasonModel SeasonModel
+function SeasonModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function SeasonModel:__init()
+    self.curFunctionOpenID = 59
+    self.settlementOffsetParams = _G.ConfigManager.discrete_cfg[105104][1]
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.AddCoin, self)
+    if AppSetting.IsXzns then
+        ---@type 角色循环周期
+        self.loopPeriod = _G.ConfigManager.discrete_cfg[122005][1][1]
+    end
+end
+
+---销毁对象时,析构函数
+function SeasonModel:Dispose()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.AddCoin, self)
+end
+
+--region 子类重写
+---从服务器拉取数据
+function SeasonModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---获取赛季信息
+function SeasonModel:GetInfo()
+    require "SeasonNet":GetInstance():GetInfo(_G.handler(self, self.GetInfoCall))
+end
+
+---获取信息回调
+---@param msg season.s2c_season_info
+function SeasonModel:GetInfoCall(msg)
+    self.isNewSeason = false
+    if self.infoData and self.infoData.end_time ~= msg.end_time then
+        self:OnSeasonEnd()
+        self.isNewSeason = true
+    end
+    self.infoData = msg
+    self.timeData = {
+        startTime = msg.start_time,
+        endTime = msg.end_time,
+        nextStartTime = msg.next_open_time,
+        settlementTime = 0
+    }
+    self.totalCoin = msg.role_info.total_coin
+    self.cfg = _G.ConfigManager.season_cfg[msg.id]
+    self:InitSeasonState()
+    self:InitOpenSystem()
+    self.count = 1 + _G.table.count(modelInstance)
+    self:InitSeasonFunctionData()
+    self:InitTimer()
+    require "SeasonNet":GetInstance():GetSignInfo(_G.handler(self, self.GetSignInfo))
+    self:ChangeMainShow()
+    if self.reconnectEndCall then
+        self.reconnectEndCall()
+    end
+end
+
+function SeasonModel:ReConnect(endcall)
+    if self.super.GetFunctionOpen(self) then
+        self.reconnectEndCall = endcall
+        self.isReConnect = true
+        self:InitData()
+    else
+        if endcall then
+            endcall()
+        end
+    end
+end
+---初始化赛季功能数据
+function SeasonModel:InitSeasonFunctionData()
+    if self:CheckSeasonIsOpen() then
+        self.count = self.count + #modelInstance
+        if self.isReConnect then
+            for k, v in pairs(modelInstance) do
+                if v:CheckIsOpen() then
+                    v:ReConnect(_G.handler(self, self.OnEndCall))
+                else
+                    self:OnEndCall()
+                end
+            end
+            self.isReConnect = false
+        elseif self.OnSixUpdateTag then
+            for k, v in pairs(modelInstance) do
+                if v:CheckIsOpen() then
+                    v:OnSixClockUpdate(_G.handler(self, self.OnEndCall))
+                else
+                    self:OnEndCall()
+                end
+            end
+        else
+            for k, v in pairs(modelInstance) do
+                if v:CheckIsOpen() then
+                    v:InitData(
+                        _G.handlerbind(
+                            self,
+                            self.OnEndCall,
+                            function()
+                                if v.redPointId > 0 then
+                                    local redId = v.redPointId
+                                    require "RedPointManager":GetInstance():AddRedPointChild(
+                                        _G.ConfigManager.redpoint_cfg.FirstTest.id,
+                                        redId
+                                    )
+                                end
+                            end
+                        )
+                    )
+                else
+                    self:OnEndCall()
+                end
+            end
+        end
+    else
+        for _, _ in pairs(modelInstance) do
+            self:OnEndCall()
+        end
+    end
+end
+
+---获取签到信息
+---@param msg season.s2c_season_sign_info
+function SeasonModel:GetSignInfo(msg)
+    self.signInfo = msg
+    self:InitSignAward()
+    self:OnEndCall()
+    _G.Events:GetInstance():Broadcast(_G.eSeason.SeasonRefreshModel, self.curFunctionOpenID)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FirstTest.id)
+end
+
+---初始化赛季状态
+function SeasonModel:InitSeasonState()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    self.state = _G.SeasonState.Open
+    if time >= self.infoData.end_time and time < self.infoData.next_open_time then
+        self.state = _G.SeasonState.WaitNext
+    elseif
+        _G.TimeUtil.GetDayBegin(self.infoData.end_time) - 86400 + self.settlementOffsetParams[1] * 3600 +
+            self.settlementOffsetParams[2] * 60 +
+            self.settlementOffsetParams[3] <
+            time
+     then
+        self.state = _G.SeasonState.Settlement
+    end
+    self:InitSeasonDay()
+end
+
+---初始化赛季天数
+function SeasonModel:InitSeasonDay()
+    self.curDay = 0
+    if self.state == _G.SeasonState.Open then
+        self.curDay = (_G.TimeUtil.GetIntervalDayBySix(
+                self.infoData.start_time,
+                _G.TimeUtil.GetServerUnixTime()
+        ) // 86400) + 1
+
+        if AppSetting.IsXzns then
+            local weekid = math.floor((self.curDay - 1)/self.loopPeriod) + 1
+            ---当前助阵角色ID
+            self.CurHelpOutRoleIds = self:GetCurCard_support()
+            local loopid = weekid % #self.CurHelpOutRoleIds
+            if loopid == 0 then
+                loopid = #self.CurHelpOutRoleIds
+            end
+            self.CurHelpOutRoleId = self.CurHelpOutRoleIds[loopid]
+            local season_cfg_boss = self:GetBossCfg()
+            ---@type EmbattleSeasonBoss
+            local item = require("EmbattleSeasonBoss").New(_G.EmbattleType.SeasonBoss, _G.EmbattleSaveType.server,  true,season_cfg_boss.monster_group)
+            local lastHelpOutRoleId = self:GetLastHelpOutRoleId()
+            if lastHelpOutRoleId == 0 then
+                self:SetLastHelpOutRoleId(self.CurHelpOutRoleId)
+                item:InitEmbattleData()
+            elseif self.CurHelpOutRoleId ~= lastHelpOutRoleId then
+                --重置阵容
+                item:ResetLineup()
+                self:SetLastHelpOutRoleId(self.CurHelpOutRoleId)
+            end
+        end
+    end
+end
+
+---初始化登录奖励
+function SeasonModel:InitSignAward()
+    self.signAward = {}
+    if self.signInfo.day_index then
+        for i = 1, #self.signInfo.day_index do
+            self.signAward[self.signInfo.day_index[i]] = true
+        end
+    end
+end
+
+---检测是否能领取登录奖励
+---@param index number 天数
+function SeasonModel:CheckCanTakeLoginAward(index)
+    return self.curDay >= index and not self:CheckGetLoginAward(index)
+end
+
+---检测奖励是否领取
+---@param index number 天数
+function SeasonModel:CheckGetLoginAward(index)
+    return self.signAward[index]
+end
+
+function SeasonModel:GetSeasonTime()
+    return _G.TimeUtil.GetServerUnixTime(), self.infoData.start_time
+end
+
+function SeasonModel:GetLoginPeriod()
+    if self.curDay > 0 then
+        local inday=self.curDay%7
+        if inday>0 then
+            return (self.curDay // 7) + 1
+        else
+            return self.curDay // 7
+        end
+    else
+        return 1
+    end
+end
+
+function SeasonModel:GetSignReward(id, callback)
+    require "SeasonNet":GetInstance():GetSignReward(
+        {index = id},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.signAward[id] = true
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if callback then
+                callback()
+            end
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstTest.id, 274)
+        end
+    )
+end
+
+---初始化计时器
+function SeasonModel:InitTimer()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if not self.cfg then
+        return
+    end
+    if not self:CheckSeasonIsOpen() then
+        return
+    end
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local tb = self.settlementOffsetParams
+    self.timeData.settlementTime = self.infoData.end_time - _G.TimeUtil.GAME_DAY_TIME + tb[1] * 3600 + tb[2] * 60 + tb[3] - 86400
+    local offset = self.timeData.settlementTime - time
+    if offset <= 0 then
+        self.state = _G.SeasonState.Settlement
+        return
+    end
+    self.timer = _G.TimerManager:GetInstance():GetTimer(offset, self.TimerOver, self, true, false, true)
+    self.timer:Start()
+end
+
+---首测结算中
+function SeasonModel:TimerOver()
+    self.timer:Stop()
+    self.timer = nil
+    self:OnSettlement()
+    self.state = _G.SeasonState.Settlement
+    self:ChangeMainShow()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FirstTest.id)
+end
+
+function SeasonModel:OnEndCall(_, call)
+    self.count = self.count - 1
+    if call then
+        call()
+    end
+    if self.count == 0 then
+        self:ParseData()
+    else
+        return
+    end
+    if self.isNewSeason then
+        self:OnSeasonStart()
+    else
+        for _, v in pairs(modelInstance) do
+            if v:CheckIsOpen() then
+                v:RefreshRedPoint()
+            end
+        end
+    end
+
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FirstTest.id)
+end
+
+---初始化开放的功能
+function SeasonModel:InitOpenSystem()
+    self.openSystem = {}
+    if self.cfg then
+        for _, v in pairs(self.cfg.system) do
+            self.openSystem[v] = true
+        end
+    end
+end
+
+---初始化数据
+function SeasonModel:InitFunction()
+    for _, v in pairs(self.cfg.system) do
+        if modelInstance[v] and modelInstance[v]:CheckIsOpen() then
+            modelInstance[v]:OnInitFunction()
+        end
+    end
+end
+
+---获取赛季配置
+function SeasonModel:GetCfg()
+    return self.cfg
+end
+
+---获取当前赛季id
+function SeasonModel:GetCurSeasonId()
+    return self.infoData and self.infoData.id or 1
+end
+
+---获取当前赛季大礼是否未领取
+function SeasonModel:GetBigGiftIsNotAccept()
+	return #self.cfg.gift > 0 and self.infoData.role_info.gift_award == 0
+end
+
+---获取赛季Boss
+---@return season_boss_cfg
+function SeasonModel:GetBossCfg()
+    local period = self:GetLoginPeriod()
+    if self.cfg.boss[period] and _G.ConfigManager.season_boss_cfg[self.cfg.boss[period]] then
+        return _G.ConfigManager.season_boss_cfg[self.cfg.boss[period]]
+    else
+        return _G.ConfigManager.season_boss_cfg[self.cfg.boss[1]]
+    end
+end
+
+---赛季借出
+function SeasonModel:OnSeasonEnd()
+    for k, v in pairs(modelInstance) do
+        if v:CheckIsOpen() then
+            v:OnSeasonEnd()
+            if v.redPointId > 0 then
+                require "RedPointManager":GetInstance():RemoveRedPointChild(
+                    _G.ConfigManager.redpoint_cfg.FirstTest.id,
+                    v.redPointId
+                )
+            end
+        end
+    end
+end
+
+---赛季开始
+function SeasonModel:OnSeasonStart()
+    for k, v in pairs(modelInstance) do
+        if v:CheckIsOpen() then
+            v:OnSeasonStart()
+            if v.redPointId > 0 then
+                require "RedPointManager":GetInstance():AddRedPointChild(
+                    _G.ConfigManager.redpoint_cfg.FirstTest.id,
+                    v.redPointId
+                )
+            end
+        end
+    end
+end
+
+---赛季结算
+function SeasonModel:OnSettlement()
+    for _, v in pairs(modelInstance) do
+        if v:CheckIsOpen() then
+            v:OnSettlement()
+            if v.redPointId > 0 then
+                require "RedPointManager":GetInstance():RemoveRedPointChild(
+                    _G.ConfigManager.redpoint_cfg.FirstTest.id,
+                    v.redPointId
+                )
+            end
+        end
+    end
+    _G.UIManager:GetInstance():CloseWindow(_G.ConfigManager.ui_cfg.SeasonView.Name)
+end
+
+---获取赛季状态
+---@return SeasonState
+function SeasonModel:GetSeasonState()
+    return self.state
+end
+
+---检测当前赛季功能是否开放
+---@param id number 共能id
+function SeasonModel:CheckFunctionIsOpen(id)
+    if not self.openSystem then
+        self:InitOpenSystem()
+    end
+    if not self:CheckSeasonIsOpen() then
+        return false
+    end
+    if id == 0 then
+        return self.infoData.id == 1
+    end
+    if _G.table.isEmptyOrNil(self.openSystem) then
+        return false
+    end
+    return self.openSystem[id] or false
+end
+
+---检测赛季功能是否开放
+---@param id number 共能id
+function SeasonModel:CheckSeasonFucntionIsOpen(id)
+    if modelInstance[id] then
+        return modelInstance[id]:CheckFunctionIsOpen()
+    end
+    return false
+end
+
+---检测赛季是否开启
+function SeasonModel:CheckSeasonIsOpen()
+    return self.state == _G.SeasonState.Open
+end
+
+---检测赛季冲锋是否开启
+function SeasonModel:CheckSeasonSpecial()
+    return self.infoData.special_award == 1 and not self:CheckIsGetSpecialAward()
+end
+
+---检测赛季期待
+function SeasonModel:CheckSeasonExpect()
+    local time = _G.TimeUtil.GetServerUnixTime()
+    if time >= self.timeData.endTime and time < self.timeData.nextStartTime then
+        return true
+    end
+    return false
+end
+
+---检测当天赛季期待奖励是否领取
+function SeasonModel:CheckSeasonExpectIsGet()
+    return self.infoData.role_info.login_award
+end
+
+---获取赛季冲锋奖励
+function SeasonModel:GetSeasonSpecialAward(call)
+    require "SeasonNet":GetInstance():GetSeasonSpecialAward(_G.handlerbind(self, self.GetSeasonSpecialAwardCall, call))
+end
+
+---获取赛季冲锋奖励回调
+---@param msg public.s2c_common_ack
+function SeasonModel:GetSeasonSpecialAwardCall(msg, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    self.infoData.special_award = 0
+    self.infoData.role_info.special_award = 1
+    if call then
+        call(msg)
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstTest.id, 0)
+end
+
+---获取赛季期待奖励数据
+function SeasonModel:GetSeasonExpectData()
+    local tb = _G.TimeUtil.TranslateSecond(self:GetNextSeasonSeasonTimeLeft())
+    if tb.hour > 0 or tb.min > 0 or tb.sec > 0 then
+        tb.day = tb.day + 1
+    end
+    local sid = self.cfg.forward[tb.day]
+    if not sid then
+        return nil
+    else
+        return _G.ConfigManager.season_login_cfg[sid] and _G.ConfigManager.season_login_cfg[sid].rewards or {}
+    end
+end
+
+---获取距离下赛季赛季剩余时间
+function SeasonModel:GetNextSeasonSeasonTimeLeft()
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    local time = self:GetTime()
+    return time.nextStartTime - curTime
+end
+
+---获取赛季剩余时间
+function SeasonModel:GetSeasonTimeLeft()
+    if not self.infoData then
+        return 0
+    end
+    local curTime = _G.TimeUtil.GetServerUnixTime()
+    local time = self:GetTime()
+    return time.endTime - curTime
+end
+
+---获取赛季结算剩余时间
+function SeasonModel:GetSeasonSettlementTimeLeft()
+    if not self.infoData then
+        return 0
+    end
+    return self.timeData.settlementTime - _G.TimeUtil.GetServerUnixTime()
+end
+
+---获取赛季期待奖励
+function SeasonModel:GetSeasonExpectAward(call)
+    if not self:CheckSeasonExpect() then
+        if call then
+            call()
+        end
+        return
+    end
+    require "SeasonNet":GetInstance():GetSeasonExpectAward(_G.handlerbind(self, self.GetSeasonExpectAwardCall, call))
+end
+
+---获取赛季期待奖励回调
+---@param msg public.s2c_common_ack
+function SeasonModel:GetSeasonExpectAwardCall(msg, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    self.infoData.role_info.login_award = true
+    if call then
+        call(msg)
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FirstTest.id)
+end
+
+---检测是否领取赛季冲锋奖励
+function SeasonModel:CheckIsGetSpecialAward()
+    return self.infoData.role_info.special_award == 1
+end
+
+---领取赛季大礼
+function SeasonModel:GetBigGift(call)
+    require "SeasonNet":GetInstance():GetSeasonBigGift(_G.handlerbind(self, self.GetBigGiftBack, call))
+end
+
+---领取赛季大礼回调
+function SeasonModel:GetBigGiftBack(msg, call)
+    if msg.ack ~= 1 then
+        if call then
+            call(msg)
+        end
+        return
+    end
+    self.infoData.role_info.gift_award = 1
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg, function()
+        if call then
+            call(msg)
+        end
+        --require "SeasonManager":GetInstance():OpenMainView()
+    end)
+end
+
+---更新主界面按钮显示
+function SeasonModel:ChangeMainShow()
+    local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name)
+    if ctrl then
+        ctrl:ShowSeasonBtn()
+    else
+        ---防止首次登录错误
+        ---H5暂时屏蔽
+        -- _G.FunctionManager:GetInstance():OpenFunById(_G.MainFunctionItems.Season)
+    end
+end
+
+function SeasonModel:OpenView(id, hideFun, openFun, ...)
+    --if modelInstance[id] and modelInstance[id]:CheckIsOpen() then
+    modelInstance[id]:OpenView(hideFun, openFun, ...)
+    --end
+end
+
+---@class SeasonTimeData
+---@field settlementTime number 结算时间
+---@field nextStartTime number 下赛季开始时间
+---@field endTime number 结束时间
+---@field startTime number 开始时间
+---获取赛季相关时间
+---@param return SeasonTimeData
+function SeasonModel:GetTime()
+    return self.timeData
+end
+
+---检测是否为新手赛季
+function SeasonModel:CheckIsFirstSeason()
+    return self.infoData.id == 1
+end
+
+---获取红点id
+---@param id number 功能id
+function SeasonModel:GetRedPointId(id)
+    return modelInstance[id] and modelInstance[id].redPointId or 0
+end
+
+function SeasonModel:ShowExtraIcon(id)
+    if modelInstance[id] then
+       local isShow,icon,onclick = modelInstance[id]:SetExtraBtn()
+       return isShow,icon,onclick
+    else
+        return 0
+    end
+end
+
+---获取结算时间
+function SeasonModel:GetEndTime()
+    return self.timeData.endTime
+end
+
+---检测是否有可领取的奖励
+function SeasonModel:CheckHaveSignReward()
+    if not self.cfg then
+        return false
+    end
+    for i, v in pairs(self.cfg.login) do
+        local cfg = _G.ConfigManager.season_login_cfg[v]
+        if cfg then
+            if self:CheckCanTakeLoginAward(i) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---检测红点
+function SeasonModel:CheckRedpoint(id)
+    if id == 0 then
+        return false
+    elseif id == 1 then
+        return false
+    elseif id == 274 then --7日签到
+        return self.state == _G.SeasonState.Open and self:CheckHaveSignReward()
+    end
+    --策划说赛季红点逻辑重做
+    --if id == 0 then
+    --    if self.state == _G.SeasonState.Settlement then
+    --        return false
+    --    elseif self.state == _G.SeasonState.Open then
+    --        return self:CheckHaveSignReward()
+    --    elseif self.state == _G.SeasonState.WaitNext then
+    --        return not self:CheckSeasonExpectIsGet()
+    --    end
+    --elseif id == 1 then
+    --    if self.state == _G.SeasonState.Settlement then
+    --        return false
+    --    elseif self.state == _G.SeasonState.Open then
+    --        return self:CheckSeasonSpecial()
+    --    elseif self.state == _G.SeasonState.WaitNext then
+    --        return not self:CheckSeasonExpectIsGet()
+    --    end
+    --end
+end
+
+function SeasonModel:GetTotalCoin()
+    return self.totalCoin or 0
+end
+
+function SeasonModel:AddCoin(data)
+    for _, v in pairs(data) do
+        if v.type[1] ==  _G.ResPropID.RecycleEquip and v.type[2] > 0 then
+            self.totalCoin = self.totalCoin + v.type[2]
+        end
+    end
+end
+
+---获取结算期时长
+---@return number
+function SeasonModel:GetSettlementDuration()
+    local cfg = _G.ConfigManager.discrete_cfg[105116]
+    if not cfg then
+        return 0
+    end
+    local hour, min, second = cfg[1][1] or 0, cfg[1][2] or 0, cfg[1][3] or 0
+    return 86400 - hour * 3600 - min * 60 - second
+end
+
+---是否在结算期中
+---@return boolean
+function SeasonModel:IsSettlementTime()
+    local sd = self:GetSettlementDuration()
+    if sd <= 0 or sd >= 86400 then
+        return false
+    end
+    local nowTime = _G.TimeUtil.GetServerUnixTime()
+    --获取赛季结束时间
+    local seasonTime = self:GetTime()
+    local seasonEndTime = seasonTime.startTime + self:GetLoginPeriod() * 7 * 86400 --单个赛季固定7天???
+    if seasonEndTime >= seasonTime.endTime then
+        seasonEndTime = seasonTime.endTime
+    end
+
+    return nowTime >= seasonEndTime - sd
+end
+
+---@return number[]
+function SeasonModel:GetCurCard_support()
+    if #self.cfg.card_support == 0 then
+        if AppSetting.DEBUG then
+            _G.LogError({},"season_cfg的助战女神未配置：cfgid:"..self.cfg.id.."字段：card_support")
+        end
+    end
+    return self.cfg.card_support
+end
+
+function SeasonModel:SetLastHelpOutRoleId(id)
+    local key = "SeasonLastHelpOutRoleI"
+    PlayerPrefsManager.SetInt(key,id)
+end
+
+function SeasonModel:GetLastHelpOutRoleId()
+    local key = "SeasonLastHelpOutRoleI"
+    if PlayerPrefsManager.HasKey(key) == false then
+        return 0
+    end
+    return PlayerPrefsManager.GetInt(key)
+end
+
+return SeasonModel

@@ -1,0 +1,263 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Season.Model. FirstTestModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/05/16
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "SeasonBaseModel"
+---@class  FirstTestModel : SeasonBaseModel	中文描述
+---@field cfg season_cfg
+---@field modelInstance
+local FirstTestModel = _G.BaseClass(" FirstTestModel", base)
+
+---@return  FirstTestModel  FirstTestModel
+function FirstTestModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---创建对象时,入口构造函数
+function FirstTestModel:__init()
+    self.curFunctionOpenID = 59
+    self.isOpen = false
+    self.modelInstance = {
+        [60] = require "FirstTestBossModel":GetInstance(),
+        [38] = require "WheelOfFortuneModel":GetInstance(),
+        --[59] = require "PingDingLingYuModel":GetInstance(),
+        [_G.FunctionID.HellGuard] = require("HellGuardModel"):GetInstance()
+    }
+end
+
+---销毁对象时,析构函数
+function FirstTestModel:Dispose()
+    if self.sixUpdateTimer then
+        _G.coroutine.stopwaiting(self.sixUpdateTimer)
+        self.sixUpdateTimer = nil
+    end
+end
+
+--region 子类重写
+---从服务器拉取数据
+function FirstTestModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---获取首测信息
+function FirstTestModel:GetInfo()
+    require "FirstTestNet":GetInstance():GetInfo(_G.handler(self, self.GetInfoCall))
+end
+
+function FirstTestModel:GetEndTime()
+    return self.infoData.start_time + self.cfg.duration * 86400
+end
+
+function FirstTestModel:OnSettlement()
+    self:OnExit()
+end
+---赛季结束
+function FirstTestModel:OnSeasonEnd()
+    _G.StorageManager:GetInstance():RemoveDatasBySid(_G.StorageID.ResProp, _G.ResPropID.Lucky_coin)
+end
+---退出
+function FirstTestModel:OnExit()
+    for _, v in pairs(self.modelInstance) do
+        if v.OnExit then
+            v:OnExit()
+        end
+    end
+end
+
+---获取信息回调
+---@param msg season.s2c_season_info
+function FirstTestModel:GetInfoCall(msg)
+    self.infoData = msg
+    self.cfg = _G.ConfigManager.season_cfg[msg.id]
+    self.curDay = _G.TimeUtil.GetInterValDayByGame(_G.TimeUtil.GetServerUnixTime(), self.infoData.start_time) + 1
+    self.count = #self.modelInstance + 1
+    self:InitOpenSystem()
+    require "FirstTestNet":GetInstance():GetSignInfo(_G.handler(self, self.GetSignInfo))
+    if self.CheckSeasonIsOpen() then
+        if self.isReConnect then
+            for _, v in pairs(self.modelInstance) do
+                v:ReConnect(_G.handler(self, self.OnEndCall))
+            end
+        elseif self.OnSixUpdateTag then
+            for _, v in pairs(self.modelInstance) do
+                v:OnSixClockUpdate(_G.handler(self, self.OnEndCall))
+            end
+        else
+            for _, v in pairs(self.modelInstance) do
+                v:InitData(_G.handler(self, self.OnEndCall))
+            end
+        end
+    end
+end
+
+function FirstTestModel:InitOpenSystem()
+    self.openSystem = {}
+    if self.cfg then
+        for _, v in pairs(self.cfg.system) do
+            self.openSystem[v] = true
+        end
+    end
+end
+
+---获取签到信息
+---@param msg season.s2c_season_sign_info
+function FirstTestModel:GetSignInfo(msg)
+    self.signInfo = msg
+    self:InitSignAward()
+    self:OnEndCall()
+    _G.Events:GetInstance():Broadcast(_G.eSeason.SeasonRefreshModel, self.curFunctionOpenID)
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstTest.id, 0)
+end
+
+function FirstTestModel:InitSignAward()
+    self.signAward = {}
+    if self.signInfo.day_index then
+        for _, v in pairs(self.signInfo.day_index) do
+            self.signAward[v] = true
+        end
+    end
+end
+
+function FirstTestModel:OnEndCall()
+    self.count = self.count - 1
+    if self.count == 0 then
+        self:ParseData()
+        if self.isReConnect then
+            self.isReConnect = false
+        end
+    end
+end
+
+function FirstTestModel:InitFunction()
+    if not self.CheckSeasonIsOpen() then
+        return
+    end
+    for _, v in pairs(self.modelInstance) do
+        v:OnInitFunction()
+    end
+end
+
+---获取首测配置
+function FirstTestModel:GetCfg()
+    return self.cfg
+end
+
+---获取当前首测id
+function FirstTestModel:GetCurSeasonId()
+    return self.infoData and self.infoData.id or 1
+end
+
+---获取首测Boss
+---@return season_boss_cfg
+function FirstTestModel:GetBossCfg()
+    return _G.ConfigManager.season_boss_cfg[self.cfg.boss]
+end
+
+---检测当前首测功能是否开放
+---@param id number 共能id
+function FirstTestModel:CheckFunctionIsOpen(id)
+    return self.openSystem[id]
+end
+
+---检测奖励是否领取
+function FirstTestModel:CheckGetLoginAward(id)
+    return self.signAward[id]
+end
+
+---检测是否能领取登录奖励
+function FirstTestModel:CheckCanTakeLoginAward(id)
+    local cfg = _G.ConfigManager.season_login_cfg[id]
+    return self.curDay >= cfg.day and not self:CheckGetLoginAward(id)
+end
+
+function FirstTestModel:GetSignReward(id, callback)
+    require "FirstTestNet":GetInstance():GetSignReward(
+        {index = id},
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            self.signAward[id] = true
+            require "CommonTipManager".OpenCommonAwardView(msg)
+            if callback then
+                callback()
+            end
+            require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FirstTest.id, 0)
+        end
+    )
+end
+
+---检测是否有可领取的奖励
+function FirstTestModel:CheckHaveSignReward()
+    if not self.cfg then
+        return false
+    end
+    for _, v in pairs(self.cfg.login) do
+        if self:CheckCanTakeLoginAward(v) then
+            return true
+        end
+    end
+    return false
+end
+
+---检测首测是否开启
+function FirstTestModel.CheckSeasonIsOpen()
+    return require "SeasonModel":GetInstance():CheckSeasonIsOpen()
+end
+---检测首测是否开启
+function FirstTestModel.CheckSeasonShopIsOpen()
+    return require "SeasonModel":GetInstance():GetSeasonState() < _G.SeasonState.WaitNext
+end
+
+---时间转换
+---@param startTime number 起始时间 单位s
+---@param duration number 持续时间 单位s
+function FirstTestModel:FormatTime(startTime, duration)
+    local stime = _G.TimeUtil.GetDateTime(startTime)
+    local etime = _G.TimeUtil.GetDateTime(startTime + duration)
+    local str =
+        _G.string.format(
+        "活动时间：%s-%s-%s 06:00 至 %s-%s-%s 06:00",
+        stime.year,
+        stime.month,
+        stime.day,
+        etime.year,
+        etime.month,
+        etime.day
+    )
+    return str
+end
+
+function FirstTestModel:OnSixClockUpdate(endcall)
+    self.sixUpdateTimer =
+        _G.DelayDo(
+        4,
+        function()
+            _G.GameDataModelBase.OnSixClockUpdate(self, endcall)
+            self.sixUpdateTimer = nil
+        end
+    )
+end
+
+function FirstTestModel:OpenFirstTestView()
+    if not self.CheckSeasonIsOpen() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(620105)
+        return
+    end
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SeasonView.Name)
+end
+
+---获取赛季的结束时间
+function FirstTestModel:GetEndTime()
+    return self.endTime
+end
+
+function FirstTestModel:ReConnect(endcall)
+    self.isReConnect = true
+    self:InitData(endcall)
+end
+
+return FirstTestModel

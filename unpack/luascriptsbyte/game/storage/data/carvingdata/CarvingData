@@ -1,0 +1,336 @@
+-- E:.01.zhj.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Storage.Data.CarvingData	(修改路径必须修正此项!)
+-----------------------------------------------------------------------
+-- Created by 此处填写你的名字
+-- DateTime: 2021/06/30
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+local base = require "BaseItemData"
+---@class CarvingData	中文描述
+---@field cfg carving_cfg
+local CarvingData = _G.BaseClass("CarvingData", base)
+_G.CarvingData = CarvingData
+local GetLangPackValue = _G.GetLangPackValue
+local decMainAttribute = {
+    atk = 90010200101,
+    bre = 90010200201,
+    def = 90010200301,
+    max_hp = 90010200401
+}
+
+---类的构造函数
+function CarvingData:__init()
+end
+
+---类的析构函数
+function CarvingData:Dispose()
+end
+
+--region 子类重写
+---物品数据解析(类重写数据解析)所有符文都在仓库(穿戴后也在仓库，所以穿戴/卸下等操作直接修改数据类即可)，卡牌身上的符文只是用于卡牌计算属性
+---@param msg prop.i_carving 数据
+function CarvingData:ParseInitMsg(data)
+    self.sid = data.sid
+    self.uid = data.uid or data.sid
+    self.level = data.level or 1
+    self.attr = data.attr_add or {}
+    self.cardUid = data.card_uid or 0
+    self.lock = data.lock
+    self.resetNum = data.reset_num
+    self.attr_cache = data.attr_cache
+    ---符文配置carving_cfg
+    self.cfg = _G.ConfigManager.carving_cfg[self.sid]
+    if not self.cfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("carving_cfg中找不到对应的符文配置，sid: " .. _G.tostring(self.sid))
+        end
+        self.cfg = _G.ConfigManager.carving_cfg[267010401]
+    end
+    self.Grade = self.cfg.grade
+    self.Icon = self.cfg.icon
+    self.parts = self.cfg.parts
+
+    ---评分：没有槽位等级的加成
+    self.activeAttr = {}
+    self:InitScoreProp()
+    self:InitPropKey()
+end
+
+---获取抗魔值
+function CarvingData:GetAbyssalMaw()
+    local resistance = 0
+    resistance = resistance + self.cfg.resistance_num
+    if self.level > 0 then
+        resistance = resistance + _G.ConfigManager.carving_level_cfg[self.level].resistance_num
+    end
+    return resistance
+end
+
+--endregion
+
+---解析奖励消息
+---@param msg table 服务器下发奖励消息
+function CarvingData:ParseAward(msg)
+    local data = {}
+    data.sid = msg[1]
+    data.uid = msg[2]
+    data.level = msg[3]
+    data.attr_add = {}
+    for i = 4, #msg, 3 do
+        _G.table.insert(data.attr_add, { index = msg[i], attr_sid = msg[i + 1], attr_value = msg[i + 2], is_lock = 0 })
+    end
+    data.reset_num = 0
+    self:ParseInitMsg(data)
+end
+
+--region 对外接口
+---额外数据解析(类重写数据解析)
+function CarvingData:ParseExtend(extend)
+    if not extend then
+        return
+    end
+    self.level = extend[1]
+end
+
+---属性加成倍率
+function CarvingData:GetPropRate(strengLv)
+    local cfg
+    if self.level then
+        cfg = _G.ConfigManager.carving_level_cfg[self.level]
+    end
+    local percent = 1
+    if cfg then
+        ---符文本身的等级加成
+        percent = percent + cfg.att_growth * 0.0001
+    end
+    if strengLv then
+        cfg = _G.ConfigManager.carving_stren_cfg[strengLv]
+        if cfg then
+            ---槽位强化等级加成
+            percent = percent + cfg.att_growth * 0.0001
+        end
+    end
+    return percent
+end
+
+---用于筛选卡
+function CarvingData:InitPropKey()
+    self.propKeyList = {}
+
+    if not _G.table.isEmptyOrNil(self.attr) then
+        local cfg = _G.ConfigManager.attribute_cfg
+        for i = 1, table.count(self.attr) do
+            self.propKeyList[cfg[self.attr[i].attr_value].attribute] = true
+        end
+    end
+end
+
+---检测是否拥有该副属性
+---@param key string 属性类型
+---@param isCheckActive boolean 是否进行激活检测
+function CarvingData:CheckHasPropType(key, isCheckActive)
+    if isCheckActive then
+        return self.propKeyList[key] and self.activeAttr[key]
+    else
+        return self.propKeyList[key]
+    end
+end
+
+---基础属性 * 倍率 + 词条属性
+function CarvingData:GetPropList(strengLv)
+    ---基础属性
+    local baseProp = {}
+    --词条属性
+    local entryProp = {}
+    local rate = self:GetPropRate(strengLv)
+    ---基础属性
+    for key, name in pairs(decMainAttribute) do
+        local tempValue = self.cfg[key]
+        if tempValue and tempValue > 0 then
+            baseProp[key] = {
+                value = _G.Mathf.RoundToInt(tempValue * rate),
+                name = name
+            }
+        end
+    end
+    ---词条属性
+    if not _G.table.isEmptyOrNil(self.attr) then
+        local cfg = _G.ConfigManager.attribute_cfg
+        for i = 1, table.count(self.attr) do
+            local attr = cfg[self.attr[i].attr_value].attribute
+            local key = attr[1][1]
+            local value_type = tonumber(attr[1][2])
+            local value = tonumber(attr[1][3])
+            entryProp[key] = {
+                value = value * 0.0001,
+                value_type = value_type,
+                name = cfg[self.attr[i].attr_value].name
+            }
+        end
+    end
+    return baseProp, entryProp
+end
+
+---获取饰品基础属性
+---@return AttributeClass
+function CarvingData:GetBasePropAttr(percent)
+    local attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    for key, value in pairs(decMainAttribute) do
+        local tempValue = self.cfg[key]
+        if tempValue and tempValue > 0 then
+            attribute:SetValueByName(key, tempValue * percent, false, _G.AttCountType.other)
+        end
+    end
+    return attribute
+end
+
+---评分属性-用于计算评分
+function CarvingData:InitScoreProp()
+    self.scoreAttribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    --local cfg = _G.ConfigManager.carving_add_cfg
+    --思维属性的 百分比  其他属性的增加
+    if not _G.table.isEmptyOrNil(self.attr) then
+        for i = 1, table.count(self.attr) do
+            local attdata = self.attr[i]
+            --LogError(attdata.attr_value)
+
+            local cfg = _G.ConfigManager.attribute_cfg[attdata.attr_value]
+
+            for _, v in pairs(cfg.attribute) do
+                self.scoreAttribute:AddValueByName(
+                    v[1],
+                    _G.AttributeClassManager:GetInstance():GetValueWithName(v[1], v[3], _G.tonumber(v[2])),
+                    false,
+                    _G.tonumber(v[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+                )
+            end
+        end
+    end
+
+    local percent = self:GetPropRate()
+    for key, value in pairs(decMainAttribute) do
+        local tempValue = self.cfg[key]
+        if tempValue and tempValue > 0 then
+            self.scoreAttribute:SetValueByName(key, tempValue * percent, false)
+        end
+    end
+
+    return self.scoreAttribute
+end
+
+---获取饰品最终属性  or not all
+---@return AttributeClass
+function CarvingData:GetProp(strengLv)
+    self.attribute = _G.AttributeClassManager:GetInstance():GetAttribtueClass()
+    --local cfg = _G.ConfigManager.carving_add_cfg
+    --思维属性的 百分比  其他属性的增加
+    if not _G.table.isEmptyOrNil(self.attr) then
+        for i = 1, table.count(self.attr) do
+            local attdata = self.attr[i]
+
+            local cfg = _G.ConfigManager.attribute_cfg[attdata.attr_value]
+
+            for _, v in pairs(cfg.attribute) do
+                self.attribute:AddValueByName(
+                    v[1],
+                    _G.AttributeClassManager:GetInstance():GetValueWithName(v[1], v[3], _G.tonumber(v[2])),
+                    false,
+                    _G.tonumber(v[2]) == 1 and _G.AttCountType.other or _G.AttCountType.basePercent
+                )
+            end
+        end
+    end
+
+    local percent = self:GetPropRate(strengLv)
+    local baseAttribute = self:GetBasePropAttr(percent)
+    _G.AttributeClassManager:GetInstance():AddAttribute(self.attribute, baseAttribute)
+
+    --- 对最终属性 四舍五入  防止小数位太多
+    for i, v in pairs(self.attribute.attriOther) do
+        if v > 0 then
+            self.attribute:SetValueByName(i, _G.Mathf.RoundToInt(v), nil, _G.AttCountType.other)
+        end
+    end
+
+    return self.attribute
+end
+
+---穿戴卡牌
+---@param uid number 卡牌uid
+function CarvingData:PutCard(uid)
+    self.cardUid = uid
+end
+
+function CarvingData:GetTxtParts()
+    local parts_array = {
+        [1] = GetLangPackValue(90022500427),
+        [2] = GetLangPackValue(90022500428),
+        [3] = GetLangPackValue(90022500429),
+        [4] = GetLangPackValue(90022500430)
+    }
+    return parts_array[self.cfg.parts]
+end
+
+---获取属性名字
+function CarvingData:GetAddName(index)
+    local info = self.attr[index]
+    local sid
+    local name = ""
+    if info then
+        sid = info.attr_value
+        local cfg = _G.ConfigManager.attribute_cfg
+        local attr = cfg[sid].attribute
+        if not _G.table.isEmptyOrNil(attr) then
+            for i =1,#attr do
+                local key = attr[1][1]
+                local value_type = tonumber(attr[1][2])
+                local value = tonumber(attr[1][3])
+                if value_type == 2 then
+                    name = name ..  (_G.AttrType[key].des .. " + ".. string.format("%d%%", math.max(1, math.floor(value / 100))))
+                else
+                    name = name ..  (_G.AttrType[key].des .. " + ".. value)
+                end
+            end
+        else
+            name = _G.GetLangPackValue(cfg[sid].describe)
+        end
+    end
+    return name
+end
+
+---获取分解后的材料
+function CarvingData:GetDecomposition()
+    local cfg = _G.ConfigManager.carving_cfg[self.sid]
+    return cfg.giveback
+end
+
+function CarvingData:GetGrade()
+    return self.Grade
+end
+
+function CarvingData:GetPower()
+    if not self.score then
+        self.score = self.scoreAttribute:CalculateArtifactPower()
+    end
+    return self.score
+end
+
+---获取槽位强化等级
+function CarvingData:GetSlotStrenLv()
+    if self.cardUid ~= 0 then
+        local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, self.cardUid)
+        if cardData and cardData.CarvingBar then
+            for _, v in pairs(cardData.CarvingBar) do
+                if v.index == self.parts and v.carving and v.carving.uid == self.uid then
+                    return v.slotLevel or 0
+                end
+            end
+        end
+    end
+    return 0
+end
+
+function CarvingData:GetName()
+    return _G.GetLangPackValue(self.cfg.name)
+end
+
+return CarvingData

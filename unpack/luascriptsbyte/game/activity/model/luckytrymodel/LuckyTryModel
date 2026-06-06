@@ -1,0 +1,190 @@
+-----------------------------------------------------------------------
+-- F:.H5.Client.Assets.Resources.LuaScripts.Game.RechargeDraw.Model.LuckyTryModel	(修改路径必须修正此项!)
+-- Created by 
+-- DateTime: 2025/07/11
+-- Description: 试试手气
+-----------------------------------------------------------------------
+local base = require "ActivitySynTypeBase"
+local MallManager = require("MallManager")
+---@class LuckyTryModel	: ActivitySynTypeBase
+local LuckyTryModel = _G.BaseClass("LuckyTryModel", base)
+local coinID = 11
+local LuckyTryNet = require("LuckyTryNet"):GetInstance()
+
+---创建对象时,入口构造函数
+function LuckyTryModel:__init()
+    self.drawTimes = 0
+    self.ActivityId = self.curActivityClass:GetActivityID()
+    self:SetSelfData(self.curActivityClass.cfg.self_info.try_luck)
+    _G.Events:GetInstance():AddListener(_G.eSixUpdate.SixClockUpdate, self.SixUpdate, self)
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    self:RefreshRedPointRecordRecharge()
+end
+
+function LuckyTryModel:SixUpdate()
+    self:RefreshRedPointRecordRecharge()
+    for k, v in ipairs(self.curActivityClass.cfg.info.front.con) do --如果开启条件里面有每天重置的，跨天关闭入口先
+        if _G.table.ContainsValue(_G.FunctionOpenDailyCheckID, v.type) then 
+            require("ActivitySynEnterManager"):GetInstance():RemoveActivityBtn(self.curActivityClass)
+            local ctrl = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.FuliView.Name)
+            if ctrl then
+                ctrl:Close()
+            end
+            return 
+        end
+    end
+end
+
+function LuckyTryModel:IsShowInFuliView()
+    return _G.GameUtil.GetFunctionOpenState(_G.FunctionBlock.LuckyDog)
+end
+
+function LuckyTryModel:ResUpdata(data)
+    for _, v in pairs(data) do
+        if v.type[1] == coinID then
+            self:RefreshRedPointRecordRecharge()
+        end
+    end
+end
+
+---获取服务器数据
+function LuckyTryModel:GetDataFormServer()
+    self:ParseData()
+end
+
+---解析数据
+---@param data table 服务器返回数据
+function LuckyTryModel:ParseData(info)
+    self:SetSelfData(info.try_luck)
+    base.ParseData(self)
+end
+
+function LuckyTryModel:SetSelfData(data)
+    self.id = data.pool_sid
+    self.gotIndexT = data.index or {}
+    self.drawTimes = #self.gotIndexT
+    self.consume_list = data.consume_list
+    coinID = self.consume_list[1].key
+    local cfg = _G.ConfigManager.prize_pool_cfg[self.id]
+    self.awardCfg = {}
+    for k, v in pairs(cfg.reward1) do 
+        local T = {v[1], v[2]}
+        table.insert(self.awardCfg, T)
+    end
+    
+end
+
+---所有活动解析完成后运行
+function LuckyTryModel:LaterInitFunction()
+    local redPointId = self:GetRedpointIDByIndex(1)
+    local taskActivity = require "ActivitySynManager":GetInstance():GetChildAcitivity(10007, self.curActivityClass:GetJumpType())
+    if taskActivity then 
+        require "RedPointManager":GetInstance():AddRedPointChild(redPointId, taskActivity:GetActivityTypeCls():GetRedpointIDByIndex(1))
+    end
+end
+
+function LuckyTryModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.LuckyTryView.Name, self.curActivityClass)
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+
+function LuckyTryModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.LuckyTryView.Name
+end
+
+function LuckyTryModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckDrawTime }
+    self.redpointTree = { { 2 }, false }
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function LuckyTryModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---刷新奖励红点
+function LuckyTryModel:RefreshRedPointRecordRecharge()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+function LuckyTryModel:CheckDrawTime()
+    local coinCount = _G.StorageManager:GetInstance():GetItemCountBySid(coinID)
+    local nowNeedCount = self:GetNowNeedCount()
+    return coinCount >= nowNeedCount and 1 or 0
+end
+
+--region 对外接口
+
+---获取配置id
+function LuckyTryModel:Getid()
+    return self.id
+end
+
+function LuckyTryModel:GetAwardCfg()
+    return self.awardCfg
+end
+
+---检查奖励是否被领取
+function LuckyTryModel:CheckAward(index1)
+    return _G.table.ContainsValue(self.gotIndexT, index1)
+end
+
+function LuckyTryModel:GetNowNeedCount()
+    -- local maxIndex = #self.consume_list
+    -- local nowIndex = self.drawTimes + 1
+    -- nowIndex = math.min(#maxIndex, nowIndex)
+    return self.consume_list[1].value
+end
+
+---抽奖
+function LuckyTryModel:Draw(pb, callback)
+    LuckyTryNet:Draw(pb, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        _G.StorageManager:GetInstance():ConsumeItem(coinID, nil, self:GetNowNeedCount())
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        if msg.args[2] then  
+            self.gotIndexT = {}
+            self.id = msg.args[2]
+            ---奖池id变化后重新获取奖励
+            local cfg = _G.ConfigManager.prize_pool_cfg[self.id]
+            self.awardCfg = {}
+            for _, v in pairs(cfg.reward1) do 
+                _G.table.insert(self.awardCfg, {v[1], v[2]})
+            end
+            self.drawTimes = 0
+        else
+            table.insert(self.gotIndexT, msg.args[1])
+            self.drawTimes = self.drawTimes + 1
+        end
+        if callback then 
+            callback{msg}
+        end
+        self:RefreshRedPointRecordRecharge()
+    end)
+end
+
+-- function LuckyTryModel:GetShowBtnType()
+--     return false 
+-- end
+
+--endregion
+
+---类的析构函数
+function LuckyTryModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eSixUpdate.SixClockUpdate, self.SixUpdate, self)
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+end
+
+return LuckyTryModel

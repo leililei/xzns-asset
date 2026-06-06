@@ -1,0 +1,180 @@
+local base = require("AIHelperModuleBaseNumberMock")
+
+---@class AIHelperModuleHellGuard : AIHelperModuleBaseNumberMock	    @AI助手-灵域守卫
+---@field index number                  @已执行次数
+local AIHelperModuleHellGuard = _G.BaseClass("AIHelperModuleHellGuard", base)
+
+---是否显示此模块(功能是否开启)
+function AIHelperModuleHellGuard:IsEnabled()
+    if not base.IsEnabled(self) then
+        return false
+    end
+    return true
+end
+
+---是否满足模块使用条件
+function AIHelperModuleHellGuard:IsActive()
+    return self.index <= self.number
+end
+
+---重置状态
+function AIHelperModuleHellGuard:Reset()
+    base.Reset(self)
+    self.index = 1
+end
+
+---获取状态(可能为异步请求数据)
+function AIHelperModuleHellGuard:Check(callback)
+    self.index = 1
+    if callback then
+        callback(true)
+    end
+end
+
+---获取当前执行状态
+function AIHelperModuleHellGuard:GetExecuteState()
+    return {
+        total = self.number,
+        index = self.index
+    }
+end
+
+---执行逻辑
+function AIHelperModuleHellGuard:Execute(callback)
+    self.index = self.index + 1
+
+    ---检测是否正在战斗中
+    if _G.MainManager:GetInstance():IsFighting(false) then
+        if callback then
+            callback(false, self:CreateFailureResults(90028010143, _G.GetLangPackValue(self.cfg.name)))
+        end
+        return
+    end
+
+    ---@type HellGuardModel
+    local model = require("HellGuardModel"):GetInstance()
+    ---@type EmbattleModel
+    local embattleModel = require("EmbattleModel"):GetInstance()
+
+    local function response(success, results)
+        if not callback then
+            return
+        end
+        callback(success, results)
+    end
+
+    --检测布阵是否为空
+    if not embattleModel:CheckBattle(_G.EmbattleType.HellGuard) then
+        response(false, self:CreateFailureResults(self.cfg.fail_tip))
+        return
+    end
+
+    --检测是否结算期中
+    if model:IsSettlementTime() then
+        response(false, self:CreateFailureResults(90033100018)) --结算期失败tip
+        return
+    end
+
+    --发起战斗结算
+    ---@param data any 结算数据
+    ---@param level number 挑战难度
+    local function fightResult(data, level)
+        require("BattleNet"):GetInstance():NpcPVEFightResult(
+            data,
+            function(msg)
+                if msg.md5_error == "1" then
+                    _G.PopWindowManager:GetInstance():ShowAllTips(44)
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                elseif msg.md5_error == "2" then
+                    _G.BattleManager:GetInstance():SaveLogNew()
+                end
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+
+                --获取奖励
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                --缓存数据
+                model:FightWin(msg.kill_num)
+
+                --当前挑战难度
+                msg.level = level
+                response(true, msg)
+            end
+        )
+    end
+    --发起战斗请求
+    local function fightBegin()
+        local level = model:GetCuDifficulty()
+        require("HellGuardNet"):GetInstance():Fight(
+            { sid = level },
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    response(false, nil)
+                    return
+                end
+
+                --计算战斗结果
+                -- _G.BattleManager:GetInstance():SetArgDataAutoCmd(msg.fight_arg)
+                -- local record = _G.BattleManager:GetInstance():GetStatisticsRecord(msg.fight_arg)
+                -- if not record or not record.result then
+                --     response(false, nil)
+                --     return
+                -- end
+                local tab = nil
+                --发起战斗结算
+                fightResult(tab, level)
+            end
+        )
+    end
+    ---更新布阵阵容
+    ---@param embattleId number 布阵id
+    local function updateEmbattle(embattleId)
+        embattleModel:SaveEmbattleDataNew(
+            embattleId,
+            function(respCode)
+                if respCode ~= 0 then
+                    response(false, nil)
+                    return
+                end
+                fightBegin()
+            end,
+            _G.EmbattleSaveType.server,
+            true,
+            nil
+        )
+    end
+
+    updateEmbattle(_G.EmbattleType.HellGuard)
+end
+
+---显示执行状态
+function AIHelperModuleHellGuard:ShowExecutingState(item, state, results)
+    base.ShowExecutingState(self, item, state, results)
+    if results and results.level then
+        item.aortext_tip.text = _G.GetLangPackValue(90027300007, results.level)
+    else
+        item.aortext_tip.text = ""
+    end
+end
+
+---显示执行结束UI状态
+---@param results public.s2c_common_ack
+function AIHelperModuleHellGuard:ShowExecuteResult(item, success, results)
+    base.ShowExecuteResult(self, item, success, results)
+    if not success or not results then
+        return
+    end
+
+    if results.award then
+        self.Util.HideAwardListOfMsg(item, results)
+    elseif results.kill_num then
+        item.obj_failure:SetActiveE(0)
+        item.aortext_failure:SetActiveE(1)
+        item.aortext_failure.text = "<color=#000000>" ..
+            _G.GetLangPackValue(90026000011) .. "：" .. results.kill_num .. "</color>"
+    end
+end
+
+return AIHelperModuleHellGuard

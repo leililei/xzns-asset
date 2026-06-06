@@ -1,0 +1,1537 @@
+-----------------------------------------------------------------------
+-- C:.alpha_JT.Client.Assets.Resources.LuaScripts.Game.SociatyMoba.Model.SociatyMobaBattleModel	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/07/30
+-- Description 冥界纷争战斗模块
+-----------------------------------------------------------------------
+local SociatyMobaCreepData = require("SociatyMobaCreepData")
+local SociatyMobaLanerData = require("SociatyMobaLanerData")
+local SociatyMobaNet = require("SociatyMobaNet")
+
+---@class SociatyMobaBattleModel : Singleton	中文描述
+---@field data guild_moba.s2c_guild_moba_fight_info 服务器初始信息
+---@field lanerOur SociatyMobaLanerData[] 我方线路数据
+---@field lanerEnemy SociatyMobaLanerData[] 敌方线路数据
+---@field creepData SociatyMobaCreepData[] 野怪数据
+local SociatyMobaBattleModel = _G.BaseClass("SociatyMobaBattleModel", _G.Singleton)
+
+---@return SociatyMobaBattleModel SociatyMobaBattleModel
+function SociatyMobaBattleModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+local LanerName = {
+    [1] = _G.GetLangPackValue(90031700028),
+    [2] = _G.GetLangPackValue(90031700029),
+    [3] = _G.GetLangPackValue(90031700030)
+}
+setmetatable(
+    LanerName,
+    {
+        __index = function(t, key)
+            t[key] = _G.GetLangPackValue(_G.ConfigManager.guild_moba_campsite_cfg[key].name[1][1])
+            return t[key]
+        end
+    }
+)
+
+---AB对应下标
+local ABIndex = {
+    a = 1,
+    b = 2
+}
+SociatyMobaBattleModel.ABIndex = ABIndex
+
+---分线状态
+local LanerState = {
+    InBattle = 1, --未出结果
+    Victory = 2,  --胜利
+    Defeat = 3    --失败
+}
+SociatyMobaBattleModel.LanerState = LanerState
+
+---野怪状态
+local CreepState = {
+    UnRefresh = 1,   --未刷新
+    NoOccupy = 2,    --无人占领
+    OurOccupy = 3,   --我方占领
+    EnemyOccupy = 4, --敌方占领
+    InBattle = 5,    --争夺中
+    OurWin = 6,      --我方获得
+    EnemyWin = 7,    --敌方获得
+    Idle = 8         --未开赛/已结束
+}
+SociatyMobaBattleModel.CreepState = CreepState
+
+---创建对象时,入口构造函数
+function SociatyMobaBattleModel:__init()
+    self.maxPlayerNum = 0
+    for _, v in pairs(_G.ConfigManager.guild_level_cfg) do
+        if v.num_player > self.maxPlayerNum then
+            self.maxPlayerNum = v.num_player
+        end
+    end
+    self.creepMaxTimes = _G.ConfigManager.discrete_cfg[101665][1][1]
+    self.reports = {}
+    self.lanerOur = {}
+    self.lanerEnemy = {}
+    self.creepData = {}
+    self.hitRotation = {}
+    self.unAutoUid = {}
+    self.rankData = {}     --uid为key，方便修改数据
+    self.rankSortData = {} --用于排序
+    local cfg, pos
+    for i = 1, 3 do
+        cfg = _G.ConfigManager.guild_moba_campsite_cfg[i]
+        pos = cfg.battle_coordinate
+        if pos[2][1] == pos[1][1] then
+            self.hitRotation[i] = pos[2][2] > pos[1][2] and -90 or -270
+        else
+            self.hitRotation[i] = math.atan((pos[2][2] - pos[1][2]) / (pos[2][1] - pos[1][1])) * 180 / math.pi
+            if self.hitRotation[i] > 0 then
+                self.hitRotation[i] = self.hitRotation[i] - 180
+            end
+        end
+    end
+end
+
+---获取战场信息
+function SociatyMobaBattleModel:GetBattleInfo(call)
+    require("SociatyMobaNet"):GetInstance():GetBattleInfo(
+        function(msg)
+            self:InitBattleData(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+---获取战场信息以初始化弹幕
+function SociatyMobaBattleModel:GetBattleInfoToDanmu(call)
+    require("SociatyMobaNet"):GetInstance():GetBattleInfo(
+        function(msg)
+            if call then
+                call(msg)
+            end
+        end
+    )
+end
+
+-- 弹幕解析组装
+function SociatyMobaBattleModel:DanmuPairse(danmuList)
+    --- 弹幕离散表配置 查找语言表
+    local LanguageList = _G.ConfigManager.discrete_cfg[116200]
+
+    local SociatySelf = require("SociatyModel"):GetInstance().SociatySelf
+    --- 组装要传入的弹幕Item结构 content为数据 color为颜色 expressionPath 为表情路径 tag频道标签
+    --- name为玩家名 【除了表情弹幕 其他消息一律拼好content为数据再传】
+    local danmuItemList = {}
+    --- 弹幕开关
+    local isDanmuShow = true
+    local MessageContentColors = {
+        [1] = "<color=#5BDF99>", --自己的文本颜色
+        [2] = "<color=#76DAF8>", --盟友的文本颜色
+        [3] = "<color=#FF5555>", --敌对的文本颜色
+    }
+    if not self.lianshaicon then
+        self.lianshaicon={
+            "ui_alxzc_zcjm_piaozi_liansha",
+            "ui_alxzc_zcjm_piaozi_baozou",
+            "ui_alxzc_zcjm_piaozi_chaosheng",
+            "ui_alxzc_zcjm_piaozi_tzzc"
+        }
+    end
+    if not self.lianshaCfg then
+        self.lianshaCfg=_G.ConfigManager.discrete_cfg[116203]
+    end
+    local atlas = "AtlasH5/nSociatyMoba_Language/nSociatyMoba_LanguageAtlas"
+    if #danmuList > 0 and isDanmuShow then
+        for i = 1, #danmuList do
+            --_G.LogError(danmuList[i])
+            --获取弹幕文本颜色
+            local isSelf = danmuList[i].r_info and
+                danmuList[i].r_info.uid == _G.PlayerModel:GetInstance():GetPlayerUid()
+
+            local isOur = danmuList[i].g_uid == SociatySelf.Uid
+
+
+            local playerName   = danmuList[i].args[2] .. ": "
+
+            --- 是否己方同盟
+            local colorNum     = isOur and 2 or 3
+            --- 是否自己
+            local contentColor = MessageContentColors[isSelf and 1 or colorNum]
+
+            local item         = {}
+            item.content       ="<size=24>".. contentColor .. playerName ..
+                _G.GetLangPackValue(LanguageList[danmuList[i].l_id][2]) .. "</color></size>"
+            item.atlas         = atlas
+            if danmuList[i].type == 1 then
+                item.icon = "ui_alxzc_zcjm_piaozi_shousha"
+            elseif danmuList[i].type == 2 then
+                local KillNum= tonumber(danmuList[i].args[3])
+                for j = 1, #self.lianshaCfg do
+                    if self.lianshaCfg[j][3]==0 and self.lianshaCfg[j][1] <=KillNum then
+                        item.icon=self.lianshaicon[j]
+                    elseif self.lianshaCfg[j][3]==1 and self.lianshaCfg[j][1] <=KillNum and self.lianshaCfg[j][2]>=KillNum then
+                        item.icon=self.lianshaicon[j]
+                    end
+                end
+            elseif danmuList[i].type == 3 then
+                item.icon = "ui_alxzc_zcjm_piaozi_zhongjie"
+            end
+
+            table.insert(danmuItemList, item)
+        end
+    end
+
+    return danmuItemList
+end
+
+---初始化战场数据
+---@param data guild_moba.s2c_guild_moba_fight_info
+function SociatyMobaBattleModel:InitBattleData(data)
+    self.SociatySelf = require("SociatyModel"):GetInstance().SociatySelf
+    self.data = data
+    if data.a_uid == 0 or data.b_uid == 0 then
+        if _G.AppSetting.DEBUG then
+            _G.Log("冥界纷争未开始匹配！")
+        end
+        self:CheckDataWildSet(data)
+        self:CheckDataMarchOrder(data)
+        self:InitCreepPreset(data.wild_set)
+        self:InitMarchOrder(data.order_set)
+        return
+    end
+    self.abOur = "a"
+    self.abEnemy = "b"
+    if data.b_uid == self.SociatySelf.Uid then
+        self.abOur = "b"
+        self.abEnemy = "a"
+    end
+    -- LogError(self.abOur)
+    self.isBye = data[self.abEnemy .. "_uid"] == 1 --轮空
+    self:CheckData(data)
+    self:InitLanerData(data.tower_march)
+    self:InitCreepTimes(data.wild_time)
+    self:InitCreepData(data.wild_march)
+    self:InitCreepPreset(data.wild_set)
+    self:InitMarchOrder(data.order_set)
+    self:InitReport(data.log)
+    self:InitKillRank(data[self.abOur .. "_rank"], data[self.abEnemy .. "_rank"])
+    self.unAutoUid = {}
+    self.creepSelf = nil
+    self.LineInfo = nil
+end
+
+---检查校验数据
+---@param data guild_moba.s2c_guild_moba_fight_info
+function SociatyMobaBattleModel:CheckData(data)
+    if not data.tower_march then
+        data.tower_march = {
+            { sid = 1, state = 0, a_line_max = 0, a_line_num = 0, b_line_max = 0, b_line_num = 0 },
+            { sid = 2, state = 0, a_line_max = 0, a_line_num = 0, b_line_max = 0, b_line_num = 0 },
+            { sid = 3, state = 0, a_line_max = 0, a_line_num = 0, b_line_max = 0, b_line_num = 0 }
+        }
+    end
+    if data.a_t_state then
+        for _, tm in pairs(data.tower_march) do
+            for _, ts in pairs(data.a_t_state) do
+                if ts.sid == tm.sid then
+                    tm.state = ts.state
+                    tm.a_line_max = ts.l_max or 0
+                    if ts.state == 0 then --为1时不做处理，全部摧毁
+                        tm.a_line_num = ts.l_index or 0
+                    else
+                        tm.a_line_num = tm.a_line_max
+                    end
+                end
+            end
+        end
+    end
+    if data.b_t_state then
+        for _, tm in pairs(data.tower_march) do
+            for _, ts in pairs(data.b_t_state) do
+                if ts.sid == tm.sid then
+                    if tm.state == 0 then
+                        tm.state = ts.state == 1 and 2 or 0 --理论上不可能进or
+                    elseif tm.state == 1 then
+                        tm.state = ts.state == 1 and 3 or 1
+                    end
+                    tm.b_line_max = ts.l_max or 0
+                    if ts.state == 0 then --为1时不做处理，全部摧毁
+                        tm.b_line_num = ts.l_index or 0
+                    else
+                        tm.b_line_num = tm.b_line_max
+                    end
+                end
+            end
+        end
+    end
+
+    if not data.wild_time then
+        data.wild_time = {}
+    end
+    if not data.wild_march then
+        data.wild_march = {}
+        for _, cfg in pairs(_G.ConfigManager.guild_moba_campsite_cfg) do
+            if cfg.type > 1 then
+                _G.table.insert(
+                    data.wild_march,
+                    { sid = cfg.id, state = -1, a_hold = 0, b_hold = 0, args = 0, last_time = 0 }
+                )
+            end
+        end
+    end
+    self:CheckDataWildSet(data)
+    self:CheckDataMarchOrder(data)
+end
+
+function SociatyMobaBattleModel:CheckDataWildSet(data)
+    if not data.wild_set then
+        data.wild_set = {}
+        for _, cfg in pairs(_G.ConfigManager.guild_moba_campsite_cfg) do
+            if cfg.type > 1 then
+                _G.table.insert(data.wild_set, { sid = cfg.id, use_type = 1, uids = {} })
+            end
+        end
+    else
+        local sids = {}
+        for _, v in pairs(data.wild_set) do
+            if not v.uids then
+                v.uids = {}
+            end
+            _G.table.insert(sids, v.sid)
+        end
+        for _, cfg in pairs(_G.ConfigManager.guild_moba_campsite_cfg) do
+            if cfg.type > 1 and not _G.table.ContainsValue(sids, cfg.id) then
+                _G.table.insert(data.wild_set, { sid = cfg.id, use_type = 1, uids = {} })
+            end
+        end
+    end
+end
+
+function SociatyMobaBattleModel:CheckDataMarchOrder(data)
+    if not data.order_set then
+        data.order_set = {}
+        for i = 1, 4 do
+            _G.table.insert(data.order_set, { k = i, v = 1 })
+        end
+    else
+        local sids = {}
+        for _, v in pairs(data.order_set) do
+            _G.table.insert(sids, v.k)
+        end
+        for i = 1, 4 do
+            if not _G.table.ContainsValue(sids, i) then
+                _G.table.insert(data.order_set, { k = i, v = 1 })
+            end
+        end
+    end
+end
+
+---初始化分线数据
+---@param towerMarch guild_moba.i_fight_tower[]
+function SociatyMobaBattleModel:InitLanerData(towerMarch)
+    self.lanerOur = {}
+    self.lanerEnemy = {}
+    self.survivalNum = { our = 0, enemy = 0 }
+    self.totalTeamNum = { our = 0, enemy = 0 }
+    local laner
+    if towerMarch then
+        for _, v in pairs(towerMarch) do
+            laner = SociatyMobaLanerData.New(self.abOur)
+            laner:Parse(v)
+            self.lanerOur[v.sid] = laner
+
+            laner = SociatyMobaLanerData.New(self.abEnemy)
+            laner:Parse(v)
+            self.lanerEnemy[v.sid] = laner
+
+            self.survivalNum.our = self.survivalNum.our + self:GetLanerCurTeamNum(v.sid, true)
+            self.survivalNum.our = self.survivalNum.our + self:GetLanerMarchNum(v.sid, true)
+            self.totalTeamNum.our = self.totalTeamNum.our + self:GetLanerMaxTeamNum(v.sid, true)
+
+            self.survivalNum.enemy = self.survivalNum.enemy + self:GetLanerCurTeamNum(v.sid, false)
+            self.survivalNum.enemy = self.survivalNum.enemy + self:GetLanerMarchNum(v.sid, false)
+            self.totalTeamNum.enemy = self.totalTeamNum.enemy + self:GetLanerMaxTeamNum(v.sid, false)
+        end
+    end
+end
+
+---初始化野怪行军次数
+---@param creepTime public.i_kv_64[]
+function SociatyMobaBattleModel:InitCreepTimes(creepTime)
+    self.creepTimes = {}
+    for _, v in pairs(creepTime) do
+        self.creepTimes[v.key] = v.value
+        if v.key == _G.PlayerModel:GetInstance():GetPlayerUid() then
+            require("SociatyMobaModel"):GetInstance():SetWildTimes(v.value)
+        end
+    end
+end
+
+---初始化野怪数据
+---@param creepMarch guild_moba.i_fight_wild[]
+function SociatyMobaBattleModel:InitCreepData(creepMarch)
+    self.creepUid = {}
+    self.creepData = {}
+    self.creepUidSort = {}
+    self.creepUidSortId = {}
+    local data
+    for _, v in pairs(creepMarch) do
+        data = SociatyMobaCreepData.New(self.abOur, self.abEnemy)
+        data:Parse(v)
+        self.creepData[v.sid] = data
+        if v["m_" .. self.abOur] then
+            for _, m in pairs(v["m_" .. self.abOur]) do
+                self:AddCreepUid(v.sid, m.team.uid)
+                self:AddCreepUidSort(v.sid, m.team.uid)
+            end
+        end
+        if v["m_" .. self.abEnemy] then
+            for _, m in pairs(v["m_" .. self.abEnemy]) do
+                self:AddCreepUidSort(v.sid, m.team.uid)
+            end
+        end
+    end
+end
+
+---初始化野怪预设
+---@param creepPreset guild_moba.i_wild_set[]
+function SociatyMobaBattleModel:InitCreepPreset(creepPreset)
+    self.creepPreset = {}
+    for _, v in pairs(creepPreset) do
+        self.creepPreset[v.sid] = v
+    end
+end
+
+---初始化分线排序规则
+---@param marchOrder public.i_k_v
+function SociatyMobaBattleModel:InitMarchOrder(marchOrder)
+    self.marchOrder = {}
+    for _, v in pairs(marchOrder) do
+        self.marchOrder[v.k] = v
+    end
+end
+
+---@param ourRank guild_moba.i_kill_rank[]
+---@param enemyRank guild_moba.i_kill_rank[]
+function SociatyMobaBattleModel:InitKillRank(ourRank, enemyRank)
+    ourRank = ourRank or {}
+    enemyRank = enemyRank or {}
+    self.rankData = {}     --uid为key，方便修改数据
+    self.rankSortData = {} --用于排序
+    for _, v in pairs(ourRank) do
+        v.isOur = true
+        self.rankData[v.rank.uid] = v
+        _G.table.insert(self.rankSortData, v)
+    end
+    for _, v in pairs(enemyRank) do
+        v.isOur = false
+        self.rankData[v.rank.uid] = v
+        _G.table.insert(self.rankSortData, v)
+    end
+    self:SortKillRank()
+end
+
+function SociatyMobaBattleModel:SortKillRank()
+    _G.table.sort(
+        self.rankSortData,
+        function(a, b)
+            if a.value == b.value then
+                return a.rank.uid > b.rank.uid
+            end
+            return a.value > b.value
+        end
+    )
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    self.selfKillRank = 0
+    for i, v in pairs(self.rankSortData) do
+        if v.rank.uid == uid then
+            self.selfKillRank = i
+            break
+        end
+    end
+end
+
+function SociatyMobaBattleModel:AddKillNum(uid)
+    if self.rankData and self.rankData[uid] then
+        self.rankData[uid].value = self.rankData[uid].value + 1
+    end
+end
+
+---设置击杀数
+function SociatyMobaBattleModel:SetKillNum(uid, num)
+    if self.rankData and self.rankData[uid] then
+        if num > self.rankData[uid].value then
+            self.rankData[uid].value = num
+        end
+    end
+end
+
+
+function SociatyMobaBattleModel:GetKillRankData()
+    return self.rankSortData or {}, self.selfKillRank
+end
+
+---更新打野数据（指挥变动）
+function SociatyMobaBattleModel:UpdateCreepTimes()
+    require("SociatyMobaNet"):GetInstance():GetBattleInfo(
+        function(msg)
+            self:InitCreepTimes(msg.wild_time)
+        end
+    )
+end
+
+---更新打野预设数据
+function SociatyMobaBattleModel:UpdateCreepPreset(call)
+    require("SociatyMobaNet"):GetInstance():GetBattleInfo(
+        function(msg)
+            self:CheckDataWildSet(msg)
+            self:InitCreepPreset(msg.wild_set)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---添加打野中uid
+function SociatyMobaBattleModel:AddCreepUid(sid, uid)
+    if self.creepUid[sid] == nil then
+        self.creepUid[sid] = {}
+    end
+    _G.table.insert(self.creepUid[sid], uid)
+end
+
+---移除打野中uid
+function SociatyMobaBattleModel:RemoveCreepUid(sid, uid)
+    if sid then
+        if self.creepUid[sid] then
+            _G.table.removebyvalue(self.creepUid[sid], uid, true)
+        end
+    else
+        for _, uids in pairs(self.creepUid) do
+            _G.table.removebyvalue(uids, uid, true)
+        end
+    end
+end
+
+function SociatyMobaBattleModel:AddCreepUidSort(sid, uid)
+    if not self.creepUidSort[sid] then
+        self.creepUidSort[sid] = {}
+    end
+    if not self.creepUidSortId[sid] then
+        self.creepUidSortId[sid] = 1
+    end
+    self.creepUidSort[sid][uid] = self.creepUidSortId[sid]
+    self.creepUidSortId[sid] = self.creepUidSortId[sid] + 1
+end
+
+function SociatyMobaBattleModel:GetCreepUidSort(sid)
+    if not self.creepUidSort then
+        return {}
+    end
+    return self.creepUidSort[sid] or {}
+end
+
+---初始化战报日志信息
+---@param logs guild_moba.i_moba_log[]
+function SociatyMobaBattleModel:InitReport(logs)
+    self.reports = {}
+    if logs then
+        for i = #logs, 1, -1 do
+            self:AddReport(logs[i])
+        end
+    end
+end
+
+---添加战报日志
+---@param data guild_moba.i_moba_log
+---@return string 日志文本
+function SociatyMobaBattleModel:AddReport(data)
+    local cfg = _G.ConfigManager.guild_moba_report_cfg[data.type]
+    if data.type == 1 or data.type == 3 then
+        data.laner = _G.table.remove(data.args, 1)
+    end
+    if data.type == 2 then
+        local lanName = LanerName[_G.tonumber(data.args[1])]
+        data.args[1] = data.args[2]
+        data.args[2] = lanName
+    elseif data.type == 4 then
+        local gName = data.args[2]
+        data.args[2] = LanerName[_G.tonumber(data.args[3])]
+        data.args[3] = data.args[4]
+        data.args[4] = gName
+    elseif data.type == 5 then
+        data.args[2] = self:GetCreepName(_G.tonumber(data.args[2]))
+    elseif data.type == 6 then
+        data.args[3] = LanerName[_G.tonumber(data.args[3])]
+    elseif data.type == 7 then
+        local laner = LanerName[_G.tonumber(data.args[1])]
+        data.args[1] = data.args[2]
+        data.args[2] = laner
+    elseif data.type == 8 then
+        data.args[1] = self:GetCreepName(_G.tonumber(data.args[1]))
+    elseif data.type == 9 then
+        if data.g_uid == 1 then ---平局
+            data.args = { self.SociatySelf.Name }
+        end
+    end
+    local report = {}
+    report.data = data
+    report.type = _G.ChatInfoType.system
+    local lanId
+    if data.type == 2 then
+        if _G.tonumber(data.args[3]) - 2 > #cfg.language then
+            lanId = cfg.language[#cfg.language]
+        else
+            lanId = cfg.language[_G.tonumber(data.args[3]) - 2]
+        end
+    else
+        lanId = cfg.language[1]
+    end
+    local srcContent = _G.SafeGetLangPackValue(lanId, _G.SafeUnpack(data.args))
+    local isOur = self:CheckIsOur(data.g_uid) or data.g_uid == 0
+    report.n_content = _G.string.AddColor(srcContent, isOur and "1796DD" or "FF5555")
+    if data.type ~= 7 then
+        _G.table.insert(self.reports, report)
+        _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaLog)
+    end
+    return srcContent, report.n_content, cfg.time
+end
+
+---获取战报日志
+function SociatyMobaBattleModel:GetReport()
+    return self.reports or {}
+end
+
+---获取野怪名字
+function SociatyMobaBattleModel:GetCreepName(id)
+    local cfg = _G.ConfigManager.guild_moba_campsite_cfg[id]
+    return _G.GetLangPackValue(cfg.name[1][1])
+end
+
+---塔摧毁
+---@param lanerId number 线路id
+---@param towerId number 防御塔id
+---@param isOur boolean 是否是我方
+function SociatyMobaBattleModel:OnTowerDestroy(lanerId, towerId, isOur)
+    if isOur then
+        self.lanerOur[lanerId]:SetTowerBroken(towerId)
+    else
+        self.lanerEnemy[lanerId]:SetTowerBroken(towerId)
+    end
+end
+
+---单线战败
+---@param lanerId number 线路id
+---@param isOur boolean 是否是我方
+function SociatyMobaBattleModel:OnLanerDefeat(lanerId, isOur)
+    if isOur then
+        for i = 1, 3 do
+            self.lanerOur[lanerId]:SetTowerBroken(i)
+        end
+        self.lanerOur[lanerId]:SetLanerWinState(false)
+        self.lanerEnemy[lanerId]:SetLanerWinState(true)
+    else
+        for i = 1, 3 do
+            self.lanerEnemy[lanerId]:SetTowerBroken(i)
+        end
+        self.lanerOur[lanerId]:SetLanerWinState(true)
+        self.lanerEnemy[lanerId]:SetLanerWinState(false)
+    end
+end
+
+---防御塔行军
+---@param lanerId number 线路id
+---@param isOur boolean 是否是我方
+---@param index number 第几个队伍
+---@param msg guild_moba.i_tower_march
+function SociatyMobaBattleModel:OnTowerMarch(lanerId, isOur, index, msg)
+    if isOur then
+        self.lanerOur[lanerId]:OnTowerMarch(index)
+        self.lanerOur[lanerId]:UpdateCurTeam(msg)
+    else
+        self.lanerEnemy[lanerId]:OnTowerMarch(index)
+        self.lanerEnemy[lanerId]:UpdateCurTeam(msg)
+    end
+end
+
+---防御塔行军战败
+---@param lanerId number 线路id
+---@param isOur boolean 是否是我方胜利
+function SociatyMobaBattleModel:OnLanerFightFail(lanerId, isOur)
+    if isOur then
+        self.lanerEnemy[lanerId]:UpdateCurTeam(nil)
+        self.survivalNum.enemy = self.survivalNum.enemy - 1
+    else
+        self.lanerOur[lanerId]:UpdateCurTeam(nil)
+        self.survivalNum.our = self.survivalNum.our - 1
+    end
+end
+
+---野怪行军
+---@param uid number 玩家uid
+function SociatyMobaBattleModel:OnCreepMarch(sid, uid, isOur)
+    if isOur then
+        if self.creepTimes[uid] == nil then
+            self.creepTimes[uid] = 1
+        else
+            self.creepTimes[uid] = self.creepTimes[uid] + 1
+        end
+        self:AddCreepUid(sid, uid)
+        if uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+            require("SociatyMobaModel"):GetInstance():SetWildTimes(self.creepTimes[uid])
+            _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaCreepChange)
+        end
+    end
+    self:AddCreepUidSort(sid, uid)
+end
+
+---野怪行军队伍移动（行军推送处理）
+---@param data guild_moba.i_wild_march
+---@param isOur boolean 是否是我方
+function SociatyMobaBattleModel:OnCreepTeamMoving(data, isOur)
+    self.creepData[data.station_id]:AddMovingTeam(data, isOur)
+end
+
+---野怪行军队伍到达
+---@param sid number 野怪sid
+---@param uid number 玩家uid
+---@param isOur boolean 是否是我方
+function SociatyMobaBattleModel:OnCreepTeamArrive(sid, uid, isOur)
+    self.creepData[sid]:OnTeamArrive(uid, isOur)
+    self.creepData[sid]:UpdateBattleState()
+end
+
+---野怪行军队伍已经到达（行军推送处理）
+---@param data guild_moba.i_wild_march
+---@param isOur boolean 是否是我方
+function SociatyMobaBattleModel:OnCreepTeamAlreadyArrive(data, isOur)
+    self.creepData[data.station_id]:AddArriveTeam(data, isOur)
+    self.creepData[data.station_id]:UpdateBattleState()
+end
+
+---野怪刷新
+---@param sid number 野怪sid
+function SociatyMobaBattleModel:OnCreepRefresh(sid)
+    self.creepData[sid]:ChangeState(CreepState.NoOccupy)
+end
+
+---野怪占领
+---@param sid number 野怪sid
+---@param isOur boolean 是否是我方
+function SociatyMobaBattleModel:OnCreepOccupy(sid, isOur)
+    if isOur then
+        self.creepData[sid]:ChangeState(CreepState.OurWin)
+    else
+        self.creepData[sid]:ChangeState(CreepState.EnemyWin)
+    end
+    for _, v in pairs(self.creepData[sid].ourArrive) do
+        self:RemoveCreepUid(sid, v.team.uid)
+    end
+    for _, v in pairs(self.creepData[sid].ourMoving) do
+        self:RemoveCreepUid(sid, v.team.uid)
+    end
+    self.creepData[sid]:ClearTeam()
+end
+
+---野怪进度同步
+---@param msg guild_moba.i_action_wild_hold
+function SociatyMobaBattleModel:OnCreepUpdateHold(msg)
+    self.creepData[msg.sid]:UpdateHold(msg)
+end
+
+---野怪单场战斗
+---@param data guild_moba.i_action_fight_win
+function SociatyMobaBattleModel:OnCreepFightWin(data)
+    local isOur = self.creepData[data.station]:CheckIsOurTeam(data.uid)
+    local tm = self.creepData[data.station]:RemoveFirstArriveTeam(not isOur)
+    self.creepData[data.station]:UpdateBattleState()
+    if not isOur and tm then
+        self:RemoveCreepUid(data.station, tm.team.uid)
+    end
+    return isOur, tm and tm.team.uid
+end
+
+---野怪buff使用
+---@param msg guild_moba.i_action_buff
+---@return boolean, string 是否刷新防御塔, 敌我key
+function SociatyMobaBattleModel:OnBuffUse(msg)
+    self.creepData[msg.wild_id].use = msg.line_id
+    local cfg = _G.ConfigManager.guild_moba_campsite_cfg[msg.wild_id]
+    if cfg.type == 3 then ---恶念体
+        if self.creepData[msg.wild_id].state == CreepState.OurWin then
+            self.lanerOur[msg.line_id]:AddCreepTeam()
+            return true, "our"
+        elseif self.creepData[msg.wild_id].state == CreepState.EnemyWin then
+            self.lanerEnemy[msg.line_id]:AddCreepTeam()
+            return true, "enemy"
+        end
+    end
+    return false, ""
+end
+
+---获取公会uid
+function SociatyMobaBattleModel:GetSociatyUid(isOur)
+    local ab = isOur and self.abOur or self.abEnemy
+    return ab and self.data[ab .. "_uid"] or 0
+end
+
+---获取基地（公会）数据
+---@param isOur boolean 是否是我方
+---@return guild_moba.i_guild_info
+function SociatyMobaBattleModel:GetHomeData(isOur)
+    local ab = isOur and self.abOur or self.abEnemy
+    return ab and self.data[ab .. "_info"] or nil
+end
+
+---获取分线数据
+---@param lanerId number 线路id
+---@param isOur boolean 是否是我方
+---@return SociatyMobaLanerData
+function SociatyMobaBattleModel:GetLanerData(lanerId, isOur)
+    if isOur then
+        return self.lanerOur[lanerId]
+    else
+        return self.lanerEnemy[lanerId]
+    end
+end
+
+---获取野怪数据
+---@param sid number 野怪sid
+---@return SociatyMobaCreepData
+function SociatyMobaBattleModel:GetCreepData(sid)
+    return self.creepData[sid]
+end
+
+---获取存活队伍总数
+function SociatyMobaBattleModel:GetSurvivalTeamNum(isOur)
+    return isOur and self.survivalNum.our or self.survivalNum.enemy
+end
+
+---获取三线队伍总数
+function SociatyMobaBattleModel:GetTotalTeamNum(isOur)
+    return isOur and self.totalTeamNum.our or self.totalTeamNum.enemy
+end
+
+---获取当前分线队伍总数
+---@param lanerId number 线路id
+---@param isOur boolean 是否是我方
+---@return number 队伍总数
+function SociatyMobaBattleModel:GetLanerMaxTeamNum(lanerId, isOur)
+    if isOur then
+        return self.lanerOur[lanerId].maxNum
+    else
+        return self.lanerEnemy[lanerId].maxNum
+    end
+end
+
+---获取当前分线队伍剩余数量
+---@param lanerId number 线路id
+---@param isOur boolean 是否是我方
+---@return number 剩余队伍数
+function SociatyMobaBattleModel:GetLanerCurTeamNum(lanerId, isOur)
+    if isOur then
+        if self.lanerOur[lanerId] == nil then
+            return 0
+        end
+        return self.lanerOur[lanerId]:GetAllTowerCurNum()
+    else
+        if self.lanerEnemy[lanerId] == nil then
+            return 0
+        end
+        return self.lanerEnemy[lanerId]:GetAllTowerCurNum()
+    end
+end
+
+---获取分线行军队伍数量
+function SociatyMobaBattleModel:GetLanerMarchNum(lanerId, isOur)
+    if isOur then
+        return self.lanerOur[lanerId]:GetMarchNum()
+    else
+        return self.lanerEnemy[lanerId]:GetMarchNum()
+    end
+end
+
+---获取当前分线防御塔队伍剩余数量
+---@param lanerId number 线路id
+---@param towerId number 防御塔id
+---@param isOur boolean 是否是我方
+---@return number 剩余队伍数
+function SociatyMobaBattleModel:GetTowerCurTeamNum(lanerId, towerId, isOur)
+    if isOur then
+        return self.lanerOur[lanerId]:GetTowerCurNum(towerId, true)
+    else
+        return self.lanerEnemy[lanerId]:GetTowerCurNum(towerId, true)
+    end
+end
+
+---获取第一个未被击破塔的id
+---@param lanerId number 线路id
+---@param isOur boolean 是否是我方
+---@return number 防御塔id
+function SociatyMobaBattleModel:GetFirstNotBrokenID(lanerId, isOur)
+    if isOur then
+        for i = 1, 3 do
+            if self.lanerOur[lanerId] and not self.lanerOur[lanerId]:CheckTowerIsBroken(i) then
+                return i
+            end
+        end
+        return 3
+    else
+        for i = 1, 3 do
+            if self.lanerEnemy[lanerId] and not self.lanerEnemy[lanerId]:CheckTowerIsBroken(i) then
+                return i
+            end
+        end
+        return 3
+    end
+end
+
+---设置打野预设
+function SociatyMobaBattleModel:SetWildPreset(presets, setType, call, preSid)
+    local presetArr = _G.table.toArray(presets)
+    local pbData = { set = presetArr, set_type = setType }
+    SociatyMobaNet:GetInstance():SetWildPreset(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if setType == 1 then
+                self.creepPreset = presets
+            elseif setType == 2 then
+                _G.table.insert(self.creepPreset[presets[1].sid].uids, presets[1].uids[1])
+                if preSid then
+                    _G.table.removebyvalue(
+                        self.creepPreset[preSid].uids,
+                        presets[1].uids[1]
+                    )
+                end
+            elseif setType == 3 then
+                _G.table.removebyvalue(
+                    self.creepPreset[presets[1].sid].uids,
+                    _G.PlayerModel:GetInstance():GetPlayerUid()
+                )
+            end
+            _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaCreepPresetChange)
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---设置分线出兵规则
+---@param lanerId number 分线id
+---@param mType number 1正序 2倒序 3乱序
+function SociatyMobaBattleModel:SetMarchOrder(lanerId, mType, call)
+    if self.marchOrder == nil or self.marchOrder[lanerId] == nil then
+        return
+    end
+    local marchOrder = _G.DeepCopy(self.marchOrder)
+    marchOrder[lanerId].v = mType
+    local pbData = { set = _G.table.toArray(marchOrder) }
+    SociatyMobaNet:GetInstance():SetMarchOrder(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.marchOrder = marchOrder
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---获取分线出兵规则
+---@param lanerId number 分线id
+function SociatyMobaBattleModel:GetLanerMarchSort(lanerId)
+    return self.marchOrder[lanerId].v
+end
+
+---公会成员托管改变
+---@param msg guild_moba.p2c_auto_wild
+function SociatyMobaBattleModel:OnPlayerCreepAutoChange(msg)
+    self.creepTimes[msg.role_uid] = msg.fight_time
+    if msg.type == 1 then
+        _G.table.removebyvalue(self.unAutoUid, msg.role_uid)
+    else
+        _G.table.insert(self.unAutoUid, msg.role_uid)
+    end
+end
+
+---获取某玩家打野剩余次数
+---@param uid number 玩家uid
+---@return number 剩余次数
+function SociatyMobaBattleModel:GetCreepTimes(uid)
+    if self.creepTimes[uid] == nil then
+        return 0
+    end
+    return self.creepMaxTimes - self.creepTimes[uid]
+end
+
+---获取某玩家能否打野
+---@param uid number 玩家uid
+---@return boolean 能否打野
+function SociatyMobaBattleModel:GetPlayerCanCreep(uid)
+    local isSelf = uid == _G.PlayerModel:GetInstance():GetPlayerUid()
+    if isSelf then
+        if
+            not require("SociatyMobaModel"):GetInstance():CheckSelfIsCommander() and
+            require("SociatyMobaModel"):GetInstance():GetWildAuto()
+        then
+            return false, 950115
+        end
+    elseif _G.table.ContainsValue(self.unAutoUid, uid) then
+        return false
+    end
+    if self:GetCreepTimes(uid) <= 0 then
+        return false
+    end
+    if self:CheckIsCreeping(uid) then
+        return false, isSelf and 950113 or 950116
+    end
+    return true
+end
+
+---检查是否正在打野
+---@param uid number 玩家uid
+function SociatyMobaBattleModel:CheckIsCreeping(uid)
+    for _, uids in pairs(self.creepUid) do
+        if _G.table.ContainsValue(uids, uid) then
+            return true
+        end
+    end
+    return false
+end
+
+---获取野怪buff分线使用数量
+---@param type number 野怪类型
+---@param lanerId number 线路id
+---@return number 使用数量
+function SociatyMobaBattleModel:GetCreepLanerUseNum(type, lanerId)
+    local count = 0
+    for _, v in pairs(self.creepData) do
+        if v.cfg.type == type and v.state == CreepState.OurWin and v.use == lanerId then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+---获取野怪buff未使用数量
+---@param type number 野怪类型
+---@return number 未使用数量
+function SociatyMobaBattleModel:GetCreepLanerNotUseNum(type)
+    local count = 0
+    for _, v in pairs(self.creepData) do
+        if v.cfg.type == type and v.state == CreepState.OurWin and v.use == 0 then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+---是否有未使用buff
+function SociatyMobaBattleModel:CheckHasUnuseBuff()
+    if not require("SociatyMobaModel"):GetInstance():CheckSelfIsCommander() then
+        return false
+    end
+    if self:CheckBattleEnd() ~= 0 then
+        return false
+    end
+    for _, v in pairs(self.creepData) do
+        if v.state == CreepState.OurWin and v.use == 0 then
+            return true
+        end
+    end
+    return false
+end
+
+---获取获得的某个野怪类型总数量
+---@param type number 野怪类型
+---@return number 获得数量
+function SociatyMobaBattleModel:GetCreepNum(type)
+    local count = 0
+    for _, v in pairs(self.creepData) do
+        if v.cfg.type == type and v.state == CreepState.OurWin then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+---检测打野预设有空位
+function SociatyMobaBattleModel:CheckCreepPresetEmpty(sid, tempData, call)
+    self:GetLineInfo(
+        4,
+        function(data)
+            local isEmpty = false
+            local num = _G.table.count(data)
+            tempData = tempData or self.creepPreset
+            for _, v in pairs(tempData) do
+                num = num - _G.table.count(v.uids)
+            end
+            if sid == nil then
+                for _, v in pairs(tempData) do
+                    if _G.table.count(v.uids) == 0 and num > 0 then
+                        isEmpty = true
+                    end
+                end
+            else
+                isEmpty = _G.table.count(tempData[sid].uids) == 0 and num > 0
+            end
+            if call then
+                call(isEmpty)
+            end
+        end
+    )
+end
+
+---检测自己打野是否预设
+function SociatyMobaBattleModel:CheckCreepSelfPreset()
+    local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    for k, v in pairs(self.creepPreset) do
+        if _G.table.ContainsValue(v.uids, uid) then
+            return true
+        end
+    end
+    return false
+end
+
+---是否获胜
+---@return boolean 是否获胜
+function SociatyMobaBattleModel:GetIsWin()
+    return self.data.win_guild == 1 or self.data.win_guild == self.SociatySelf.Uid
+end
+
+---是否平局（平局也是胜利）
+---@return boolean 是否平局
+function SociatyMobaBattleModel:GetIsDraw()
+    return self.data.win_guild == 1
+end
+
+---计算防御塔行军参数
+---@param lanerId number 线路id
+---@param eTime number 到达时间
+---@param isOur boolean 是否是我方
+---@return boolean, number, number, number, number, number 是否在行军路上，用时，出发x， 出发y，到达x，到达y
+function SociatyMobaBattleModel:CalLanerPlayerPos(lanerId, eTime, isOur)
+    -- eTime = eTime / 1000
+    local cfg = _G.ConfigManager.guild_moba_campsite_cfg[lanerId]
+    local targetPos = isOur and cfg.battle_coordinate[1] or cfg.battle_coordinate[2]
+    local delta = eTime - _G.TimeUtil.GetServerUnixTime()
+    if delta <= 0 then
+        return false, 0, targetPos[1], targetPos[2], targetPos[1], targetPos[2]
+    end
+    local index = self:GetFirstNotBrokenID(lanerId, isOur)
+    local rate = delta / cfg.move_time[index]
+    if rate > 1 then
+        rate = 1
+    end
+    if not isOur then
+        index = index + 3
+    end
+    local towerPos = cfg.coordinate[index]
+    local x = towerPos[1] * rate + targetPos[1] * (1 - rate)
+    local y = towerPos[2] * rate + targetPos[2] * (1 - rate)
+    return true, delta, x, y, targetPos[1], targetPos[2]
+end
+
+---计算野怪行军参数
+---@param sid number 野怪sid
+---@param eTime number 到达时间
+---@param isOur boolean 是否是我方
+---@param sSid number 点位sid
+---@param index number 出发次序
+---@return boolean, number, number, number, number, number 是否在行军路上，用时，出发x， 出发y，到达x，到达y
+function SociatyMobaBattleModel:CalCreepPlayerPos(sid, eTime, isOur, sSid, index)
+    -- eTime = eTime / 1000
+    local cfg = _G.ConfigManager.guild_moba_campsite_cfg[sid]
+    local targetPos = isOur and cfg.battle_coordinate[1] or cfg.battle_coordinate[2]
+    local delta = eTime - _G.TimeUtil.GetServerUnixTime()
+    if delta <= 0 then
+        return false, 0, targetPos[1], targetPos[2], targetPos[1], targetPos[2]
+    end
+    local id = isOur and 101678 or 101681
+    local sPos = _G.ConfigManager.discrete_cfg[id][sSid]
+    local totalTime = cfg.move_time[isOur and ABIndex[self.abOur] or ABIndex[self.abEnemy]]
+    local rate = delta / totalTime
+    if rate > 1 then
+        rate = 1
+    end
+    if index == 1 then
+        local x = sPos[1] * rate + targetPos[1] * (1 - rate)
+        local y = sPos[2] * rate + targetPos[2] * (1 - rate)
+        return true, delta, x, y, targetPos[1], targetPos[2]
+    end
+    local bia = _G.ConfigManager.discrete_cfg[101679][1][1]
+    if sPos[1] == targetPos[1] then
+        return true, delta, sPos[1], sPos[2] - bia, targetPos[1], targetPos[2]
+    end
+    local alpha = math.atan((sPos[2] - targetPos[2]) / (sPos[1] - targetPos[1]))
+    index = index - 1
+    local k = index * bia
+    local x = (sPos[1] - k * math.cos(alpha)) * rate + targetPos[1] * (1 - rate)
+    local y = (sPos[2] - k * math.sin(alpha)) * rate + targetPos[2] * (1 - rate)
+    -- LogError("角度" .. alpha .. ", x偏移:" .. x .. ", y偏移:" .. y)
+    return true, delta, x, y, targetPos[1], targetPos[2]
+end
+
+---判断uid是否是我方人员(公会uid)
+---@param uid number 玩家uid
+---@return boolean 是否是我方
+function SociatyMobaBattleModel:CheckIsOur(uid)
+    return uid == self.SociatySelf.Uid
+end
+
+---获取分线状态
+---@param lanerId number 分线id
+function SociatyMobaBattleModel:GetLanerState(lanerId)
+    if self.lanerOur[lanerId] == nil then
+        return LanerState.InBattle
+    end
+    return self.lanerOur[lanerId].state
+end
+
+---设置获胜公会
+---@param uid number 公会uid
+function SociatyMobaBattleModel:SetWinSociaty(uid)
+    if self.data == nil then
+        self.data = {}
+    end
+    self.data.win_guild = uid
+end
+
+---检查战斗是否结束
+---@return number 0-未结算，1-我方胜利，2-敌方胜利，3-平局（我方胜利）
+function SociatyMobaBattleModel:CheckBattleEnd()
+    if self.data == nil then
+        return 0
+    end
+    if self.data.win_guild > 0 then
+        if self:GetIsWin() then
+            if self:GetIsDraw() then
+                return 3
+            end
+            return 1
+        else
+            return 2
+        end
+    end
+    return 0
+end
+
+---检查是否在战斗中
+function SociatyMobaBattleModel:CheckInBattle()
+    local state, nextTime = require("SociatyMobaModel"):GetInstance():GetMobaBattleStage()
+    return state == require("SociatyMobaModel"):GetInstance().SociatyMobaBattleState.Fighting and
+        self:CheckBattleEnd() == 0
+end
+
+---根据分线防御塔剩余队伍检测是否结算（暂时弃用，战斗结果后台推送，且防御塔剩余数量计算有误）
+---@return number 0-未结算，1-我方胜利，2-敌方胜利
+function SociatyMobaBattleModel:CheckSettlement()
+    local brokenOur = 0
+    local brokenEnemy = 0
+    for i = 1, 3 do
+        if self:GetLanerCurTeamNum(i, true) == 0 then
+            brokenOur = brokenOur + 1
+        end
+        if brokenOur >= 2 then
+            return 2
+        end
+        if self:GetLanerCurTeamNum(i) == 0 then
+            brokenEnemy = brokenEnemy + 1
+        end
+        if brokenEnemy >= 2 then
+            self.data.win_guild = self.SociatySelf.Uid
+            return 1
+        end
+    end
+    return 0
+end
+
+function SociatyMobaBattleModel:ClearBattleData()
+    self.data = nil
+end
+
+---显示合击技静态方法
+---@param tb table goTable
+---@param sid number 合击技sid
+function SociatyMobaBattleModel.ShowSingleCombine(tb, sid)
+    local petCfg, skillId, cfgt, cfg
+    local PetOrderFrame = require("PetModel").PetOrderFrame
+    if sid and sid > 0 then
+        tb.gameObject:SetActiveE(1)
+        petCfg = _G.ConfigManager.pet_cfg[sid]
+        skillId = petCfg.skill_id[1]
+        cfgt = _G.ConfigManager.card_skills_cfg[skillId]
+        cfg = _G.ConfigManager.battle_skill_cfg[cfgt.skills[1]]
+
+        tb.aorrawimage_icon:LoadImage(cfg.Icon)
+        -- combineItem.aortext_type.text = _G.ConfigManager.language_package_cfg[cfg.Brief]
+        -- combineItem.aortext_name.text = _G.GetLangPackValue(petCfg.Name)
+        tb.aorimage_bg.SpriteName = PetOrderFrame[petCfg.Order]
+    else
+        tb.gameObject:SetActiveE(0)
+    end
+end
+
+---派遣打野
+---@param id number 野怪sid
+---@param uidLis number[] 玩家uid列表
+---@param call function 回调
+function SociatyMobaBattleModel:SetCreepMarch(id, uidLis, call)
+    if self.creepUid[id] and _G.table.count(self.creepUid[id]) >= 20 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            950109,
+            nil,
+            _G.handlerbind(self, self.SureSetCreepMarch, id, uidLis, call)
+        )
+    else
+        self:SureSetCreepMarch(id, uidLis, call)
+    end
+end
+
+---派遣打野
+---@param id number 野怪sid
+---@param uidLis number[] 玩家uid列表
+---@param call function 回调
+function SociatyMobaBattleModel:SureSetCreepMarch(id, uidLis, call)
+    local pbData = { station = id, uid = {} }
+    local ssid
+    for i = 1, #uidLis do
+        ssid = ((i - 1) % 5 + 1) * 1000 + (i - 1) // 5 + 1
+        _G.table.insert(pbData.uid, { uid = uidLis[i], s_id = ssid })
+    end
+    SociatyMobaNet:GetInstance():SetWildMarch(
+        pbData,
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if call then
+                call(id, msg)
+            end
+        end
+    )
+end
+
+---使用buff
+---@param id number buffId
+---@param line number 分路
+function SociatyMobaBattleModel:SendUseBuff(id, line)
+    SociatyMobaNet:GetInstance():UseBuff(
+        id,
+        line,
+        function(msg)
+            if msg.ack == 1 then
+                self:GetCreepData(id).use = line
+                _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaBuffChange, id)
+            end
+        end
+    )
+end
+
+---获取个人打野队伍数据
+---@param call function 回调
+function SociatyMobaBattleModel:GetSelfCreepInfo(call)
+    if self.creepSelf == nil then
+        local uid = _G.PlayerModel:GetInstance():GetPlayerUid()
+        require("SociatyMobaModel"):GetInstance():GetLineInfo(
+            4,
+            function(msg)
+                if msg and msg[1] and msg[1].role then
+                    for _, v in pairs(msg[1].role) do
+                        if v.uid == uid then
+                            self.creepSelf = v
+                            break
+                        end
+                    end
+                else
+                    self.creepSelf = {}
+                end
+                if call then
+                    call(self.creepSelf)
+                end
+            end
+        )
+    else
+        if call then
+            call(self.creepSelf)
+        end
+    end
+end
+
+---获取分路信息
+---@param line number 分路
+---@return table<uid,i_line_role>  table<玩家uid,i_line_role>
+function SociatyMobaBattleModel:GetLineInfo(line, callback, force)
+    if self.LineInfo == nil or force then
+        self.LineInfo = {}
+        for i = 1, 4 do
+            self.LineInfo[i] = {}
+        end
+        SociatyMobaNet:GetInstance():GetLineInfo(
+            0,
+            function(msg)
+                if msg.line_info then
+                    for i, v in ipairs(msg.line_info) do
+                        if self.LineInfo[v.line_id] == nil then
+                            self.LineInfo[v.line_id] = {}
+                        end
+                        if v.role then
+                            for k2, v2 in ipairs(v.role) do
+                                self.LineInfo[v.line_id][v2.uid] = v2
+                            end
+                        end
+                    end
+                end
+                local data
+                if line == 0 then
+                    data = self.LineInfo
+                else
+                    data = self.LineInfo[line]
+                end
+                if callback then
+                    callback(data)
+                end
+            end
+        )
+    else
+        local data
+        if line == 0 then
+            data = self.LineInfo
+        else
+            data = self.LineInfo[line]
+        end
+        if callback then
+            callback(data)
+        end
+    end
+end
+
+---交换队伍
+function SociatyMobaBattleModel:ChangeLineInfo(uid, line, line2)
+    if self.LineInfo[line2][uid] then
+        SociatyMobaNet:GetInstance():CommandUpdateGarry(
+            { uid },
+            line,
+            line2,
+            function(msg)
+                if msg.ack == 1 then
+                    local data = self.LineInfo[line][uid]
+                    self.LineInfo[line][uid] = self.LineInfo[line2][uid]
+                    self.LineInfo[line2][uid] = data
+                    _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaTeamChange)
+                end
+            end
+        )
+    elseif _G.table.count(self.LineInfo[line2]) < 40 then
+        SociatyMobaNet:GetInstance():CommandUpdateGarry(
+            { uid },
+            line,
+            line2,
+            function(msg)
+                if msg.ack == 1 then
+                    self.LineInfo[line2][uid] = self.LineInfo[line][uid]
+                    self.LineInfo[line][uid] = nil
+                    _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaTeamChange)
+                end
+            end
+        )
+    end
+end
+
+---交换队伍
+function SociatyMobaBattleModel:ChangeAllLineInfo(line, line2)
+    if self.LineInfo[line2] then
+        local uids = {}
+        for i, v in pairs(self.LineInfo[line2]) do
+            if not _G.table.ContainsValue(uids, v.uid) then
+                _G.table.insert(uids, v.uid)
+            end
+        end
+        for i, v in pairs(self.LineInfo[line]) do
+            if not _G.table.ContainsValue(uids, v.uid) then
+                _G.table.insert(uids, v.uid)
+            end
+        end
+        SociatyMobaNet:GetInstance():CommandUpdateGarry(
+            uids,
+            line,
+            line2,
+            function(msg)
+                if msg.ack == 1 then
+                    local data = self.LineInfo[line]
+                    self.LineInfo[line] = self.LineInfo[line2]
+                    self.LineInfo[line2] = data
+                    _G.Events:GetInstance():Broadcast(_G.eSociatyMobaBattle.SociatyMobaTeamChange)
+                end
+            end
+        )
+    end
+end
+
+function SociatyMobaBattleModel:GetLinePower(line)
+    local data = _G.table.toArray(self.LineInfo[line])
+    _G.table.sort(
+        data,
+        function(a, b)
+            return a.power > b.power
+        end
+    )
+    return data[1] and data[1].power or 0
+end
+
+function SociatyMobaBattleModel:CheckLanerVictory(lanerId)
+    return self.lanerOur[lanerId].state == LanerState.Victory, self.lanerEnemy[lanerId].state == LanerState.Victory
+end
+
+---获取双方最大击杀数量
+function SociatyMobaBattleModel:GetKillMaxNum()
+    local ourKillMax, enemyKillMax = 0, 0
+    for _, v in pairs(self.rankData) do
+        if v.isOur then
+            if v.value > ourKillMax then
+                ourKillMax = v.value
+            end
+        else
+            if v.value > enemyKillMax then
+                enemyKillMax = v.value
+            end
+        end
+    end
+    return ourKillMax, enemyKillMax
+end
+
+---获取双方最大连杀数量
+function SociatyMobaBattleModel:GetSerialMaxNum()
+    local ourSerialMax, enemySerialMax = 0, 0
+    for _, v in pairs(self.rankData) do
+        if v.isOur then
+            if v.max_line_kill > ourSerialMax then
+                ourSerialMax = v.max_line_kill
+            end
+        else
+            if v.max_line_kill > enemySerialMax then
+                enemySerialMax = v.max_line_kill
+            end
+        end
+    end
+    return ourSerialMax, enemySerialMax
+end
+
+---销毁对象时,析构函数
+function SociatyMobaBattleModel:Dispose()
+end
+
+return SociatyMobaBattleModel

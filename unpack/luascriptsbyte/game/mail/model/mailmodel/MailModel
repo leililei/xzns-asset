@@ -1,0 +1,347 @@
+-----------------------------------------------------------------------
+-- F:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Mail.Model.MailModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/02/25
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+require "MailNet"
+---@class MailModel : Singleton	邮箱数据
+---@field data mail.mail.s2c_get_mails 从服务器获取的邮件数据
+---@field curMail mail.i_mail_brief 邮箱界面当前选中的邮件
+---@field private timer Timer 邮件计时
+---@field eMail mail.i_mail_brief 倒计时邮件
+local MailModel = _G.BaseClass("MailModel", _G.GameDataModelBase)
+local LangUtil = _G.LangUtil
+---@return MailModel MailModel
+function MailModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+---获取邮件数据打开邮件界面
+---@param callback function 获取邮箱
+function MailModel:GetMailsData(callback)
+    require("MailNet"):GetInstance():GetMails(_G.handlerbind(self, self.GetMailsSuccess, callback))
+end
+---从服务器获取数据
+function MailModel:GetDataFormServer()
+    self:GetMailsData()
+    self:ParseData()
+end
+---获取邮箱数据打开界面
+function MailModel:OpenView()
+    self:GetMailsData(
+        function(data)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.MailView.Name, data)
+        end
+    )
+end
+
+---获取发送时间距离现在的时间
+---@param time number 结束时间
+function MailModel:GetSendTime(time)
+    local offetTime = _G.TimeUtil.GetServerUnixTime() - time
+    offetTime = offetTime / 60
+    if offetTime <= 10 then
+        return LangUtil.GetLangPackValue(90027000005)
+    end
+    if offetTime > 10 and offetTime < 60 then
+        return _G.string.format(
+            LangUtil.GetLangPackValue(90022100083),
+            (_G.math.floor(offetTime) - _G.math.floor(offetTime) % 10)
+        )
+    end
+    offetTime = offetTime / 60
+    if offetTime > 0 and offetTime < 24 then
+        return _G.string.format(LangUtil.GetLangPackValue(90021800065), _G.math.floor(offetTime))
+    end
+    offetTime = offetTime / 24
+    return _G.string.format(LangUtil.GetLangPackValue(90021800066), _G.math.floor(offetTime))
+end
+---获取有效期
+---@param time number 结束时间
+function MailModel:GetValidityTime(time)
+    --若为日常任务，此处指得是距离第二天6点的时间
+    if time == 0 then
+        return _G.LangUtil.GetLangPackValue(18900000017)
+    end
+    local offetTime = time - _G.TimeUtil.GetServerUnixTime()
+    if offetTime <= 0 then
+        return LangUtil.GetLangPackValue(90022100001, 0, 0)
+    end
+    local day = _G.math.floor(offetTime / 3600 / 24)
+    local hour = offetTime / 3600 - day * 24
+    hour = math.floor(hour + 0.5)
+    if hour == 24 then
+        day = day + 1
+        hour = 0
+    end
+    return _G.string.format(LangUtil.GetLangPackValue(90022100001), day, hour)
+end
+
+---获取邮件数据回调
+---@param data mail.s2c_get_mails
+function MailModel:GetMailsSuccess(data, callBack)
+    --处理数据 进行排序 已读的在下面  未读的在上面
+    if data.award then
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+        local tb = {}
+        if data.mails then
+            for _, v in pairs(data.mails) do
+                tb[v.uid] = true
+            end
+        end
+        for _, v in pairs(self.tempMails) do
+            if not tb[v.uid] then
+                require "RedPointManager":GetInstance():RemoveRedPointParam(
+                    _G.ConfigManager.redpoint_cfg.MailList.id,
+                    _G.tonumber(v.uid)
+                )
+                _G.Events:GetInstance():Broadcast(_G.eMail.ExpireMail, v.uid)
+                self.tempMails[v.uid] = nil
+            end
+        end
+    end
+    if data.mails == nil then
+        self.data = {}
+    else
+        self.data = self:SortMailData(data.mails)
+        self:CheckIsNewMail(data.mails)
+    end
+    if callBack then
+        callBack(self.data)
+    end
+    self:InitTimer()
+end
+
+function MailModel:InitTimer()
+    if self.timer then
+        self.timer:Stop()
+    end
+    local timer = _G.TimeUtil.GetServerUnixTime()
+    local mail
+    for _, v in ipairs(self.data) do
+        if v.etime > 0 then
+            if not mail then
+                mail = v
+            else
+                if mail.etime > v.etime then
+                    mail = v
+                end
+            end
+        end
+    end
+    if not mail then
+        return
+    end
+    self.eMail = mail
+    self.timer =
+        _G.TimerManager:GetInstance():GetTimer(
+        _G.math.max(mail.etime - timer, 0),
+        self.TimerOver,
+        self,
+        true,
+        false,
+        true
+    )
+    self.timer:Start()
+end
+---邮件结束
+function MailModel:TimerOver()
+    if not self.eMail then
+        return
+    end
+    _G.Events:GetInstance():Broadcast(_G.eMail.ExpireMail, self.eMail.uid)
+    require "RedPointManager":GetInstance():RemoveRedPointParam(
+        _G.ConfigManager.redpoint_cfg.MailList.id,
+        _G.tonumber(self.eMail.uid)
+    )
+    self.eMail = nil
+    self:InitTimer()
+end
+
+---将邮件数据进行排序
+function MailModel:SortMailData(data)
+    _G.SortList(data, function(mailData)
+        local order = 1
+        if mailData.state == 0 or (mailData.state == 1 and mailData.annex) then
+            order = 2
+        end
+        return order, mailData.stime
+    end)
+    return data
+end
+---检测是否有新邮件
+function MailModel:CheckIsNewMail(data)
+    for _, v in pairs(data) do
+        if not self.tempMails[v.uid] then
+            self.tempMails[v.uid] = v
+            require "RedPointManager":GetInstance():AddRedPointParam(
+                _G.ConfigManager.redpoint_cfg.MailList.id,
+                _G.tonumber(v.uid)
+            )
+        end
+    end
+end
+
+---邮件排序排序
+---@param table mail.s2c_get_mails 需要插入的邮件table
+---@param data mail.i_mail_brief 要插入的邮件数据
+function MailModel:InsertData(table, data)
+    --排序规则：未读的在上，已读的在下面，同一层按照发送时间进行排序
+    for i = 1, #data do
+        if data[i].stime < data.stime then
+            _G.table.insert(table, i, data)
+            return
+        end
+    end
+    _G.table.insert(table, data)
+end
+---获取所有未读邮件
+function MailModel:GetUnReadMails()
+    local table = {}
+    local count = 0
+    for i = 1, #self.data do
+        if self.data[i].state == 0 or (self.data[i].state == 1 and self.data[i].annex) then
+            _G.table.insert(table, self.data[i])
+            count = count + 1
+        end
+    end
+    return table
+end
+--删除邮件
+---@param data i_mail_brief 邮件的uid
+function MailModel:DelMail(uid, callBack)
+    local msg = {uid = uid}
+    require("MailNet"):GetInstance():DeleteMails(msg, callBack)
+end
+
+--一键删除所有已读邮件
+---@param callBack function  删除邮件后的回调
+function MailModel:DelAllMails(callBack)
+    require("MailNet"):GetInstance():DeleteAllMails(_G.handlerbind(self, self.DelAllMailsCall, callBack))
+end
+
+---删除邮件之后的回调
+---@param msg mail.s2c_mail 删除邮件数据
+---@param callBack function  删除邮件后的回调
+function MailModel:DelAllMailsCall(msg, callBack)
+    if msg.ack ~= 1 then
+        return
+    end
+    local table = {}
+    for i = 1, #self.data do
+        if (not self.data[i].annex and self.data[i].state < 1) or (self.data[i].state < 2 and self.data[i].annex) then
+            _G.table.insert(table, self.data[i])
+        end
+    end
+    self.data = table
+    callBack(self.data)
+end
+
+---领取附件
+------@param data table 邮件的uid
+------@param callBack function  获取邮件的回调
+function MailModel:GetAffix(uid, callBack)
+    local msg = {uid = uid}
+    require("MailNet"):GetInstance():TakeMails(msg, callBack)
+end
+
+---一键领取
+---@param callBack function  一键领取附件之后的View回调
+function MailModel:GetAllAffix(uids, callBack)
+    local msg = {uid_list = uids}
+    require("MailNet"):GetInstance():TakeAllMails(msg, _G.handlerbind(self, self.GetAllAffixCall, callBack))
+end
+
+---一键领取邮件的回调
+---@param msg mail.s2c_mail_all 邮件附件的数据
+---@param callBack function  一键领取附件之后的View回调
+function MailModel:GetAllAffixCall(msg, callback)
+    if msg.uid_list then
+        for i = 1, #self.data do
+            for j = 1, #msg.uid_list do
+                if self.data[i].uid == msg.uid_list[j] then
+                    self.data[i].state = 2
+                    break
+                end
+            end
+        end
+    end
+    -- if msg.ack == "cant_take" then
+    --     if msg.uid_list == nil then
+    --         _G.PopWindowManager:GetInstance():ShowAllTips(330101)
+    --         return
+    --     end
+    -- end
+    if msg.ack ~= 1 then
+        return
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    if callback then
+        callback(msg)
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MailList.id)
+end
+--设置已读邮件
+---@param data number 邮件的uid
+---@param callBack function 设置已读邮件的回调
+function MailModel:ReadMail(uid, callBack)
+    local msg = {}
+    msg.uid = uid
+    require("MailNet"):GetInstance():ReadMails(msg, callBack)
+end
+
+---创建对象时,入口构造函数
+function MailModel:__init()
+    self.tempMails = {}
+end
+
+---销毁对象时,析构函数
+function MailModel:Dispose()
+    self.tempMails = nil
+end
+
+--获取推送  刷新界面
+---@param data public.s2c_common_ack 邮箱推送的相关数据
+function MailModel:GetCommon(data)
+    local win = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.MailView.Name)
+    self:GetMailsData(
+        function(msg)
+            if win then
+                win.View:SetMailsRefresh()
+            end
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.MailList.id)
+        end
+    )
+end
+
+---获取邮箱数据 并排序
+---@return mail.s2c_get_mails 所有邮件的数据
+function MailModel:GetMailDataAndSort()
+    self.data = self:SortMailData(self.data)
+    return self.data
+end
+
+---设置当前显示的邮件
+---@param data mail.i_mail_brief 当前显示邮件的table
+function MailModel:SetCurMail(data)
+    self.curMail = data
+end
+
+function MailModel:GetRedPoint(callback)
+    require("MailNet"):GetInstance():GetRedPoint(callback)
+end
+
+---检测是否为当前显示的邮件
+---@param uid number 邮件的uid
+---@return boolean
+function MailModel:CheckIsCurMail(uid)
+    if self.curMail == nil then
+        return false
+    end
+    if self.curMail.uid == uid then
+        return true
+    end
+    return false
+end
+
+return MailModel

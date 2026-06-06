@@ -1,0 +1,629 @@
+-----------------------------------------------------------------------
+-- E:01.zhj.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Afk.Model.DecorationModel.lua	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2020/09/28
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+
+---@class DecorationModel : GameDataModelBase
+local DecorationModel = _G.BaseClass("DecorationModel", _G.GameDataModelBase)
+
+function DecorationModel:__init()
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+    require("DecorationNet"):GetInstance():StartUp()
+end
+
+---被销毁时
+function DecorationModel:Dispose()
+    self.super:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+end
+
+function DecorationModel:ResUpdata(data)
+    if not self.materialId then
+        ---强化材料每级都相同所以直接取一级的
+        local cfg = _G.ConfigManager.decoration_stren_cfg[1]
+        self.materialId = cfg.cost[1]
+    end
+    for _, value in pairs(data) do
+        local sid = value.type[1]
+
+        if sid == self.materialId then
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RuneStrength
+                                                                              .id)
+            return
+        end
+    end
+end
+
+---解析奖励
+function DecorationModel:ParseData(data)
+    if data ~= nil then
+    end
+    self.super.ParseData(self)
+end
+
+---分解符文
+function DecorationModel:Decompose(selectUid, uids, callback, isNoTip)
+    require("DecorationNet"):GetInstance():Decompose(
+        { uids = uids },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+
+            local StorageManager = _G.StorageManager:GetInstance()
+            for uid, v in pairs(selectUid) do
+                StorageManager:ConsumeItem(v.sid, uid, 1)
+            end
+            StorageManager:ReceiveAwardData(msg)
+            if not isNoTip then
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            end
+            require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DecorationSlot.id)
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---穿戴/替换符文(单个)
+---@param cardData CardData 卡牌数据类
+---@param index number 穿戴部位
+---@param decorationData DecorationData 符文数据类
+function DecorationModel:PutOnDecoration(cardData, index, decorationData, call)
+    if cardData == nil or cardData.uid == nil then
+        _G.LogError("【容错】符文穿戴卡牌uid为空！")
+        return 
+    end
+    if decorationData == nil or decorationData.uid == nil then
+        _G.LogError("【容错】符文穿戴符文uid为空！")
+        return 
+    end
+    local msg = { uid = cardData.uid, d_index = { { index = index, uid = decorationData.uid } } }
+    require("DecorationNet"):GetInstance():SetDecorationAccess(
+        msg,
+        _G.handlerbind(self, self.PutOnDecorationSuc, cardData, index, decorationData, call)
+    )
+end
+
+---穿戴/替换符文(多个)
+---@param cardData CardData 卡牌数据类
+---@param index number 穿戴部位
+---@param decorationDatas DecorationData[] 符文数据类
+function DecorationModel:PutOnDecorations(cardData, decorationDatas, call)
+    if cardData == nil or cardData.uid == nil then
+        _G.LogError("【容错】符文穿戴卡牌uid为空！")
+        return
+    end
+    if decorationDatas == nil or decorationDatas[1] == nil or decorationDatas[1].uid == nil then
+        _G.LogError("【容错】符文穿戴符文uid为空！")
+        return
+    end
+    local count = #decorationDatas
+    local msg = { uid = cardData.uid, d_index = {} }
+    local indexs = {}
+    for i = 1, count do
+        local decorationData = decorationDatas[i]
+        local index = decorationData.cfg.parts
+        local msg_item = { index = index, uid = decorationData.uid }
+        table.insert(msg.d_index, msg_item)
+        table.insert(indexs, index)
+    end
+    require("DecorationNet"):GetInstance():SetDecorationAccess(
+            msg,
+            _G.handlerbind(self, self.PutOnDecorationSucs, cardData, indexs, decorationDatas, call)
+    )
+end
+
+function DecorationModel:PutOnDecorationSucs(msg, cardData, indexs, decorationDatas, call)
+    if msg.ack ~= 1 then
+        return
+    end
+
+    local power = _G.StorageManager:GetInstance():GetPlayerPower()
+    local count = #decorationDatas
+    for i = 1, count do
+        local decorationData = decorationDatas[i]
+        self:PutOnDecorationSuc(msg, cardData, indexs[i], decorationData)
+    end
+
+    local offset = _G.StorageManager:GetInstance():GetPlayerPower() - power
+    if offset > 0 and call then
+        call(power, offset)
+    end
+
+end
+
+--穿戴/替换符文回调
+function DecorationModel:PutOnDecorationSuc(msg, cardData, index, decorationData, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    local decoData = cardData.DecorationBar[index]
+    local power = _G.StorageManager:GetInstance():GetPlayerPower()
+    if _G.table.isEmptyOrNil(decoData) or _G.table.isEmptyOrNil(decoData.decoration) then
+        ---被替换的符文被其他卡牌穿戴，需要卸下穿戴的符文即可
+        if decorationData.cardUid ~= 0 then
+            local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, decorationData.cardUid)
+            if card then
+                decoData.decoration = nil
+            end
+        end
+    else
+        ---替换符文,先把身上穿戴的符文卸下来
+        local data = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Decoration, decoData.decoration.uid)
+        if data then
+            data:PutCard(0)
+        end
+        if decorationData.cardUid ~= 0 then
+            ---被替换的符文在其他卡牌身上需要卸下来
+            if decorationData.cardUid ~= cardData.uid then
+                local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, decorationData.cardUid)
+                if card then
+                    card.DecorationBar[index].decoration = nil
+                end
+            end
+        end
+    end
+
+    decoData.decoration = decorationData or {}
+    if not decoData.slotLevel then
+        decoData.slotLevel = 0
+        decoData.index = index
+    end
+    decorationData:PutCard(cardData.uid)
+
+    cardData:CalcNowSumProp(_G.AttrFunType.Decoration)
+    require("CardInfoManager"):GetInstance():Updata_CardViewUpdataFun(cardData, true)
+    local offset = _G.StorageManager:GetInstance():GetPlayerPower() - power
+    --if offset > 0 then
+    --    require "CommonTipManager".OpenPowerUpView(power, offset)
+    --end
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RuneStrength.id)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DecorationSlot.id)
+    if call then
+        call(power, offset)
+    end
+end
+
+---卸下符文(单个)
+function DecorationModel:TakeOffDecoration(cardData, index, decorationData, call)
+    local msg = { uid = cardData.uid, d_index = { { index = index, uid = 0 } } }
+    require("DecorationNet"):GetInstance():SetDecorationAccess(
+        msg,
+        _G.handlerbind(self, self.TakeOffDecorationSuc, cardData, index, decorationData, call)
+    )
+end
+
+--卸下符文回调
+function DecorationModel:TakeOffDecorationSuc(msg, cardData, index, decorationData, call)
+    if msg.ack ~= 1 then
+        return
+    end
+
+    cardData.DecorationBar[index].decoration = nil
+    if decorationData then
+        decorationData:PutCard(0)
+    end
+    cardData:CalcNowSumProp(_G.AttrFunType.Decoration)
+    require("CardInfoManager"):GetInstance():Updata_CardViewUpdataFun(cardData, true)
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.RuneStrength.id, cardData.uid)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DecorationSlot.id)
+    if call then
+        call()
+    end
+end
+
+---领取图鉴奖励
+function DecorationModel:GetIllAward(sids, call)
+    local msg = { sids = sids }
+    require("DecorationNet"):GetInstance():GetIllAward(
+        msg,
+        _G.handlerbind(self, self.GetIllAwardSuc, sids, call)
+    )
+end
+
+---领取图鉴奖励回调
+function DecorationModel:GetIllAwardSuc(msg, sids, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+
+    for _, v in ipairs(sids) do
+        require("RuneIllustrationModel"):GetInstance():GetIllAward(v)
+    end
+    require("RuneIllustrationModel"):GetInstance():RefreshRedPoint()
+    if call then
+        call()
+    end
+end
+
+---强化饰品
+---@param cardData CardData 卡牌数据
+---@param slot decoration.c2s_up_streng
+---@param cost table 消耗材料
+---@param call function 回调
+function DecorationModel:DecorationUp(cardData, slot, cost, call)
+    local msg = { c_uid = cardData.uid, decoration_slot = slot }
+    require("DecorationNet"):GetInstance():DecorationUpAccess(
+        msg,
+        _G.handlerbind(self, self.DecorationUpSuc, cardData, slot, cost, call)
+    )
+end
+
+---强化饰品返回
+function DecorationModel:DecorationUpSuc(data, cardData, slot, cost, call)
+    if data.ack ~= 1 then
+        return
+    end
+    local power = _G.StorageManager:GetInstance():GetPlayerPower()
+    for _, v in pairs(slot) do
+        if not _G.table.isEmptyOrNil(cardData.DecorationBar[v.k]) then
+            cardData.DecorationBar[v.k].slotLevel = v.v
+        end
+    end
+    cardData:CalcNowSumProp(_G.AttrFunType.Decoration)
+    require("CardInfoManager"):GetInstance():Updata_CardViewUpdataFun(cardData, true)
+    local offset = _G.StorageManager:GetInstance():GetPlayerPower() - power
+    if offset > 0 then
+        require "CommonTipManager".OpenPowerUpView(power, offset)
+    end
+
+    for _, v in pairs(cost) do
+        _G.StorageManager:GetInstance():ConsumeItem(v[1], v[1], v[2])
+    end
+    if call then
+        call()
+    end
+end
+
+---符文词条洗炼
+---@param uid int32 符文uid
+---@param index int32 洗炼词条下标
+function DecorationModel:RestRuneAttr(uid,index,call)
+    local msg = {uid_index={{ key = uid, value=index }}}
+    require("DecorationNet"):GetInstance():RestRuneAttr(
+            msg,
+            _G.handlerbind(self, self.RestRuneAttrSuc,call)
+    )
+end
+
+---符文词条选择
+---@param uid int32 符文uid
+---@param index int32 洗炼词条下标
+function DecorationModel:ChooseRuneAttr(uid,type, call)
+    local msg = {uid = uid, type = type}
+    require("DecorationNet"):GetInstance():ChooseRuneAttr(
+            msg,
+            _G.handlerbind(self, self.ChooseRuneAttrSuc,call)
+    )
+end
+
+---符文词条刷新成功
+function DecorationModel:RestRuneAttrSuc(msg,call)
+    local data=_G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Decoration,msg.decorations[1].uid)
+    data:ParseInitMsg(msg.decorations[1])
+
+    if call then
+        call()
+    end
+end
+
+---符文词条选择成功
+function DecorationModel:ChooseRuneAttrSuc(msg,call)
+    if msg.ack == 1 then 
+        local data=_G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Decoration,msg.decorations[1].uid)
+        data:ParseInitMsg(msg.decorations[1])
+        _G.Events:GetInstance():Broadcast(_G.eRune.RestRuneAttr)
+        if call then
+            call(msg)
+        end
+    end
+end
+
+
+---饰品锁操作
+---@param decoData DecorationData 饰品
+---@param type number 操作类型0：设置为空闲，1：设置为锁定
+---@param call function 回调函数
+function DecorationModel:Lock(cardData, decoData, type, call)
+    cardData = cardData or {}
+    local msg = {}
+    msg.d_uid = decoData.uid
+    msg.type = type
+    require("DecorationNet"):GetInstance():LockAccess(
+        msg,
+        _G.handlerbind(self, self.LockSuc, cardData, decoData, type, call)
+    )
+end
+
+---饰品锁操作成功
+---@param data table 服务器返回消息
+---@param cardData CardData 卡牌数据
+---@param decoData DecorationData 饰品
+---@param type number 操作类型0：设置为空闲，1：设置为锁定
+---@param call function 回调函数
+function DecorationModel:LockSuc(data, cardData, decoData, type, call)
+    if data.ack ~= 1 then
+        return
+    end
+    decoData.lock = type
+    if not _G.table.isEmptyOrNil(cardData) then
+        local decorationBar = cardData.DecorationBar[decoData.parts]
+        if decorationBar and not _G.table.isEmptyOrNil(decorationBar.decoration) then
+            decorationBar.decoration.lock = type
+        end
+    end
+    if call then
+        call()
+    end
+end
+
+---重置槽位
+---@param cardData CardData 卡牌数据
+---@param call function 回调函数
+function DecorationModel:ResetSlot(cardData, call)
+    require("DecorationNet"):GetInstance():ResetSlot(
+        { c_uid = cardData.uid },
+        _G.handlerbind(self, self.ResetSlotSuc, cardData, call)
+    )
+end
+
+---重置槽位成功
+---@param msg table 服务器返回消息
+---@param cardData CardData 卡牌数据
+---@param call function 回调函数
+function DecorationModel:ResetSlotSuc(msg, cardData, call)
+    if msg.ack ~= 1 then
+        return
+    end
+
+    for _, v in pairs(cardData.DecorationBar) do
+        v.slotLevel = 0
+    end
+    cardData:CalcNowSumProp(_G.AttrFunType.Decoration)
+    require("CardInfoManager"):GetInstance():Updata_CardViewUpdataFun(cardData, true)
+
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.RuneStrength.id)
+    if call then
+        call()
+    end
+end
+
+--卡牌重置/升星等操作回退符文都放到服务器上，客户端更新数据即可
+function DecorationModel:P2CDecorationUpdate(msg)
+    if msg.decoration_update then
+        local decoData
+        local cardUid
+        local StorageManager = _G.StorageManager:GetInstance()
+        for _, v in pairs(msg.decoration_update) do
+            decoData = StorageManager:GetDatasByUid(_G.StorageID.Decoration, v.uid)
+            if decoData then
+                if not cardUid then
+                    cardUid = decoData.cardUid
+                end
+                decoData:Parse(v)
+            end
+        end
+
+        ---重置卡牌上的数据
+        if cardUid then
+            local cardData = _G.StorageManager:GetInstance():GetDatasByUid(_G.StorageID.Card, cardUid)
+            if cardData and cardData.DecorationBar then
+                for _, v in pairs(cardData.DecorationBar) do
+                    if v and v.decoration then
+                        v.decoration = nil
+                    end
+                end
+            end
+        end
+        self.IsRebirth = true
+        require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.DecorationSlot.id)
+    end
+end
+
+---一键卸下卡牌组里所有的饰品
+---@param cards table<number> 卡牌uid数组
+---@param call function 回调
+function DecorationModel:OneKeyOff(cards, call)
+    if call then
+        call()
+    end
+end
+
+---卸下刻印 角色重生使用---XZNS-5495
+---@param cards CardData 卡牌
+function DecorationModel:UnfixDecoration(cardData, call)
+    for _,decorationData in pairs(cardData.DecorationBar) do
+        if decorationData and decorationData.decoration then
+            decorationData.decoration:PutCard(0)
+        end
+    end
+    for i = 1, #cardData.DecorationBar do
+        cardData.DecorationBar[i].decoration = nil
+    end
+    cardData:CalcNowSumProp(_G.AttrFunType.Decoration)
+    require("CardInfoManager"):GetInstance():Updata_CardViewUpdataFun(cardData, true)
+    if call then
+        call()
+    end
+end
+
+---一键卸下卡牌组里所有的饰品 吃卡
+---@param cards table<number> 卡牌uid数组
+---@param call function 回调
+function DecorationModel:OneKeyOffChiKa(cards, call)
+    if call then
+        call()
+    end
+end
+
+---统计饰品穿戴个数 和 套装的个数
+---@param upOrDown number 0 = 替换，1=穿 2 = 卸下
+---@param card table 卡牌数据
+---@param decoUId table 饰品uid
+---@param other_card_uid number 饰品交换 （其他卡牌穿戴的饰品的 uid）
+function DecorationModel:CalulateDecorationAndSuitCount(card, upOrDown, other_card_uid)
+    local count, suit_count = 0, 0
+    ---当前穿戴饰品的个数 调用下当前的数据
+    local storage = _G.StorageManager:GetInstance():GetDataStorageByID(_G.StorageID.Card)
+    count = storage:GetDecorationUseCount()
+    suit_count = storage:GetSuit_count_noSame()
+    if upOrDown == 2 then
+        storage:SetDecorationUseCount(count - 1)
+        storage:SetDecorationSuitCount(2, card.uid)
+    elseif upOrDown == 1 then
+        storage:SetDecorationSuitCount(1, card.uid)
+        storage:SetDecorationUseCount(count + 1)
+    else
+        storage:SetDecorationSuitCount(0, card.uid, other_card_uid)
+    end
+    count = storage:GetDecorationUseCount()
+    --("饰品：增删改查..数量：" .. count)
+    suit_count = storage:GetSuit_count_noSame()
+
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        { _G.ActiveTaskEnum.ConditionEnum.Equipment.DecorationAllWearCount },
+        count,
+        nil,
+        true
+    )
+
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        { _G.ActiveTaskEnum.ConditionEnum.Equipment.DecorationSuit4Count },
+        suit_count,
+        nil,
+        true
+    )
+
+    --("饰品：套装（穿戴） 不同数量" .. suit_count)
+    --填写 发送消息的 类型
+end
+
+---一键卸下统计 饰品数量、饰品套装数量
+---@param uid number 卡牌的uid
+---@param num number 卸下的饰品数量
+function DecorationModel:OneKeyOffSucCalulateCount(uid, num)
+    local count, suit_count = 0
+    local storage = _G.StorageManager:GetInstance():GetDataStorageByID(_G.StorageID.Card)
+    count = storage:GetDecorationUseCount()
+    suit_count = storage:GetSuit_count_noSame()
+    storage:SetDecorationUseCount(count - num)
+    storage:SetDecorationSuitCount(2, uid)
+    ---填写 消息数据类型
+    count = storage:GetDecorationUseCount()
+    --("饰品：增删改查..数量：" .. count)
+    suit_count = storage:GetSuit_count_noSame()
+    --("饰品：套装（穿戴） 不同数量" .. suit_count)
+
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        { _G.ActiveTaskEnum.ConditionEnum.Equipment.DecorationAllWearCount },
+        count,
+        nil,
+        true
+    )
+
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        { _G.ActiveTaskEnum.ConditionEnum.Equipment.DecorationSuit4Count },
+        suit_count,
+        nil,
+        true
+    )
+end
+
+---@private
+function DecorationModel:ShowPowerAndUp(decoData)
+    if decoData.cardUid ~= 0 then
+        local power = _G.StorageManager:GetInstance():GetPlayerPower()
+        local card = _G.StorageManager:GetInstance():GetItemDataByID(_G.StorageID.Card, decoData.cardUid)
+        require("CardInfoManager"):GetInstance():Updata_CardViewUpdataFun(card)
+        if (_G.StorageManager:GetInstance():GetPlayerPower() - power) > 0 then
+            require "CommonTipManager".OpenPowerUpView(power, _G.StorageManager:GetInstance():GetPlayerPower() - power)
+        end
+    end
+end
+
+---转换  根据出入的品质 获得对应的数据信息
+---@param grade number 品质
+---@param target table 需要转换的数据
+function DecorationModel:GetGradeToValue(grade, target)
+    if target == nil then
+        return nil
+    end
+    local tmep = {}
+    for i = 1, #target do
+        local id = target[i][1]
+        if tmep[id] == nil then
+            tmep[id] = 0
+        end
+        tmep[id] = target[i][2]
+    end
+    if tmep[grade] then
+        return tmep[grade]
+    else
+        return nil
+    end
+end
+
+---获取套装数量
+---@return number 数量
+function DecorationModel:GetSuitCount(sid)
+    local count = 0
+    local dList = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Decoration)
+
+    for _, v in pairs(dList) do
+        if v.cfg.suit == sid then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+function DecorationModel:GetUpLevelLimit(lv, grade)
+    local cfg = _G.ConfigManager.decoration_stren_cfg
+    local limit = 0
+    if lv == 0 then
+        limit = 0
+    elseif lv > 0 then
+        if cfg[lv] then
+            limit = self:GetGradeToValue(grade, cfg[lv].points_up)
+        else
+            limit = 0
+        end
+    end
+    return limit
+end
+
+---检测是否可以升级(金币,材料（饰品，材料）) 库存金币 足够（就显示）
+---@param ddata number 饰品
+function DecorationModel:CheckUpLevelHint(ddata)
+    return true
+end
+
+--ZHJ-15397 【客户端】刻魂系统的红点添加 只检测首次(显示红点),其他不在显示红点
+function DecorationModel:UpdateFirstRedpoint(card, parts)
+    if card == nil then
+        return
+    end
+    local param = card.uid * 10 + parts
+    if not card.soulLink_sign then
+        card.soulLink_sign = true
+    end
+    --刷新红点
+    require("RedPointManager"):GetInstance():RefreshNode(
+        _G.ConfigManager.redpoint_cfg.EngraveSoul.id,
+        param
+    )
+end
+
+return DecorationModel

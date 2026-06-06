@@ -1,0 +1,370 @@
+---@class AIHelperExecuteView : UIBaseView	    @AI助手执行页面
+---@field go_table AIHelperExecuteView_GoTable
+---@field scrollRect UnityEngine.UI.ScrollRect
+---@field modules AIHelperModuleBase[]          @需要执行的模块列表
+---@field index number                          @当中执行的模块序号
+---@field options AIHelperExecuteOptions        @设置项
+---@field executeItems AIHelperExecuteView._obj_listItem_GoTable[]  @执行状态节点
+---@field executeStates AIHelperExecuteState[]  @执行状态数据
+---@field executeStatesEmpty number             @执行填充空位
+---@field curExecuteState AIHelperExecuteState  @当前执行中的状态数据
+---@field executing boolean                     @是否正在执行中
+---@field pause number                          @暂停执行计数: 1有弹窗提示, >=2表示有弹窗提示且有挂起的任务
+---@field tasks table<number,ActiveTaskBase>    @正在执行中的任务
+local AIHelperExecuteView = _G.BaseClass("AIHelperExecuteView", _G.UIBaseView)
+function AIHelperExecuteView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self.scrollRect = self.go_table.scrollloopvectical_list:GetComponentE(_G.typeof(_G.CS.UnityEngine.UI.ScrollRect))
+end
+
+function AIHelperExecuteView:OnCreate(modules, options)
+    self.modules = modules or {}
+    self.index = 1
+    self.options = options or {}
+    ---配置延迟时间，方便配置调整
+    local yc = _G.ConfigManager.discrete_cfg[126104][1][1]
+    self.options.interval = self.options.interval or yc
+    self.executeStates = {}
+
+    --填充空位节点
+    self.executeStatesEmpty = 5
+    local executeEmpty = {}
+    for i = 1, self.executeStatesEmpty do
+        table.insert(self.executeStates, executeEmpty)
+    end
+
+    self:Init()
+    self:InitTasks()
+
+    if modules and #modules > 0 then
+        self.pause = nil
+        self.executing = true
+        self:ShowState(1)
+        self:StartModule(true)
+    else
+        self:ShowState(0)
+    end
+end
+
+---初始化界面
+---@return void
+function AIHelperExecuteView:Init()
+    self.go_table.aortext_title.text = ""
+    self.go_table.obj_listItem:SetActiveE(0)
+    self.go_table.scrollloopvectical_list:InitItemData(0, _G.handler(self, self.RefreshItem))
+end
+
+---初始化日常任务列表
+---@return void
+function AIHelperExecuteView:InitTasks()
+    if self.options and self.options.unfreeze then
+        return
+    end
+    self.tasks = {}
+
+    --获取日常任务列表
+    ---@type ActiveTaskBase[]
+    local taskList = require("ActiveTaskManager"):GetInstance().tasks
+    if not taskList then
+        return
+    end
+    for _, task in pairs(taskList) do
+        if task.Cfg.type_mission == 1 then
+            self.tasks[task.Cfg.id] = task
+        end
+    end
+end
+
+---开始一个模块的(单次)调用
+---@param check boolean         @是否需要调用Check方法
+function AIHelperExecuteView:StartModule(check)
+    local module = self.modules[self.index]
+    if not module then
+        local executing = self.executing
+        --执行完成
+        self.executing = false
+        self:ShowState(2)
+        --self.go_table.aortext_title.text = ""
+        if executing then
+            self:ShowResultsAward(nil)
+        end
+        return
+    end
+
+    --检测是否已暂停执行
+    if self.pause and self.pause > 0 then
+        self.pause = self.pause + 1
+        return
+    end
+
+    --移除占位节点
+    if self.executeStatesEmpty > 0 then
+        self.executeStatesEmpty = self.executeStatesEmpty - 1
+        table.remove(self.executeStates, 1)
+    end
+
+    --创建状态然后刷新列表
+    self.curExecuteState = {
+        module = module,
+        state = module:GetExecuteState()
+    }
+    table.insert(self.executeStates, self.curExecuteState)
+
+    --滑动到底部
+    if self:IsShowBottom() then
+        self.go_table.scrollloopvectical_list:UpdateCount(#self.executeStates, #self.executeStates)
+        self.go_table.scrollloopvectical_list:ScrollToIndex(#self.executeStates)
+        self:ScrollToBottom()
+    else
+        self.go_table.scrollloopvectical_list:SetCount(#self.executeStates, 1)
+    end
+
+    --ui标题
+    self.go_table.aortext_title.text = module:GetExecuteTitle(self.curExecuteState.state)
+
+    --执行逻辑
+    local function executing()
+        if self:IsNil() or not self.executing then
+            return
+        end
+        if check then
+            self:CheckCurrentModule()
+        else
+            self:ExecuteCurrentModule()
+        end
+    end
+    local delay = math.max(self.options.interval, module:GetExecuteDelay())
+    if delay and delay > 0 then
+        _G.DelayDo(delay, executing)
+    else
+        executing()
+    end
+end
+
+---执行下一个模块
+---@return void
+function AIHelperExecuteView:StartNextModule()
+    self.index = self.index + 1
+    self:StartModule(true)
+end
+
+---检查当前模块是否满足执行条件
+---@return void
+function AIHelperExecuteView:CheckCurrentModule()
+    local module = self.modules[self.index]
+    module:Check(
+        function(ok)
+            if self:IsNil() or not self.executing then
+                return
+            end
+
+            if not ok then
+                self:FinishCurrentModule(false, nil, true)
+                self:StartNextModule() --执行下一个模块
+            elseif not module:IsActive() then
+                self:FinishCurrentModule(false, module:GetCurrentFailureResults())
+                self:StartNextModule() --执行下一个模块
+            else
+                --Check之后重新拉取状态并更新视图
+                if self.curExecuteState then
+                    self.curExecuteState.state = self.curExecuteState.module:GetExecuteState()
+                    self.go_table.scrollloopvectical_list:UpdateAllItem()
+                end
+                self:ExecuteCurrentModule()
+            end
+        end
+    )
+end
+
+---检查当前模块的逻辑并获取结果
+---@return void
+function AIHelperExecuteView:ExecuteCurrentModule()
+    local module = self.modules[self.index]
+    if not module:IsActive() then
+        self:FinishCurrentModule(false, module:GetCurrentFailureResults())
+        self:StartNextModule() --执行下一个模块
+        return
+    end
+    --检测关联的任务是否完成
+    if self.tasks and module:IsCompletedTask(self.tasks) then
+        self:FinishCurrentModule(false, module:CreateFailureResults(2))
+        self:StartNextModule() --执行下一个模块
+        return
+    end
+
+    module:Execute(
+        function(ok, results)
+            if self:IsNil() or not self.executing then
+                return
+            end
+
+            self:FinishCurrentModule(ok, results)
+
+            --执行下一个模块(根据设置, 如果不成功是否继续执行此模块)
+            if not module:IsActive() or not ok and not self.options.continue then
+                self:StartNextModule() --执行下一个模块
+                return
+            end
+
+            --执行下一次循环调用
+            self:StartModule(false)
+        end
+    )
+end
+
+---结束一个模块的(单次)调用
+---@param success boolean       @调用是否成功
+---@param results any           @调用结束返回的数据
+---@param fatalError boolean    @是否存在致命错误, 强制中断当前模块的循环调用
+---@return void
+function AIHelperExecuteView:FinishCurrentModule(success, results, fatalError)
+    if not self.curExecuteState then
+        return
+    end
+    self.curExecuteState.success = success or false
+    self.curExecuteState.results = results
+    self.curExecuteState = nil
+
+    self.go_table.scrollloopvectical_list:UpdateAllItem()
+end
+
+---更新执行状态
+---@param state number          @0空任务, 1执行中, 2执行结束
+function AIHelperExecuteView:ShowState(state)
+    self.go_table.obj_nothing:SetActiveE(state == 0 and 1 or 0)
+    self.go_table.obj_executing:SetActiveE(state == 1 and 1 or 0)
+    self.go_table.obj_completed:SetActiveE(state == 2 and 1 or 0)
+end
+
+---显示执行结束奖励
+---@param callback fun():void   确定回调事件
+---@return void
+function AIHelperExecuteView:ShowResultsAward(callback)
+    local lstAwardItems = {}
+    --遍历获取奖励列表
+    for i = 1, #self.executeStates do
+        local state = self.executeStates[i]
+        local award = state and state.results and type(state.results) == "table" and state.results.award
+        if award and award.item then
+            for _, item in ipairs(award.item) do
+                table.insert(lstAwardItems, item)
+            end
+        end
+    end
+
+    if #lstAwardItems == 0 then
+        if callback then
+            callback()
+        end
+        return
+    end
+    _G.UIUtils.ShowCommonAward({ award = { item = lstAwardItems } }, callback)
+    if _G.AppSetting.IsXzns then--星座执行结束后刷新观影台红点
+        require("ViewingADModel"):GetInstance():RefreshRedpoint(1)
+    end
+end
+
+---是否正在展示最下面的节点
+function AIHelperExecuteView:IsShowBottom()
+    return true
+end
+
+---滑动到视图底部(更新content位置)
+function AIHelperExecuteView:ScrollToBottom()
+    if not self.scrollRect or not self.scrollRect.content then
+        return
+    end
+    local _, height = self.scrollRect.content:GetRectTransformSize()
+    local x = self.scrollRect.content:GetLocalPosition()
+    self.scrollRect.content:SetLocalPosition(x, height, 0)
+end
+
+---刷新左边标签栏列表
+---@param index number 序号下标, C#从0开始lua从1开始
+---@param obj GameObject    节点实例
+function AIHelperExecuteView:RefreshItem(index, obj)
+    if not self.executeItems then
+        self.executeItems = {}
+    end
+    local item = self.executeItems[obj:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(obj)
+        self.executeItems[obj:GetInstanceIDE()] = item
+    end
+
+    index = index + 1
+    if index <= self.executeStatesEmpty then
+        item.gameObject:SetActiveE(0)
+        return
+    end
+    item.gameObject:SetActiveE(1)
+
+    local data = self.executeStates[index]
+
+    ---回收上一个节点的状态
+    ---@type AIHelperExecuteState
+    local oldData = item.data
+    if oldData and oldData ~= data then
+        --显示的数据相同, 不要回收奖励节点
+        --例如调用: UpdateAllItem
+        oldData.module:HideExecuteResult(item, oldData.results)
+    end
+    --显示数据
+    item.data = data
+    data.module:ShowExecutingState(item, data.state, data.results)
+    if data == self.curExecuteState then
+        data.module:ShowExecuting(item)
+    else
+        data.module:ShowExecuteResult(item, data.success, data.results)
+    end
+end
+
+---处理按钮事件
+function AIHelperExecuteView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_close or go == self.go_table.aorbtn_close1 then
+        if self.executing then
+            self.pause = 1
+            --正在执行中, 弹窗提示
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                1005,
+                nil,
+                function()
+                    local executing = self.executing
+                    self.executing = false
+                    --self:Close()
+                    if executing then
+                        self:ShowResultsAward(_G.handler(self, self.Close))
+                    end
+                end,
+                function()
+                    if not self.executing or not self.pause then
+                        return
+                    end
+                    local count = self.pause
+                    self.pause = nil
+                    if count > 1 then --有挂起的任务
+                        self:StartModule(true)
+                    end
+                end
+            )
+        else
+            self:Close()
+        end
+    end
+end
+
+--region    -----------------------类型定义----------------------
+
+---@class AIHelperExecuteOptions    @执行设置
+---@field continue boolean              @失败后继续执行模块(默认: false)
+---@field interval number               @执行间隔, 单位秒(默认值:1)
+---@field unfreeze boolean              @解除执行限制(不检查日常任务完成状态)
+
+---@class AIHelperExecuteState      @执行状态
+---@field module AIHelperModuleBase     @绑定的模块数据
+---@field state any                     @执行状态
+---@field success boolean               @执行是否成功
+---@field resutls any                   @执行结束返回的数据
+--endregion
+
+return AIHelperExecuteView

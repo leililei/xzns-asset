@@ -1,0 +1,390 @@
+-----------------------------------------------------------------------
+-- C:\alpha_JT\Client\Assets\Resources\LuaScripts\Game\Common\CommonTipView\EquipBrokenGiftTipView.lua
+-- Created by ly
+-- DateTime: 2024/07/16
+-- Description 破解石道具弹窗
+-- 生命周期Awake,Start, OnDisable, OnEnable, OnDispose 可根据情况自行添加
+-----------------------------------------------------------------------
+
+---@class EquipBrokenGiftTipView : Component    中文描述
+local EquipBrokenGiftTipView = _G.BaseClass("EquipBrokenGiftTipView", _G.Component)
+local CommonTipManager = require "CommonTipManager"
+
+local CS = _G.CS
+local typeof = _G.typeof
+local table = _G.table
+local tonumber = _G.tonumber
+
+function EquipBrokenGiftTipView:__init(transform, view)
+    -- 组件集合(减少对c#测调用)
+    self.Components = {}
+
+    self.gameObject = transform
+    self.transform = transform
+    self.go_table = _G.GetAutoGoTable(self.gameObject)
+    self.CacheListener = {}
+    self.view = view
+end
+
+function EquipBrokenGiftTipView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+    self.nameOutLine = self.go_table.aortext_name:GetComponentE(_G.typeof(_G.CS.TextOutline))
+end
+
+---创建对象时,入口构造函数
+function EquipBrokenGiftTipView:OnCreate()
+    self.itemTransDic = {}
+    self.clickArrow = false
+    self.rect = self.go_table.aorimage_itemBg:GetComponentE(typeof(CS.UnityEngine.RectTransform))
+    self.go_table.scrollloophorizontal_ItemGet:InitItemData(0, _G.handler(self, self.RefreshItem))
+end
+
+function EquipBrokenGiftTipView:Init(data)
+    self.data = data
+    self.sid = data.sid
+    local count = data.count
+    _G.StorageManager:GetInstance():GetItemBaseView(
+            self.sid,
+            count or 0,
+            self.go_table.obj_root,
+            function(item)
+                if _G.IsNil(self.go_table.obj_root) then
+                    _G.DestroyObject(item.gameObject)
+                    return
+                end
+                item.gameObject:SetLocalPosition(0, 0, 0)
+                item.gameObject:SetLocalScaleXYZ(1)
+            end,
+            function()
+            end
+    )
+
+    local value = _G.StorageManager:GetInstance():GetItemCountBySid(self.sid)
+    self.go_table.aortext_haveCount.text = value
+
+    local id = _G.GameUtil.GetItemTypeLanguageID(data.cfg.ID)
+    _G.GameUtil.SetActiveByCondition(
+            self.go_table.aortext_use,
+            id > 0 and data.cfg.UseType ~= _G.ItemUseType.GetProp
+    )
+    if id > 0 then
+        self.go_table.aortext_useName.text = _G.LangUtil.GetLangPackValue(data.cfg.title)
+    end
+    local grade = data.cfg.Quality
+    ---@type UnityEngine.Component 彩色渐变框
+    -- local component = self.go_table.aortext_name:GetComponentE(_G.typeof(_G.CS.FrameWork.AorUI.effects.Gradient))
+    -- if not _G.IsNil(component) then
+    --     component.enabled = _G.GameUtil.IsGradientQuality(grade)
+    -- end
+
+    self.go_table.aortext_name.text = _G.LangUtil.GetLangPackValue(data.cfg.Name)
+    ---@type CommonTipManager
+    local ctm = require "CommonTipManager":GetInstance()
+    ctm:SetItemTextGradient(self.go_table.aortext_name.gameObject, grade)
+    self.go_table.aorrawimage_di:LoadImage(ctm:GetItemBgPathByGrade(grade))
+
+    ---展示的装备索引
+    self.showEquipIndex = 1
+    ---展示的item索引
+    self.selectItemIndex = 1
+    self.selectItemSid = 0
+    self:InitArawdTitle()
+    ---缓存属性字典
+    self.propItemDic = {}
+    self:InitEquipInfo()
+    self:UpdateTimer()
+    self.view:SetPos(self.rect, data.pos)
+
+    ---@type UnityEngine.Component 彩色描边
+    local outLineColor = CommonTipManager:GetInstance():GetTipTypeNameOutLineColorByGrade(grade)
+    self.nameOutLine.OutlineColor = _G.ColorTools.FormatColorByString(outLineColor)
+    self:RefreshBgEffect(grade)
+end
+
+function EquipBrokenGiftTipView:UpdateTimer()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    if self.clickArrow then
+        return
+    end
+    local delay = _G.ConfigManager.discrete_cfg[104910][1][1]
+    self.timer = _G.TimerManager:GetInstance():GetTimer(delay, self.OnTimeCall, self, false, false)
+    self.timer:Start()
+end
+
+---奖励标题
+function EquipBrokenGiftTipView:InitArawdTitle()
+    if self.data.cfg.UseType == _G.ItemUseType.ItemDrop or self.data.cfg.UseType == _G.ItemUseType.DrawCard then
+        self.go_table.aortext_title.text = _G.LangUtil.GetLangPackValue(20001000008)
+    elseif self.data.cfg.UseType == _G.ItemUseType.GetProp or self.data.cfg.UseType == _G.ItemUseType.SelectProp or
+            self.data.cfg.UseType == _G.ItemUseType.CardOptional
+    then
+        self.go_table.aortext_title.text = _G.LangUtil.GetLangPackValue(20001000009)
+    else
+        self.go_table.aortext_title.text = _G.LangUtil.GetLangPackValue(20001000007)
+    end
+    self:InitAwardData()
+end
+
+----刷新item
+function EquipBrokenGiftTipView:InitAwardData()
+    self.awardData = {}
+    local item_cfgItem = self.data.cfg
+    for _, v in pairs(item_cfgItem.UseParameter) do
+        table.insert(self.awardData, v)
+    end
+    self.go_table.scrollloophorizontal_ItemGet:UpdateCount(#self.awardData)
+end
+
+---刷新物体信息
+function EquipBrokenGiftTipView:RefreshItem(index, obj)
+    local newIndex = index + 1
+    local data = self.awardData[newIndex]
+    local tb = _G.GetAutoGoTable(obj)
+    _G.StorageManager:GetInstance():GetItemBaseView(
+            tonumber(data[1]),
+            tonumber(data[2]),
+            tb.obj_Root,
+            function(item)
+                if _G.IsNil(tb.obj_Root) then
+                    _G.DestroyObject(item.gameObject)
+                    return
+                end
+                item.gameObject:SetLocalScaleXYZ(0.6)
+            end,
+            function()
+                self:OnClickItem(newIndex)
+            end
+    )
+    tb.aorimage_select:SetActiveE(self.selectItemIndex == newIndex and 1 or 0)
+    if self.selectItemIndex == newIndex then
+        self.selectItemSid = tonumber(data[1])
+    end
+    self.itemTransDic[newIndex] = tb
+end
+
+function EquipBrokenGiftTipView:OnClickItem(index)
+    if self.selectItemIndex == index then
+        return
+    end
+
+    self.itemTransDic[self.selectItemIndex].aorimage_select:SetActiveE(0)
+    self.selectItemIndex = index
+    self.itemTransDic[index].aorimage_select:SetActiveE(1)
+    self.selectItemSid = tonumber(self.awardData[index][1])
+    self.showEquipIndex = 1
+    self:InitEquipInfo()
+    self:UpdateTimer()
+end
+
+---初始化属性
+function EquipBrokenGiftTipView:InitAttribute()
+    local advance = _G.ConfigManager.stone_cfg[self.selectItemSid].advance
+    local cfgs = _G.ConfigManager.equipment_cfg
+    local propList = {}
+    for _, v in pairs(_G.AttrType) do
+        ---当前装备
+        local leftEquipId = advance[self.showEquipIndex][1]
+        local leftEquipCfg = cfgs[leftEquipId]
+        ---突破后的装备
+        local rightEquipId = advance[self.showEquipIndex][2]
+        local rightEquipCfg = cfgs[rightEquipId]
+        if leftEquipCfg[v.key] and leftEquipCfg[v.key] > 0 then
+            ---突破前和突破后的装备属性一定是一样的，否则无法对比（不一样就是配错了）
+            table.insert(propList, {
+                name = v.des,
+                percentage = v.percentage,
+                sortid = v.sortid,
+                leftNum = leftEquipCfg[v.key],
+                rightNum = rightEquipCfg[v.key] or 0
+            })
+        end
+    end
+
+    ---装备属性显示排序
+    _G.table.sort(
+            propList,
+            function(a, b)
+                return a.sortid < b.sortid
+            end
+    )
+
+    local obj
+    for i, v in ipairs(propList) do
+        ---生成属性条
+        if not self.propItemDic[i] then
+            obj = _G.InstantiateObject(self.go_table.obj_propItem, self.go_table.obj_propGrid)
+            _G.table.insert(self.propItemDic, obj)
+        else
+            obj = self.propItemDic[i]
+        end
+
+        local leftNum, rightNum
+        if v.percentage == 1 then
+            leftNum = _G.GameUtil.FormatNum(v.leftNum * 0.01) .. "%"
+            rightNum = _G.GameUtil.FormatNum(v.rightNum * 0.01) .. "%"
+        else
+            leftNum = _G.math.floor(v.leftNum)
+            rightNum = _G.math.floor(v.rightNum)
+        end
+        local go_table = _G.GetAutoGoTable(obj)
+        go_table.aorimage_di:SetActiveE(i % 2 == 0 and 0 or 1)
+        go_table.aortext_des.text = v.name
+        go_table.aortext_num.text = leftNum
+        go_table.aortext_num1.text = rightNum
+        obj:SetActiveE(1)
+    end
+
+    for i = #propList + 1, #self.propItemDic do
+        self.propItemDic[i]:SetActiveE(0)
+    end
+end
+
+---初始化装备
+function EquipBrokenGiftTipView:InitEquipInfo()
+    local advance = _G.ConfigManager.stone_cfg[self.selectItemSid].advance
+    ---当前装备
+    local leftEquipId = advance[self.showEquipIndex][1]
+    self.go_table.obj_item1:ClearChildren()
+    _G.StorageManager:GetInstance():GetItemBaseView(
+            leftEquipId,
+            1,
+            self.go_table.obj_item1,
+            function(item)
+                if _G.IsNil(self.go_table.obj_item1) then
+                    _G.DestroyObject(item.gameObject)
+                    return
+                end
+
+                item.gameObject:SetLocalScaleXYZ(0.8)
+                local equipmentData = _G.StorageManager:GetInstance():GetDatasBySid(
+                        _G.StorageID.Equipment,
+                        leftEquipId
+                )
+                if table.isEmptyOrNil(equipmentData) then
+                    item.go_table.aortext_num.text = _G.string.format("<color=#e33f3f>%s</color>/%s", 0, 1)
+                else
+                    local count = 0
+                    for _, v in pairs(equipmentData) do
+                        count = v.count + count
+                    end
+                    item.go_table.aortext_num.text = count .. "/" .. 1
+                end
+            end
+    )
+
+    ---消耗的道具
+    self.go_table.obj_item2:ClearChildren()
+    _G.StorageManager:GetInstance():GetItemBaseView(
+            self.selectItemSid,
+            0,
+            self.go_table.obj_item2,
+            function(item)
+                if _G.IsNil(self.go_table.obj_item2) then
+                    _G.DestroyObject(item.gameObject)
+                    return
+                end
+                item.gameObject:SetLocalScaleXYZ(0.8)
+            end,
+            function()
+            end
+    )
+
+    ---当前装备
+    local rightEquipId = advance[self.showEquipIndex][2]
+    self.go_table.obj_item3:ClearChildren()
+    _G.StorageManager:GetInstance():GetItemBaseView(
+            rightEquipId,
+            0,
+            self.go_table.obj_item3,
+            function(item)
+                if _G.IsNil(self.go_table.obj_item3) then
+                    _G.DestroyObject(item.gameObject)
+                    return
+                end
+                item.gameObject:SetLocalScaleXYZ(0.8)
+            end
+    )
+    self:InitAttribute()
+    self.refreshEquipInfo = false
+end
+
+function EquipBrokenGiftTipView:OnTimeCall()
+    self.refreshEquipInfo = true
+    local advance = _G.ConfigManager.stone_cfg[self.selectItemSid].advance
+    if self.showEquipIndex >= #advance then
+        self.showEquipIndex = 1
+    else
+        self.showEquipIndex = self.showEquipIndex + 1
+    end
+    self:InitEquipInfo()
+end
+
+function EquipBrokenGiftTipView:OnClcikArrow(change)
+    if self.refreshEquipInfo then
+        return
+    end
+
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+        self.clickArrow = true
+    end
+
+    self.showEquipIndex = self.showEquipIndex + change
+    local advance = _G.ConfigManager.stone_cfg[self.selectItemSid].advance
+    if self.showEquipIndex > #advance then
+        self.showEquipIndex = 1
+    elseif self.showEquipIndex <= 0 then
+        self.showEquipIndex = #advance
+    end
+    self:InitEquipInfo()
+end
+
+function EquipBrokenGiftTipView:OnClickBtn(go)
+    if go == self.go_table.aorbtn_close then
+        self.view:CloseTip(_G.TipType.EquipBrokenMaterial)
+    elseif go == self.go_table.aorbtn_leftArrow then
+        self:OnClcikArrow(-1)
+    elseif go == self.go_table.aorbtn_rightArrow then
+        self:OnClcikArrow(1)
+    end
+end
+
+function EquipBrokenGiftTipView:EscClose()
+    self.view:CloseTip(_G.TipType.EquipBrokenMaterial)
+end
+
+---刷新背景特效
+function EquipBrokenGiftTipView:RefreshBgEffect(quality)
+    local effectPath = CommonTipManager:GetInstance():GetItemBgEffectPathByGrade(quality)
+    _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg[effectPath],
+            self.go_table.obj_bgEffect,
+            function(trans)
+                if _G.IsNil(trans) then
+                    _G.DestroyObject(trans)
+                    return
+                end
+                self.bgEffect = trans
+            end
+    )
+end
+
+---销毁对象时,析构函数
+function EquipBrokenGiftTipView:Dispose()
+    self.go_table = nil
+    self.Components = nil
+    self.gameObject = nil
+    self.transform = nil
+    self.CacheListener = nil
+    self.view = nil
+    self.bgEffect = nil
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+return EquipBrokenGiftTipView

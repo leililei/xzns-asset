@@ -1,0 +1,2453 @@
+local ObjectFactory = require("ObjectFactory")
+local DungeonChallengeBattleModel = require("DungeonChallengeBattleModel")
+local DungeonChallengeEquipData = require("DungeonChallengeEquipData")
+local DungeonChallengeBattleView_EquipItem = require("DungeonChallengeBattleView_EquipItem")
+local DungeonChallengeBattleView_EquipUsableItem = require("DungeonChallengeBattleView_EquipUsableItem")
+
+---横向ROW个, 竖向COLUMN个
+---使用一维数组表示二维网格, 对于一维数组index的x丶y坐标:
+--- x = index % ROW, y = math.ceil(index / ROW)
+--- x - 1 = index -1, x + 1 = index + 1 (x取值范围[1, ROW])
+--- y + 1 = index + ROW, y - 1 = index - ROW (y取值范围[1, COLUMN])
+local ROW, COLUMN = 6, 3
+---装备背包元素间隔
+local BAG_DEFAULT_SPACING = 10
+local BAG_MAX_SPACING = 50
+
+---角色阴影配置(对应星级)
+local StarColorPaths = {
+    "UIH5/Embattle/Grade/bai",
+    "UIH5/Embattle/Grade/lv",
+    "UIH5/Embattle/Grade/lan",
+    "UIH5/Embattle/Grade/zi",
+    "UIH5/Embattle/Grade/cheng",
+    "UIH5/Embattle/Grade/hong",
+    "UIH5/Embattle/Grade/jin",
+    "UIH5/Embattle/Grade/cai"
+}
+---场景镜头偏移值
+local SceneCameraOffset = {
+    ---策划说写死固定值
+    x = 1.46,
+    y = -3.5,
+    z = 0
+}
+
+---准备阶段: 角色站位位置(1-3)个, 2个待选角色要特殊处理
+local ScenePreparePositions = {
+    ---策划说写死固定值
+    Three = {
+        { 0, 0, -2.34 }, --第一个角色(左)
+        { 0, 0, 0 },     --第二个角色(中)
+        { 0, 0, 2.34 },  --第三个橘色(右)
+    },
+    Two = {
+        { 0, 0, -1.5 }, --第一个角色(左)
+        { 0, 0, 1.5 },  --第二个角色(右)
+    },
+}
+
+---战斗阶段
+local Stage = {
+    None = 0,
+    Prepare = 1,     --战前选关
+    BattleEquip = 2, --战斗阶段: 穿戴装备
+    Battle = 3,      --战斗阶段: 战斗中
+}
+
+---装备合成升级特效
+local EquipConflateEffects = {  
+    [5] = "ef_dungeon_cheng",
+    [6] = "ef_dungeon_hong",
+    [7] = "ef_dungeon_jin",
+}
+
+--工具类
+local utils = {
+    ---将屏幕坐标转换为RectTransform本地坐标
+    ---@param rectTransform UnityEngine.RectTransform 目标RectTransform
+    ---@param x number 屏幕坐标X
+    ---@param y number 屏幕坐标Y
+    ---@param ignorePivot? boolean 是否忽略pivot影响, 默认false
+    ---@return number,number @x,y
+    screenPointToRectLocalPosition = function(rectTransform, x, y, ignorePivot)
+        local _, localPosition = _G.CS.UnityEngine.RectTransformUtility.ScreenPointToLocalPointInRectangle(
+            rectTransform,
+            _G.Vector2.New(x, y),
+            _G.UIManager:GetInstance().UICamera
+        )
+        local x, y = localPosition.x, localPosition.y
+        --修正pivot影响
+        if ignorePivot then
+            local pointX, pointY = rectTransform:GetPivotPosition()
+            local width, height = rectTransform:GetRectTransformWidthHeight()
+            y = y + (pointY - 0.5) * height
+            x = x + (pointX - 0.5) * width
+        end
+        return x, y
+    end,
+    ---屏幕坐标是否在RectTransform内
+    ---@param rectTransform UnityEngine.RectTransform 目标RectTransform
+    ---@param x number 屏幕坐标X
+    ---@param y number 屏幕坐标Y
+    ---@return boolean
+    screenPointInRect = function(rectTransform, x, y)
+        local _, localPosition = _G.CS.UnityEngine.RectTransformUtility.ScreenPointToLocalPointInRectangle(
+            rectTransform,
+            _G.Vector2.New(x, y),
+            _G.UIManager:GetInstance().UICamera
+        )
+        local x, y = localPosition.x, localPosition.y
+        --修正pivot影响
+        local pointX, pointY = rectTransform:GetPivotPosition()
+        local width, height = rectTransform:GetRectTransformWidthHeight()
+        y = y + (pointY - 0.5) * height
+        x = x + (pointX - 0.5) * width
+
+        return x >= -width * 0.5 and
+            x <= width * 0.5 and
+            y >= -height * 0.5 and
+            y <= height * 0.5
+    end,
+    ---创建事件触发条目
+    ---@param eventType UnityEngine.EventSystems.EventTriggerType @事件类型
+    ---@param callback fun(data:UnityEngine.EventSystems.PointerEventData):void @回调函数
+    createTriggerEntry = function(eventType, callback)
+        local entry = _G.CS.UnityEngine.EventSystems.EventTrigger.Entry()
+        entry.eventID = eventType
+        entry.callback:AddListener(callback)
+        return entry
+    end,
+    ---寻找模型挂点
+    ---@param trans UnityEngine.Transform
+    ---@param forceUpdate? boolean   是否立即更新骨骼位置
+    ---@return UnityEngine.Transform
+    findModelPoint = function(trans, forceUpdate)
+        local rp = trans:GetComponentInChildrenE(_G.typeof(_G.CS.SkeletonBoneReferences))
+        if not rp then
+            return nil
+        end
+        local node = rp:Get("Point_Hp")
+        if not _G.IsNil(node) then
+            rp:ForceUpdate(0) --立即同步一次骨骼位置
+            return node
+        end
+        local node = rp:Get("Point_Head")
+        if not _G.IsNil(node) then
+            rp:ForceUpdate(0) --立即同步一次骨骼位置
+            return node
+        end
+        return nil
+    end,
+    ---播放模型的stand2动画(如果有)
+    ---@param trans UnityEngine.Transform
+    playModelStand2 = function(trans)
+        local animator = trans:GetComponentInChildrenE(_G.typeof(_G.CS.UnityEngine.Animator))
+        if _G.IsNil(animator) then
+            return
+        end
+        animator:Play("stand_2", true)
+    end,
+    ---获取相机俯视角度
+    ---@return number
+    getCameraAngleX = function()
+        ---@type UnityEngine.Camera
+        local mainCamera
+        if _G.CS.FrameWork.Graphic.GraphicsManager.Instance then
+            mainCamera = _G.CS.FrameWork.Graphic.GraphicsManager.Instance.MainCamera
+        end
+        return _G.CS.CameraUtils.GetCameraAngleX(mainCamera)
+    end,
+    ---获取相机控制组件
+    ---@param go UnityEngine.Obejct
+    ---@return CS.CameraMovement
+    getCameraMovement = function(go)
+        local component = go:GetComponentE(_G.typeof(_G.CS.CameraMovement))
+        if _G.IsNil(component) then
+            component = go:AddComponentE(_G.typeof(_G.CS.CameraMovement))
+        end
+        return component
+    end,
+}
+
+---@class DungeonChallengeBattleView : UIBaseView    装备合成闯关_布阵/战斗页面
+---@field go_table DungeonChallengeBattleView_GoTable
+---@field model DungeonChallengeBattleModel
+---@field stage number
+-----------------------------------------------------------------------
+---@field equipModelPool ObjectFactory<DungeonChallengeBattleView._trans_equipModelItem_GoTable>        @当前装备模型_对象池
+---@field equipItems DungeonChallengeBattleView_EquipItem[]                             @当前装备的Item(装备格子)
+---@field equipDragItem DungeonChallengeBattleView._trans_dragModel_GoTable             @装备拖拽模型
+---@field equipUsablePool ObjectFactory<DungeonChallengeBattleView_EquipUsableItem>     @装备背包Item_对象池
+---@field equipUsableItems DungeonChallengeBattleView_EquipUsableItem[]                 @装备背包Item
+-----------------------------------------------------------------------
+---@field sceneRoot UnityEngine.Transform                                               @场景根节点
+---@field scenePath string                                                              @场景加载路径
+---@field sceneTrans UnityEngine.Transform                                              @场景实例节点
+---@field sceneTransCamera UnityEngine.Camera                                           @场景实例相机
+---@field attackRoles DungeonChallengeBattle_RoleData[]                                 @进攻方角色数据
+---@field defenceRoles DungeonChallengeBattle_RoleData[]                                @防守方角色数据
+---@field prepareRoles DungeonChallengeBattle_RoleData[]                                @备选英雄数据
+-----------------------------------------------------------------------
+---@field chapterIndex number                                                           @选择的关卡序号
+---@field chapterDatas dungeon_challenge_cfg[]                                          @关卡数据
+---@field chapterItems table<number,DungeonChallengeBattleView._obj_chapterTemplateItem_GoTable>   @关卡Item
+---@field prepareRoleInfos DungeonChallengeBattleView._obj_prepareRoleInfo_GoTable[]    @战前选人, 人物信息展示
+---@field prepareRoleIndex number                                                       @选人序号
+-----------------------------------------------------------------------
+---@field power number                                                                  @缓存当前战力
+---@field isPlayingAnimation boolean                                                    @是否正在播放动画
+local DungeonChallengeBattleView = _G.BaseClass("DungeonChallengeBattleView", _G.UIBaseView)
+
+function DungeonChallengeBattleView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+
+    --初始化
+    --self.go_table.obj_chapterTemplate:SetActiveE(0)
+    --self.go_table.aorbtn_chapterTemplateBlocker:SetActiveE(0)
+    self.go_table.aorbtn_reset:SetActiveE(0)
+    self:SetChapterTemplateActive(false)
+
+    self:InitPools()
+    self:InitDragHandlers()
+end
+
+function DungeonChallengeBattleView:OnDestroy()
+    self:ClearRoleModels(true)        --回收角色(进攻/防守)
+    self:ClearPrepareRoleModels(true) --回收角色(战前选人)
+    self:RemoveScene(true)            --回收场景
+end
+
+---界面的入口函数
+function DungeonChallengeBattleView:OnCreate()
+    self.model = DungeonChallengeBattleModel:GetInstance()
+    self.model:SetRedPointHidden()
+
+    if _G.PlayerPrefsManager.GetInt(_G.PlayerModel:GetInstance():GetPlayerUid() .. "NewFunctionWearBoss") == 0 then
+        _G.PlayerPrefsManager.SetInt(
+            _G.PlayerModel:GetInstance():GetPlayerUid() .. "NewFunctionWearBoss", 1)
+    end
+    _G.Events:GetInstance():Broadcast(_G.DungeonChallengeBattleViewShow.Open)
+
+    self:InitEquipItems()
+    self:InitPreparePlayerInfos()
+    --初始化关卡数据
+    self.chapterDatas = self.model:GetChapterCfgs()
+    self.stage = Stage.None
+    self.isClickBattleBtn = false
+    self.lastProp = { atk = 0, bre = 0, def = 0, max_hp = 0 }
+
+    self:UpdateView()
+    if self.stage ~= Stage.Prepare then
+        _G.BattleManager:GetInstance():SetBattlePause(false)
+        _G.WorldManager:GetInstance():DestoryRoleParent()
+        _G.BattleManager:GetInstance():DestroyBattle()
+
+        self.model:ResetChapter(function(msg)
+            --清空人物模型丶背包装备
+            self:ClearRoleModels(true)
+            self:ClearEquipUsableItems()
+            self:ClearEquipItems()
+
+            --初始化关卡
+            self.chapterIndex = math.min(self.model:GetMaxChapterIndex() + 1, #self.chapterDatas)
+            self:LoadPrepare(self.chapterDatas[self.chapterIndex])
+        end)
+    end
+end
+
+---更新页面状态
+function DungeonChallengeBattleView:UpdateView(isBattleEnd)
+    --清空装备状态
+    self:ClearEquipItems()
+    self:ClearEquipUsableItems()
+
+    if self.model:IsChallenging() and self.model:GetCardSid() > 0 then
+        --立即同步布局状态(稍后马上将会使用)
+        _G.GameUtil.ReBuildRTF(self.go_table.trans_equipParent)
+        --初始化为挑战中状态
+        self.chapterIndex = self.model:GetChallengingIndex()
+        self:LoadBattleEquip(isBattleEnd)
+    else
+        --初始化选关页面
+        self.chapterIndex = math.min(self.model:GetMaxChapterIndex() + 1, #self.chapterDatas)
+        self:LoadPrepare(self.chapterDatas[self.chapterIndex])
+    end
+
+    --至少通关一关, 才显示选关按钮
+    self.go_table.obj_chapters:SetActiveE(self.model:GetMaxChapterIndex() > 0 and 1 or 0)
+end
+
+---加载关卡
+---@param cfg dungeon_challenge_cfg
+---@return void
+function DungeonChallengeBattleView:LoadPrepare(cfg)
+    self.go_table.trans_prepare:SetActiveE(1)
+    self.go_table.trans_challenge:SetActiveE(0)
+    self.go_table.aorbtn_battle:SetActiveE(1)
+    self.go_table.aorbtn_details:SetActiveE(0)
+    self.stage = Stage.Prepare
+
+    self:ClearPrepareRoleModels(true) --回收所有角色模型
+    self:ClearPreparePlayerInfos()
+
+    --初始化
+    self:InitPrepareRoleDatas(cfg)
+    self.prepareRoleIndex = 1
+    self.go_table.obj_title:SetActiveE(0)
+
+    --初始化场景丶角色模型
+    local mgCfgId = 502010110
+    local firstLevelCfg = _G.ConfigManager.dungeon_challenge_Level_cfg[cfg.level[1]]
+    if firstLevelCfg and not _G.table.isEmptyOrNil(firstLevelCfg.monster_group) then
+        mgCfgId = firstLevelCfg.monster_group[1][1]
+    end
+    local mgCfg = _G.ConfigManager.monster_group_cfg[mgCfgId]
+    if not mgCfg and _G.AppSetting.DEBUG then
+        _G.LogError("monster_group_cfg.id = " .. tostring(mgCfgId))
+    end
+    self:LoadScene(mgCfg) --新场景加载时, 会自动回收旧场景
+    self:UpdatePrepareRoleModels(function(d)
+        if not d.model or not self.prepareRoles or not self.prepareRoleInfos then
+            return
+        end
+        for index, roleData in ipairs(self.prepareRoles) do
+            if d == roleData then
+                local info = self.prepareRoleInfos[index]
+                if info then
+                    info.data = d
+                    utils.findModelPoint(d.model, true) --立即同步一次骨骼
+                    _G.DelayDo(0.5, function()
+                        if self:IsNil() then
+                            return
+                        end
+                        self:UpdatePreparePlayerInfo(index, info) --某些情况下模型加载出来需等待几帧, 其骨骼才能正确同步
+                    end)
+                end
+                break
+            end
+        end
+    end)
+
+    --关卡信息
+    self.go_table.aortext_chapterName.text = _G.GetLangPackValue(cfg.name)
+
+    --战力缓存
+    self.power = nil
+    self.lastProp = nil
+    self.isPlayingAnimation = false
+end
+
+---选定关卡和卡牌, 开始战前处理装备
+function DungeonChallengeBattleView:LoadBattleEquip(isBattleEnd)
+    self.go_table.trans_prepare:SetActiveE(0)
+    self.go_table.trans_challenge:SetActiveE(1)
+    self.go_table.aorbtn_battle:SetActiveE(1)
+    self.go_table.aorbtn_details:SetActiveE(1)
+    self.stage = Stage.BattleEquip
+
+    self:ClearPrepareRoleModels(true) --回收所有角色模型
+    self:ClearPreparePlayerInfos()
+
+    --地图数据
+    local mgCfgId = self.model:GetMonsterGroupId()
+    if not mgCfgId or mgCfgId <= 0 then
+        return
+    end
+    local mgCfg = _G.ConfigManager.monster_group_cfg[mgCfgId]
+    if not mgCfg and _G.AppSetting.DEBUG then
+        _G.LogError("monster_group_cfg.id = " .. tostring(mgCfgId))
+    end
+
+    --初始化
+    self:InitRoleDatas(mgCfg, self.model:GetCardSid(), 1)
+    self:LoadScene(mgCfg) --新场景加载时, 会自动回收旧场景
+    self:UpdateRoleModels()
+
+    --名称
+    local cfg = self.chapterDatas[self.model:GetChallengingIndex()]
+    self.go_table.obj_title:SetActiveE(1)
+    self.go_table.aortext_name.text = _G.GetLangPackValue(
+        90036102016,
+        self.model:GetChallengingMonsterIndex(),
+        #cfg.level
+    )
+
+    --当前装备
+    local equips = self.model:GetEquips()
+    if equips then
+        for index, equipData in pairs(equips) do
+            self:InstallEquip(index, equipData)
+        end
+    end
+    --装备背包
+    local usableEquips = self.model:GetUsableEquips()
+    --- 临时缓存要飞的item
+    self.linshiList = {}
+    if usableEquips then
+        for _, equipData in ipairs(usableEquips) do
+            self:AddEquipUsableItem(equipData, nil, isBattleEnd)
+        end
+        self:SortEquipUsableItems()
+        if isBattleEnd then
+            local targetX, targetY = self.go_table.trans_equipUsableParent:GetPosition()
+            if targetX == nil or targetY == nil then
+                targetX = 0
+                targetY = -8
+            end
+            self.isPlayingAnimation = true
+            self.go_table.obj_FlyList:DoMove(targetX, targetY, 0, function()
+                for i = 1, #self.linshiList do
+                    self.linshiList[i]:SetParentE(self.go_table.trans_equipUsableParent)
+                end
+                self:SortEquipUsableItems()
+                self.isPlayingAnimation = false
+            end, 0.5)
+        end
+    else
+        self.isPlayingAnimation = false
+    end
+
+    --更新战力缓存
+    self:UpdatePower(false)
+
+    if self.model:GetChallengingMonsterIndex() == 1 and self.isClickBattleBtn then
+        self:Fight()
+    end
+end
+
+---战斗中
+function DungeonChallengeBattleView:LoadBattle()
+    self.go_table.trans_prepare:SetActiveE(0)
+    self.go_table.trans_challenge:SetActiveE(0)
+    self.go_table.aorbtn_battle:SetActiveE(0)
+    self.go_table.aorbtn_details:SetActiveE(1)
+    self.stage = Stage.Battle
+
+    --清空临时背包
+    self:ClearEquipUsableItems()
+    --将玩家模型丶场景模型加入缓存节点
+    local root = _G.WorldManager:GetInstance():GetRoleParent()
+    _G.WorldManager:GetInstance():DestoryRoleParent()
+    if self.sceneTrans then
+        self.sceneTrans:SetParentE(root, 1) --不要恢复相机设定, 直接使用
+        self.sceneTrans = nil
+    end
+    if self.attackRoles then
+        for _, roleData in ipairs(self.attackRoles) do
+            if roleData.model then
+                roleData.model:SetParentE(root, 1)
+                roleData.model = nil
+            end
+        end
+    end
+    if self.defenceRoles then
+        for _, roleData in ipairs(self.defenceRoles) do
+            if roleData.model then
+                roleData.model:SetParentE(root, 1)
+                roleData.model = nil
+            end
+        end
+    end
+
+    --清空节点状态
+    self:RemoveScene(false)
+    self:ClearRoleModels(true)
+end
+
+--region ==============================初始化==============================
+
+---初始化对象池
+---@return void
+function DungeonChallengeBattleView:InitPools()
+    self.equipModelPool = ObjectFactory.New(
+        function()
+            --create
+            local instance = _G.InstantiateObject(
+                self.go_table.trans_equipModelItem,
+                self.go_table.trans_equipModelParent
+            )
+            instance:SetLocalScaleXYZ(1)
+            return _G.GetAutoGoTable(instance)
+        end,
+        ---@param item DungeonChallengeBattleView._trans_equipModelItem_GoTable
+        function(item)
+            --active
+            item.gameObject:SetActiveE(1)
+        end,
+        ---@param item DungeonChallengeBattleView._trans_equipModelItem_GoTable
+        function(item)
+            --release
+            item.gameObject:SetActiveE(0)
+        end
+    )
+    self.equipUsablePool = ObjectFactory.New(
+        function()
+            --create
+            local instance = _G.InstantiateObject(
+                self.go_table.trans_equipUsableItem,
+                self.go_table.trans_equipUsableParent
+            )
+            instance:SetLocalScaleXYZ(1)
+            instance:SetActiveE(1)
+            return self:AddComponent(instance, DungeonChallengeBattleView_EquipUsableItem.New(
+                instance,
+                self.go_table.trans_equipParent --root根节点, 相对此节点计算坐标
+            ))
+        end,
+        ---@param item DungeonChallengeBattleView_EquipUsableItem
+        function(item)
+            --active
+            item.gameObject:SetActiveE(1)
+        end,
+        ---@param item DungeonChallengeBattleView_EquipUsableItem
+        function(item)
+            --release
+            item.gameObject:SetActiveE(0)
+        end
+    )
+end
+
+---初始化装备拖拽事件
+---@return void
+function DungeonChallengeBattleView:InitDragHandlers()
+    --初始化拖拽模型
+    self.equipDragItem = _G.GetAutoGoTable(self.go_table.trans_dragModel)
+    self.equipDragItem.gameObject:SetActiveE(0)
+
+    ---当前持有的装备格子
+    ---@type DungeonChallengeBattleView_EquipItem, UnityEngine.EventSystems.PointerEventData,{x:number,y:number}
+    local holdEquipItem, holdData, holdPositionOffset = nil, nil, { x = 0, y = 0 }
+    ---当前持有的装备背包序号
+    local holdEquipUsableIndex
+    --拖拽过程中, 实时计算占用的装备格
+    ---@type DungeonChallengeBattleView_EquipItem[]
+    local selectedEquipItems
+
+    local isDrag, pointerDownTime = false, 0
+    --记录按下屏幕时的战斗阶段: 处理战斗中按下屏幕丶战斗结束切换为准备阶段
+    local pointerStage = Stage.None
+
+    ---获取坐标对应的装备格子
+    ---@param localX number
+    ---@param localY number
+    ---@return DungeonChallengeBattleView_EquipItem
+    local function findEquipItem(localX, localY)
+        for _, equipItem in ipairs(self.equipItems) do
+            if equipItem:ContainsPoint(localX, localY) then
+                return equipItem
+            end
+        end
+        return nil
+    end
+    ---检查选中的装备格子是否符合要求
+    ---@param selectedIndex number @选中的装备格子索引
+    ---@param data DungeonChallengeEquipData @装备数据
+    ---@return DungeonChallengeBattleView_EquipItem[],number,{data:DungeonChallengeEquipData,index:number}[] @占用的装备格子, falg状态, 占用的装备格子数据
+    local function checkSelectedEquipItems(selectedIndex, data)
+        local items, isOk, isAllEmpty = self:GetEquipAreaItems(selectedIndex, data, true)
+        local flag = isOk and
+            DungeonChallengeBattleModel.EquipSoltFlags.Ok or
+            DungeonChallengeBattleModel.EquipSoltFlags.Error
+        local datas = {}
+        if isOk and not isAllEmpty then
+            --检查格子中是否有多件装备
+            local exists = {}
+            for _, item in ipairs(items) do
+                if item:GetData() and not exists[item:GetData()] then
+                    exists[item:GetData()] = true
+                    table.insert(datas, {
+                        data = item:GetData(),
+                        index = self:GetRootEquipIndex(item:GetIndex())
+                    })
+                    if item:GetData():IsConsume(data) then
+                        -- 装备id相同, 可以升级
+                        flag = DungeonChallengeBattleModel.EquipSoltFlags.HighLight
+                    end
+                end
+            end
+            if flag == DungeonChallengeBattleModel.EquipSoltFlags.HighLight and #datas >= 2 then
+                flag = DungeonChallengeBattleModel.EquipSoltFlags.Ok
+            end
+        end
+        return items, flag, datas
+    end
+    ---检查坐标对应的可用装备Item
+    ---@param localX number @装备格子本地X
+    ---@param localY number @装备格子本地Y
+    ---@return DungeonChallengeBattleView_EquipUsableItem,number
+    local function findEquipUsableItem(localX, localY)
+        if not self.equipUsableItems then
+            return nil, 0
+        end
+        for i = #self.equipUsableItems, 1, -1 do
+            if self.equipUsableItems[i]:ContainsPoint(localX, localY) then
+                return self.equipUsableItems[i], i
+            end
+        end
+        return nil, 0
+    end
+    ---清空状态
+    local function clear()
+        holdEquipItem = nil
+        holdData = nil
+        holdEquipUsableIndex = nil
+        pointerStage = Stage.None
+    end
+
+    --创建滑动事件监听器
+    local eventTriggers = self.go_table.trans_dragRoot:GetComponentE(
+        _G.typeof(_G.CS.UnityEngine.EventSystems.EventTrigger))
+    eventTriggers.triggers:Add(utils.createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.PointerDown,
+        function(data)
+            if self.isPlayingAnimation then
+                return
+            end
+            --ZHJH-18542【真机】【时空之门】闯关过程中，将装备全部下下来，有低概率丢失重叠的装备，并且报错无法继续游戏
+            --真机APP和微信小游戏小概率复现, 猜测可能是bug连续调用了两次PointerDown而没有调用PointerUp
+            if holdData then
+                return
+            end
+            local position = data.position
+            local localX, localY = utils.screenPointToRectLocalPosition( --转换为装备格子所在的本地坐标系
+                self.go_table.trans_equipParent,
+                position.x,
+                position.y,
+                false
+            )
+            pointerStage = self.stage
+            --战斗中查看装备详情
+            if self.stage == Stage.Battle then
+                local selected = findEquipItem(localX, localY)
+                if selected and selected:GetData() then
+                    holdData = selected:GetData()
+                else
+                    if not selected and utils.screenPointInRect(
+                            self.go_table.trans_equipUsableParent,
+                            position.x,
+                            position.y)
+                    then
+                        local usableItem, usableIndex = findEquipUsableItem(localX, localY)
+                        if usableItem then
+                            holdData = usableItem:GetData()
+                        end
+                    end
+                end
+
+                --记录拖放状态
+                isDrag = false
+                pointerDownTime = _G.Time.unscaledTime
+                return
+            end
+
+            --计算当前选中的格子
+            local selected = findEquipItem(localX, localY)
+            if selected and selected:GetData() then
+                holdEquipItem = self:GetRootEquipItem(selected:GetIndex()) --获取真实装备格子(在卸载之前)
+                holdData = selected:GetData()
+                self:UninstallEquip(selected:GetIndex())                   --卸载装备格子, 之后将模型创建出来
+            end
+
+            --是否点击装备背包
+            holdEquipUsableIndex = nil
+            if not selected and utils.screenPointInRect(
+                    self.go_table.trans_equipUsableParent,
+                    position.x,
+                    position.y)
+            then
+                local usableItem, usableIndex = findEquipUsableItem(localX, localY)
+                if usableItem then
+                    holdData = usableItem:GetData()
+                    holdEquipUsableIndex = usableIndex
+                    self:RemoveEquipUsableItemAt(usableIndex)
+                end
+            end
+
+            if holdData and self.stage == Stage.BattleEquip then
+                --计算当前装备中心点与root格子偏移值
+                local items = self:GetEquipAreaItems(1, holdData, false)
+                if items and #items > 0 then
+                    local centerX, centerY = self:GetEquipAreaCenterPosition(items)
+                    local rootPosX, rootPosY = items[1]:GetPosition()
+                    holdPositionOffset.x = rootPosX - centerX
+                    holdPositionOffset.y = rootPosY - centerY
+                else
+                    holdPositionOffset.x = 0
+                    holdPositionOffset.y = 0
+                end
+
+                --显示拖拽模型
+                self.equipDragItem.gameObject:SetActiveE(1)
+                self.equipDragItem.gameObject:SetLocalPosition(localX, localY, 0)
+                self:UpdateEquipModel(self.equipDragItem, holdData, false)
+            end
+
+            --记录拖放状态
+            isDrag = false
+            pointerDownTime = _G.Time.unscaledTime
+        end)
+    )
+    eventTriggers.triggers:Add(utils.createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.Drag,
+        function(data)
+            if self.isPlayingAnimation then
+                return
+            end
+            if not holdData or self.stage ~= Stage.BattleEquip or self.stage ~= pointerStage then
+                return
+            end
+            local position = data.position
+            local localX, localY = utils.screenPointToRectLocalPosition(
+                self.go_table.trans_equipParent,
+                position.x,
+                position.y,
+                false
+            )
+            --更新拖拽模型
+            self.equipDragItem.gameObject:SetLocalPosition(localX, localY, 0)
+            --还原上一次格子的选中状态
+            if selectedEquipItems then
+                for _, equipItem in ipairs(selectedEquipItems) do
+                    equipItem:SetFlag(DungeonChallengeBattleModel.EquipSoltFlags.Normal)
+                    equipItem:Update()
+                end
+                selectedEquipItems = nil
+            end
+
+            --计算当前选中的格子
+            local selected = findEquipItem(localX + holdPositionOffset.x, localY + holdPositionOffset.y)
+            if selected then
+                local items, flag = checkSelectedEquipItems(selected:GetIndex(), holdData)
+                --选中的格子高亮显示
+                if items then
+                    for _, equipItem in ipairs(items) do
+                        equipItem:SetFlag(flag)
+                        equipItem:Update()
+                    end
+                end
+                selectedEquipItems = items
+            end
+
+            --记录拖放状态
+            isDrag = true
+        end)
+    )
+    eventTriggers.triggers:Add(utils.createTriggerEntry(
+        _G.CS.UnityEngine.EventSystems.EventTriggerType.PointerUp,
+        function(data)
+            if self.isPlayingAnimation then
+                clear()
+                return
+            end
+            if not holdData or self.stage == Stage.Prepare or self.stage ~= pointerStage then
+                clear()
+                return
+            end
+            --战斗中查看装备详情
+            if self.stage == Stage.Battle then
+                if not isDrag and _G.Time.unscaledTime - pointerDownTime < 0.2 then
+                    _G.UIManager:GetInstance():OpenWindow(
+                        _G.ConfigManager.ui_cfg.DungeonChallengeEquipTipView.Name,
+                        { holdData.cfg }
+                    )
+                end
+                --清空状态
+                clear()
+                return
+            end
+
+            local position = data.position
+            local localX, localY = utils.screenPointToRectLocalPosition(
+                self.go_table.trans_equipParent,
+                position.x,
+                position.y,
+                false
+            )
+            --移除拖拽模型
+            self.equipDragItem.gameObject:SetActiveE(0)
+            --还原上一次格子的选中状态
+            if selectedEquipItems then
+                for _, equipItem in ipairs(selectedEquipItems) do
+                    equipItem:SetFlag(DungeonChallengeBattleModel.EquipSoltFlags.Normal)
+                    equipItem:Update()
+                end
+                selectedEquipItems = nil
+            end
+
+            --计算当前选中的格子
+            local selected = findEquipItem(localX + holdPositionOffset.x, localY + holdPositionOffset.y)
+            local selectedDatas
+            if selected then
+                --检查是否符合装备要求
+                local _, flag, datas = checkSelectedEquipItems(selected:GetIndex(), holdData)
+                selectedDatas = datas
+                if flag ~= DungeonChallengeBattleModel.EquipSoltFlags.Ok and
+                    flag ~= DungeonChallengeBattleModel.EquipSoltFlags.HighLight then
+                    selected = nil
+                    selectedDatas = nil
+                end
+            end
+            if selected then
+                --已选中格子: 替换装备, 旧装备替换位置或放回背包
+                if selectedDatas and #selectedDatas == 1 and selectedDatas[1].data:IsConsume(holdData) then
+                    --装备升级操作
+                    --还原装备
+                    if holdEquipItem then
+                        self:InstallEquip(holdEquipItem:GetIndex(), holdData)
+                    else
+                        self:AddEquipUsableItem(holdData, holdEquipUsableIndex)
+                    end
+                    --升级操作
+                    self.model:SetChangeEquip(true) --标记强制同步一次
+                    self:UpgradeEquip(selectedDatas[1].data, holdData)
+                    --self:UninstallEquip(selectedDataIndex)
+                    holdData = nil
+                    selectedDatas = nil
+                elseif selectedDatas and #selectedDatas > 0 then
+                    --卸载旧装备, 安装新装备
+                    for _, d in ipairs(selectedDatas) do
+                        self:UninstallEquip(d.index)
+                    end
+                    self:InstallEquip(selected:GetIndex(), holdData)
+                    --记录装备状态
+                    self.model:SetChangeEquip(true)
+                else
+                    self:InstallEquip(selected:GetIndex(), holdData)
+                    --记录装备状态
+                    self.model:SetChangeEquip(true)
+                end
+
+                --将旧装备放回到格子或背包中
+                if selectedDatas and #selectedDatas > 0 then
+                    --寻找空位放回
+                    for i = #selectedDatas, 1, -1 do
+                        for index, _ in ipairs(self.equipItems) do
+                            local _, isOk, isAllEmpty = self:GetEquipAreaItems(index, selectedDatas[i].data, true)
+                            if isOk and isAllEmpty then
+                                self:InstallEquip(index, selectedDatas[i].data)
+                                table.remove(selectedDatas, i)
+                                break
+                            end
+                        end
+                    end
+                    --装备失败, 尝试放入背包
+                    if #selectedDatas > 0 then
+                        --放入背包
+                        for _, d in ipairs(selectedDatas) do
+                            self:AddEquipUsableItem(d.data, holdEquipUsableIndex)
+                        end
+                        self:SortEquipUsableItems()
+                    end
+                end
+
+                --装备成功, 且是从背包拖上去的, 排序背包
+                if (not selectedDatas or #selectedDatas == 0) and not holdEquipItem then
+                    self:SortEquipUsableItems()
+                end
+            else
+                --未选中格子: 检查是否放回背包, 或还原位置
+                local inEquipUsableRect = utils.screenPointInRect(
+                    self.go_table.trans_equipUsableParent,
+                    position.x,
+                    position.y
+                )
+                if inEquipUsableRect or not holdEquipItem then
+                    ---@type DungeonChallengeEquipData
+                    local swapEquipData
+                    --重新拖放回背包, 寻找合适的位置
+                    if inEquipUsableRect and self.equipUsableItems then
+                        local tempIndex = 1
+                        for index, item in ipairs(self.equipUsableItems) do
+                            local x = item:GetPosition()
+                            if item:ContainsPoint(localX, localY) then
+                                swapEquipData = item:GetData()
+                                if holdEquipUsableIndex and holdEquipUsableIndex > 0 and holdEquipUsableIndex <= index then
+                                    tempIndex = index + 1 --将左边的装备移动到右边: 开始拖动时holdEquipUsableIndex已经从列表中移除, 因此需额外+1
+                                else
+                                    tempIndex = index
+                                end
+                                break
+                            elseif x < localX then
+                                tempIndex = index + 1
+                            else
+                                break
+                            end
+                        end
+                        holdEquipUsableIndex = tempIndex
+                    end
+
+                    --放入背包
+                    self:AddEquipUsableItem(holdData, holdEquipUsableIndex)
+                    self:SortEquipUsableItems()
+                    --记录装备状态
+                    self.model:SetChangeEquip(true)
+
+                    --升级操作: 在临时背包内进行
+                    if swapEquipData and swapEquipData ~= holdData and swapEquipData:IsConsume(holdData) then
+                        --升级操作
+                        self.model:SetChangeEquip(true) --标记强制同步一次
+                        self:UpgradeEquip(swapEquipData, holdData)
+                        holdData = nil
+                    end
+                else
+                    --还原位置
+                    self:InstallEquip(holdEquipItem:GetIndex(), holdData)
+                end
+            end
+
+            --如果是点击装备
+            if holdData and not isDrag and _G.Time.unscaledTime - pointerDownTime < 0.2 then
+                --弹出装备详情
+                _G.UIManager:GetInstance():OpenWindow(
+                    _G.ConfigManager.ui_cfg.DungeonChallengeEquipTipView.Name,
+                    { holdData.cfg }
+                )
+            end
+
+            --显示战力change tip
+            self:UpdatePower(true)
+
+            --清空状态
+            clear()
+        end)
+    )
+end
+
+---初始化装备格子
+---@return void
+function DungeonChallengeBattleView:InitEquipItems()
+    self.go_table.trans_equipItem:SetActiveE(0)
+
+    self.equipItems = {}
+    for index = 1, ROW * COLUMN do
+        local instance = _G.InstantiateObject(
+            self.go_table.trans_equipItem,
+            self.go_table.trans_equipParent
+        )
+        instance:SetActiveE(1)
+        if _G.AppSetting.DEBUG then
+            instance:SetName(index)
+        end
+        local item = self:AddComponent(instance, DungeonChallengeBattleView_EquipItem.New(
+            instance,
+            index,
+            self.go_table.trans_equipParent --root根节点, 相对此节点计算坐标
+        ))
+        table.insert(self.equipItems, item)
+    end
+end
+
+---准备阶段: 初始化战前选人, 信息展示Item
+---@return void
+function DungeonChallengeBattleView:InitPreparePlayerInfos()
+    self.go_table.obj_prepareRoleInfo:SetActiveE(0)
+
+    self.prepareRoleInfos = {}
+    local num = 3
+    for i = 1, num do
+        local instance = i == num and self.go_table.obj_prepareRoleInfo or _G.InstantiateObject(
+            self.go_table.obj_prepareRoleInfo,
+            self.go_table.trans_prepare
+        )
+        instance:SetAsFirstSiblingE()
+        local item = _G.GetAutoGoTable(instance)
+        _G.AddViewBtnClick(instance, _G.handlerbind(self, self.OnClickPrepareRole, item))
+        _G.table.insert(self.prepareRoleInfos, item)
+    end
+end
+
+---初始化角色数据
+---@param cfg monster_group_cfg @怪物组配置
+---@param selfCardSid number    @当前玩家的卡牌sid
+---@param selfCardIndex? number  @当前玩家的卡牌索引(默认4)
+function DungeonChallengeBattleView:InitRoleDatas(cfg, selfCardSid, selfCardIndex)
+    if not cfg then
+        return
+    end
+    self.attackRoles = {}
+    self.defenceRoles = {}
+
+    selfCardIndex = selfCardIndex or 4
+
+    local defaultDefenserSids = cfg.DefaultDefenserSids[1] or {}
+    --初始化坐标位置
+    local posCfg = _G.ConfigManager.pos_cfg[cfg.pos]
+    if posCfg then
+        local centerX, centerY, centerZ = cfg.FightAreaPos[1] or 0,
+            cfg.FightAreaPos[2] or 0,
+            cfg.FightAreaPos[3] or 0
+        for i = 1, 5 do
+            if posCfg.AttackerPos[i] then
+                local pos = posCfg.AttackerPos[i]
+                table.insert(self.attackRoles, {
+                    enabled = false,
+                    pos = {
+                        (pos[1] or 0) + centerX,
+                        (pos[2] or 0) + centerY,
+                        (pos[3] or 0) + centerZ,
+                    },
+                    direction = pos[5] or 0,
+                    sid = 0,
+                })
+                if i == selfCardIndex then
+                    local cur = self.attackRoles[#self.attackRoles]
+                    cur.enabled = true
+                    cur.sid = selfCardSid or 0
+                end
+            end
+            if posCfg.DefenserPos[i] then
+                local pos = posCfg.DefenserPos[i]
+                local sid = defaultDefenserSids[i] or 0
+                --monster_cfg.id转card_cfg.id
+                local monsterCfg = sid > 0 and _G.ConfigManager.monster_cfg[sid]
+                if monsterCfg then
+                    sid = monsterCfg.CardID
+                end
+                table.insert(self.defenceRoles, {
+                    enabled = sid > 0,
+                    pos = {
+                        (pos[1] or 0) + centerX,
+                        (pos[2] or 0) + centerY,
+                        (pos[3] or 0) + centerZ,
+                    },
+                    direction = pos[5] or 0,
+                    sid = sid,
+                })
+            end
+        end
+    end
+end
+
+---准备阶段: 初始化战前选人数据
+---@param cfg dungeon_challenge_cfg
+---@return void
+function DungeonChallengeBattleView:InitPrepareRoleDatas(cfg)
+    if not cfg then
+        return
+    end
+    self.prepareRoles = {}
+
+    --初始化坐标位置
+    local count = #cfg.heroes
+    local positions = count == 2 and ScenePreparePositions.Two or ScenePreparePositions.Three
+
+    for i = 1, count do
+        if not positions[i] then
+            break
+        end
+        table.insert(self.prepareRoles, {
+            enabled = true,
+            pos = positions[i],
+            direction = 1,
+            sid = cfg.heroes[i],
+        })
+    end
+end
+
+--endregion
+
+--region ==============================UI操作==============================
+
+---设置显示关卡模板
+---@param active boolean
+function DungeonChallengeBattleView:SetChapterTemplateActive(active)
+    self.go_table.obj_chapterTemplate:SetActiveE(active and 1 or 0)
+    self.go_table.aorbtn_chapterTemplateBlocker:SetActiveE(active and 1 or 0)
+    self.go_table.aorimage_charpterArrow:SetLocalEulerAngles(active and 0 or -180, 0, 0)
+
+    if active then
+        --最小偏移-40, 最大偏移为-120
+        local jumpOffset = math.min(self.chapterIndex, 3) * -40
+        --只显示已解锁的关卡
+        --local count = #self.chapterDatas
+        local count = math.min(self.model:GetMaxChapterIndex() + 1, #self.chapterDatas)
+
+        local isInit = self[self.go_table.scrollloopvectical_chapterTemplateList]
+        if not isInit then
+            self[self.go_table.scrollloopvectical_chapterTemplateList] = true
+            self.go_table.scrollloopvectical_chapterTemplateList:InitItemData(
+                count,
+                _G.handler(self, self.OnRefreshChapterTemplate),
+                self.chapterIndex, --当前选中关卡
+                jumpOffset
+            )
+        else
+            self.go_table.scrollloopvectical_chapterTemplateList:UpdateCount(
+                count,
+                self.chapterIndex, --当前选中关卡
+                jumpOffset
+            )
+        end
+    end
+end
+
+---更新显示人物信息
+---@param index number
+---@param item DungeonChallengeBattleView._obj_prepareRoleInfo_GoTable|{data:DungeonChallengeBattle_RoleData}
+function DungeonChallengeBattleView:UpdatePreparePlayerInfo(index, item)
+    if not item then
+        return
+    end
+    if not item.data or not item.data.model or not item.data.sid or item.data.sid <= 0 then
+        item.gameObject:SetActiveE(0)
+        return
+    end
+    item.gameObject:SetActiveE(1)
+
+    ---@type dungeon_challenge_card_cfg
+    local cfg = _G.ConfigManager.dungeon_challenge_card_cfg[item.data.sid]
+
+    --基础位置
+    local x, y = _G.CS.UIUtils.WorldPointToLocalPointInRect(item.data.model, self.go_table.trans_prepare)
+    local _, height = item.transform:GetRectTransformWidthHeight()
+    item.transform:SetLocalPosition(x, y + height * 0.5, 0)
+
+    --显示名字
+    item.aortext_name.text = _G.GetLangPackValue(cfg.name)
+    local hpPoint = utils.findModelPoint(item.data.model, true)
+    if hpPoint then
+        --local x, y = _G.CS.UIUtils.WorldPointToLocalPointInRect(hpPoint, self.go_table.trans_prepare)
+        local x, y = _G.CS.UIUtils.WorldPointToLocalPointInRect(hpPoint, item.transform)
+        item.aortext_name:SetLocalPosition(x, y, 0)
+        if _G.AppSetting.IsXzns then
+            item.obj_nameBg:SetLocalPosition(x, y, 0)
+        end
+        item.obj_flag:SetLocalPosition(x, y + 70, 0)
+    end
+    item.obj_flag:SetActiveE(index == self.prepareRoleIndex and 1 or 0)
+    item.obj_effect:SetActiveE(index == self.prepareRoleIndex and 1 or 0)
+
+    --选中特效
+    if not item.__initEffect then
+        item.__initEffect = true
+        _G.UIUtils.LoadEffectByCfg(
+            _G.ConfigManager.ui_effect_cfg.ef_dungeon_xuanze,
+            item.obj_effect
+        )
+    end
+
+    --技能信息
+    if not _G.table.isEmptyOrNil(cfg.skill) and #cfg.skill > 0 then
+        local skillCfg = _G.ConfigManager.card_skills_cfg[cfg.skill[1]]
+        if skillCfg then
+            item.aorrawimage_icon:LoadImage(skillCfg.icon)
+        end
+    end
+end
+
+---清理隐藏战前选人阶段, 人物信息
+---@return void
+function DungeonChallengeBattleView:ClearPreparePlayerInfos()
+    if self.prepareRoleInfos then
+        for i = 1, #self.prepareRoleInfos do
+            self.prepareRoleInfos[i].gameObject:SetActiveE(0)
+        end
+    end
+end
+
+---显示战力变化提示
+---@param showTip boolean   是否弹出tip窗口
+---@private
+function DungeonChallengeBattleView:UpdatePower(showTip)
+    if self.stage == Stage.Prepare then
+        return
+    end
+    --战力属性
+    ---@type AttributeClass
+    local attributes = _G.AttributeClass.New()
+    attributes:OnInit(nil, nil)
+
+    --卡牌战力
+    local roleCfg = _G.ConfigManager.dungeon_challenge_card_cfg[self.model:GetCardSid()]
+    if roleCfg then
+        for _, attr in pairs(_G.ConfigManager.type_attribute_cfg) do
+            attributes:AddValueByID(
+                attr.id,
+                roleCfg[attr.attribute_type] or 0,
+                false,
+                attr.value_type == 1 and _G.AttCountType.base or _G.AttCountType.basePercent
+            )
+        end
+    end
+    local prop = { atk = 0, bre = 0, def = 0, max_hp = 0 }
+    --装备战力
+    if self.equipItems then
+        for index, item in ipairs(self.equipItems) do
+            if item:GetData() and item:GetSolt() == index then
+                local equipData = item:GetData()
+
+                prop.atk = prop.atk + equipData.cfg.atk
+                prop.bre = prop.bre + equipData.cfg.bre
+                prop.def = prop.def + equipData.cfg.def
+                prop.max_hp = prop.max_hp + equipData.cfg.max_hp
+
+                for _, attr in pairs(_G.ConfigManager.type_attribute_cfg) do
+                    attributes:AddValueByID(
+                        attr.id,
+                        equipData.cfg[attr.attribute_type] or 0,
+                        false,
+                        attr.value_type == 1 and _G.AttCountType.base or _G.AttCountType.basePercent
+                    )
+                end
+            end
+        end
+    end
+
+    _G.UIManager:GetInstance():CloseWindow(
+        _G.ConfigManager.ui_cfg.PowerUpView.Name
+    )
+    local power = attributes:CalculatePower()
+    -- if showTip and self.power and self.power ~= power then
+    --     _G.UIManager:GetInstance():OpenWindow(
+    --         _G.ConfigManager.ui_cfg.PowerUpView.Name,
+    --         self.power,
+    --         power - self.power
+    --     )
+    -- end
+
+    if not showTip then
+        self.lastProp = prop
+    else
+        _G.UIUtils.ShowPropUp(nil, self.lastProp, nil, { prop = prop })
+        self.lastProp = prop
+    end
+
+    self.power = power
+end
+
+--endregion
+
+--region ==============================滑动列表/刷新==============================
+
+---准备阶段: 刷新关卡列表
+---@param index number
+---@param go UnityEngine.GameObject
+function DungeonChallengeBattleView:OnRefreshChapterTemplate(index, go)
+    if not self.chapterItems then
+        self.chapterItems = {}
+    end
+
+    ---@type DungeonChallengeBattleView._obj_chapterTemplateItem_GoTable
+    local item = self.chapterItems[go:GetInstanceIDE()]
+    if not item then
+        item = _G.GetAutoGoTable(go)
+        _G.AddViewBtnClick(go, _G.handlerbind(self, self.OnClickChapterBtn, item))
+        self.chapterItems[go:GetInstanceIDE()] = item
+    end
+    index = index + 1
+
+    local data = self.chapterDatas[index]
+    local name = _G.GetLangPackValue(data.name)
+
+    item.index = index
+    item.aortext_label.text = name
+    item.aortext_label2.text = name
+    item.aortext_label:SetActiveE(index == self.chapterIndex and 0 or 1)
+    item.aortext_label2:SetActiveE(index == self.chapterIndex and 1 or 0)
+    item.aorimage_lock:SetActiveE((index > self.model:GetMaxChapterIndex() + 1) and 1 or 0)
+end
+
+--endregion
+
+--region ==============================装备操作==============================
+
+---获取装备所需格子
+---@param index number 装备格子索引(实际安装的位置)
+---@param data DungeonChallengeEquipData
+---@param checkEmpty? boolean 检查格子是否为空
+---@return DungeonChallengeBattleView_EquipItem[], boolean,boolean @装备格子, 是否可以成功安装, 是否所有格子都为空
+function DungeonChallengeBattleView:GetEquipAreaItems(index, data, checkEmpty)
+    local width, height = data:GetSize()
+
+    local baseX = index % ROW
+    local baseY = math.ceil(index / ROW)
+    if baseX == 0 then
+        baseX = ROW
+    end
+
+    local results, ok, isAllEmpty = {}, true, false
+    for r = 1, width do
+        for c = 1, height do
+            local x, y = baseX + r - 1, baseY + c - 1
+            --检查格子范围是否安全
+            if x >= 1 and x <= ROW and y >= 1 and y <= COLUMN then
+                local index = (y - 1) * ROW + x
+                table.insert(results, self.equipItems[index])
+            else
+                ok = false
+                -- if _G.AppSetting.DEBUG then
+                --     _G.LogError(string.format(
+                --         "装备格子索引超出范围: id= %s , index = %s(%s,%s), x = %s, y = %s",
+                --         data.id,
+                --         index,
+                --         baseX,
+                --         baseY,
+                --         x,
+                --         y
+                --     ))
+                -- end
+            end
+        end
+    end
+
+    if checkEmpty and #results > 0 then
+        isAllEmpty = true
+        for i = 1, #results do
+            if results[i]:GetData() then
+                isAllEmpty = false
+                break
+            end
+        end
+    end
+    return results, ok, isAllEmpty
+end
+
+---获取装备格子区域中心位置
+---@param items DungeonChallengeBattleView_EquipItem[] @装备格子
+---@return number,number @中心位置X, 中心位置Y
+function DungeonChallengeBattleView:GetEquipAreaCenterPosition(items)
+    if not items or #items == 0 then
+        return 0, 0
+    end
+
+    local xMin, xMax, yMin, yMax = 9999, -9999, 9999, -9999
+    for _, item in ipairs(items) do
+        local x, y = item:GetPosition()
+        xMin = math.min(xMin, x)
+        xMax = math.max(xMax, x)
+        yMin = math.min(yMin, y)
+        yMax = math.max(yMax, y)
+    end
+    return (xMin + xMax) * 0.5, (yMin + yMax) * 0.5
+end
+
+---获取装备实际安装的格子
+---@param index number 装备格子索引(装备的任意插槽)
+---@return DungeonChallengeBattleView_EquipItem @装备格子
+function DungeonChallengeBattleView:GetRootEquipItem(index)
+    local item = self.equipItems[index]
+    if not item or not item:GetData() then
+        return item
+    end
+
+    if item:GetSolt() ~= index then
+        local newItem = self.equipItems[item:GetSolt()] --取实际装备的节点
+        if newItem and newItem:GetData() == item:GetData() then
+            item = newItem
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError(string.format(
+                    "装备格子数据异常: id= %s , index = %s",
+                    item:GetData() and item:GetData().id or nil,
+                    item:GetSolt()
+                ))
+                self:PrintEquipSlots()
+            end
+        end
+    end
+    return item
+end
+
+---获取装备实际安装的格子索引
+---@param index number 装备格子索引(装备的任意插槽)
+---@return number
+function DungeonChallengeBattleView:GetRootEquipIndex(index)
+    local item = self:GetRootEquipItem(index)
+    if item then
+        return item:GetIndex()
+    end
+    return index
+end
+
+---获取装备格子数据
+---@param index number 装备格子索引(装备的任意插槽)
+---@return DungeonChallengeEquipData,number   @装备数据,装备的插槽索引(实际安装的位置)
+function DungeonChallengeBattleView:GetEquipData(index)
+    local rootEquipItem = self:GetRootEquipItem(index)
+    local item = self.equipItems[index]
+    if not rootEquipItem or not rootEquipItem:GetData() then
+        return nil
+    end
+    return rootEquipItem:GetData(), rootEquipItem:GetSolt()
+end
+
+---(安装)设置装备格子数据
+---@param index number 装备格子索引(实际安装的位置)
+---@param data DungeonChallengeEquipData
+function DungeonChallengeBattleView:InstallEquip(index, data)
+    local items = self:GetEquipAreaItems(index, data, false)
+    if not items or #items == 0 then
+        return
+    end
+
+    for _, item in ipairs(items) do
+        if _G.AppSetting.DEBUG then
+            if item:GetData() then
+                _G.LogError(string.format(
+                    "装备格子数据已占用: id= %s , index = %s, errorIndex = %s",
+                    data.id,
+                    index,
+                    item:GetIndex()
+                ))
+                self:PrintEquipSlots()
+            end
+        end
+        item:SetData(data)
+        item:SetSolt(index) --插槽状态, 改为实际安装位置
+        item:Update()
+    end
+
+    --装备模型信息
+    ---@type DungeonChallengeBattleView._trans_equipModelItem_GoTable
+    local modelItem = self.equipModelPool:Get()
+    local cx, cy = self:GetEquipAreaCenterPosition(items)
+    modelItem.gameObject:SetLocalPosition(cx, cy, 0)
+    self:UpdateEquipModel(modelItem, data, data.cfg.quality >= 7)
+
+    --关联模型(默认放在第一个节点)
+    items[1]:BindModel(modelItem)
+end
+
+---(卸载)设置装备格子数据
+---@param index number 装备格子索引(装备的任意插槽)
+function DungeonChallengeBattleView:UninstallEquip(index)
+    local item = self.equipItems[index]
+    if not item or not item:GetData() then
+        return
+    end
+    local data = item:GetData()
+    index = item:GetSolt() --真实安装位置
+
+    local items = self:GetEquipAreaItems(index, data, false)
+    if _G.AppSetting.DEBUG then
+        local isAnyError = false
+        for _, item in ipairs(items) do
+            if item:GetData() ~= data then
+                isAnyError = true
+                _G.LogError(string.format(
+                    "装备格子数据异常: id= %s , index = %s",
+                    item:GetData() and item:GetData().id or nil,
+                    index
+                ))
+            end
+        end
+        if isAnyError then
+            self:PrintEquipSlots()
+        end
+    end
+    for _, item in ipairs(items) do
+        item:SetData(nil)
+        item:SetSolt(DungeonChallengeBattleModel.EquipSolts.None) --插槽状态, 改为可使用
+        item:Update()
+
+        --回收模型数据
+        if item:GetModel() then
+            self.equipModelPool:Release(item:GetModel())
+            item:BindModel(nil)
+        end
+    end
+end
+
+---更新并显示装备模型
+---@param modelItem DungeonChallengeBattleView._trans_equipModelItem_GoTable| DungeonChallengeBattleView._trans_dragModel_GoTable @装备模型Item
+---@param data DungeonChallengeEquipData @装备数据
+---@param showAreaEffect boolean @是否显示装备氛围特效
+function DungeonChallengeBattleView:UpdateEquipModel(modelItem, data, showAreaEffect)
+    modelItem.aorrawimage_icon.color = _G.Color.New(1, 1, 1, 0)
+    modelItem.aorrawimage_icon:LoadImage(data:GetModel(), function(img)
+        if not img then
+            return
+        end
+        img:SetNativeSize()
+        local x, y, angle = data:GetModelParams()
+        modelItem.aorrawimage_icon:SetLocalScale(x, y, 1)
+        modelItem.aorrawimage_icon:SetLocalEulerAngles(0, 0, angle)
+        --modelItem.aorrawimage_icon.color = _G.Color.New(1, 1, 1, 1)
+    end)
+
+    --更新装备氛围特效
+    local effectCfg = showAreaEffect and data:GetAreaEffect() or nil
+    if modelItem.__effectCfg ~= effectCfg then
+        modelItem.__effectCfg = effectCfg
+        --清理模型缓存
+        if modelItem.__effectModel then
+            _G.DestroyObject(modelItem.__effectModel)
+            modelItem.__effectModel = nil
+        end
+        --加载新的模型
+        if effectCfg then
+            _G.UIUtils.LoadEffectByCfg(
+                effectCfg,
+                modelItem.trans_effect,
+                function(trans)
+                    if self:IsNil() or modelItem.__effectCfg ~= effectCfg or modelItem.__effectModel then
+                        _G.DestroyObject(trans)
+                        return
+                    end
+                    modelItem.__effectModel = trans
+                end
+            )
+        end
+    else
+        if modelItem.__effectModel then
+            modelItem.__effectModel:SetActiveE(0)
+            modelItem.__effectModel:SetActiveE(1)
+        end
+    end
+end
+
+---清空装备格子(数据/模型)
+---@return void
+function DungeonChallengeBattleView:ClearEquipItems()
+    for _, item in ipairs(self.equipItems) do
+        item:BindModel(nil)
+        item:SetData(nil)
+        item:SetSolt(DungeonChallengeBattleModel.EquipSolts.None) --插槽状态, 改为可使用
+        item:Update()
+    end
+
+    self.equipModelPool:ReleaseAll() --回收所有模型
+end
+
+---打印装备格子状态(仅DEBUG下调用)
+---@private
+---@return void
+function DungeonChallengeBattleView:PrintEquipSlots()
+    local strings = { "\n" }
+    for c = 1, COLUMN do
+        for r = 1, ROW do
+            if r > 1 then
+                table.insert(strings, ", ")
+            end
+            local index = (c - 1) * ROW + r
+            local state = self.equipItems[index]:GetSolt() or DungeonChallengeBattleModel.EquipSolts.None
+            table.insert(strings, state) --table.concat将自动转为字符串
+        end
+        table.insert(strings, "\n")
+    end
+    _G.LogError(table.concat(strings, "\t"))
+end
+
+---添加装备数据到背包
+---@param data DungeonChallengeEquipData
+function DungeonChallengeBattleView:AddEquipUsableItem(data, index, isBattleEnd)
+    if not self.equipUsableItems then
+        self.equipUsableItems = {}
+    end
+
+    ---@type DungeonChallengeBattleView_EquipUsableItem
+
+    local item = self.equipUsablePool:Get()
+    item:SetData(data)
+    item:Update(data)
+    if isBattleEnd then
+        item.gameObject:SetParentE(self.go_table.obj_FlyList)
+        table.insert(self.linshiList, item.gameObject)
+    end
+
+    if index and index > 0 and index <= #self.equipUsableItems then
+        table.insert(self.equipUsableItems, index, item)
+    else
+        table.insert(self.equipUsableItems, item)
+    end
+end
+
+---从装备背包移除数据(根据索引)
+---@param index number @装备格子索引
+function DungeonChallengeBattleView:RemoveEquipUsableItemAt(index)
+    if not self.equipUsableItems or #self.equipUsableItems == 0 then
+        return
+    end
+    if index < 1 or index > #self.equipUsableItems then
+        return
+    end
+    self.equipUsablePool:Release(self.equipUsableItems[index])
+    table.remove(self.equipUsableItems, index)
+end
+
+---排序装备背包物品位置
+---@return void
+function DungeonChallengeBattleView:SortEquipUsableItems()
+    if not self.equipUsableItems or #self.equipUsableItems == 0 then
+        return
+    end
+    --父容器宽度
+    local pWidth, pHeight = self.go_table.trans_equipUsableParent:GetRectTransformWidthHeight()
+
+    ---@type {items:DungeonChallengeBattleView_EquipUsableItem[], offset:number, spacing:number}[]
+    local groups = {}
+    ---添加一组装备到排序组
+    ---@param groups {items:DungeonChallengeBattleView_EquipUsableItem[], offset:number, spacing:number}[]
+    ---@param list DungeonChallengeBattleView_EquipUsableItem[]
+    ---@param pWidth number @父容器宽度
+    local function addToGroup(groups, list, pWidth)
+        if not list or #list == 0 then
+            return
+        end
+        local offset, spacing = 0, 0
+        local w = 0
+        for _, item in ipairs(list) do
+            w = w + item:GetSize()
+        end
+        if w < pWidth then
+            spacing = (pWidth - w) / #list
+            if spacing <= BAG_MAX_SPACING then
+                offset = spacing * 0.5
+            else
+                spacing = BAG_MAX_SPACING
+                offset = (pWidth - w - spacing * (#list - 1)) * 0.5
+            end
+        end
+        table.insert(groups, { items = list, offset = offset, spacing = spacing })
+    end
+    --对装备进行分组
+    local offset, list = 0, {}
+    for _, item in ipairs(self.equipUsableItems) do
+        local width = item:GetSize()
+        if offset + width > pWidth then
+            addToGroup(groups, list, pWidth)
+            offset, list = 0, {}
+        end
+        offset = offset + width + BAG_DEFAULT_SPACING
+        table.insert(list, item)
+    end
+    if #list > 0 then
+        addToGroup(groups, list, pWidth)
+    end
+
+    --开始放入元素(间隔10个单位)
+    for index, group in ipairs(groups) do
+        local offset = index == 1 and group.offset or 0 --第一组, 才居中排列
+        for _, item in ipairs(group.items) do
+            local width = item:GetSize()
+            item.transform:SetLocalPosition(
+                offset + width * 0.5 - pWidth * 0.5, --元素以父容器左中点对齐
+                pHeight * 0.5,
+                0
+            )
+            item:ResetPosition()
+            item.gameObject:SetAsLastSiblingE()
+            offset = offset + width + group.spacing
+        end
+    end
+
+    -- local layoutGroup = self[self.go_table.trans_equipUsableParent]
+    -- if not layoutGroup then
+    --     layoutGroup = self.go_table.trans_equipUsableParent:GetComponentE(
+    --         _G.typeof(_G.CS.UnityEngine.UI.HorizontalLayoutGroup))
+    --     self[self.go_table.trans_equipUsableParent] = layoutGroup
+    -- end
+    -- layoutGroup.enabled = true
+    -- _G.GameUtil.ReBuildRTF(self.go_table.trans_equipUsableParent)
+    -- layoutGroup.enabled = false
+end
+
+---清空装备背包
+---@return void
+function DungeonChallengeBattleView:ClearEquipUsableItems()
+    self.equipUsableItems = nil
+    self.equipUsablePool:ReleaseAll()
+end
+
+---立即同步装备状态至服务器
+---@param callback fun() 回调
+function DungeonChallengeBattleView:SynchronizeEquips(callback)
+    if not self.model:IsChangedEquip() then
+        if callback then
+            callback()
+        end
+        return
+    end
+    ---@type dungeon_challenge.c2s_remove_equip[]
+    local equips = {}
+    if self.equipItems then
+        --穿戴中装备
+        for index, item in ipairs(self.equipItems) do
+            if item:GetData() and item:GetSolt() == index then
+                table.insert(equips, {
+                    type = 1,
+                    index = index, --装备本位(填充位不管)
+                    sid = item:GetData():GetId(),
+                })
+            end
+        end
+    end
+    if self.equipUsableItems then
+        --临时背包装备
+        for index, item in ipairs(self.equipUsableItems) do
+            table.insert(equips, {
+                type = 2,
+                index = index,
+                sid = item:GetData():GetId(),
+            })
+        end
+    end
+
+    if #equips == 0 then
+        self.model:SetChangeEquip(false)
+        if callback then
+            callback()
+        end
+        return
+    end
+    self.model:SynchronizeEquips(equips, function(msg)
+        if not msg or msg.ack ~= 1 then
+            return
+        end
+        self.model:SetChangeEquip(false)
+        if callback then
+            callback()
+        end
+    end)
+end
+
+---装备升级操作
+---@param equip1 DungeonChallengeEquipData @装备1
+---@param equip2 DungeonChallengeEquipData @装备2
+function DungeonChallengeBattleView:UpgradeEquip(equip1, equip2)
+    if not equip1:IsConsume(equip2) then
+        return
+    end
+    --如果需要同步装备状态, 先执行同步
+    if self.model:IsChangedEquip() then
+        self:SynchronizeEquips(_G._G.handlerbind(self, self.UpgradeEquip, equip1, equip2))
+        return
+    end
+
+    local equip1Data, equip2Data = self:FindEquipDataToProtocol(equip1),
+        self:FindEquipDataToProtocol(equip2)
+
+    --如果有多件装备可用, 则弹窗询问
+    if #equip1.cfg.merge_equip > 1 then
+        local cfgs = {}
+        for _, sid in ipairs(equip1.cfg.merge_equip) do
+            local cfg = _G.ConfigManager.dungeon_challenge_equip_cfg[sid]
+            if cfg then
+                table.insert(cfgs, cfg)
+            else
+                if _G.AppSetting.DEBUG then
+                    _G.LogError(string.format("找不到配置表dungeon_challenge_equip_cfg.id=%s", sid))
+                end
+            end
+        end
+
+        --只留下2件装备
+        while #cfgs > 2 do
+            local index = math.random(1, #cfgs)
+            table.remove(cfgs, index)
+        end
+
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.DungeonChallengeEquipTipView.Name,
+            cfgs,
+            function(cfg)
+                if self:IsNil() then
+                    return
+                end
+                local newEquipSid = cfg.id
+                self.model:ConflateEquip(equip1Data, equip2Data, newEquipSid, function(msg)
+                    if not msg or msg.ack ~= 1 or self:IsNil() then
+                        return
+                    end
+                    self:ParseProtocolData(true, newEquipSid, equip1Data, equip2Data)
+                end)
+            end
+        )
+    else
+        local newEquipSid = equip1.cfg.merge_equip[1]
+        self.model:ConflateEquip(equip1Data, equip2Data, newEquipSid, function(msg)
+            if not msg or msg.ack ~= 1 or self:IsNil() then
+                return
+            end
+            self:ParseProtocolData(true, newEquipSid, equip1Data, equip2Data)
+        end)
+    end
+end
+
+---查找DungeonChallengeEquipData转dungeon_challenge.i_equip
+---@private
+---@param d DungeonChallengeEquipData
+---@return dungeon_challenge.i_equip
+function DungeonChallengeBattleView:FindEquipDataToProtocol(d)
+    if self.equipItems then
+        for _, item in ipairs(self.equipItems) do
+            if item:GetData() == d then
+                return {
+                    type = 1,
+                    index = self:GetRootEquipIndex(item:GetIndex()),
+                    sid = item:GetData():GetId(),
+                }
+            end
+        end
+    end
+    if self.equipUsableItems then
+        for index, item in ipairs(self.equipUsableItems) do
+            if item:GetData() == d then
+                return {
+                    type = 2,
+                    index = index,
+                    sid = item:GetData():GetId(),
+                }
+            end
+        end
+    end
+    return nil
+end
+
+---解析并移除dungeon_challenge.i_equip数据, 并添加新装备实例
+---@private
+---@param playEffect boolean    是否播放合成特效
+---@param newEquipSid number
+---@param ... dungeon_challenge.i_equip
+function DungeonChallengeBattleView:ParseProtocolData(playEffect, newEquipSid, ...)
+    local isChangeUsable = false
+    local lastUsablePosition = nil --缓存记录usableItem位置, 之后播放特效需要使用
+
+    --卸载旧装备
+    ---@type dungeon_challenge.i_equip[]
+    local datas = { ... }
+    table.sort(datas, function(a, b)
+        return a.index > b.index --index排序从大到小
+    end)
+    for _, d in ipairs(datas) do
+        if d.type == 1 then
+            self:UninstallEquip(d.index)
+        else
+            local item = self.equipUsableItems and self.equipUsableItems[d.index]
+            if item then
+                lastUsablePosition = { item:GetPosition() }
+            end
+            self:RemoveEquipUsableItemAt(d.index)
+            isChangeUsable = true
+        end
+    end
+
+    --添加新装备
+    local newEquipInfo = ... --取第一个装备的位置信息
+    ---@type DungeonChallengeEquipData
+    local newEquipData = DungeonChallengeEquipData.New(_G.ConfigManager.dungeon_challenge_equip_cfg[newEquipSid])
+    local function completed()
+        if newEquipInfo.type == 1 then
+            self:InstallEquip(newEquipInfo.index, newEquipData)
+        else
+            --临时背包栏中合成装备时, 有装备1/2/3, 装备1和2进行合成, 合成后的装备序号应该还是1号位
+            --但如果是拖放1->2进行合成, 这里的newEquipInfo.index = 2, 且装备1/2已经从equipUsableItems中移除, 导致新装备错误的安装到2号位上
+            local index = newEquipInfo.index
+            for _, d in ipairs(datas) do
+                if d.type ~= 1 and d.index < index then
+                    index = index - 1
+                    break
+                end
+            end
+            self:AddEquipUsableItem(newEquipData, newEquipInfo.index)
+            isChangeUsable = true
+        end
+
+        if isChangeUsable then
+            self:SortEquipUsableItems()
+        end
+        self:UpdatePower(true)
+    end
+
+    --装备合成特效
+    local conflateEffectCfg = playEffect and EquipConflateEffects[newEquipData.cfg.quality] and
+        _G.ConfigManager.ui_effect_cfg[EquipConflateEffects[newEquipData.cfg.quality]]
+    if conflateEffectCfg then
+        --创建模型状态
+        ---@type DungeonChallengeBattleView._trans_equipModelItem_GoTable
+        local modelItem = self.equipModelPool:Get()
+        self:UpdateEquipModel(modelItem, newEquipData, false)
+        --模型位置信息
+        if newEquipInfo.type == 1 then
+            local items = self:GetEquipAreaItems(newEquipInfo.index, newEquipData)
+            local cx, cy = self:GetEquipAreaCenterPosition(items)
+            modelItem.gameObject:SetLocalPosition(cx, cy, 0)
+        else
+            if lastUsablePosition then
+                modelItem.gameObject:SetLocalPosition(lastUsablePosition[1], lastUsablePosition[2], 0)
+            end
+        end
+        --模型特效(将自动销毁)
+        _G.UIUtils.LoadEffectByCfg(conflateEffectCfg, modelItem.trans_effect)
+
+        modelItem.transform:DOKill()
+        modelItem.transform:SetLocalScaleXYZ(1)
+
+        --放大缩小动画
+        local tweener = modelItem.transform:DOBlendableScaleBy(_G.Vector3(1.1, 1.1, 1.1), 0.3)
+        tweener:SetEase(_G.CS.DG.Tweening.Ease.Linear)
+        tweener:SetLoops(2, _G.CS.DG.Tweening.LoopType.Yoyo)
+        tweener:SetTarget(modelItem.transform)
+        self.isPlayingAnimation = true
+        tweener:OnComplete(function()
+            if self:IsNil() then
+                return
+            end
+            completed();
+            self.isPlayingAnimation = false
+            self.equipModelPool:Release(modelItem)
+        end)
+    else
+        completed();
+        if _G.AppSetting.DEBUG and playEffect then
+            _G.LogError("找不到装备合成特效: " .. tostring(newEquipData.cfg.quality))
+        end
+    end
+end
+
+--endregion
+
+--region ==============================场景/模型操作==============================
+
+---更新所有角色模型(进攻/防守)
+---@return void
+function DungeonChallengeBattleView:UpdateRoleModels()
+    if self.attackRoles then
+        for _, roleData in ipairs(self.attackRoles) do
+            self:LoadRoleModel(roleData)
+            self:LoadShadowModel(roleData)
+        end
+    end
+    if self.defenceRoles then
+        for _, roleData in ipairs(self.defenceRoles) do
+            self:LoadRoleModel(roleData)
+            self:LoadShadowModel(roleData)
+        end
+    end
+end
+
+---移除所有角色模型(进攻/防守)
+---@param isRemoveShadow? boolean        是否移除shadow站位阴影, 默认true
+---@return void
+function DungeonChallengeBattleView:ClearRoleModels(isRemoveShadow)
+    if isRemoveShadow == nil then
+        isRemoveShadow = true
+    end
+    if self.attackRoles then
+        for _, roleData in ipairs(self.attackRoles) do
+            self:RemoveRoleModel(roleData)
+            if isRemoveShadow then
+                self:RemoveShadowModel(roleData)
+            end
+        end
+    end
+    if self.defenceRoles then
+        for _, roleData in ipairs(self.defenceRoles) do
+            self:RemoveRoleModel(roleData)
+            if isRemoveShadow then
+                self:RemoveShadowModel(roleData)
+            end
+        end
+    end
+end
+
+---准备阶段: 更新所有角色模型(战前选人)
+---@param callback? fun(d:DungeonChallengeBattle_RoleData):void    @加载完成回调
+---@return void
+function DungeonChallengeBattleView:UpdatePrepareRoleModels(callback)
+    if self.prepareRoles then
+        for _, roleData in ipairs(self.prepareRoles) do
+            self:LoadRoleModel(roleData, nil, callback)
+            self:LoadShadowModel(roleData)
+        end
+    end
+end
+
+---准备阶段: 移除所有角色模型(战前选人)
+---@param isRemoveShadow? boolean        是否移除shadow站位阴影, 默认true
+---@return void
+function DungeonChallengeBattleView:ClearPrepareRoleModels(isRemoveShadow)
+    if self.prepareRoles then
+        for _, roleData in ipairs(self.prepareRoles) do
+            self:RemoveRoleModel(roleData)
+            if isRemoveShadow then
+                self:RemoveShadowModel(roleData)
+            end
+        end
+    end
+end
+
+---初始化加载场景
+---@param mgCfg monster_group_cfg @怪物组配置
+---@param callback? function    @加载完成回调
+function DungeonChallengeBattleView:LoadScene(mgCfg, callback)
+    --目标场景与加载中场景相同, 不再重复加载
+    if mgCfg and mgCfg.ScenePath == self.scenePath then
+        return
+    end
+
+    self:RemoveScene(false)
+    if not mgCfg then
+        return
+    end
+    --创建场景根节点
+    if not self.sceneRoot then
+        self.sceneRoot = _G.CS.UnityEngine.GameObject("DungeonChallengeSceneRoot")
+        self.sceneRoot:SetPosition(0, 0, 0)
+        --隐藏界面其他UI
+        --_G.UIManager:GetInstance():SetWorldSceneHideTimes(1)
+    end
+
+    local path = mgCfg.ScenePath
+    local cameraPath = _G.string.IsNullOrEmpty(mgCfg.EmbattleCamera) and mgCfg.BattleCamera or mgCfg.EmbattleCamera
+    self.scenePath = path
+    _G.PoolsManager:GetInstance():Spawn(
+        path,
+        _G.ePoolType.Static,
+        self.sceneRoot,
+        function(trans)
+            if self:IsNil() or self.scenePath ~= path or self.sceneTrans then
+                _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.Static)
+                return
+            end
+            trans:ChangeCameraAdaption()
+            trans:SetLocalPositionToZero()
+
+            self.sceneTrans = trans
+            ---如果对话结束完需要加载布阵前剧情则
+            _G.WorldManager:SetCurrentWorldVisible(false, true)
+
+            if not string.IsNullOrEmpty(cameraPath) then
+                local component = trans:GetComponentE(_G.typeof(_G.CS.WorldSetting))
+                if component then
+                    local cameraNum = string.match(cameraPath, "%d+")
+                    component:ChangeCameraParams(cameraPath, cameraNum)
+                end
+            end
+            _G.GraphicsManager.Instance:UpdateMainCameraPosImmediate()
+
+            --相机降低固定值
+            self.sceneTransCamera = trans:FindE("Environment/Parent/Main Camera"):GetComponentE(
+                _G.typeof(_G.CS.FrameWork.Graphic.VisualCamera)
+            )
+            if self.sceneTransCamera then
+                local x, y, z = self.sceneTransCamera:GetLocalPosition()
+                self.sceneTransCamera:SetLocalPosition(
+                    x + SceneCameraOffset.x,
+                    y + SceneCameraOffset.y,
+                    z + SceneCameraOffset.z
+                )
+            end
+
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---移除/回收场景
+---@param destroyRoot? boolean @是否销毁根节点
+---@return void
+function DungeonChallengeBattleView:RemoveScene(destroyRoot)
+    if self.sceneTrans then
+        --还原镜头信息
+        if self.sceneTransCamera then
+            local x, y, z = self.sceneTransCamera:GetLocalPosition()
+            self.sceneTransCamera:SetLocalPosition(
+                x - SceneCameraOffset.x,
+                y - SceneCameraOffset.y,
+                z - SceneCameraOffset.z
+            )
+        end
+
+        _G.PoolsManager:GetInstance():Despawn(self.sceneTrans, _G.ePoolType.Static, destroyRoot)
+        --_G.UIManager:GetInstance():SetWorldSceneHideTimes(-1)
+        self.sceneTrans = nil
+    end
+    if destroyRoot and self.sceneRoot then
+        _G.DestroyObject(self.sceneRoot)
+        self.sceneRoot = nil
+    end
+
+    self.scenePath = nil
+end
+
+---加载角色模型
+---@param data DungeonChallengeBattle_RoleData
+---@param modelPath? string                 @模型路径: 如不传则从card_cfg取默认参数
+---@param callback? fun(d:DungeonChallengeBattle_RoleData):void    @加载完成回调
+function DungeonChallengeBattleView:LoadRoleModel(data, modelPath, callback)
+    if not data.enabled then
+        return
+    end
+    if not self.sceneRoot then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("场景根节点未实例化")
+        end
+        return
+    end
+    --如果没传路径, 则取card_cfg中的配置
+    if _G.string.IsNullOrEmpty(modelPath) and data.sid and data.sid > 0 then
+        local cfg = _G.ConfigManager.dungeon_challenge_card_cfg[data.sid]
+        if cfg and cfg.skin ~= 0 then
+            modelPath = require("CardInfoManager").GetBattleModelPath(cfg.skin, true)
+        else
+            modelPath = require("CardInfoManager").GetBattleModelPath(data.sid, false) --传true将会读取账号皮肤配置
+        end
+    end
+
+    --目标模型与加载中模型相同, 不再重复加载
+    if modelPath == data.modelPath and not _G.string.IsNullOrEmpty(modelPath) then
+        return
+    end
+
+    --移除旧的缓存模型
+    self:RemoveRoleModel(data)
+    if _G.string.IsNullOrEmpty(modelPath) then
+        return
+    end
+
+    data.modelPath = modelPath
+    local nx, ny = _G.UIManager:GetInstance().UICamera:WorldToScreenPointE(data.pos[1], data.pos[2], data.pos[3])
+    local sx = nx * (_G.CS.Launcher.Inst.ScreenSize.x / _G.AppSetting.SCREEN_WIDTH) // 2
+    local sy = ny * (_G.CS.Launcher.Inst.ScreenSize.y / _G.AppSetting.SCREEN_HEIGHT) // 2
+    self.go_table.obj_FlyList:SetLocalPosition(sx, sy, 0)
+
+    require("CardInfoManager").GetRole(
+        modelPath,
+        _G.ePoolType.Static,
+        self.sceneRoot,
+        _G.RoleEffTypeEnum.Fight,
+        function(trans)
+            if self:IsNil() or data.modelPath ~= modelPath or data.model then
+                _G.DestroyObject(trans)
+                return
+            end
+            utils.playModelStand2(trans)
+            trans:SetPosition(data.pos[1], data.pos[2], data.pos[3])
+            data.model = trans
+            if data.direction == 1 then
+                trans:SetLocalEulerAngles(0, 0, utils.getCameraAngleX())    --朝右
+            else
+                trans:SetLocalEulerAngles(0, 180, -utils.getCameraAngleX()) --朝左
+            end
+            if callback then
+                callback(data)
+            end
+        end
+    )
+end
+
+---移除角色模型
+---@param data DungeonChallengeBattle_RoleData
+function DungeonChallengeBattleView:RemoveRoleModel(data)
+    if data.model then
+        _G.DestroyObject(data.model)
+        data.model = nil
+    end
+    data.modelPath = nil
+end
+
+---加载角色阴影信息
+---@param data DungeonChallengeBattle_RoleData
+function DungeonChallengeBattleView:LoadShadowModel(data)
+    if not data.enabled then
+        return
+    end
+
+    if not self.sceneRoot then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("场景根节点未实例化")
+        end
+        return
+    end
+    local star = 1
+    if data.star and data.star > 0 then
+        star = require("CardInfoManager"):GetInstance():GetOrderStarCount(star) + 1
+    end
+    --目标模型与加载中模型相同, 不再重复加载
+    if star == data.shadowStar then
+        return
+    end
+
+    self:RemoveShadowModel(data)
+    data.shadowStar = star
+    _G.PoolsManager:GetInstance():Spawn(
+        StarColorPaths[star] or StarColorPaths[#StarColorPaths],
+        _G.ePoolType.Temporary,
+        self.sceneRoot,
+        function(trans)
+            if self:IsNil() or data.shadowStar ~= star or data.shadow then
+                _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.Static)
+                return
+            end
+            trans:SetPosition(
+                data.pos[1],
+                data.pos[2] + 0.1,
+                data.pos[3]
+            )
+            data.shadow = trans
+        end
+    )
+end
+
+---移除角色阴影模型
+---@param data DungeonChallengeBattle_RoleData
+function DungeonChallengeBattleView:RemoveShadowModel(data)
+    if data.shadow then
+        _G.PoolsManager:GetInstance():Despawn(data.shadow, _G.ePoolType.Static)
+        data.shadow = nil
+    end
+    data.shadowStar = nil
+end
+
+--endregion
+
+--region ==============================网络请求==============================
+
+--进入关卡挑战
+function DungeonChallengeBattleView:Challenge()
+    if self:IsNil() then
+        return
+    end
+    local chapterCfg = self.chapterDatas[self.chapterIndex]
+    local cardSid = chapterCfg.heroes[self.prepareRoleIndex]
+    --选择关卡
+    self.model:ChooseChapter(self.chapterIndex, function(msg)
+        if not msg or msg.ack ~= 1 or self:IsNil() then
+            return
+        end
+        --选择卡牌
+        self.model:ChooseCard(cardSid, function(msg)
+            if not msg or msg.ack ~= 1 or self:IsNil() then
+                return
+            end
+            self:LoadBattleEquip()
+        end)
+    end)
+end
+
+--进入战斗
+function DungeonChallengeBattleView:Fight()
+    self.model:Fight(function(msg)
+        if not msg or msg.ack ~= 1 or self:IsNil() then
+            return
+        end
+        self:LoadBattle()
+
+        --进入战斗
+        _G.BattleManager:GetInstance():DestroyBattle()
+        _G.BattleManager:GetInstance():EnterFight(
+            _G.BattleControllerType.DungeonChallenge,
+            self.model:GetMonsterGroupId(),
+            msg.fight_arg
+        )
+    end)
+end
+
+--endregion
+
+---准备阶段: 选关卡列表点击事件
+---@param item DungeonChallengeBattleView._obj_chapterTemplateItem_GoTable|{index:number}
+function DungeonChallengeBattleView:OnClickChapterBtn(go, isOn, item)
+    if not item.index then
+        return
+    end
+    if item.index > self.model:GetMaxChapterIndex() + 1 then
+        --需先通关前置关卡
+        _G.PopWindowManager:GetInstance():ShowAllTips(0)
+        return
+    end
+
+    self.chapterIndex = item.index
+    self:LoadPrepare(self.chapterDatas[self.chapterIndex])
+    self:SetChapterTemplateActive(false)
+end
+
+---准备阶段: 点击人物
+---@param item DungeonChallengeBattleView._obj_prepareRoleInfo_GoTable|{data:DungeonChallengeBattle_RoleData}
+function DungeonChallengeBattleView:OnClickPrepareRole(go, isOn, item)
+    if not item.data then
+        return
+    end
+    if go == item.aorbtn_skill then
+        --点击查看技能
+        ---@type dungeon_challenge_card_cfg
+        local cfg = _G.ConfigManager.dungeon_challenge_card_cfg[item.data.sid]
+        if not _G.table.isEmptyOrNil(cfg.skill) and #cfg.skill > 0 then
+            require("CommonTipManager"):GetInstance():OpenSkillTip(cfg.skill[1])
+        end
+    elseif go == item.aorbtn_details then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.DungeonChallengeRoleTipView.Name,
+            item.data.sid
+        )
+    elseif go == item.aorbtn_click then
+        --点击选人
+        local beforeRoleIndex = self.prepareRoleIndex
+        if self.prepareRoleInfos then
+            for i, node in ipairs(self.prepareRoleInfos) do
+                node.obj_flag:SetActiveE(item == node and 1 or 0)
+                node.obj_effect:SetActiveE(item == node and 1 or 0) --选中特性
+                if item == node then
+                    self.prepareRoleIndex = i
+                end
+            end
+        end
+
+        if beforeRoleIndex == self.prepareRoleIndex then
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.DungeonChallengeRoleTipView.Name,
+                item.data.sid
+            )
+        end
+    end
+end
+
+---按钮点击事件在这里派发
+function DungeonChallengeBattleView:OnClickBtn(go, isOn)
+    if self.isPlayingAnimation then
+        --播放动画期间, 不允许用户操作
+        return
+    end
+    if go == self.go_table.aorbtn_CloseView then
+        if self.stage ~= Stage.Prepare then
+            _G.BattleManager:GetInstance():SetBattlePause(true)
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                1140004,
+                nil,
+                function()
+                    _G.BattleManager:GetInstance():SetBattlePause(false)
+                    _G.WorldManager:GetInstance():DestoryRoleParent()
+                    _G.BattleManager:GetInstance():DestroyBattle()
+
+                    local function clear()
+                        --清空人物模型丶背包装备
+                        self:ClearRoleModels(true)
+                        self:ClearEquipUsableItems()
+                        self:ClearEquipItems()
+
+                        --初始化关卡
+                        self.chapterIndex = math.min(self.model:GetMaxChapterIndex() + 1, #self.chapterDatas)
+                        self:LoadPrepare(self.chapterDatas[self.chapterIndex])
+                    end
+
+                    if self.model:IsChallenging() then
+                        self.model:ResetChapter(clear)
+                    else
+                        clear()
+                    end
+                end,
+                function()
+                    _G.BattleManager:GetInstance():SetBattlePause(false)
+                end
+            )
+        else
+            self:Close()
+            --打开上级页面
+            _G.UIManager:GetInstance():OpenWindow(
+                _G.ConfigManager.ui_cfg.DungeonChallengeHallView.Name
+            )
+        end
+    elseif go == self.go_table.aorbtn_reset then
+        if self.model:IsChallenging() then
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                1140004,
+                nil,
+                function()
+                    self.model:ResetChapter(function(msg)
+                        --清空人物模型丶背包装备
+                        self:ClearRoleModels(true)
+                        self:ClearEquipUsableItems()
+                        self:ClearEquipItems()
+
+                        --初始化关卡
+                        self.chapterIndex = math.min(self.model:GetMaxChapterIndex() + 1, #self.chapterDatas)
+                        self:LoadPrepare(self.chapterDatas[self.chapterIndex])
+                    end)
+                end,
+                function()
+
+                end
+            )
+        end
+    elseif go == self.go_table.aorbtn_battle then
+        self.isClickBattleBtn = true
+        if self.stage == Stage.Prepare then
+            --进入关卡
+            if self.model:IsChallenging() then
+                self.model:ResetChapter(function(msg)
+                    if not msg or msg.ack ~= 1 then
+                        return
+                    end
+                    --清空人物模型丶背包装备
+                    self:ClearRoleModels(true)
+                    self:ClearEquipUsableItems()
+                    self:ClearEquipItems()
+
+                    --初始化关卡数据状态
+                    self.chapterIndex = math.min(self.model:GetMaxChapterIndex() + 1, #self.chapterDatas)
+                    self.prepareRoleIndex = 1
+
+                    self:Challenge()
+                end)
+            else
+                self:Challenge()
+            end
+        elseif self.stage == Stage.BattleEquip then
+            --开始战斗
+            if self.model:IsChangedEquip() then
+                --如果需要同步装备状态, 先执行同步
+                self:SynchronizeEquips(_G._G.handlerbind(self, self.Fight))
+            else
+                self:Fight()
+            end
+        end
+    elseif go == self.go_table.aorbtn_details then
+        local cardSid, cardEquips
+        if self.stage == Stage.Prepare then
+            cardSid = self.chapterDatas[self.chapterIndex].heroes[self.prepareRoleIndex]
+        else
+            cardSid = self.model:GetCardSid()
+            if self.equipItems then
+                cardEquips = {}
+                for index, item in ipairs(self.equipItems) do
+                    if item:GetData() and item:GetSolt() == index then
+                        table.insert(cardEquips, item:GetData())
+                    end
+                end
+            end
+        end
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.DungeonChallengeRoleTipView.Name,
+            cardSid,
+            cardEquips
+        )
+    elseif go == self.go_table.aorbtn_chapter then
+        self:SetChapterTemplateActive(true)
+    elseif go == self.go_table.aorbtn_chapterTemplateBlocker then
+        self:SetChapterTemplateActive(false)
+    elseif go == self.go_table.aorbtn_task then
+        ---任务
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.DungeonChallengeTaskView.Name
+        )
+    elseif go == self.go_table.aorbtn_illustration then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.DungeonChallengeIllustrationView.Name)
+    elseif go == self.go_table.aorbtn_help then
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.GamePlayDescribeView.Name,
+            215
+        )
+    end
+end
+
+--region ==============================类型声明==============================
+
+---@class DungeonChallengeBattle_RoleData   角色数据
+---@field enabled boolean                       @是否启用
+---@field pos number[]                          @角色位置坐标
+---@field direction number                      @角色朝向: 1=朝右, -1=朝左
+---@field sid number                            @角色ID
+---@field star? number                          @角色星级
+---@field modelPath? string                     @模型路径
+---@field model? UnityEngine.Transform          @模型实例
+---@field shadowStar? number                    @角色阴影星级
+---@field shadow? UnityEngine.Transform         @角色阴影实例
+---@field data? any
+
+--endregion
+
+return DungeonChallengeBattleView

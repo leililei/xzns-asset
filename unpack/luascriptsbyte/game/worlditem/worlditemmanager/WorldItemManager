@@ -1,0 +1,415 @@
+-----------------------------------------------------------------------
+-- D:.ProjectHZ.Alpha.Client.Assets.Resources.LuaScripts.Game.WorldItem.WorldItemManager	(修改路径必须修正此项!)
+-- Created by wxy
+-- DateTime: 2020/03/20
+-- Description 世界交互物体管理器
+-----------------------------------------------------------------------
+local WorldDoorModel = require("WorldDoorModel")
+local WorldNPCModel = require("WorldNPCModel")
+local base = require "GameDataModelBase"
+---@class WorldItemManager : Singleton	世界物体管理器
+local WorldItemManager = _G.BaseClass("WorldItemManager", base)
+_G.WorldItemManager = WorldItemManager
+
+---@class WorldItemManager.ItemEvent
+---@field public enemyDispeared string 敌人消失(用于战斗宝箱)
+---@field public showTag string 展示物件UI标签
+---@field public skillEffectHurt string 主角受到技能特效物件伤害
+---@field public resetPlayerSafePoint string 重置主角到安全点
+---@field public enemyBattleDone string 敌人战斗结束
+---@field public interactionDone string 普通宝箱交互结束
+---@field public interactionBoxStart string 普通宝箱交互表现开始
+---@field public interactionBoxEnd string 普通宝箱交互表现结束(关闭奖励界面)
+local ItemEvent = {
+    enemyDispeared = "OnEnemyDispeared",
+    showTag = "ShowObjectTag",
+    skillEffectHurt = "SkillEffectHurt",
+    resetPlayerSafePoint = "resetPlayerSafePoint",
+    enemyBattleDone = "OnEnemyBattleDone",
+    interactionDone = "WorldObjectInteractionDone",
+    interactionBoxStart = "WorldBoxInteractionBoxStart",
+    interactionBoxEnd = "WorldBoxInteractionBoxEnd"
+}
+WorldItemManager.ItemEvent = ItemEvent
+
+---创建对象时,入口构造函数
+function WorldItemManager:__init()
+    self.TotalModels = {}
+    self.TotalModels[_G.WorldItemType.Door] = WorldDoorModel.New()
+    self.TotalModels[_G.WorldItemType.NPC] = WorldNPCModel.New()
+    self.interactionObjects = {}
+    self.curSceneSid = 0
+    self.dynWorldItemIndex = 0
+    self.interactedItemDic = {}
+end
+
+function WorldItemManager:Dispose()
+    self.TotalModels = nil
+    self.interactionObjects = nil
+    self.curSceneSid = nil
+    self.dynWorldItemIndex = nil
+    self.interactedItemDic = nil
+end
+
+function WorldItemManager:GetDataFormServer()
+    _G.WorldNet:GetInstance():GetWorldObjectInfo(_G.handler(self, self.ParseData))
+end
+function WorldItemManager:ParseData(data)
+    data = data.sid or {}
+    self.interactionObjects = {}
+    for i = 1, #data do
+        self.interactionObjects[data[i]] = true
+    end
+    base.ParseData(self, data)
+end
+
+--region 对外接口
+---当所有物件加载完毕后调用
+function WorldItemManager:OnLoadObjectComplete()
+    if not _G.AppSetting.IsloadScence then
+        return
+    end
+    self.curWorld = _G.WorldManager:GetInstance():GetCurWorld()
+    self.AllWorldItems = self.curWorld.AllWorldItems
+    for _, value in pairs(self.TotalModels) do
+        if value.OnLoadObjectComplete then
+            value:OnLoadObjectComplete(self.curWorld)
+        end
+    end
+end
+---寻找对应的功能模块
+---@param type WorldItemType 中文描述
+---@return table 对应的功能模块
+function WorldItemManager:GetModelByType(type)
+    if self.TotalModels[type] then
+        return self.TotalModels[type]
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.LogError("Dont Find this Model", type)
+    end
+    return nil
+end
+---根据类型获取物件组
+---@param type WorldItemType 物件类型
+---@return table 物件数组
+function WorldItemManager:GetItemsByType(type)
+    local items = {}
+    for key, value in pairs(self.AllWorldItems) do
+        if value.ItemType == type then
+            items[key] = value
+        end
+    end
+    return items
+end
+---根据类型显示或者隐藏物件
+---@param _type number 物件类型
+---@param show boolean 显示(true)/隐藏(false)
+---@param force boolean 是否强制
+function WorldItemManager:ShowOrHideByType(_type, show, force)
+    local items = self:GetItemsByType(_type)
+    for key, value in pairs(items) do
+        value:ShowOrHide(show, force)
+    end
+end
+---获取物件sid数组
+---@param type WorldItemType 物件类型
+---@param worldSid number 世界id(scene_cfg中的id)
+---@return table 物件sid数组
+function WorldItemManager:GetItemSidsByType(type, worldSid)
+    local cfg = _G.ConfigManager.scene_cfg[worldSid]
+    local data = require(cfg.TiledResLua)
+    local _datas = data.WorldItemDatas
+    local items = {}
+    for _, value in pairs(_datas) do
+        for _, itemData in pairs(value) do
+            if itemData.ItemType == type then
+                _G.table.insert(items, itemData.Sid)
+            end
+        end
+    end
+    return items
+end
+
+---隐藏显示当前场景 AllItemRoot节点
+---@param bl boolean
+function WorldItemManager:SetAllItemVisible(bl)
+    -- if not self.curWorld then
+    --     return
+    -- end
+    -- for _, value in pairs(self.curWorld.AllWorldItems) do
+    --     value:ShowOrHide(bl)
+    -- end
+end
+---隐藏其他玩家
+---@param visible boolean true隐藏其他玩家
+function WorldItemManager:SetOtherPlayVisible(bl)
+    ---以上两个visible接口暂时统一不处理，等配置处理后打开测试OK后再放开
+    -- if not self.curWorld then
+    --     return
+    -- end
+    -- local roleuid = _G.PlayerModel:GetInstance():GetPlayerUid()
+    -- for _, value in pairs(self.curWorld.AllWorldItems) do
+    --     if value.DataType == _G.WorldItemDataType.Player then
+    --         if value.Uid ~= roleuid then
+    --             value:ShowOrHide(bl)
+    --         end
+    --     end
+    -- end
+end
+-----根据UID获取对应的场景物件
+---@param uid number 物件uid
+---@return BaseItem 物件对象
+function WorldItemManager:GetItemByUid(uid)
+    return self.curWorld:GetItemInfo(uid)
+end
+--region物件交互
+---获取是否交互过
+---@param sid number 物件sid
+---@return boolean 是否交互过(true交互过 false未交互过)
+function WorldItemManager:GetInteractionBySid(sid)
+    return self.interactionObjects[sid] or false
+end
+---交互
+---@param sid number 交互物件sid
+---@param callback function 交互完成回调
+function WorldItemManager:InteractionBySid(sid, callback)
+    local cfg = _G.ConfigManager.object_world_cfg[sid]
+    if #cfg.Params <= 0 then
+        self.interactionObjects[sid] = true
+        callback(true)
+        self:BroadcastWorldItemEvent(ItemEvent.interactionDone, sid)
+        return
+    end
+    if _G.PlayerModel:GetInstance():CheckCreateRole() then
+        _G.WorldNet:GetInstance():OpenWorldBox(
+            sid,
+            function(msg)
+                if msg.ack == 1 then
+                    self.interactionObjects[sid] = true
+                    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                    callback(true, msg)
+                    self:BroadcastWorldItemEvent(ItemEvent.interactionDone, sid)
+                else
+                    callback(false, msg.ack)
+                end
+            end
+        )
+    else
+        self.interactionObjects[sid] = true
+        local msg = {award = {item = {}}}
+        local dropCfg
+        for i = 1, #cfg.Params do
+            dropCfg = _G.ConfigManager.drop_cfg[cfg.Params[i]]
+            if dropCfg then
+                for j = 1, #dropCfg.fixed_drop do
+                    _G.table.insert(msg.award.item, {type = dropCfg.fixed_drop[j]})
+                end
+            end
+        end
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        callback(true, msg)
+        self:BroadcastWorldItemEvent(ItemEvent.interactionDone, sid)
+    end
+end
+--endregion
+
+--region 创建物件
+---动态创建物件
+---@param uid number 物件UID(可指定便于管理，传入0，则动态生成)
+---@param sid number 物件表ID
+---@param posx number 初始化位置X
+---@param posz number 初始化位置Z
+---@param rotx number 初始化朝向X
+---@param roty number 初始化朝向Y
+---@param rotz number 初始化朝向Z
+---@param extra table 额外参数
+---@return WorldBaseItem 物件对象
+function WorldItemManager:DynamicCreateWorldItem(uid, sid, posx, posz, rotx, roty, rotz, call, extra)
+    local cfg = _G.ConfigManager.object_world_cfg[sid]
+    if not cfg then
+        return nil
+    end
+    if self.curWorld.Sid ~= self.curSceneSid then
+        self.curSceneSid = self.curWorld.Sid
+        self.dynWorldItemIndex = 0
+    end
+    local wid = _G.WorldItemData.New()
+    local posy = self.curWorld.WorldSetting:GetY(posx, posz)
+    wid.InitPoint = {{["p_x"] = posx, ["p_y"] = posy, ["p_z"] = posz, ["r_x"] = rotx, ["r_y"] = roty, ["r_z"] = rotz}}
+    wid.IsMove = false
+    wid.IsInShadow = extra and extra.IsInShadow or false
+    wid.IsHidden = extra and extra.IsHidden or false
+    wid.EnterFightId = extra and extra.EnterFightId or 0
+    wid.ResPath = extra and extra.ResPath or ""
+    wid.EventId = extra and extra.EventId or 0
+    wid.Sid = sid
+    if not uid or uid <= 0 then
+        self.dynWorldItemIndex = self.dynWorldItemIndex + 1
+        uid = self.curWorld.Sid * 1000 + self.dynWorldItemIndex
+    end
+    --动态创建UID (用场景sid*1000+序列号)
+    wid.Uid = uid
+    local function OnObjCreateCall(_item)
+        self.AllWorldItems[uid] = _item
+        if call then
+            call(_item)
+        end
+    end
+    local item = self.curWorld:CreateWorldItem(cfg.Type1, wid, OnObjCreateCall)
+    item:Init()
+    self.curWorld.AllWorldItems[uid] = item
+end
+---创建物件模型
+---@param path string 路径
+---@param call function 创建完成回调
+---@param parent UnityEngine.Transform 父节点
+function WorldItemManager:CreateObjectModel(path, call, parent)
+    if _G.string.contains(path, "/") then
+        _G.PoolsManager:GetInstance():Spawn(path, _G.ePoolType.World, parent, call)
+    else
+        local trans = _G.WorldManager:GetInstance():GetItemGameObj(path)
+        trans:SetParentE(parent)
+        call(trans)
+    end
+end
+---回收模型
+---@param path string 路径
+---@param trans  UnityEngine.Transform 模型
+function WorldItemManager:ClearObjectModel(path, trans)
+    if _G.string.contains(path, "/") then
+        _G.PoolsManager:GetInstance():Despawn(trans, _G.ePoolType.World)
+    else
+        _G.WorldManager:GetInstance():PutItemGameObj(trans)
+    end
+end
+--endregion
+
+--region 交互界面
+---打开交互界面
+---@param _type _G.WorldItemType 物件类型
+---@param func function 点击回调
+---@param trans UnityEngine.Transform 物件
+---@param time number 交互时间
+function WorldItemManager:OpenInteractedView(_type, func, trans, time)
+    if not _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainView.Name) then
+        if _G.UIManager:GetInstance():IsActiveWindow(_G.ConfigManager.ui_cfg.MainSiegeView.Name) then
+        else
+            return
+        end
+    end
+    if not self.interactedItemDic[trans] then
+        self.interactedItemDic[trans] = {t = _type, call = func, t = time and time > 0 and time or nil}
+    end
+    self.interactedItemDic[trans].type = _type
+    self.interactedItemDic[trans].call = func
+    self.interactedItemDic[trans].time = time and time > 0 and time or nil
+    if not self.interactedView then
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnInteractedViewOpen, self)
+        _G.UIManager:GetInstance():OpenWindow(
+            _G.ConfigManager.ui_cfg.WorldItemInteractedView.Name,
+            _G.handler(self, self.OnInteractedClick)
+        )
+        _G.Events:GetInstance():AddListener(_G.ePlayerStatus.PlayerMoveing, self.UpdateShowInteractedIcon, self)
+    else
+        self:UpdateShowInteractedIcon()
+    end
+end
+---关闭交互界面
+---@param _type _G.WorldItemType 物件类型
+---@param trans UnityEngine.Transform 物件
+function WorldItemManager:CloseInteractedView(_type, trans)
+    if _G.table.isEmptyOrNil(self.interactedItemDic) then
+        return
+    end
+    self.interactedItemDic[trans] = nil
+    if _G.table.isEmptyOrNil(self.interactedItemDic) then
+        if self.interactedView then
+            self.interactedView:Hide()
+            self.interactedView = nil
+        end
+    end
+end
+--endregion
+
+--region 事件
+---注册物件交互事件
+---@param eventType WorldItemManager.ItemEvent 事件类型
+---@param func function 交互回调方法
+---@param obj table 绑定对象
+function WorldItemManager:RegiestWorldItemEvent(eventType, func, obj)
+    _G.Events:GetInstance():AddListener(eventType, func, obj)
+end
+---反注册物件交互事件
+---@param eventType WorldItemManager.ItemEvent 事件类型
+---@param func function 交互回调方法
+---@param obj table 绑定对象
+function WorldItemManager:UnRegiestWorldItemEvent(eventType, func, obj)
+    _G.Events:GetInstance():RemoveListener(eventType, func, obj)
+end
+---派发物件交互事件
+---@param eventType WorldItemManager.ItemEvent 事件类型
+function WorldItemManager:BroadcastWorldItemEvent(eventType, ...)
+    _G.Events:GetInstance():Broadcast(eventType, ...)
+end
+--endregion
+--endregion
+
+--region交互按钮
+local curDis, minDis
+---更新图标展示
+function WorldItemManager:UpdateShowInteractedIcon()
+    if not self.interactedView then
+        return
+    end
+    if not MainManager:GetInstance().isInMainView then
+        return
+    end
+    self.chooseTrans = nil
+    local player = _G.WorldManager:GetInstance():GetCurWorldPlayer()
+    for trans, _ in pairs(self.interactedItemDic) do
+        curDis = trans:GetDistancePowXZ(player.Transform)
+        if self.chooseTrans == nil or curDis < minDis then
+            minDis = curDis
+            self.chooseTrans = trans
+        end
+    end
+    self.interactedView:Show(self.interactedItemDic[self.chooseTrans].type)
+end
+---监听界面打开
+---@param name string 打开的界面名称
+function WorldItemManager:OnInteractedViewOpen(name)
+    if name == _G.ConfigManager.ui_cfg.WorldItemInteractedView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnInteractedViewOpen, self)
+        _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIClosed, self.OnInteractedViewClose, self)
+        self.interactedView = _G.UIManager:GetInstance():GetWindowCtrl(name)
+        if _G.table.isEmptyOrNil(self.interactedItemDic) then
+            self.interactedView:Close()
+        else
+            self:UpdateShowInteractedIcon()
+        end
+    end
+end
+---监听界面关闭
+---@param name string 关闭的界面名称
+function WorldItemManager:OnInteractedViewClose(name)
+    if name == _G.ConfigManager.ui_cfg.WorldItemInteractedView.Name then
+        _G.Events:GetInstance():RemoveListener(_G.ePlayerStatus.PlayerMoveing, self.UpdateShowInteractedIcon, self)
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIClosed, self.OnInteractedViewClose, self)
+        self.interactedItemDic = {}
+        self.interactedView = nil
+    end
+end
+---交互按钮点击回调
+---@param _type number 点击类型
+function WorldItemManager:OnInteractedClick(_type)
+    local item = self.interactedItemDic[self.chooseTrans]
+    if item then
+        self.interactedView:ShowTime(item.time)
+        item.call()
+    else
+        self.interactedView:Close()
+    end
+end
+--endregion
+return WorldItemManager

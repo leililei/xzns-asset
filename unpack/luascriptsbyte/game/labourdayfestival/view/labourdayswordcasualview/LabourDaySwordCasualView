@@ -1,0 +1,355 @@
+local SwordCasual_MapControll = require("SwordCasual_MapControll")
+local SwordCasual_Utils = require("SwordCasual_Utils")
+local base= require "SwordCasualView"
+---@class LabourDaySwordCasualView : SwordCasualView	剑之修行_战斗页面
+---@field go_table SwordCasualView_GoTable
+local LabourDaySwordCasualView = _G.BaseClass("LabourDaySwordCasualView", base)
+
+---界面的入口函数
+---@param stageIndex number @关卡序号
+---@param cfg jzxx_stage_cfg
+---@param callback fun(win:boolean,num:number,time:number,score:number):void     @是否胜利/击杀数量/总耗时时间
+---@param showScore boolean @是否显示得分
+---@param isPayment boolean @是否显示支付模块
+function LabourDaySwordCasualView:OnCreate(callback, cfg)
+    self.cfg = cfg
+    self.callback = callback
+    self.time = 0
+    self.kill = 0
+    self.boxUpdateInterval = 0
+    self.boxCollectInterval = 0
+	self.countdown = cfg.time
+
+    --初始化怪物波次
+    self.createFinish = false
+    self.createCfg = {}
+    for _, v in ipairs(self.cfg.monster_config) do
+        local startTime, endTime, interval, count, monsterId = v[1], v[2], v[3], v[4], v[5]
+        table.insert(
+            self.createCfg,
+            {
+                time = 0,
+                startTime = startTime,
+                endTime = endTime,
+                interval = interval,
+                count = count,
+                monsterIds = { monsterId }
+            }
+        )
+    end
+
+    --初始事件
+    self.effectCfgs = {}
+    if self.cfg.event_config and #self.cfg.event_config > 0 then
+        for _, eventId in ipairs(self.cfg.event_config[1]) do
+            local cfg = _G.ConfigManager.jzxx_event_cfg[eventId]
+            if cfg then
+                table.insert(self.effectCfgs, cfg)
+            end
+        end
+    end
+
+    self:InitView()
+    --初始化摇杆
+    self:InitJoystick()
+    --初始化对象池
+    self:InitPools()
+
+    --初始化组件
+    self.mapControll =
+        self:AddComponent(self.go_table.obj_mapRoot, SwordCasual_MapControll.New(self.go_table.obj_mapRoot))
+    self.masterItem = self:CreateMasterItem()
+    self.monsterItems = {}
+    self.monsterUpdateSiblingInterval = 0
+    self.bulletItems = {}
+    self.boxItems = {}
+
+    --初始化主循环
+    self.mainLoop = _G.TimerManager:GetInstance():GetTimer(1, self.Update, self, false, true)
+    self.mainLoop:Start()
+    self:UpdateTime()
+    --积分信息
+    self.score = showScore and 0 or -1
+    self.go_table.obj_score:SetActiveE(showScore and 1 or 0)
+    if showScore then
+        self:UdpateScore()
+    end
+    self.go_table.obj_tip:SetActiveE(0)
+end
+
+function LabourDaySwordCasualView:InitView()
+    self.go_table.aortext_name.text = ""
+end
+---主循环事件
+function LabourDaySwordCasualView:Update()
+    if self:IsPause() then
+        return
+    end
+
+    local dt = _G.Time.deltaTime
+
+    --时间计数
+    self.time = self.time + dt
+    self.countdown=self.countdown-dt
+    self:UpdateTime()
+
+    --主角移动
+    if self.direction.x ~= 0 or self.direction.y ~= 0 then
+        local delta = self.masterItem:GetSpeed() * dt
+        self.mapControll:UpdatePosition(delta)
+        --self.roleItem:UpdatePosition(delta)
+    end
+    --物理逻辑更新
+    self.masterItem:Update(dt)
+    for i = #self.monsterItems, 1, -1 do
+        self.monsterItems[i]:Update(dt)
+    end
+    for i = #self.bulletItems, 1, -1 do
+        self.bulletItems[i]:Update(dt)
+    end
+    --计算掉落物过期
+    self.boxUpdateInterval = self.boxUpdateInterval + dt
+    if self.boxUpdateInterval >= 0.1 then
+        local _dt = self.boxUpdateInterval
+        self.boxUpdateInterval = 0
+        for i = #self.boxItems, 1, -1 do
+            self.boxItems[i]:Update(_dt)
+            --进入选事件界面
+            if self:IsPause() then
+                return
+            end
+        end
+    end
+
+    --更新怪物层级(定时)
+    -- self.monsterUpdateSiblingInterval = self.monsterUpdateSiblingInterval - dt
+    -- if self.monsterUpdateSiblingInterval <= 0 then
+    --     self.monsterUpdateSiblingInterval = 0.1
+    --     self:UpdateMonsterSibling()
+    -- end
+    self:UpdateMonsterSibling()
+
+    --计算角色/武器碰撞
+    for i = #self.monsterItems, 1, -1 do
+        self:UpdateRoleOverlap(self.masterItem, self.monsterItems[i])
+
+        --如果怪物死亡, 播放死亡动画
+        if self.monsterItems[i]:IsDeath() then
+            local monsterItem = self.monsterItems[i]
+            table.remove(self.monsterItems, i)
+            self:OnMonsterDeath(monsterItem)
+        end
+
+        --如果玩家死亡, 则结束游戏
+        if self.masterItem:IsDeath() then
+            self:OnMasterDeath()
+            return
+        end
+    end
+
+    --计算子弹碰撞
+    self:UpdateBulletOverlap(self.masterItem, self.bulletItems)
+    if self.masterItem:IsDeath() then
+        self:OnMasterDeath()
+        return
+    end
+    local masterBullets = self.masterItem:GetBulletItems()
+    if masterBullets and #masterBullets > 0 then --主角发出的子弹
+        for i = #self.monsterItems, 1, -1 do
+            self:UpdateBulletOverlap(self.monsterItems[i], masterBullets)
+            --如果怪物死亡, 播放死亡动画
+            if self.monsterItems[i]:IsDeath() then
+                local monsterItem = self.monsterItems[i]
+                table.remove(self.monsterItems, i)
+                self:OnMonsterDeath(monsterItem)
+            end
+        end
+    end
+
+    --计算物品拾取
+    self.boxCollectInterval = self.boxCollectInterval + dt
+    if self.boxCollectInterval >= 0.1 then
+        self.boxCollectInterval = 0
+        for i = #self.boxItems, 1, -1 do
+            if SwordCasual_Utils.Physics:rectOverlapOBB(self.masterItem:GetRect(), self.boxItems[i]:GetRect()) then
+                self:OnBoxCollect(self.masterItem, self.boxItems[i])
+                self.boxPool:Release(self.boxItems[i])
+                table.remove(self.boxItems, i)
+            end
+        end
+    end
+
+    --生成怪物实例
+    self.createFinish = true
+    for _, v in pairs(self.createCfg) do
+        if self.time >= v.startTime and self.time <= v.endTime then
+            v.time = v.time - dt
+            if v.time <= 0 then
+                v.time = v.interval
+                local mx, my = self.masterItem:GetPosition()
+                for _ = 1, v.count do
+                    local monsterId = v.monsterIds[math.random(1, #v.monsterIds)]
+                    local cfg = _G.ConfigManager.jzxx_role_cfg[monsterId]
+                    local monsterItem = self:CreateMonsterItem(mx, my, cfg)
+                    table.insert(self.monsterItems, monsterItem)
+                end
+            end
+        end
+        if self.time <= v.endTime then
+            self.createFinish = false
+        end
+    end
+
+    --通关WASD或方向键, 控制玩家行进
+    if _G.AppSetting.IS_EDITOR and not self.isMoveJoystick then
+        local horizontal = _G.CS.UnityEngine.Input.GetAxis("Horizontal")
+        local vertical = _G.CS.UnityEngine.Input.GetAxis("Vertical")
+
+        --归一化处理
+        local len = math.sqrt(horizontal ^ 2 + vertical ^ 2)
+        if len > 0.0001 then
+            self.direction.x = horizontal / len
+            self.direction.y = vertical / len
+        else
+            self.direction.x = 0
+            self.direction.y = 0
+        end
+
+        if not self:IsPause() then
+            self:UpdateDirection()
+        end
+    end
+end
+
+
+---更新显示时间UI
+function LabourDaySwordCasualView:UpdateTime()
+    if self.countdown>0 then
+        self.go_table.aortext_time.text = _G.GetLangPackValue(92010600062,_G.TimeUtil.TimeToString(math.floor(self.countdown), 2))
+    else
+        self.go_table.aortext_time.text = _G.GetLangPackValue(92010600063)
+    end
+end
+
+
+---监听处理怪物死亡事件
+---@param roleItem SwordCasual_RoleItem @角色实例
+function LabourDaySwordCasualView:OnMonsterDeath(monsterItem)
+    self.kill = self.kill + 1
+
+    --分数
+    local cfg = monsterItem:GetData()
+    if cfg then
+        if self.score >= 0 then
+            self.score = self.score + cfg.score
+            self:UdpateScore()
+        end
+    end
+
+    --延迟回收实例(等待动画完成)
+    _G.DelayDo(
+        0.2,
+        function()
+            if self:IsNil() then
+                return
+            end
+            monsterItem:PlayDeathAnimation(
+                function()
+                    --生成掉落物
+                    ---@type jzxx_role_cfg
+                    local cfg = monsterItem:GetData()
+                    if cfg then
+                        local drop = 0
+                        if cfg.drop_rate > 0 and math.random() <= cfg.drop_rate then
+                            drop = drop + 1
+                            local cx, cy = monsterItem:GetPosition()
+                            ---@type SwordCasual_BoxItem
+                            local boxItem = self:CreateBoxItem(1, cfg, cx, cy)
+                            boxItem:SetDuration(30) --保留30秒
+                            table.insert(self.boxItems, boxItem)
+                        end
+                        if cfg.event_rate > 0 and math.random() <= cfg.event_rate and self.effectCfgs and #self.effectCfgs > 0 then
+                            local cx, cy = monsterItem:GetPosition()
+                            if drop > 0 then
+                                cx = cx + math.random(-20, 20)
+                                cy = cy - 50
+                            end
+                            cx = cx + math.random(-10, 10)
+                            cy = cy + math.random(-10, 10)
+                            ---@type SwordCasual_BoxItem
+                            local boxItem = self:CreateBoxItem(2, cfg, cx, cy)
+                            boxItem:SetDuration(30) --保留30秒
+                            table.insert(self.boxItems, boxItem)
+                        end
+                    end
+
+                    --回收节点
+                    self:ReleaseMonsterItem(monsterItem)
+                    --战斗胜利结算
+                    if self:IsFinish() then
+                        self:SetPause(true)
+                        local jssc = _G.ConfigManager.jzxx_stage_show_cfg[1000 + self.cfg.type]
+
+                        if self.callback then
+                            self:callback(1)
+                            self.callback = nil
+                        end
+                    end
+                end
+            )
+        end
+    )
+end
+
+--监听主角死亡事件
+function LabourDaySwordCasualView:OnMasterDeath()
+    -- if true then
+    --     --TODO: 测试数据
+    --     self.masterItem:SetHp(99)
+    --     self.masterItem:SetShowHp(true)
+    --     return
+    -- end
+    self:SetPause(true)
+
+    ---更新所有monster动作为idle
+    local direction = { x = 0, y = 0 }
+    for i = 1, #self.monsterItems do
+        self.monsterItems[i]:SetDirection(direction, true)
+    end
+
+    --延迟回收实例(等待动画完成)
+    _G.DelayDo(
+        0.2,
+        function()
+            if self:IsNil() then
+                return
+            end
+            --self.masterItem:SetSuperArmor(-1) --关闭闪烁
+            self.masterItem:PlayDeathAnimation(
+                function()
+                    local jssc = _G.ConfigManager.jzxx_stage_show_cfg[1000 + self.cfg.type]
+
+                    if self.callback then
+                        self:callback(1)
+                        self.callback = nil
+                    end
+                end
+            )
+        end
+    )
+end
+
+---按钮点击事件在这里派发
+function LabourDaySwordCasualView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_CloseView or go == self.go_table.aorbtn_settings then
+        if self.callback then
+            self:callback(0)
+            self.callback = nil
+        end
+    else
+        base.OnClickBtn(self,go,isOn)
+    end
+end
+
+
+return LabourDaySwordCasualView

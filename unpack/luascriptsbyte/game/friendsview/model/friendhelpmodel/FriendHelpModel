@@ -1,0 +1,1528 @@
+-----------------------------------------------------------------------
+-- E:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.FriendsView.Model.FriendHelpModel	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/10/14
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+---@class FriendHelpModel : GameDataModelBase
+---@field infoData FriendHelpInfoData 好友助战信息数据
+---@field timer Timer 助战归还倒计时
+---@field endTime number 归还时间戳
+---@field HelpDatas HelpSingleData[] 助战卡牌信息(其他玩家)
+local FriendHelpModel = _G.BaseClass("FriendHelpModel", _G.GameDataModelBase)
+
+FriendHelpModel.npcKey = "FriendHelpNpcKey"
+
+local Key = "FriendHelpModelSetPos"
+---@return FriendHelpModel FriendHelpModel
+function FriendHelpModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+function FriendHelpModel:OnFunctionOpenCall(id)
+    if id == _G.FunctionID.FriendHelp then
+        self.addFunctionListener = nil
+        _G.Events:GetInstance():RemoveListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnFunctionOpenCall, self)
+        self:InitData(_G.handler(self, self.OnInitFunction))
+    end
+end
+
+---创建对象时,入口构造函数
+function FriendHelpModel:__init()
+    -- self.curFunctionOpenID = _G.FunctionID.FriendHelp
+    self.cardDatas = {}
+    ---冒险关卡npc助战条件
+    self.npcConditionsOfAfk = _G.ConfigManager.discrete_cfg[106417]
+    ---死魂塔npc助战条件
+    self.npcConditionsOfDeadsoulTower1 = _G.ConfigManager.discrete_cfg[106422]
+    ---死魂塔(试炼)npc助战条件
+    self.npcConditionsOfDeadsoulTower2 = _G.ConfigManager.discrete_cfg[106423]
+    self.npcSid = _G.ConfigManager.discrete_cfg[106416][1][1]
+end
+
+---销毁对象时,析构函数
+function FriendHelpModel:Dispose()
+    self.curFunctionOpenID = nil
+    self.UseAssist = nil
+    self.cardDatas = nil
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+
+--region 子类重写
+---从服务器拉取数据
+function FriendHelpModel:GetDataFormServer()
+    self:GetInfo()
+end
+
+---获取Info
+function FriendHelpModel:GetInfo()
+    require "FriendsHelpNet":GetInstance():GetInfo(_G.handler(self, self.GetInfoCall))
+    -- require "FriendsHelpNet":GetInstance():GetGarray(_G.handler(self, self.GetGarrayCall))
+end
+
+---获取Info回调
+function FriendHelpModel:GetInfoCall(msg)
+    if not self.infoData then
+        self.infoData = require "FriendHelpInfoData".New(msg)
+    else
+        self.infoData:Parse(msg)
+    end
+    self:InitTimer()
+    self.isOpen = _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.FriendHelp)
+    if not self.isOpen and not self.addFunctionListener then
+        self.addFunctionListener = true
+        _G.Events:GetInstance():AddListener(_G.eFunctionsStatus.OpenCfgFunctionId, self.OnFunctionOpenCall, self)
+    end
+    if self.isReconnect then
+        self:InitSetCard()
+    end
+    if self.timeOver or self.isReconnect then
+        self.timeOver = false
+        self.isReconnect = false
+        _G.Events:GetInstance():Broadcast(_G.eFriendHelp.TimeOver)
+    end
+    self:ParseData()
+    self:InitRedPoint()
+end
+
+---获取阵容数据
+---@param msg assist.s2c_assist_get_array
+function FriendHelpModel:GetGarrayCall(msg)
+    self.garrayList = {}
+    for _, v in pairs(msg.garrays) do
+        self.garrayList[v.id] = v
+    end
+end
+
+---刷新红点
+function FriendHelpModel:InitRedPoint()
+    self.isRedPoint = false
+    if not self.HelpDatas or not self:ChekcOperation() then
+        for k, v in pairs(self.infoData.borrowDatas) do
+            local uid = _G.tonumber(_G.PlayerPrefsManager.GetString(Key .. k))
+            if v.cardData.uid > 0 and v.cardData.uid ~= uid then
+                self.isRedPoint = true
+                break
+            end
+        end
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FriendsHelpSetup.id)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.FriendsHelpSetupSeekhelp.id
+    )
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.FriendsHelpSetupAdministration.id
+    )
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.FriendsHelpSetupAssistance.id
+    )
+end
+
+---显示红点（周一统一刷新后显示
+function FriendHelpModel:WeekRed()
+    local time = _G.PlayerPrefsManager.GetInt("FriendHelpModelWeekRed")
+    if time == nil or time == 0 then
+        return true
+    end
+    if _G.TimeUtil.GetServerUnixTime() >= time then
+        return true
+    end
+    return false
+end
+
+---红点刷新时间写入
+function FriendHelpModel:SetWeekRed()
+    local endTime
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local data = _G.TimeUtil.GetDateTime(time)
+    local params = _G.ConfigManager.discrete_cfg[106413][1]
+    local duration = _G.ConfigManager.discrete_cfg[106403][1][1] * 86400
+    data.week = data.week == 0 and 7 or data.week
+    if data.week > 1 then
+        endTime = _G.TimeUtil.GetDayBegin(time) - ((data.week - 1) * 86400) + params[1] * 3600 + duration
+    else
+        endTime = _G.TimeUtil.GetDayBegin(time) - math.abs(6 + data.week) * 86400 + params[1] * 3600 + duration
+    end
+    if endTime <= time then
+        endTime = _G.TimeUtil.GetDayBegin(time) + params[1] * 3600 + duration
+    end
+    _G.PlayerPrefsManager.SetInt("FriendHelpModelWeekRed", endTime)
+end
+
+---初始化归还倒计时
+function FriendHelpModel:InitTimer()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    local time = _G.TimeUtil.GetServerUnixTime()
+    local data = _G.TimeUtil.GetDateTime(time)
+    local params = _G.ConfigManager.discrete_cfg[106413][1]
+    local duration = _G.ConfigManager.discrete_cfg[106403][1][1] * 86400
+    data.week = data.week == 0 and 7 or data.week
+    if data.week > 1 then
+        self.endTime = _G.TimeUtil.GetDayBegin(time) - ((data.week - 1) * 86400) + params[1] * 3600 + duration
+    else
+        self.endTime = _G.TimeUtil.GetDayBegin(time) - math.abs(6 + data.week) * 86400 + params[1] * 3600 + duration
+    end
+    if self.endTime <= time then
+        self.endTime = _G.TimeUtil.GetDayBegin(time) + params[1] * 3600 + duration
+    end
+
+    local offset = self.endTime - time + 2
+    -- if time < settleTime and time < self.endTime then
+    --     offset = settleTime - time
+    -- end
+    self.timer = _G.TimerManager:GetInstance():GetTimer(offset, self.OnTimeOver, self, true, false, true)
+    self.timer:Start()
+end
+
+---归还计时结束
+function FriendHelpModel:OnTimeOver()
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+    self.timeOver = true
+    self:GetInfo()
+    self:SetWeekRed()
+    --require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FriendsHelpSetupRefresh.id, 0)
+end
+
+---初始化设置卡牌
+function FriendHelpModel:InitSetCard(call)
+    if not _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.FriendHelp) then
+        return
+    end
+    ---@type CardData[]
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local lowStar = _G.ConfigManager.discrete_cfg[106402][1][1]
+    ---@param v CardData
+    local cardDatas =
+        _G.table.chooseToArray(
+        cards,
+        function(_, v)
+            return v.star >= lowStar
+        end
+    )
+    _G.table.sort(
+        cardDatas,
+        function(a, b)
+            return a.power > b.power
+        end
+    )
+    local sets = {}
+    for i = 1, 5 do
+        if cardDatas[i] then
+            sets[i] = {uid = cardDatas[i].uid, type = 1, index = i}
+        else
+            break
+        end
+    end
+    self:SetBorrowCard(sets, call)
+end
+
+---获取结束时间
+---@return number
+function FriendHelpModel:GetEndTime()
+    return self.endTime
+end
+
+---检测功能是否能使用助战角色
+---@param id FriendsHelpType 功能id
+function FriendHelpModel:CheckCanUseHelp(id, param, type, uid)
+    if not self.infoData then
+        return false
+    end
+    if not type then
+        type = 1
+        if uid and uid == self.npcSid then
+            type = 2
+        end
+    end
+    return self.infoData:CheckCanUse(id, param, type)
+end
+
+--region 获取可助战卡牌的卡牌列表(未借入)
+---@param call fun() 回调
+---@param type number 1所有，2特定卡
+---@param roleUid number 角色uid
+---@param cardUid number 卡牌uid
+function FriendHelpModel:GetHelpCardDatas(call, type, roleUid, cardUid)
+    self.isRedPoint = false
+    if not self:ChekcOperation() then
+        self.HelpDatas = {}
+        if call then
+            call()
+        end
+        return
+    end
+    require "FriendsHelpNet":GetInstance():GetHelpCardInfo(
+        {type = type, uid = roleUid, card_uid = cardUid},
+        function(msg)
+            self:InitHelpCardDatas(msg)
+            if call then
+                call()
+            end
+        end
+    )
+    for k, v in pairs(self.infoData.borrowDatas) do
+        _G.PlayerPrefsManager.SetString(Key .. k, _G.tostring(v.cardData.uid))
+    end
+    require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.FriendsHelpSetupAssistance.id, 0)
+end
+
+---初始化助战卡牌数据
+---@param msg assist.s2c_assist_resort
+function FriendHelpModel:InitHelpCardDatas(msg)
+    self.HelpDatas = {}
+    if _G.table.isEmptyOrNil(msg.simple) then
+        return
+    end
+    for i = 1, #msg.simple do
+        if msg.simple[i].cards then
+            for j = 1, #msg.simple[i].cards do
+                local data = msg.simple[i].cards[j]
+                _G.table.insert(
+                    self.HelpDatas,
+                    require "HelpSingleData".New(
+                        {
+                            lend_role = {uid = msg.simple[i].role_uid, name = msg.simple[i].role_name},
+                            card = {
+                                sid = data.sid,
+                                star = data.star,
+                                uid = data.card_uid,
+                                lv = data.lv,
+                                power = data.power
+                            },
+                            time = {0},
+                            apply_num = data.apply_num
+                        }
+                    )
+                )
+            end
+        end
+    end
+    local isHave = false
+    for _, v in pairs(self:GetApplyData()) do
+        isHave = false
+        for _, v2 in pairs(self.HelpDatas) do
+            if v2.cardData.uid == v.cardData.uid then
+                isHave = true
+                break
+            end
+        end
+        if not isHave then
+            -- self:ApplyHelpCard(v, 2)
+            ---@type assist.i_assist
+            local data = _G.DeepCopy(v.msg)
+            data.resort_role = {{uid = _G.PlayerModel:GetInstance():GetPlayerUid()}}
+            _G.table.insert(self.HelpDatas, require "HelpSingleData".New(data))
+        end
+    end
+    for _, v in pairs(self:GetBorrowDatas()) do
+        _G.table.insert(self.HelpDatas, v)
+    end
+end
+
+---更新卡牌信息
+---@param data prop.i_card 卡牌数据
+---@param maxData CardData 战力最高的卡牌
+---@param maxLevel number 共鸣神石上的卡牌等级
+function FriendHelpModel:UpdateCardMsg(data)
+    local cards = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local cardDatas = {}
+    for _, value in pairs(cards) do
+        table.insert(cardDatas, value)
+    end
+    _G.table.sort(
+        cardDatas,
+        function(a, b)
+            return a.power > b.power
+        end
+    )
+
+    local maxGrade = 0
+    local maxGradeEquipBar = cardDatas[1].EquipBar
+    local maxStreng = 0
+    local maxStrengEquipBar = cardDatas[1].EquipBar
+    for i = 1, 5 do
+        if _G.IsNil(cardDatas[i]) then
+            break
+        end
+        local sumGrade = 0
+        local sumStreng = 0
+        local equipBar = cardDatas[i].EquipBar
+        for j = 1, #equipBar do
+            if not _G.table.isEmptyOrNil(equipBar[j]) then
+                sumGrade = sumGrade + equipBar[j].Grade
+                sumStreng = sumStreng + equipBar[j].streng
+            end
+        end
+        if sumGrade > maxGrade then
+            maxGrade = sumGrade
+            maxGradeEquipBar = equipBar
+        end
+        if sumStreng > maxStreng then
+            maxStreng = sumStreng
+            maxStrengEquipBar = equipBar
+        end
+    end
+
+    local equipments = {}
+    for i = 1, #maxGradeEquipBar do
+        if not _G.table.isEmptyOrNil(maxGradeEquipBar[i]) then
+            ---@type card_cfg
+            local cfg = _G.ConfigManager.card_cfg[data.sid]
+            ---@type prop.i_equipment
+            local equipData = {}
+            ---装备胚子
+            equipData.sid = 201000000 + cfg.EquipmentType * 1000 + i * 100 + maxGradeEquipBar[i].Grade
+            equipData.uid = 0
+            ---装备五行属性
+            equipData.element = cfg.Elements
+            equipData.reset_element = 0
+            ---装备强化
+            if not _G.table.isEmptyOrNil(maxStrengEquipBar[i]) then
+                equipData.streng = maxStrengEquipBar[i].streng
+                equipData.exp = maxStrengEquipBar[i].strengExp
+            else
+                equipData.streng = 0
+                equipData.exp = 0
+            end
+            --if maxGradeEquipBar[i]:CheckEquipmentBoundSidIsCurCardSid() then
+            --    equipData.bound = data.sid
+            --end
+            _G.table.insert(equipments, equipData)
+        end
+    end
+    ---卡牌星级、魂链等级、饰品、聚灵法阵阵内属性、天赋取对方
+    ---卡牌等级
+    data.lv = self:GetMaxLevel()
+    data.equipments = equipments
+end
+
+--region  申请
+---(取消)申请助战卡牌
+---@param msg HelpSingleData 申请数据
+---@param type number  1申请 2取消
+---@param call function 回调
+function FriendHelpModel:ApplyHelpCard(msg, type, call)
+    if not self:ChekcOperation() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(4514)
+        return
+    end
+    if type == 1 and self.infoData:CheckIsMaxApply() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(100306)
+        return
+    end
+    if type == 1 and self.infoData:CheckIsBorrowMax() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(100321)
+        return
+    end
+    require "FriendsHelpNet":GetInstance():ApplyHelpCard(
+        {role_uid = msg.lendRole.uid, card_uid = msg.cardData.uid, type = type},
+        _G.handlerbind(self, self.ApplyHelpCardCall, msg, type, call)
+    )
+end
+
+---(取消)申请成功回调
+---@param msg public.s2c_common_ack
+---@param data HelpSingleData
+function FriendHelpModel:ApplyHelpCardCall(msg, data, type, call)
+    if msg.ack ~= 1 then
+        ---4406无法申请 4514申请已满
+        _G.PopWindowManager:GetInstance():ShowAllTips(100308)
+        return
+    end
+    if type == 1 and msg.auto_agree then
+        self.infoData:AddApplyWithSingleData(data, _G.TimeUtil.GetServerUnixTime())
+        _G.Events:GetInstance():Broadcast(_G.eFriendHelp.BorrowCard, data)
+        --申请自动通过
+        self:ApplyBorrowCallback(data.cardData.uid, data.lendRole.uid)
+        if call then
+            call()
+        end
+    else
+        if type == 1 then
+            self.infoData:AddApplyWithSingleData(data, _G.TimeUtil.GetServerUnixTime())
+        elseif type == 2 then
+            self.infoData:RemoveApply(data.cardData.uid)
+        elseif type == 3 then
+            local pos = self.infoData:RemoveBorrowCardData(data.cardData.uid, data.lendRole.uid)
+            for k, v in pairs(self.HelpDatas) do
+                if v.cardData.uid == data.cardData.uid then
+                    _G.table.remove(self.HelpDatas, k)
+                    break
+                end
+            end
+            _G.Events:GetInstance():Broadcast(_G.eFriendHelp.ReturnCard, pos)
+        end
+        if call then
+            call()
+        end
+        _G.Events:GetInstance():Broadcast(_G.eFriendHelp.BorrowCard, data)
+    end
+end
+
+---检测是否能操作助战信息
+---@return boolean
+function FriendHelpModel:ChekcOperation()
+    -- local param = _G.ConfigManager.discrete_cfg[106415][1]
+    -- local time = _G.TimeUtil.GetDateTime(_G.TimeUtil.GetServerUnixTime())
+    -- if time.hour >= param[1] and time.hour < param[2] then
+    --     return false
+    -- end
+    return true
+end
+
+--endregion
+
+--region 设置助战卡牌
+---(取消)设置借出助战卡牌
+---@param msg assist.i_set[] 改动的卡牌数据
+function FriendHelpModel:SetBorrowCard(msg, call)
+    if msg == nil then
+        if call then
+            call()
+        end
+        return
+    end
+    if not self:ChekcOperation() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(4514)
+        return
+    end
+
+    require "FriendsHelpNet":GetInstance():SetHelpCard(
+        {sets = msg},
+        _G.handlerbind(self, self.SetBorrowCardCall, msg, call)
+    )
+end
+
+---设置助战卡牌
+---@param msg public.s2c_common_ack
+---@param data assist.i_set[]
+function FriendHelpModel:SetBorrowCardCall(msg, data, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    for _, v in pairs(data) do
+        self.infoData:RemoveSetCard(v.index)
+    end
+    for _, v in pairs(data) do
+        if v.type == 1 then
+            self.infoData:AddSetCard(v.index, v.uid)
+        end
+    end
+    if call then
+        call()
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FriendsHelpSetup.id)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.FriendsHelpSetupSeekhelp.id
+    )
+end
+
+--endregion
+--region 处理其他玩家申请
+
+---处理其他玩家申请
+---@param msg assist.i_apply[]
+function FriendHelpModel:DealResort(msg, call)
+    if not self:ChekcOperation() then
+        _G.PopWindowManager:GetInstance():ShowAllTips(4514)
+        return
+    end
+    require "FriendsHelpNet":GetInstance():DealApply(
+        {apply = msg},
+        _G.handlerbind(self, self.DealResortCall, msg, call)
+    )
+end
+
+---处理其他玩家申请回调
+---@param msg assist.s2c_assist_apply 返回值
+---@param data assist.i_apply[]
+---@param call fun() 回调
+function FriendHelpModel:DealResortCall(msg, data, call)
+    if msg.ack ~= 1 then
+        return
+    end
+    if msg.reply then
+        local isSingle = #data == 1
+        for _, v in pairs(data) do
+            for _, v2 in pairs(msg.reply) do
+                if v2.card_uid == v.card_uid and v.role_uid == v2.role_uid then
+                    if v.type == 1 then
+                        if v2.type == 1 then
+                            self.infoData:ApplyResort(v.card_uid, v.role_uid)
+                            if v2.award then
+                                _G.StorageManager:GetInstance():ReceiveAwardData(v2)
+                            end
+                        else
+                            self.infoData:RefuseResort(v.card_uid, v.role_uid)
+                            if isSingle then
+                                if v2.type == 4507 then
+                                    _G.PopWindowManager:GetInstance():ShowAllTips(100310)
+                                else
+                                    _G.PopWindowManager:GetInstance():ShowAllTips(100308)
+                                end
+                            end
+                        end
+                    else
+                        self.infoData:RefuseResort(v.card_uid, v.role_uid)
+                    end
+                    break
+                end
+            end
+        end
+    end
+
+    if call then
+        call()
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.FriendsHelpSetupSeekhelp.id
+    )
+end
+
+--endregion
+
+---获取助战角色最大上阵数
+---@return number
+function FriendHelpModel:GetMaxHelpCard()
+    return _G.ConfigManager.discrete_cfg[106404][1][1]
+end
+
+---同意借出卡牌
+---@param msg assist.p2c_assist_agree
+function FriendHelpModel:P2CAgreeBorrow(msg)
+    if msg.type == 1 then
+        self:ApplyBorrowCallback(msg.card_uid, msg.role_uid)
+    elseif msg.type == 2 then
+        if self.HelpDatas then
+            for k, v in pairs(self.HelpDatas) do
+                if v.cardData.uid == msg.card_uid and v.lendRole.uid == msg.role_uid then
+                    _G.table.remove(self.HelpDatas, k)
+                    break
+                end
+            end
+        end
+        self.infoData:RemoveApply(msg.card_uid)
+        _G.Events:GetInstance():Broadcast(_G.eFriendHelp.UnPutCard, msg)
+    end
+end
+
+---申请自动通过回调
+function FriendHelpModel:ApplyBorrowCallback(card_uid, role_uid)
+    if self.HelpDatas then
+        for _, v in pairs(self.HelpDatas) do
+            if v.cardData.uid == card_uid and v.lendRole.uid == role_uid then
+                v.browRole = {uid = _G.PlayerModel:GetInstance():GetPlayerUid()}
+                break
+            end
+        end
+    else
+        self.isRedPoint = true
+    end
+    require "FriendsHelpNet":GetInstance():GetInfo(
+        function(data)
+            if data.ack ~= 1 then
+                return
+            end
+            local assist
+            for _, v in pairs(data.borrow) do
+                if v.lend_role.uid == role_uid and v.card.uid == card_uid then
+                    assist = v
+                    break
+                end
+            end
+            if assist then
+                local pos = self.infoData:AddBorrowCardData(card_uid, assist)
+                _G.Events:GetInstance():Broadcast(_G.eFriendHelp.AgreeBorrow, pos)
+                require "RedPointManager":GetInstance():RefreshNode(
+                    _G.ConfigManager.redpoint_cfg.FriendsHelpSetupAssistance.id,
+                    0
+                )
+            end
+        end
+    )
+end
+
+---其他玩家申请借入卡牌
+---@param msg assist.p2c_assist_resort
+function FriendHelpModel:P2CResort(msg)
+    local data
+    if msg.type == 1 then
+        if self.infoData:CheckIsMaxResort() then
+            return
+        end
+        self.infoData:AddResort(msg.resort)
+    elseif msg.type == 4 then
+        --此处服务器发的i_assist里面没有card数据，他们硬是不发，不想再讲了，重拉数据
+        require "FriendsHelpNet":GetInstance():GetInfo(
+            function(data)
+                if data.ack ~= 1 then
+                    return
+                end
+                self.infoData:InitLendCardDatas(data.lend)
+                self.infoData:InitPoint(data.point)
+                _G.Events:GetInstance():Broadcast(_G.eFriendHelp.AgreeResort)
+            end
+        )
+        if msg.award then
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        end
+    else
+        self.infoData:RemoveResort(msg.role_uid, msg.card_uid)
+    end
+    _G.Events:GetInstance():Broadcast(_G.eFriendHelp.Resort)
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.FriendsHelpSetupSeekhelp.id
+    )
+end
+
+function FriendHelpModel:GetCurBattleUseAssist()
+    return self.UseAssist
+end
+
+---保存布阵
+---@param id number 布阵id
+---@param garray number[] 阵容
+function FriendHelpModel:SaveGarray(id, garray, call)
+    if not self.infoData then
+        if call then
+            call()
+        end
+        return
+    end
+    self.UseAssist = false
+    for k, v in pairs(garray) do
+        if v ~= 0 then
+            self.UseAssist = true
+            break
+        end
+    end
+    require "FriendsHelpNet":GetInstance():SaveGarray(
+        {garrays = {{id = id, sits = garray, skill_index = {0, 0, 0}, pet = { 0, 0, 0 }}}},
+        function(msg)
+            if msg.ack ~= 1 then
+                if call then
+                    call()
+                end
+                return
+            end
+            --self.garrayList[id]={id = id, sits = garray, skill_index = {0, 0, 0}}
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---获取强援卡牌
+---@param sid number 卡牌sid
+---@return HelpSingleData[]
+function FriendHelpModel:GetHelpCardDataBySid(sid)
+    if _G.IsNil(sid) then
+        return nil
+    end
+    ---@param v HelpSingleData
+    return _G.table.chooseToArray(
+        self.HelpDatas,
+        function(_, v)
+            return v.cardData.sid == sid
+        end
+    )
+end
+
+---检测是否申请
+---@param cardUid number 卡牌uid
+function FriendHelpModel:CheckIsApply(cardUid)
+    return self.infoData:CheckIsApply(cardUid)
+end
+
+---获取申请信息
+---@return HelpSingleData[]
+function FriendHelpModel:GetResortData()
+    if not self.infoData or not self:ChekcOperation() then
+        return {}
+    end
+    return self.infoData.resortDatas
+end
+
+---玩家是否已经提示过助战
+function FriendHelpModel:HasShowTips()
+    return self.infoData.isOpenNpc
+end
+
+---获取设置的卡牌
+function FriendHelpModel:GetSetCardDatas()
+    if not self.infoData then
+        return {}
+    end
+    return self.infoData.setInfo
+end
+
+function FriendHelpModel:CheckSetRedPoint()
+    local cardDatas = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local lowStar = _G.ConfigManager.discrete_cfg[106402][1][1]
+    ---@param card CardData
+    local tb =
+        _G.table.chooseToArray(
+        cardDatas,
+        function(_, card)
+            return card.star >= lowStar
+        end
+    )
+    local isHave = false
+    for _, v in pairs(cardDatas) do
+        if v.star >= lowStar then
+            isHave = true
+            break
+        end
+    end
+    return #self:GetSetCardDatas() <= 0 and isHave
+end
+
+---刷新设置红点
+function FriendHelpModel:RefreshSetPoint()
+    if not self.infoData then
+        return
+    end
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.FriendsHelpSetup.id)
+end
+
+---获取设置的卡牌Uids
+---@return table<number,number>
+function FriendHelpModel:GetSetCardUids()
+    if not self.infoData then
+        return {}
+    end
+    return self.infoData.setCardUids
+end
+
+---获取可设置卡牌
+---@return CardData[]
+function FriendHelpModel:GetCanSetCardDatas()
+    local cardDatas = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    local lowStar = _G.ConfigManager.discrete_cfg[106402][1][1]
+    ---@param card CardData
+    local tb =
+        _G.table.chooseToArray(
+        cardDatas,
+        function(_, card)
+            return card.star >= lowStar
+        end
+    )
+    local setUids = self:GetSetCardUids()
+    ---@param data CardData
+    _G.SortList(
+        tb,
+        function(data)
+            local choose = setUids[data.uid] and 1 or 0
+            return choose, data.star, data.power, data.Grade, -data.sid, -data.uid
+        end
+    )
+    return tb
+end
+
+---获取借入数据
+---@return HelpSingleData[]
+function FriendHelpModel:GetBorrowDatas(isNotRefresh)
+    if not self.isOpen or not self:ChekcOperation() then
+        return {}
+    end
+    if _G.IsNil(isNotRefresh) then
+        self:RefreshBorrowDatas()
+    end
+
+    return self.infoData.borrowDatas
+end
+
+---获取介入卡牌
+---@param needNpc boolean   @是否需要npc助战
+---@param npcType number   @1.AFK冒险 2.死魂塔 3.死魂塔试炼
+---@return CardData[]
+function FriendHelpModel:GetBorrowCardDatas(needNpc, npcType)
+    if not self.infoData or not self:ChekcOperation() then
+        return {}
+    end
+    local tb = {}
+    local npc = {}
+    for _, v in pairs(self:GetBorrowDatas()) do
+        _G.table.insert(tb, v.cardData)
+    end
+    if needNpc and self:CheckNpcConditions(npcType or 1, true) then
+        _G.table.insert(npc, self:CreateNpcCardDatas())
+    end
+    return tb, npc
+end
+
+---是否显示npc助战引导
+function FriendHelpModel:CheckCanShowNpcGuide()
+    return not self.infoData.isOpenNpc and self.infoData:CheckNpcOpen()
+end
+
+---生成卡牌数据
+function FriendHelpModel:CreateCardDatas(sid)
+    ---@type prop.i_card
+    local msg = {}
+    msg.sid = sid
+    msg.uid = msg.sid
+
+    local params, maxData = self:GetMaxParams()
+    msg.lv = params.maxLevel
+    msg.soul_chain_lv = params.maxHunLian
+    msg.soul_state = params.hunlianIsActive
+    ---@type card_cfg
+    local cfg = _G.ConfigManager.card_cfg[msg.sid]
+    params.maxStar = _G.Mathf.Max(params.maxStar, cfg.Star)
+    msg.star = cfg.Star > params.maxStar and cfg.Star or params.maxStar
+    msg.open_inborn = {}
+    if params.maxTF > 0 then
+        local index = 0
+        for i = 1, #cfg.talent do
+            for j = 1, #cfg.talent[i] do
+                index = index + 1
+                msg.open_inborn[index] = cfg.talent[i][j]
+                if index >= params.maxTF then
+                    break
+                end
+            end
+            if index >= params.maxTF then
+                break
+            end
+        end
+    end
+    msg.big_born_num = require("CardInfoManager"):GetInstance():GetTalentsNumByInborn(msg.open_inborn)
+
+    local tb = {}
+    if params.maxGrade > 0 then
+        for i = 1, #maxData.EquipBar do
+            if i ~= 3 then
+                ---@type prop.i_equipment
+                local data2 = {}
+                data2.sid = 201000000 + params.maxGrade + cfg.EquipmentType * 1000 + i * 100
+                data2.uid = 0
+                data2.streng = params.maxStreng
+                data2.exp = 0
+                data2.element = cfg.Elements
+                -- if maxData.EquipBar[i]:CheckEquipmentBoundSidIsCurCardSid() then
+                --     data2.bound = msg.sid
+                -- end
+                data2.reset_element = 0
+                _G.table.insert(tb, data2)
+            end
+        end
+    end
+    local decTb = {}
+    if params.isDec then
+        local tempDecTb = {}
+        for i, v in pairs(_G.ConfigManager.monster_dungeons_cfg) do
+            if v.min_level <= params.maxLevel and v.max_level >= params.maxLevel then
+                tempDecTb = v.decoration_pools[cfg.Professional]
+                break
+            end
+        end
+        if not _G.table.isEmptyOrNil(tempDecTb) then
+            for i = 1, #maxData.DecorationBar do
+                ---@type prop.i_equipment
+                local data2 = {}
+                data2.sid = tempDecTb[i]
+                data2.uid = 0
+                data2.level = params.maxDecStreng
+                data2.exp = 0
+                data2.resonance_sid = 0
+                data2.resonance = 0
+                data2.lock = 0
+                _G.table.insert(decTb, data2)
+            end
+        end
+    end
+    local artifactTb = {}
+    if params.maxArtifactOrder > 0 then
+        local artifact = {
+            sid = 255000000 + params.maxArtifactOrder * 100000 + cfg.Professional * 10000 + 100,
+            uid = 0,
+            num = 1,
+            level = params.maxArtifactLevel,
+            star = params.maxArtifactStar,
+            awaken = params.maxArtifactAwaken
+        }
+        _G.table.insert(artifactTb, artifact)
+    end
+    local lv = 0
+    local count = 0
+    for _, v in pairs(_G.PlayerTreeID) do
+        if v ~= _G.PlayerTreeID.none or v ~= _G.PlayerTreeID.mainTree then
+            lv = lv + require("PlayerTreeModel"):GetInstance():GetLv(v)
+            count = count + 1
+        end
+    end
+    lv = _G.Mathf.RoundToInt(lv / count)
+    msg.equipments = tb
+    msg.decoration = decTb
+    msg.artifact = artifactTb
+    ---@type HelpNpcCardData
+    local data = require "HelpNpcCardData".New()
+    data:Parse(msg)
+    data:OnInitMutuallyData(true)
+    data:SetBranchLv(lv)
+    return data
+end
+
+---获取出战npc
+function FriendHelpModel:CreateNpcCardDatas()
+    ---@type prop.i_card
+    local msg = {}
+    msg.sid = _G.ConfigManager.discrete_cfg[106416][1][1]
+    msg.uid = msg.sid
+
+    local params, maxData = self:GetMaxParams()
+    msg.lv = params.maxLevel
+    msg.soul_chain_lv = params.maxHunLian
+    msg.soul_state = params.hunlianIsActive
+    ---@type card_cfg
+    local cfg = _G.ConfigManager.card_cfg[msg.sid]
+    params.maxStar = _G.Mathf.Max(params.maxStar, cfg.Star)
+    msg.star = cfg.Star > params.maxStar and cfg.Star or params.maxStar
+    msg.open_inborn = {}
+    if params.maxTF > 0 then
+        local index = 0
+        for i = 1, #cfg.talent do
+            for j = 1, #cfg.talent[i] do
+                index = index + 1
+                msg.open_inborn[index] = cfg.talent[i][j]
+                if index >= params.maxTF then
+                    break
+                end
+            end
+            if index >= params.maxTF then
+                break
+            end
+        end
+    end
+    msg.big_born_num = require("CardInfoManager"):GetInstance():GetTalentsNumByInborn(msg.open_inborn)
+
+    local tb = {}
+    if params.maxGrade > 0 then
+        for i = 1, #maxData.EquipBar do
+            if i ~= 3 then
+                ---@type prop.i_equipment
+                local data2 = {}
+                data2.sid = 201000000 + params.maxGrade + cfg.EquipmentType * 1000 + i * 100
+                data2.uid = 0
+                data2.streng = params.maxStreng
+                data2.exp = 0
+                data2.element = cfg.Elements
+                -- if maxData.EquipBar[i]:CheckEquipmentBoundSidIsCurCardSid() then
+                --     data2.bound = msg.sid
+                -- end
+                data2.reset_element = 0
+                _G.table.insert(tb, data2)
+            end
+        end
+    end
+    local decTb = {}
+    if params.isDec then
+        local tempDecTb = {}
+        for i, v in pairs(_G.ConfigManager.monster_dungeons_cfg) do
+            if v.min_level <= params.maxLevel and v.max_level >= params.maxLevel then
+                tempDecTb = v.decoration_pools[cfg.Professional]
+                break
+            end
+        end
+        if not _G.table.isEmptyOrNil(tempDecTb) then
+            for i = 1, #maxData.DecorationBar do
+                ---@type prop.i_equipment
+                local data2 = {}
+                data2.sid = tempDecTb[i]
+                data2.uid = 0
+                data2.level = params.maxDecStreng
+                data2.exp = 0
+                data2.resonance_sid = 0
+                data2.resonance = 0
+                data2.lock = 0
+                _G.table.insert(decTb, data2)
+            end
+        end
+    end
+    local artifactTb = {}
+    if params.maxArtifactOrder > 0 then
+        local artifact = {
+            sid = 255000000 + params.maxArtifactOrder * 100000 + cfg.Professional * 10000 + 100,
+            uid = 0,
+            num = 1,
+            level = params.maxArtifactLevel,
+            star = params.maxArtifactStar,
+            awaken = params.maxArtifactAwaken
+        }
+        _G.table.insert(artifactTb, artifact)
+    end
+    local lv = 0
+    local count = 0
+    for _, v in pairs(_G.PlayerTreeID) do
+        if v ~= _G.PlayerTreeID.none or v ~= _G.PlayerTreeID.mainTree then
+            lv = lv + require("PlayerTreeModel"):GetInstance():GetLv(v)
+            count = count + 1
+        end
+    end
+    lv = _G.Mathf.RoundToInt(lv / count)
+    msg.equipments = tb
+    msg.decoration = decTb
+    msg.artifact = artifactTb
+    ---@type HelpNpcCardData
+    local data = require "HelpNpcCardData".New()
+    data:Parse(msg)
+    data:OnInitMutuallyData(true)
+    data:SetBranchLv(lv)
+    return data
+end
+
+---共鸣神石上最高等级
+function FriendHelpModel:GetMaxLevel()
+    local maxLevel
+    local lv = _G.ConfigManager.discrete_cfg[114503][1][1]
+    local model = require("CardResonanceModel"):GetInstance()
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.Stone) then
+        ---最高等级
+        maxLevel = _G.Mathf.Max(lv, model:GetAverageLevel())
+    else
+        ---共鸣神石功能未开启时候使用配置的等级
+        maxLevel = lv
+    end
+
+    return maxLevel
+end
+
+---获取卡牌参数
+function FriendHelpModel:GetMaxParams()
+    ---@type CardData[]
+    local datas = _G.StorageManager:GetInstance():GetDataByID(_G.StorageID.Card, _G.CardType.Normal)
+    datas = _G.table.toArray(datas)
+    _G.SortList(
+        datas,
+        function(data)
+            return data.power, data.star, data.Grade, data.uid
+        end
+    )
+    ---@type CardData[]
+    local chooseCards = {}
+    local count = #datas
+    if count > 5 then
+        count = 5
+    end
+    for i = 1, count do
+        chooseCards[i] = datas[i]
+    end
+    local param = {
+        maxLevel = 0,
+        maxStar = 0,
+        maxHunLian = 0,
+        maxGrade = 0,
+        maxStreng = 0,
+        maxTF = 0,
+        maxDecStreng = 0,
+        maxArtifactOrder = 0,
+        maxArtifactLevel = 0,
+        maxArtifactStar = 0,
+        maxArtifactAwaken = 0
+    }
+    param.maxLevel = self:GetMaxLevel()
+    param.hunlianIsActive = false
+    local table = _G.table
+    for _, v in pairs(chooseCards) do
+        -- if param.maxStar == 0 or param.maxStar < v:GetStar() then
+        --     param.maxStar = v:GetStar()
+        -- end
+        if v.soulLink_IsActivate == 1 then
+            param.hunlianIsActive = 1
+        end
+        if param.maxHunLian == 0 or param.maxHunLian < v.soulLink_lv then
+            param.maxHunLian = v.soulLink_lv
+        end
+        if not _G.table.isEmptyOrNil(v.ArtifactBar) then
+            if param.maxArtifactOrder <= v.ArtifactBar:GetOrder() then
+                if param.maxArtifactOrder == 0 or param.maxArtifactOrder < v.ArtifactBar:GetOrder() then
+                    param.maxArtifactOrder = v.ArtifactBar:GetOrder()
+                    param.maxArtifactAwaken = v.ArtifactBar:GetAwaken()
+                end
+                if param.maxArtifactLevel == 0 or param.maxArtifactLevel < v.ArtifactBar:GetLevel() then
+                    param.maxArtifactLevel = v.ArtifactBar:GetLevel()
+                end
+                if param.maxArtifactStar == 0 or param.maxArtifactStar < v.ArtifactBar:GetStar() then
+                    param.maxArtifactStar = v.ArtifactBar:GetStar()
+                end
+            end
+        end
+
+        for _, v2 in pairs(v.EquipBar) do
+            if not table.isEmptyOrNil(v2) then
+                if param.maxGrade < v2.Grade then
+                    param.maxGrade = v2.Grade
+                end
+                local v2str = v2.streng
+                if v2str > v2.cfg.strengthen_level then
+                    v2str = v2.cfg.strengthen_level
+                end
+                if param.maxStreng < v2str then
+                    param.maxStreng = v2str
+                end
+            end
+        end
+        for _, v2 in pairs(v.DecorationBar) do
+            if not table.isEmptyOrNil(v2) and v2.streng then
+                if param.maxDecStreng < v2.streng then
+                    param.maxDecStreng = v2.streng
+                end
+                param.isDec = true
+            end
+        end
+        if v.open_inborn and param.maxTF < #v.open_inborn then
+            param.maxTF = #v.open_inborn
+        end
+    end
+    param.maxStar = require("IllustrationModel"):GetInstance():GetAllCardMaxStar()
+    return param, chooseCards[1]
+end
+
+---获取借出卡牌
+---@return HelpSingleData[]
+function FriendHelpModel:GetLendDatas()
+    if not self.isOpen or not self:ChekcOperation() then
+        return {}
+    end
+    return self.infoData.lendCardDatas
+end
+
+---获取已经获取的友情点
+---@return boolean
+function FriendHelpModel:GetPoint()
+    if not self.isOpen or not self:ChekcOperation() then
+        return 0, self.infoData.maxPoint
+    end
+    return self.infoData.point, self.infoData.maxPoint
+end
+
+---检测是否借出
+---@param cardUid number 卡牌uid
+---@return boolean
+function FriendHelpModel:CheckIsLend(cardUid)
+    return self.infoData:CheckIsLend(cardUid)
+end
+
+---获取最大可布阵数
+function FriendHelpModel:GetMaxUseAssistNum()
+    return _G.ConfigManager.discrete_cfg[106404][1][1]
+end
+
+---获取最大使用次数
+function FriendHelpModel:GetMaxUseCount(id, isNpc)
+    if not self.infoData then
+        return 0
+    end
+    return self.infoData:GetMaxUseCount(id, isNpc)
+end
+
+---获取使用次数
+function FriendHelpModel:GetUseCount(id, isNpc)
+    if not self.infoData then
+        return 0
+    end
+    local type = 1
+    if isNpc then
+        type = 2
+    end
+    return self.infoData:GetUseCount(id, nil, type)
+end
+
+---增加使用次数
+---@param isClear boolean               @清理助战阵容
+---@param applyTempCount boolean        @应用临时次数至永久次数
+---@param fightArgs? fight.i_fight_arg[] @战报数据(如不传则取C#统计数据)
+---@return void
+function FriendHelpModel:AddUseCount(id, isClear, applyTempCount, fightArgs)
+    local isAssist, type = self:HasBorrowCard(fightArgs)
+    if isAssist then
+        if isClear then
+            require "EmbattleModel":GetInstance():ClearLastAssist()
+        end
+        self.infoData:AddUseCount(id, nil, type)
+    end
+    if applyTempCount then
+        self.infoData:ApplyTempCount()
+    end
+end
+
+---增加临时使用次数
+---@param fightArgs? fight.i_fight_arg[] @战报数据(如不传则取C#统计数据)
+---@return void
+function FriendHelpModel:AddTempCount(id, fightArgs)
+    local isAssist, type = self:HasBorrowCard(fightArgs)
+    if isAssist then
+        self.infoData:AddTempCount(id, nil, type)
+    end
+end
+
+---移除临时使用次数
+---@return void
+function FriendHelpModel:RemoveTempCount()
+    self.infoData:RemoveTempCount()
+end
+
+---应用临时使用次数至永久次数
+---@return void
+function FriendHelpModel:ApplyTempCount()
+    self.infoData:ApplyTempCount()
+end
+
+---是否存在助战NPC
+---@private
+---@param fightArgs? fight.i_fight_arg[] @战报数据(如不传则取C#统计数据)
+---@return boolean,number   是否存在助战, 借用类型
+function FriendHelpModel:HasBorrowCard(fightArgs)
+    local isAssist = false
+    local type = 1
+
+    local npcId = self.npcSid
+    if fightArgs and #fightArgs > 0 then
+        --从战报数据中判断是否存在助战角色
+        ---@param fightArg fight.i_fight_arg
+        for _, fightArg in pairs(fightArgs) do
+            for _, teamData in pairs(fightArg.attacker_team) do
+                for _, fightData in pairs(teamData.fights) do
+                    if self:CheckIsBorrowCard(fightData.uid) then
+                        isAssist = true
+                        break
+                    end
+                    if fightData.sid == npcId and fightData.uid == npcId * 10 then
+                        isAssist = true
+                        type = 2
+                        break
+                    end
+                end
+            end
+        end
+    else
+        --从C#拉取统计数据, 判断是否存在助战
+        local statistics = _G.BattleManager:GetInstance():GetStatistics()
+        for _, v in pairs(statistics.FighterInfo) do
+            for _, v2 in pairs(v.Attacker) do
+                if self:CheckIsBorrowCard(v2.Uid) then
+                    isAssist = true
+                    break
+                end
+                if v2.Sid == npcId and v2.Uid == npcId * 10 then
+                    isAssist = true
+                    type = 2
+                    break
+                end
+            end
+        end
+    end
+    return isAssist, type
+end
+
+---获取设置卡牌槽位
+function FriendHelpModel:GetBorrowIndex(uid)
+    if not self.isOpen then
+        return nil
+    end
+    return self.infoData.setCardUids[uid]
+end
+
+---检测是否为助战卡牌
+---@param cardUid number 卡牌uid
+function FriendHelpModel:CheckIsBorrowCard(cardUid)
+    if not self.isOpen then
+        return
+    end
+    return self.infoData.borrowUids[cardUid]
+end
+
+---显示红点
+function FriendHelpModel:ShowRedPoint()
+    if not self:ChekcOperation() then
+        return false
+    end
+    return self.isRedPoint
+end
+
+---获取剩余时间
+function FriendHelpModel:GetRTSStr()
+    return self:TimeToStr(self.endTime - _G.TimeUtil.GetServerUnixTime())
+end
+
+---时间转换
+---@param RTS number 剩余时间RTS
+function FriendHelpModel:TimeToStr(RTS)
+    local time = _G.TimeUtil.TranslateSecond(RTS)
+    if time.day >= 1 then
+        return _G.LangUtil.GetLangPackValue(90022100001, time.day, time.hour)
+    elseif time.hour >= 1 then
+        return _G.LangUtil.GetLangPackValue(90022100002, time.hour, time.min)
+    elseif time.min >= 1 then
+        return _G.LangUtil.GetLangPackValue(90000010394, time.min)
+    else
+        return _G.LangUtil.GetLangPackValue(90000010395)
+    end
+end
+
+---移除助战数据
+function FriendHelpModel:RemoveHelpDatas()
+    self.HelpDatas = nil
+end
+
+---刷新借入卡牌数据
+function FriendHelpModel:RefreshBorrowDatas()
+    self.infoData:RefreshBorrowDatas()
+end
+
+---获取申请数据
+function FriendHelpModel:GetApplyData()
+    if not self:ChekcOperation() then
+        return {}
+    end
+    return self.infoData.apply
+end
+
+---获取申请数量
+function FriendHelpModel:GetApplyCount()
+    return _G.table.count(self:GetApplyData()), self.infoData.maxApply
+end
+
+function FriendHelpModel:ReConnect(endcall)
+    self.isReconnect = true
+    self:InitData(endcall)
+end
+
+---开启npc助战
+---@param type boolean 助战提示仅播一次 在准备提示时传true标记播放
+---@param npcType number   @1.AFK冒险 2.死魂塔 3.死魂塔试炼
+function FriendHelpModel:OpenNpc(callback, type, npcType)
+    if not self.infoData then
+        return
+    end
+    if not self:CheckNpcConditions(npcType or 1, false) then
+        return
+    end
+    if type then
+        if self.infoData:CheckNpcHasOpen() then
+            return
+        end
+    else
+        if self.infoData:CheckNpcOpen() then
+            return
+        end
+    end
+    require "FriendsHelpNet":GetInstance():OpenNpc(
+        function(msg)
+            if msg.ack ~= 1 then
+                if callback then
+                    callback()
+                end
+                return
+            end
+            --助战提示仅播一次 在准备提示时传true标记播放
+            if type then
+                self.infoData.isOpenNpc = true
+            else
+                self.infoData.npcOpen = true
+            end
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---检测所有同类型卡牌是否被借出
+function FriendHelpModel:CheckIsUse(sid)
+    local datas = self:GetBorrowCardDatas()
+    for _, v in pairs(datas) do
+        if v.sid == sid then
+            return true
+        end
+    end
+    return false
+end
+
+--endregion
+
+---@private
+function FriendHelpModel:InitFunction()
+    if self.infoData then
+        ---刷新助战卡牌数据，首次初始化在聚灵法阵之前，无法获得聚灵法阵加成，因此在这里进行刷新
+        self:RefreshBorrowDatas()
+        if self.isOpen and not self.infoData.isAssist then
+            self:InitSetCard()
+        end
+    end
+end
+
+---获取阵容数据
+function FriendHelpModel:GetGarray(id)
+    return self.garrayList[id] and self.garrayList[id].sits or {0, 0, 0, 0, 0}
+end
+
+function FriendHelpModel:GetAssistType(uid)
+    local npc = self.npcSid
+    if uid == npc then
+        return _G.AssistType.Npc
+    end
+    return _G.AssistType.Friend
+end
+
+---获取是否自动通过申请
+function FriendHelpModel:GetAutoAgree()
+    if not self.infoData then
+        return false
+    end
+    return self.infoData.auto_agree
+end
+
+---设置自动通过申请
+function FriendHelpModel:SetAutoAgree(call)
+    if not self.infoData then
+        return false
+    end
+    require "FriendsHelpNet":GetInstance():ChangeAutoAgree(
+        function(msg)
+            if self.infoData then
+                self.infoData.auto_agree = not self.infoData.auto_agree
+            end
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---是否开启npc助战()
+---@private
+---@param type number   @1.AFK冒险 2.死魂塔 3.死魂塔试炼
+---@param checkFunctionOpen boolean 额外检查功能是否已开启
+function FriendHelpModel:CheckNpcConditions(type, checkFunctionOpen)
+    if checkFunctionOpen and (not self.infoData or not self.infoData:CheckNpcOpen()) then
+        return false
+    end
+    local params =
+        type == 1 and self.npcConditionsOfAfk or type == 2 and self.npcConditionsOfDeadsoulTower1 or
+        type == 3 and self.npcConditionsOfDeadsoulTower2
+    if not params then
+        return false
+    end
+
+    for _, condition in pairs(params) do
+        if not _G.GlobalConditionManager.CheckCondition(condition[1], condition[2]) then
+            return false
+        end
+    end
+    return true
+end
+
+return FriendHelpModel

@@ -1,0 +1,1629 @@
+--------------------------------------------------------------------------
+-- F:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.SystemSetting.Model.SociatyModel	(修改路径必须修正此项!)
+-- Created by szs
+-- DateTime: 2021/02/24
+-- Description 公会数据管理
+-----------------------------------------------------------------------
+local SociatyNet = require("SociatyNet")
+local ELocationEnum = require("MemberEnum").ELocationEnum
+
+---@class SociatyModel : GameDataModelBase    公会
+---@field SociatySelf SociatyData 自己的公会数据
+---@field SociatyRoleSelf guild.i_role_guild 公会个人数据
+---@field FameData guild.s2c_guild_statue 名人堂数据
+---@field super GameDataModelBase 游戏数据基类
+local SociatyModel = _G.BaseClass("SociatyModel", _G.GameDataModelBase)
+
+---@return SociatyModel SociatyModel
+function SociatyModel:GetInstance()
+    return self.super.GetInstance(self)
+end
+
+---公会数据类构造函数
+function SociatyModel:__init()
+    self.SociatySelf = nil
+    self.CardChat = true
+    self.SociatyRoleSelf = {
+        ["uid"] = 0,
+        ["exit_time"] = 0,
+        ["requests"] = {},
+        ["position"] = 0,
+        ["liveness"] = 0,
+        ["week_liveness"] = 0,
+        ["exit_num"] = 0,
+        ["update_name_time"] = 0,
+        ["name_award"]={},
+        ["enter_time"]=0
+    }
+    self.maxLike = _G.ConfigManager.discrete_cfg[102703][1][1]
+    self.ImpeachUidList = {}
+    self.ImpeachNum = 0
+
+    _G.Events:GetInstance():AddListener(_G.eSociatyEvent.RefreshDonate, self.OnUpdateDonate, self)
+    _G.Events:GetInstance():AddListener(_G.eSociatyEvent.RefreshBuild, self.OnRefreshBuild, self)
+end
+
+function SociatyModel:Dispose()
+    if self.YHBattleCdTimer then
+        self.YHBattleCdTimer:Stop()
+        self.YHBattleCdTimer = nil
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eSociatyEvent.RefreshDonate, self.OnUpdateDonate, self)
+    _G.Events:GetInstance():RemoveListener(_G.eSociatyEvent.RefreshBuild, self.OnRefreshBuild, self)
+end
+
+---初始化自己的公会信息
+---@param msg guild.i_guild 公会数据
+function SociatyModel:ParseSociatySelf(msg)
+    if nil ~= msg then
+        local SociatyData = require("SociatyData")
+        self.SociatySelf = SociatyData.New()
+        self.SociatySelf:Parse(msg)
+        self:InitSociatyOtherModel()
+        self.super.ParseData(self)
+        require("SociatyManager"):GetInstance():OnP2CEnterGuildNew()
+    else
+        self.super.ParseData(self)
+
+        if _G.AppSetting.DEBUG then
+            _G.Log("现在还没有公会")
+        end
+    end
+end
+
+---初始化公会其他数据
+function SociatyModel:InitSociatyOtherModel()
+    if self.SociatyRoleSelf.uid <= 0 then
+        return
+    end
+    self:InitRequest()
+    self:InitYHModel()
+    self:InitDonateModel()
+    self:InitBountyModel()
+    self:InitGuildStatue()
+    self:InitProfound()
+    self:InitSociatyBattleModel()
+    self:InitSociatyMobaModel()
+    self:InitSociatyBattleLeagueModel()
+    self:InitSociatyMazeModel()
+    self:InitSociatyShopModel()
+end
+
+---初始化公会请求
+function SociatyModel:InitRequest()
+    if
+        self.SociatyRoleSelf.position == require "MemberEnum".ELocationEnum.Chairman or
+        self.SociatyRoleSelf.position == require "MemberEnum".ELocationEnum.CoChairman
+    then
+        require("SociatyNet"):GetInstance():GetRequests(
+            function(data)
+                if data.ack ~= 1 then
+                    return
+                end
+                self.SociatySelf.GetMemberModule().Requests = data.requests or {}
+                require "RedPointManager":GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.JoinGuildButton.id, 0)
+            end
+        )
+    end
+end
+
+---初始化YH数据
+function SociatyModel:InitYHModel(callback)
+    if _G.FunctionManager:GetInstance():CheckFunctionIsUnlock(_G.FunctionID.ScoaityYH) then
+        require "SociatyNet":GetInstance():GetFeastInfo(
+            function(msg)
+                if msg.ack ~= 1 then
+                    return
+                end
+                self.feastData = msg.feast_info
+                _G.Events:GetInstance():Broadcast(_G.FunctionOpenDailyCheckEvent.GuildTrain)
+                --登录报错, 容错处理
+                if not self.feastData.last_rank then
+                    self.feastData.last_rank = 0
+                end
+                self.SociatyYHNum = _G.ConfigManager.discrete_cfg[102801][1][1]
+                local data = require "PrivilegeManager":GetInstance():GetPrivilegeData({ _G.PrivilegeType.VIP
+                    .GongHui_Boss })
+                if not _G.table.isEmptyOrNil(data) then
+                    self.SociatyYHNum = self.SociatyYHNum + data[1]
+                end
+                self.SociatyYHNum = self.SociatyYHNum - msg.feast_info.challenge_times
+                self:CreateUnopenedBox()
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.GuildchallengeButton.id
+                )
+                require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                    _G.ConfigManager.redpoint_cfg.SociatyTrialRankAward.id
+                )
+                self:SetYHBattleCdTimer()
+                if self:CheckBattleTime(false) then
+                    if callback then
+                        callback(msg, true)
+                    end
+                else
+                    if _G.AppSetting.DEBUG then
+                        _G.Log("公会试炼结算中")
+                    end
+                    if callback then
+                        callback(msg, false)
+                    end
+                end
+            end
+        )
+    end
+end
+
+---获取今日公会试炼已挑战次数
+function SociatyModel:GetChallenge_times()
+    if self.feastData then 
+        return self.feastData.challenge_times or 0
+    end 
+    return 0
+end
+
+---检测是否能战斗（有公会试炼boss结算期）
+function SociatyModel:CheckBattleTime(isPopTip)
+    if isPopTip == nil then
+        isPopTip = true
+    end
+    if _G.TimeUtil.GetSecondsOfDay() < _G.ConfigManager.discrete_cfg[124401][1][1] * 3600 then
+        return true
+    end
+    if isPopTip then
+        _G.PopWindowManager:GetInstance():ShowAllTips(827)
+    end
+    return false
+end
+
+---
+---@protected
+function SociatyModel:SetYHBattleCdTimer()
+    if self.YHBattleCdTimer == nil then
+        local curTime = _G.TimeUtil.GetSecondsOfDay()
+        local cdTime = _G.ConfigManager.discrete_cfg[124401][1][1] * 3600
+        if curTime < cdTime then
+            local time = cdTime - curTime
+            self.YHBattleCdTimer = _G.TimerManager:GetInstance():GetTimer(time, self.YHBattleCdTimerFunc, self, true,
+                false, true)
+            self.YHBattleCdTimer:Start()
+        end
+    end
+end
+
+function SociatyModel:YHBattleCdTimerFunc()
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.GuildchallengeButton.id
+    )
+    if self.YHBattleCdTimer then
+        self.YHBattleCdTimer:Stop()
+        self.YHBattleCdTimer = nil
+    end
+end
+
+---检测公会试炼伤害排行奖励红点
+function SociatyModel:CheckSociatyDamageRankAward()
+    if self.feastData then
+        local awardList = {}
+        local ids = _G.ConfigManager.discrete_cfg[124501][1]
+        local cfg = _G.ConfigManager.system_rank_cfg
+        local awardRank = 0
+        for i, v in ipairs(ids) do
+            local data = cfg[v]
+            _G.table.insert(awardList, data)
+            if awardRank < data.max_rank then
+                awardRank = data.max_rank
+            end
+        end
+        if self.feastData.last_rank > 0 and self.feastData.last_rank <= awardRank and self.feastData.rank_award == false then
+            return true
+        end
+    end
+    return false
+end
+
+---获取未领取（可领取）宝箱
+function SociatyModel:CreateUnopenedBox()
+    self.unopenedBox = {}
+    if _G.table.isEmptyOrNil(self.feastData.get_foods) then
+        self.feastData.get_foods = {}
+    end
+    local boxCondition = {}
+    for _, v in pairs(_G.ConfigManager.guild_level_cfg[self.SociatySelf.Level].feast) do
+        _G.table.insert(boxCondition, _G.ConfigManager.guild_feast_cfg[v])
+    end
+    local getNum = #self.feastData.get_foods
+    for i = 1, #boxCondition do
+        local need = boxCondition[i].materials[2]
+        if self.feastData.fight_times >= need then
+            if getNum < i then
+                _G.table.insert(self.unopenedBox, i)
+            end
+        end
+    end
+end
+
+---检查是否有宴会宝箱未开
+function SociatyModel:CheckHaveBox()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return false
+    end
+    if self.unopenedBox then
+        return #self.unopenedBox > 0
+    end
+    return false
+end
+
+---移除开启奖励的宴会宝箱
+function SociatyModel:RemoveHadBox(index)
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return
+    end
+    for i = 1, #self.unopenedBox do
+        if self.unopenedBox[i] == index then
+            table.remove(self.unopenedBox, i)
+            break
+        end
+    end
+end
+
+---初始化捐献数据
+function SociatyModel:InitDonateModel(call)
+    require "SociatyNet":GetInstance():GetDonateInfo(
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            if not self.donateData then
+                self.donateData = require "SociatyDonateData".New()
+            end
+            self.donateData:ParseData(msg)
+            _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefreshDonate)
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+                _G.ConfigManager.redpoint_cfg.GuildDonation.id
+            )
+            if call then
+                call()
+            end
+        end
+    )
+end
+
+---初始化团队讨伐数据
+function SociatyModel:InitBountyModel(call)
+    require "BountyGroupModel":GetInstance():Info(call)
+end
+
+function SociatyModel:InitProfound()
+    require("SociatyProfoundModel"):GetInstance():GetInfo(true)
+end
+
+function SociatyModel:GetRequests()
+end
+
+---退出公会就把个人所在公会数据清理
+---@param isKick boolean 是否踢出
+function SociatyModel:ClearSociatySelf(isKick)
+    self.SociatySelf:Dispose()
+    self.SociatySelf = nil
+
+    if not self.SociatyRoleSelf.exit_num then
+        self.SociatyRoleSelf.exit_num = 0
+    end
+    self.SociatyRoleSelf = {
+        ["uid"] = 0,
+        ["exit_time"] = TimeUtil.GetServerUnixTime(),
+        ["requests"] = {},
+        ["position"] = 0,
+        ["liveness"] = 0,
+        ["week_liveness"] = 0,
+        ["exit_num"] = self.SociatyRoleSelf.exit_num + 1,
+        ["update_name_time"]=self.SociatyRoleSelf.update_name_time or 0,
+        ["name_award"] =self.SociatyRoleSelf.name_award or {},
+        ["enter_time"] =self.SociatyRoleSelf.enter_time or 0
+    }
+    ---ZHJH-7897 首次退出（解散）无加入CD
+    local isFirst = self.SociatyRoleSelf.exit_num == 1 and not isKick
+    ---如果被踢了就不存在CD
+    if isKick or isFirst then
+        self.SociatyRoleSelf.exit_time = 0
+    end
+end
+
+---拿数据
+function SociatyModel:GetDataFormServer()
+    self:GetSociatyInfo()
+end
+
+---是否在入会CD中
+function SociatyModel:IsCding()
+    ---没有时间可以看成无CD
+    if self.SociatyRoleSelf.exit_time <= 0 then
+        return false
+    end
+    local severTime = TimeUtil.GetServerUnixTime()
+    local cdTime = _G.ConfigManager.discrete_cfg[101604][1][1]
+    ---离线时间+冷却时间
+    local cdtime = self.SociatyRoleSelf.exit_time + cdTime - severTime
+    if cdtime > 0 then
+        return true, TimeUtil.TimeToStringHMS(cdtime)
+    end
+    return false
+end
+
+---拿宴会对应文本库
+function SociatyModel:GetYHTextCfg(week)
+    if week > 5 then
+        return _G.ConfigManager.discrete_cfg[102607]
+    else
+        return _G.ConfigManager.discrete_cfg[102606]
+    end
+end
+
+---拿公会数据
+function SociatyModel:GetSociatyInfo()
+    if require("SociatyManager"):GetInstance():CheckFunctionIsUnlock(FunctionID.Sociaty) then
+        SociatyNet:GetInstance():GetGuild(_G.handler(self, self.ParseData))
+    else
+        self:ParseData()
+
+        if _G.AppSetting.DEBUG then
+            _G.Log("<color=#ff0000>不满足公会开放等级，拿到不公会数据</color>")
+        end
+    end
+end
+
+---数据回调
+---@param msg guild.s2c_get_guild 公会相关数据
+function SociatyModel:ParseData(msg)
+    if msg then
+        self.SociatyRoleSelf = msg.role_guild
+        self.SociatyRoleSelf.requests = msg.role_guild.requests or {}
+        self:InitLike()
+        self:ParseSociatySelf(msg.guild)
+        if self.CardChat then
+            self.CardChat = false
+            require "ChatManager":GetInstance():GetSociatyChat()
+        end
+        self.FameData = nil
+    else
+        self.super.ParseData(self)
+    end
+    self:UpdateBuildAwardLevels()
+    --刷新红点信息
+    require("RedPointManager"):GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GuildGlory.id)
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefreshSociatyInfo)
+end
+
+---初始化雕像数据
+function SociatyModel:InitLike()
+    self.likeList = {}
+    self.likeCount = 5
+    if self.SociatyRoleSelf.statue_points then
+        for _, v in pairs(self.SociatyRoleSelf.statue_points) do
+            self.likeList[v] = true
+        end
+    end
+    self.likeCount = self.maxLike - _G.table.count(self.likeList)
+end
+
+---公会boss挑战
+---@param sid number 公会Boss sid
+function SociatyModel:OnChallenge(sid, isTest)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SociatyMainView.Name)
+    _G.UIManager:GetInstance():HideWindow(_G.ConfigManager.ui_cfg.SociatyWitchTrialsView.Name)
+    self.curBossCfg = _G.ConfigManager.guild_boss_cfg[sid]
+    self.isTest = isTest
+
+    _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleOpened, self)
+    require("EmbattleController"):GetInstance():OpenEmbattle(
+        _G.EmbattleType.sociatyBoss,
+        _G.EmbattleSaveType.server,
+        false,
+        _G.EmbattleControllerItemType.sociatyBoss,
+        _G.handler(self, self.ExitEmbattle),
+        _G.handler(self, self.EnterFight),
+        self.curBossCfg.monster_group
+    )
+end
+
+function SociatyModel:OnEmbattleOpened(name)
+    if name ~= _G.ConfigManager.ui_cfg.EmbattleView.Name then
+        return
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OnEmbattleOpened, self)
+    ---@type EmbattleNewView
+    local embattleView = _G.UIManager:GetInstance():GetWindowCtrl(name)
+    if embattleView then
+        embattleView:SetVsDescription(_G.PlayerModel:GetInstance():GetName(), _G.GetLangPackValue(90021800374))
+    end
+end
+
+---退出布阵
+function SociatyModel:ExitEmbattle()
+    _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SociatyMainView.Name)
+    if _G.UIManager:GetInstance():IsExitWindow(_G.ConfigManager.ui_cfg.SociatyWitchTrialsView.Name) then
+        _G.UIManager:GetInstance():ShowWindow(_G.ConfigManager.ui_cfg.SociatyWitchTrialsView.Name)
+    else
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyWitchTrialsView.Name)
+    end
+end
+
+---进入战斗
+function SociatyModel:EnterFight()
+    local leftName, rightName = _G.PlayerModel:GetInstance():GetName(), _G.GetLangPackValue(90021800374)
+    _G.BattleManager:GetInstance():EnterFight(
+        _G.BattleControllerType.SociatyBoss,
+        self.curBossCfg.id,
+        false,
+        leftName,
+        rightName,
+        self.isTest
+    )
+end
+
+---进入回放战斗
+function SociatyModel:ReplayReport(log_id)
+    _G.BattleManager:GetInstance():EnterFight(_G.BattleControllerType.SociatyBoss, log_id, true)
+end
+
+function SociatyModel:ReturnPanel()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.SociatyWitchTrialsView.Name, 1)
+end
+
+function SociatyModel:ReEnterFight()
+    self:OnChallenge(self.curBossCfg.id)
+end
+
+function SociatyModel:UpdateSociatyYHNum(num)
+    self.SociatyYHNum = num
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(
+        _G.ConfigManager.redpoint_cfg.GuildchallengeButton.id
+    )
+end
+
+function SociatyModel:CheckDonateRedPoint()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return false
+    end
+
+    if not self.donateData then
+        return false
+    end
+
+    if not self.donateData.isDonate then
+        for _, v in pairs(_G.ConfigManager.guild_donate_cfg) do
+            --只检测魂币捐献
+            if
+                v.consume[1] == _G.ResPropID.Coin and
+                _G.StorageManager:GetInstance():CheckItem(v.consume[1], v.consume[2]) and
+                not self.donateData:CheckIsDonate(v.id)
+            then
+                return true
+            end
+        end
+        ---@type guild_level_cfg
+        local guildCfg = self.SociatySelf.LevelCfg
+        ---@type guild_donate_goal_cfg
+        local cfg
+        for _, v in pairs(guildCfg.donate_goal) do
+            cfg = _G.ConfigManager.guild_donate_goal_cfg[v]
+            if cfg.point_donate <= self.donateData.donate and not self.donateData:CheckIsGet(v % 100) then
+                return true
+            end
+        end
+    else
+        ---@type guild_level_cfg
+        local guildCfg = self.SociatySelf.LevelCfg
+        ---@type guild_donate_goal_cfg
+        local cfg
+        for _, v in pairs(guildCfg.donate_goal) do
+            cfg = _G.ConfigManager.guild_donate_goal_cfg[v]
+            if cfg.point_donate <= self.donateData.donate and not self.donateData:CheckIsGet(v % 100) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---公会雕像点赞玩家
+---@param uid number 玩家uid
+function SociatyModel:Like(uid, call)
+    if self.likeList[uid] then
+        _G.PopWindowManager:GetInstance():ShowAllTips(740101)
+        return
+    end
+    if self.likeCount <= 0 then
+        _G.PopWindowManager:GetInstance():ShowAllTips(740102)
+        return
+    end
+    require "SociatyNet":GetInstance():Like(
+        { uid = uid },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            self.likeCount = self.likeCount - 1
+            self.likeList[uid] = true
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            if uid == _G.PlayerModel:GetInstance():GetPlayerUid() then
+                _G.PlayerModel:GetInstance():AddPoint(1)
+            end
+            if call then
+                call(msg)
+            end
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GuildStatue.id)
+        end
+    )
+end
+
+function SociatyModel:OnSixClockUpdate(endcall)
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        if endcall then
+            endcall()
+        end
+        return
+    end
+    self:InitYHModel()
+    self:InitDonateModel()
+    self:InitGuildStatue()
+    self:InitSevenDayLiveRank()
+    self.LeagueModelCor = _G.DelayDo(5, function()
+        self:InitSociatyBattleLeagueModel()
+    end)
+
+    self.likeList = {}
+    self.likeCount = self.maxLike
+    _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefreshLike)
+    if endcall then
+        endcall()
+    end
+end
+
+function SociatyModel:Dispose()
+    if self.LeagueModelCor then
+        _G.coroutine.stopwaiting(self.LeagueModelCor)
+        self.LeagueModelCor = nil
+    end
+    SociatyModel = nil
+end
+
+function SociatyModel:ReConnect(endcall)
+    self:InitData(endcall)
+end
+
+---初始化公会活跃度排名数据
+function SociatyModel:InitSevenDayLiveRank()
+    if require "SociatyManager":GetInstance():CheckFunctionIsUnlock(FunctionID.Sociaty) then
+        require "SociatyNet":GetInstance():GetGuild(
+            function(msg)
+                if msg then
+                    local SociatyData = require("SociatyData")
+                    self.SociatySelf = SociatyData.New()
+                    self.SociatySelf:Parse(msg.guild)
+                end
+                _G.Events:GetInstance():Broadcast(_G.eSociatyEvent.RefreshSevenDayLiveRank)
+            end
+        )
+    end
+end
+
+---初始化雕像数据
+function SociatyModel:InitGuildStatue()
+    if require "SociatyManager".CheckGuideIsLock() then
+        require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GuildStatue.id)
+        return
+    end
+    require "SociatyNet":GetInstance():GetGuildRank(_G.handler(self, self.InitGuildStatueCall))
+end
+
+---初始化雕像回调
+function SociatyModel:InitGuildStatueCall(msg)
+    if msg.ack ~= 1 then
+        return
+    end
+    self.roles = msg.roles
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GuildStatue.id)
+end
+
+---检测是否点在
+function SociatyModel:CheckIsLikeWithIndex(index)
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return
+    end
+    if require "SociatyManager".CheckGuideIsLock() or _G.table.isEmptyOrNil(self.roles) then
+        return false
+    end
+    if require "SociatyManager":GetInstance():GetLikeNum() <= 0 then
+        return
+    end
+    local role = self.roles[index]
+    if role then
+        return not self.likeList[role.uid]
+    end
+    return false
+end
+
+function SociatyModel:InitSociatyBattleModel()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return
+    end
+    require "SociatyBattleModel":GetInstance():InitData()
+end
+
+function SociatyModel:InitSociatyMobaModel()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return
+    end
+    require "SociatyMobaModel":GetInstance():InitData()
+end
+
+---公会战联赛在公会初始化时拉取数据
+function SociatyModel:InitSociatyBattleLeagueModel()
+    require "SociatyBattleLeagueModel":GetInstance():InitEggInfo(true)
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return
+    end
+    require "SociatyBattleLeagueModel":GetInstance():InitData()
+end
+
+---暗影迷宫拉取数据
+function SociatyModel:InitSociatyMazeModel()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return
+    end
+    require "SociatyMazeModel":GetInstance():InitData()
+end
+
+---公会商店拉取数据
+function SociatyModel:InitSociatyShopModel()
+    if not require "SociatyManager":GetInstance():HasSociaty() then
+        return
+    end
+    require "SociatyShopModel":GetInstance():InitData()
+end
+
+---活动目标活动剩余次数
+function SociatyModel:GetTargetActivityTimes(type)
+    if type == _G.ScoaityActivityType.WitchTrail then
+        return self.SociatyYHNum
+    elseif type == _G.ScoaityActivityType.SociatyBattle then
+        return require "SociatyBattleManager":GetInstance():GetChallengeNum()
+    elseif type == _G.ScoaityActivityType.SociatyMobaBattle then
+        --冥界纷争次数
+    elseif type == _G.ScoaityActivityType.SociatyBattleLeague then
+        return require "SociatyBattleLeagueManager":GetInstance():GetChallengeNum()
+    end
+end
+
+---获取试炼次数
+function SociatyModel:GetTrailTimes(type)
+    if type == _G.ScoaityTrialType.WitchTrail then
+        return self.SociatyYHNum
+    end
+end
+
+---获取公会操作日志
+---@param type number   @1公会成员日志, 2建筑日志
+function SociatyModel:GetLog(type, callback)
+    require("SociatyNet"):GetInstance():ShowLog({ type = type }, callback)
+end
+
+function SociatyModel:AddSevenDayLive(num)
+    self.SociatySelf.SevenDayLive = self.SociatySelf.SevenDayLive + num
+end
+
+---获取公会试炼战报回放
+---@param uid number
+---@param callback fun(msg:guild.s2c_guild_boss_report):void
+function SociatyModel:GetWitchTrialsPlayback(uid, callback)
+    SociatyNet:GetInstance():GetWitchTrialsPlayback({ role_uid = uid }, callback)
+end
+
+--region ------------公会工资/捐献福利---------------------
+
+---是否已领取工资福利
+---@return SociatyMemberBase
+function SociatyModel:IsGetReward()
+    if not self.SociatyRoleSelf then
+        return true
+    end
+    return self.SociatyRoleSelf.wages == 1
+end
+
+---领取工资福利
+---@param callback fun():void
+---@return void
+function SociatyModel:GetReward(callback)
+    --TODO: 实现领取工资接口
+    SociatyNet:GetInstance():GetReward(_G._G.handlerbind(self, self.OnGetRewardCallback, callback))
+end
+
+---领取工资福利回调处理
+function SociatyModel:OnGetRewardCallback(msg, callback)
+    if not msg or msg.ack ~= 1 then
+        return
+    end
+    if self.SociatyRoleSelf then
+        self.SociatyRoleSelf.wages = 1
+    end
+    if callback then
+        callback()
+    end
+
+    --获取奖励
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    _G.UIUtils.ShowCommonAward(msg)
+end
+
+---公会捐献
+---@param callback fun(msg:any):void
+---@return void
+function SociatyModel:Donate(index, callback)
+    require "SociatyNet":GetInstance():Donate(
+        { d_id = index },
+        _G.handlerbind(self, self.OnDonateCallback, index, callback)
+    )
+end
+
+---公会捐献回调
+---@param index number
+---@param callback fun(msg:any):void
+function SociatyModel:OnDonateCallback(msg, index, callback)
+    if msg.ack ~= 1 then
+        if callback then
+            callback(nil)
+        end
+        return
+    end
+    local cfg = _G.ConfigManager.guild_donate_cfg[index]
+    --获取奖励/消费物品
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    _G.StorageManager:GetInstance():ConsumeItem(cfg.consume[1], nil, cfg.consume[2])
+
+    ---获得建筑币
+    self:ReceiveBuildCoin(msg)
+
+    self:AutoUseBuildCoin()
+
+    if callback then
+        callback(msg)
+    end
+
+    --更新红点
+    require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GuildBuild.id)
+end
+
+---处理建筑币奖励
+function SociatyModel:ReceiveBuildCoin(msg)
+    if msg.award then
+        local buildCoinId = self:GetBuildCoinCfg()
+        for _, d in ipairs(msg.award.item) do
+            local id, change, total = table.unpack(d.type)
+            if id == buildCoinId then
+                self:SetBuildCoin(total, change)
+                break
+            end
+        end
+    end
+end
+
+--- 自动使用建筑币建设公会大厅
+function SociatyModel:AutoUseBuildCoin()
+    -- 根据大厅最高等级所需经验，计算能够使用的建筑币
+    local _, _, maxNeedExp = self:GetBuildExp(1)
+    local coinId, coinExp = self:GetBuildCoinCfg()
+    local maxNum, ownNum, curNum
+    if coinId > 0 and coinExp > 0 then
+        maxNum = math.ceil(maxNeedExp / coinExp)
+        ownNum = _G.StorageManager:GetInstance():GetOtherItemCountBySid(coinId)
+    else
+        maxNum = 999999
+        ownNum = 0
+    end
+    curNum = ownNum
+    if curNum > ownNum then
+        curNum = ownNum
+    elseif curNum < 0 then
+        curNum = 0
+    end
+    if curNum > maxNum then
+        curNum = maxNum
+    end
+
+    if curNum <= 0 then
+        return
+    end
+    local lastLevel = self:GetBuildLevel(1)
+    self:BuildUp(
+        1,
+        curNum,
+        function()
+            self:SetDefaultBuildState()
+
+            --显示tip
+            local buildName = _G.GetLangPackValue(_G.ConfigManager.guild_unit_cfg[1].name)
+            _G.PopWindowManager:GetInstance():ShowAllTips(250145, nil, nil, nil, nil, nil, buildName)
+
+            --更新建筑页面
+            ---@type SociatyBuildView
+            local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.SociatyBuildView.Name)
+            if view then
+                view:UpdateView()
+                local curLevel = self:GetBuildLevel(1)
+                if curLevel > lastLevel then
+                    view:ShowUpgradeFlashEffect()
+                end
+                view:ShowUpgradeUseEffect()
+            end
+        end
+    )
+end
+
+---公会捐献推送监听
+function SociatyModel:OnUpdateDonate(data)
+    if data and self.SociatySelf then
+        self.SociatySelf.BuildCoin = data.day_build_coin
+    end
+end
+
+---公会建筑状态监听
+---@param data guild.i_guild_build[]
+function SociatyModel:OnRefreshBuild(data)
+    if data and self.SociatySelf then
+        for _, build in pairs(data) do
+            self.SociatySelf:UpdateBuildState(build.sid, build)
+        end
+    end
+end
+
+--endregion
+
+--region ------------公会职位相关---------------------
+
+---获取会长信息
+---@return SociatyMemberBase
+function SociatyModel:GetChairman()
+    if not self.SociatySelf or not self.SociatySelf.SociatyMemberModule then
+        return nil
+    end
+    return self.SociatySelf.SociatyMemberModule:GetChairman()
+end
+
+---获取公会内自身信息
+---@return SociatyMemberBase
+function SociatyModel:GetSelfMember()
+    if not self.SociatySelf or not self.SociatySelf.SociatyMemberModule then
+        return nil
+    end
+    return self.SociatySelf.SociatyMemberModule:GetSelfMember()
+end
+
+---自身是否是会长
+---@return SociatyMemberBase
+function SociatyModel:CheckSelfIsChairman()
+    if not self.SociatySelf or not self.SociatySelf.SociatyMemberModule then
+        return false
+    end
+    return self.SociatySelf.SociatyMemberModule:GetSelfMember().Location == ELocationEnum.Chairman
+end
+
+---获取职位翻译表
+---@return number
+function SociatyModel:GetLocationLanguage(location)
+    if location == ELocationEnum.Chairman then
+        return 90021800027
+    elseif location == ELocationEnum.CoChairman then
+        return 90021800028
+    elseif location == ELocationEnum.Elder then
+        return 90021800375
+    else
+        return 90021800029
+    end
+end
+
+---获取指定职位的成员
+---@param position number 职位ID
+---@return SociatyMemberBase[]
+function SociatyModel:GetMembersByPosition(position)
+    if not self.SociatySelf or not self.SociatySelf.SociatyMemberModule then
+        return nil
+    end
+    local memberModule = self.SociatySelf.SociatyMemberModule
+
+    ---@type SociatyMemberBase[]
+    local results = {}
+    for i = 1, memberModule:GetCurMemberCount() do
+        local memeber = memberModule:GetMemberByIndex(i)
+        if memeber.Location == position then
+            table.insert(results, memeber)
+        end
+    end
+    return results
+end
+
+---获取指定UID的成员
+---@param uid number 成员UID
+---@return SociatyMemberBase
+function SociatyModel:GetMemberByUid(uid)
+    if not self.SociatySelf or not self.SociatySelf.SociatyMemberModule then
+        return nil
+    end
+    return self.SociatySelf.SociatyMemberModule:GetMember(uid)
+end
+
+---获取名人堂成员(战力值最高的n位玩家)
+---@param callback fun(data:role.i_role[]):void 回调信息
+function SociatyModel:GetFameMembers(callback)
+    if self.FameData then
+        if callback then
+            callback(self.FameData.roles)
+        end
+        return self.FameData
+    end
+    require("SociatyNet"):GetInstance():GetGuildRank(
+        function(msg)
+            if msg.ack ~= 1 then
+                msg = nil
+            end
+            self.FameData = msg
+            if callback then
+                callback(msg and msg.roles or nil)
+            end
+        end
+    )
+end
+
+---是否为名人堂成员(战力值最高的n位玩家), 依赖于GetFameMembers接口
+---@param data SociatyMemberBase 目标成员
+---@return boolean
+function SociatyModel:IsFameMember(data)
+    if not self.FameData or not self.FameData.roles then
+        return false
+    end
+    if data.Location ~= ELocationEnum.Member then
+        --有职位的玩家, 不计算入名人堂
+        return false
+    end
+    local uid = data.Uid
+    for _, v in pairs(self.FameData.roles) do
+        if uid == v.uid then
+            return true
+        end
+    end
+    return false
+end
+
+---获取名人堂人数
+---@return number
+function SociatyModel:GetFameCount()
+    local fameCfg = _G.ConfigManager.discrete_cfg[102705]
+    return fameCfg and fameCfg[1][1] or 0
+end
+
+---获取公会最高等级特殊职位数量
+---@param number location 职位
+---@return number 职位数量
+function SociatyModel:GetMaxLocationNum(location)
+    local cfg = _G.ConfigManager.guild_level_cfg
+    local numT = cfg[#cfg].num_position
+    for i = 1, #numT do
+        if numT[i][1] == location then
+            return numT[i][2]
+        end
+    end
+    return 0
+end
+
+---获取解锁某职位某数量对应的公会等级
+---@param number location 职位
+---@param number num 职位数量
+---@return number 公会等级
+function SociatyModel:GetUnlockLocationNumLv(location, num)
+    local cfg = _G.ConfigManager.guild_level_cfg
+    for i = 1, #cfg do
+        for j = 1, #cfg[i].num_position do
+            if cfg[i].num_position[j][1] == location and cfg[i].num_position[j][2] >= num then
+                return i
+            end
+        end
+    end
+    return 1
+end
+
+--endregion
+
+--region ------------公会建筑接口---------------------
+
+---获取公会建筑id列表
+---@return number[]
+function SociatyModel:GetBuildIds()
+    if not self.buildIds then
+        self.buildIds = { 1, 2, 3, 4, 5 }
+    end
+    return self.buildIds
+end
+
+function SociatyModel:GetBuildLevelCfg()
+    local cfg = _G.ConfigManager.guild_unit_cfg[1].conditions
+    self.buildLevelCfg = { [1] = { 1, 1, 1, 1, 1 } }
+    for k, v1 in pairs(cfg) do
+        if v1[1] ~= 0 then
+            if not self.buildLevelCfg[k] then
+                self.buildLevelCfg[k] = {}
+            end
+            for i = 2, 5 do
+                self.buildLevelCfg[k][i] = self.buildLevelCfg[k - 1][i]
+            end
+            for i = 1, #v1, 2 do
+                self.buildLevelCfg[k][v1[i]] = v1[i + 1]
+            end
+        end
+    end
+    return self.buildLevelCfg
+end
+
+---获取公会建筑等级配置
+---@param level number 公会大厅等级
+function SociatyModel:GetBuildLevelCfgByMainBuild(level)
+    if not self.buildLevelCfg then
+        self:GetBuildLevelCfg()
+    end
+    return self.buildLevelCfg[level] or nil
+end
+
+---获取公会建筑币配置
+---@return number,number 代币id,每一个代币转化的经验值
+function SociatyModel:GetBuildCoinCfg()
+    local cfg = _G.ConfigManager.discrete_cfg[101655]
+    if not cfg then
+        return 0, 0
+    end
+    return cfg[1][1], cfg[1][2]
+end
+
+---获取公会建筑币数量
+---@return number
+function SociatyModel:GetBuildCoinNumber()
+    if not self.SociatyRoleSelf then
+        return 0
+    end
+    return self.SociatyRoleSelf.build_coin or 0
+end
+
+---设置建筑币数量更改
+---@private
+---@param total number      当前货币总数
+---@param change number     change数量
+function SociatyModel:SetBuildCoin(total, change)
+    if not self.SociatyRoleSelf then
+        return
+    end
+    if change == nil then
+        change = total - (self.SociatyRoleSelf.build_coin or 0)
+    end
+    self.SociatyRoleSelf.build_coin = total
+
+    local coinId = self:GetBuildCoinCfg()
+    --推送货币状态
+    local tmp = {}
+    _G.table.insert(tmp, coinId)
+    _G.table.insert(tmp, change)
+    _G.table.insert(tmp, total)
+    _G.Events:GetInstance():Broadcast(_G.eItemUpdata.Updata, { { type = tmp } })
+end
+
+---获取建筑特权加成
+---@private
+---@param buildId number 建筑ID
+---@param privilegeId number 特权ID
+---@return number
+function SociatyModel:GetBuildPrivilege(buildId, privilegeId)
+    if not self.SociatySelf then
+        return 0
+    end
+
+    local cfg = _G.ConfigManager.guild_unit_cfg[buildId]
+    if not cfg then
+        return 0
+    end
+    local privilege = cfg.privilege[self:GetBuildLevel(buildId)]
+    if not privilege then
+        return 0
+    end
+    for i = 1, #privilege do
+        if privilege[i] == privilegeId and privilege[i + 1] > 0 then
+            return privilege[i + 1]
+        end
+    end
+    return 0
+end
+
+---获取装备强化金币减少加成
+---@return number
+function SociatyModel:GetBuildEquipGoldReduce()
+    local value = self:GetBuildPrivilege(2, 2)
+    if value > 0 then
+        return value * 0.0001
+    end
+    return 0
+end
+
+---获取神器强化金币减少加成
+---@return number
+function SociatyModel:GetBuildArtifactGoldReduce()
+    local value = self:GetBuildPrivilege(2, 3)
+    if value > 0 then
+        return value * 0.0001
+    end
+    return 0
+end
+
+---获取灵契强化金币减少加成
+---@return number
+function SociatyModel:GetBuildSpiritualGoldReduce()
+    local value = self:GetBuildPrivilege(2, 4)
+    if value > 0 then
+        return value * 0.0001
+    end
+    return 0
+end
+
+---获取公会boss宝箱加成（万分比）
+---@return number
+function SociatyModel:GetBuildBoxAdd()
+    local value = self:GetBuildPrivilege(4, 6)
+    if value > 0 then
+        return value * 0.0001
+    end
+    return 0
+end
+
+---获取公会boss挑战加成（万分比）
+---@return number
+function SociatyModel:GetBuildChallengeAdd()
+    local value = self:GetBuildPrivilege(4, 7)
+    if value > 0 then
+        return value * 0.0001
+    end
+    return 0
+end
+
+---是否为公会大厅建筑
+---@return boolean
+function SociatyModel:IsMasterBuild(id)
+    if not self.SociatySelf then
+        return false
+    end
+    return self.SociatySelf:IsMasterBuild(id)
+end
+
+---是否为重点关注建筑
+---@param id number    建筑sid
+---@return boolean
+function SociatyModel:IsPriorityBuild(id)
+    if not self.SociatySelf then
+        return false
+    end
+    return self.SociatySelf:IsPriorityBuild(id)
+end
+
+function SociatyModel:SetDefaultBuildState()
+    if not self.SociatySelf then
+        return false
+    end
+    return self.SociatySelf:SetDefaultBuildState()
+end
+
+---获取公会建筑等级
+---@param id number    建筑sid
+---@return number
+function SociatyModel:GetBuildLevel(id)
+    if not self.SociatySelf then
+        return 1
+    end
+    return self.SociatySelf:GetBuildLevel(id, 1)
+end
+
+---获取公会建筑最后一级需要的经验
+---@param id number    建筑id
+---@return number 最后一级需要的经验
+function SociatyModel:GetfinalLvExp(id)
+    if not self.SociatySelf then
+        return 0
+    end
+    return self.SociatySelf:GetfinalLvExp(id)
+end
+
+---获取公会大厅等级(公会等级)
+---@return number
+function SociatyModel:GetMasterBuildLevel()
+    if not self.SociatySelf then
+        return 1
+    end
+    return self.SociatySelf:GetMasterBuildLevel()
+end
+
+---获取公会大厅id
+---@return number
+function SociatyModel:GetMasterBuildId()
+    if not self.SociatySelf then
+        return 1
+    end
+    return self.SociatySelf:GetMasterBuildId()
+end
+
+---获取公会建筑当前经验进度
+---@param id number    建筑sid
+---@return number,number,number        当前等级拥有经验丶当前等级所需经验丶总共可接收的经验
+function SociatyModel:GetBuildExp(id)
+    if not self.SociatySelf then
+        return 0, 0, 0
+    end
+    return self.SociatySelf:GetBuildExp(id)
+end
+
+---升级建筑/捐献
+---@param id number 建筑id
+---@param num number 使用道具数量
+---@param callback fun(msg:any):void  回调函数
+function SociatyModel:BuildUp(id, num, callback)
+    SociatyNet:GetInstance():BuildUp(
+        { sid = id, num = num },
+        function(msg)
+            if self.SociatySelf and msg.build then
+                self.SociatySelf:UpdateAllBuildState(msg.build)
+            end
+            --获取公会币剩余数量
+            if self.SociatyRoleSelf and msg.consume and msg.consume.item then
+                self.SociatyRoleSelf.build_coin = msg.consume.item[1].item[3]
+                self:SetBuildCoin(msg.consume.item[1].item[3])
+            end
+            if callback then
+                callback(msg)
+            end
+            --更新红点
+            require "RedPointManager":GetInstance():RefreshNodeByAllParams(_G.ConfigManager.redpoint_cfg.GuildBuild.id)
+        end
+    )
+end
+
+---设置是否优先关注
+---@param id number 建筑id
+---@param enable boolean 设置为重点建筑或取消设置
+---@param callback fun(msg:any):void  回调函数
+function SociatyModel:SetBuildPriority(id, enable, callback)
+    SociatyNet:GetInstance():SetKeyBuild(
+        { sid = id, state = enable and 1 or 0 },
+        function(msg)
+            if self.SociatySelf then
+                if msg.builds then
+                    self.SociatySelf:UpdateBuildState(msg.builds.sid, msg.builds)
+                end
+                if msg.ack == 1 then
+                    self.SociatySelf:SetPriorityBuild(id, enable)
+                end
+            end
+            if callback then
+                callback(msg)
+            end
+        end
+    )
+end
+
+---获取重点建筑id, 如果为0表示没有重点建筑
+---@return number
+function SociatyModel:GetBuildPriorityId()
+    if not self.SociatySelf then
+        return 0
+    end
+    return self.SociatySelf:GetBuildPriorityId()
+end
+
+---获取(更新)建筑状态
+---@param callback fun():void   回调函数
+---@return void
+function SociatyModel:GetBuildInfo(callback)
+    SociatyNet:GetInstance():GetBuildInfo(
+        function(msg)
+            if msg.builds and self.SociatySelf then
+                for _, build in pairs(msg.builds) do
+                    self.SociatySelf:UpdateBuildState(build.sid, build)
+                end
+            end
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---是否有建筑优先关注设置权限
+---@return false
+function SociatyModel:HasBuildPriorityAuth()
+    if not self.SociatySelf then
+        return false
+    end
+    local selfData = self.SociatySelf.SociatyMemberModule:GetSelfMember()
+    if not selfData then
+        return false
+    end
+    local cfg = _G.ConfigManager.guild_position_cfg[selfData.Location]
+    return cfg and cfg.set_key_build
+end
+
+---更新公会建筑等级奖励进度
+function SociatyModel:UpdateBuildAwardLevels()
+    self.gotBuildAwardList = {}
+    if not self.SociatyRoleSelf or not self.SociatyRoleSelf.build_award then
+        return {}
+    end
+    for k, v in pairs(self.SociatyRoleSelf.build_award) do
+        self.gotBuildAwardList[v] = v
+    end
+end
+
+--- 获取当前已领取公会建筑等级奖励进度
+function SociatyModel:GetBuildAwardLevels()
+    if not self.gotBuildAwardList then
+        self.gotBuildAwardList = {}
+        if not self.SociatyRoleSelf or not self.SociatyRoleSelf.build_award then
+            return {}
+        end
+        for k, v in pairs(self.SociatyRoleSelf.build_award) do
+            self.gotBuildAwardList[v] = v
+        end
+    end
+
+    return self.gotBuildAwardList
+end
+
+--- 获取建筑等级奖励
+function SociatyModel:GetBuildAward(levelList, callback)
+    SociatyNet:GetInstance():GetBuildAward(
+        { level_list = levelList },
+        function(msg)
+            if msg.ack ~= 1 then
+                return
+            end
+            for k, v in pairs(levelList) do
+                if not self.gotBuildAwardList[v] then
+                    self.gotBuildAwardList[v] = v
+                else
+                    if _G.AppSetting.DEBUG then
+                        _G.LogError("重复领取同一级奖励")
+                    end
+                end
+            end
+            _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            if callback then
+                callback()
+            end
+        end
+    )
+end
+
+---获取指定公会名人堂
+function SociatyModel:GetOtherStatueInfo(uid, call)
+    local pbData = { uid = uid }
+    SociatyNet:GetInstance():GetOtherStatueInfo(pbData, call)
+end
+
+--endregion
+
+---获取弹劾信息
+function SociatyModel:GetImpeachInfo(call)
+    self.ImpeachUidList = {}
+    self.ImpeachNum = 0
+    SociatyNet:GetInstance():GetImpeachInfo(
+        function(msg)
+            if msg.ack == 1 then
+                local ilt = msg.impeach_list
+                if ilt then
+                    for i = 1, #ilt do
+                        table.insert(self.ImpeachUidList, ilt[i])
+                    end
+                end
+                self.ImpeachNum = #self.ImpeachUidList
+                self.ImpeachInfo = msg
+                if call then
+                    call(msg.is_open)
+                end
+            else
+                if call then
+                    call(0)
+                end
+            end
+        end
+    )
+end
+
+---弹劾
+function SociatyModel:DoImpeach(uid, call)
+    SociatyNet:GetInstance():DoImpeach(
+        function(msg)
+            if msg.ack == 1 then
+                if false == table.indexof(self.ImpeachUidList, uid) then
+                    table.insert(self.ImpeachUidList, uid)
+                end
+
+                self.ImpeachNum = msg.curr
+
+                ---自己是最后一个弹劾的，不会有推送，自行处理职位变更
+                if self.ImpeachNum >= self.ImpeachInfo.need_num then
+                    ---@type guild.p2c_guild_position
+                    local guild_p2c_guild_position = {
+                        ["pos"] = {
+                            {
+                                ["uid"] = self.SociatySelf:GetChairman().Uid,
+                                ["pos"] = ELocationEnum.Member
+                            },
+                            {
+                                ["uid"] = self.ImpeachInfo.role.uid,
+                                ["pos"] = ELocationEnum.Chairman
+                            }
+                        }
+                    }
+
+                    self.SociatySelf.SociatyMemberModule:OnSetPosition(guild_p2c_guild_position)
+                end
+                if call then
+                    call(msg)
+                end
+            elseif msg.ack == 829 then
+                if call then
+                    call(msg)
+                end
+            end
+        end
+    )
+end
+
+---是否参与了弹劾
+function SociatyModel:IsImpeach(uid)
+    if false ~= table.indexof(self.ImpeachUidList, uid) then
+        return true
+    end
+    return false
+end
+
+--region-----------公会同名系统---------
+---修改/设置公会同名前缀
+function SociatyModel:ChangeHonoName(str,callback)
+    local pb={prefix=str}
+    SociatyNet:GetInstance():SetHone(pb,function(msg)
+        if msg.ack==1 then
+            self.SociatySelf.guild_prefix=pb.prefix
+            self.SociatySelf.prefix_time=_G.TimeUtil.GetServerUnixTime()
+            self.SociatySelf.prefix_role={}
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+---修改玩家名字
+function SociatyModel:ChangePlayerName(str,callback)
+    local pb={name=str}
+    SociatyNet:GetInstance():ChangePlayerName(pb,function(msg)
+        if msg.ack==1 then
+            _G.PlayerModel:GetInstance():UpdateName(pb.name)
+            self.SociatyRoleSelf.update_name_time=_G.TimeUtil.GetServerUnixTime()
+            -- _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MainView.Name):UpdateName()
+            -- _G.WorldManager:GetInstance():GetCurWorldPlayer().TitleTextName.text = "<color=#fff08d>" .. name .. "</color>"
+            local member=table.find(self.SociatySelf.prefix_role,function(a) return a.role_uid==_G.PlayerModel:GetInstance():GetPlayerUid() end)
+            if member then
+                member.role_name=pb.name
+            else
+                table.insert(self.SociatySelf.prefix_role,
+                        {role_uid=_G.PlayerModel:GetInstance():GetPlayerUid(),
+                         role_name=pb.name})
+            end
+            if callback then
+                callback(msg)
+            end
+        end
+    end)
+end
+---领取同名系统目标奖励
+function SociatyModel:GetHomeTargetAward(callback)
+    local pb={award_id=self:GetAllCanGetHomoTargetIds()}
+    SociatyNet:GetInstance():GetHonoAward(pb,function(msg)
+        if msg.ack==1 then
+            if msg.award then
+                _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+                _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+            end
+            
+            if not self.SociatyRoleSelf.name_award then
+                self.SociatyRoleSelf.name_award = {}
+            end
+            for i = 1, #pb.award_id do
+                table.insert(self.SociatyRoleSelf.name_award,pb.award_id[i])
+            end
+            require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SocaityMemberHonoRedPoint.id)
+            if callback then
+                callback()
+            end
+        end
+    end)
+end
+---公会成员同名修改推送
+function SociatyModel:MemberUpDateName(msg)
+    local member=table.find(self.SociatySelf.prefix_role,function(a) return a.role_uid==msg.role.role_uid end)
+    if member then
+        member.role_name=msg.role.role_name
+    else
+        table.insert(self.SociatySelf.prefix_role,{role_uid= msg.role.role_uid,role_name=msg.role.role_name})
+    end
+    self.SociatySelf.SociatyMemberModule.MemberDic[msg.role.role_uid].Name=msg.role.role_name
+    local memberitem=table.find(self.SociatySelf.SociatyMemberModule.Member,
+            function(a) return a.Uid == msg.role.role_uid end)
+    memberitem.Name=msg.role.role_name
+    require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SocaityMemberHonoRedPoint.id)
+end
+
+---公会会长同名前缀修改推送
+function SociatyModel:HomoUpDateName(msg)
+    self.SociatySelf.guild_prefix=msg.prefix
+end
+---获取同名系统达到目标所有可领取的奖励id
+function SociatyModel:GetAllCanGetHomoTargetIds()
+    local guild_name_cfg = _G.ConfigManager.guild_name_cfg
+    local ids={}
+    for id,cfg  in pairs(guild_name_cfg) do
+        if not table.ContainsValue(self.SociatyRoleSelf.name_award,id) 
+        and table.count(self.SociatySelf.prefix_role)>=cfg.condition then
+            table.insert(ids,id)
+        end
+    end
+    return ids
+end
+---判断是否存在同名系统目标奖励未领取
+function SociatyModel:CheckHasAwardCanGetInHomo()
+    local guild_name_cfg = _G.ConfigManager.guild_name_cfg
+    for id,cfg  in pairs(guild_name_cfg) do
+        if not table.ContainsValue(self.SociatyRoleSelf.name_award,id)
+                and table.count(self.SociatySelf.prefix_role)>=cfg.condition then
+            return 1
+        end
+    end
+    return 0
+end
+---通过id判断同名目标奖励是否已经领取
+function SociatyModel:CheckHomoAwardIsGetById(id)
+    local isget= table.ContainsValue(self.SociatyRoleSelf.name_award,id)
+    return isget and 1 or 0
+end
+
+---通过id判断同名目标奖励是否可领取
+function SociatyModel:CheckHomoAwardCanGetById(id)
+    return table.ContainsValue(self.SociatyRoleSelf.name_award,id) and 1 or 0
+end
+---通过时间戳判断玩家是否第一次改名
+function SociatyModel:CheckChooseNameIsFirstByTime()
+    return self.SociatySelf.prefix_time>=self.SociatyRoleSelf.update_name_time
+end
+function SociatyModel:CheckIsShowHomoNameBtn()
+    return self.SociatySelf.Level>=_G.ConfigManager.discrete_cfg[201301][1][1] and 1 or 0
+end
+function SociatyModel:GetNowHonoMemberNum()
+    return table.isEmptyOrNil(self.SociatySelf.prefix_role) and 0 or table.count(self.SociatySelf.prefix_role)
+end
+function SociatyModel:CheckMemberHonoRedPoint()
+    if table.isEmptyOrNil(self.SociatySelf) then
+        return 0
+    end
+    if self:CheckIsShowHomoNameBtn()==0 then
+        return 0
+    end
+    if _G.PlayerPrefsManager.GetInt("MemberHonoRedPoint",0)==0 then
+        return 1
+    end
+    return self:CheckHasAwardCanGetInHomo()
+end
+---endregion
+
+---@return SociatyModel
+return SociatyModel

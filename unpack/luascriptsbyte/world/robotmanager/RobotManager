@@ -1,0 +1,420 @@
+-----------------------------------------------------------------------
+-- G:.zhenhunjie.client.trunk.alpha.Client.Assets.Resources.LuaScripts.World.RobotManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/10/19
+-- Description: 主城机器人管理类
+-----------------------------------------------------------------------
+local WorldRobotsPlayerItem = require "WorldRobotsPlayerItem"
+local WorldRobotsOfflinePlayerItem = require "WorldRobotsOfflinePlayerItem"
+---@class RobotManager	中文描述
+---@field curWorld BaseWorld	当前世界
+---@field allRobots WorldRobotsBasePlayerItem[] 所有机器人
+local RobotManager = _G.BaseClass("RobotManager")
+---机器人移动路径类型值
+local ROBOTMOVEPATHTYPE = 2
+---机器人数量 离散配置ID
+local ROBOTNUMSDISCRETEID = 103509
+---机器人数量比例 离散配置ID
+local ROBOTPERCENTDISCRETEID = 103510
+---低端机器人比例序列号
+local ROBOTLOWINDEX = 1
+---高端机器人比例序列号
+local ROBOTHIGHINDEX = 2
+---低端机器人类型值
+local ROBOTLOWTYPE = 1
+---高端机器人类型值
+local ROBOTHIGHTYPE = 2
+---机器人放置关卡随机范围离散表配置ID
+local ROBOTAFKDISCRETEID = 103511
+local discretecfg = _G.ConfigManager.discrete_cfg
+---类的构造函数
+function RobotManager:__init(world)
+    self.curWorld = world
+    --TODO:初始化路径数据
+    self.movePathIDs = {false, false, false, false, false, false, false, false}
+    self.allRobots = {}
+    local index = 1
+    for id, cfg in pairs(_G.ConfigManager.city_display_cfg) do
+        if cfg.type == ROBOTMOVEPATHTYPE then
+            self.movePathIDs[index] = id
+            index = index + 1
+        end
+    end
+    self.userPathIds = {}
+    --TODO:初始化机器人创建的数量
+    local discretecfg = _G.ConfigManager.discrete_cfg
+    self.MaxRobotCount = self.curWorld.Cfg.display_screen
+    --TODO:初始化机器人随机ID的范围
+    self.lowRobotIDs = {false, false, false, false}
+    self.highRobotIDs = {false, false, false, false}
+    local index2 = 1
+    index = 1
+    local isemptyornil = _G.table.isEmptyOrNil
+    local checkfunc = _G.GlobalConditionManager.CheckConditionArrays
+    for id, cfg in pairs(_G.ConfigManager.scene_robot_cfg) do
+        if isemptyornil(cfg.condition_extra) or checkfunc(cfg.condition_extra) then
+            if cfg.type == ROBOTLOWTYPE then
+                self.lowRobotIDs[index] = id
+                index = index + 1
+            elseif cfg.type == ROBOTHIGHTYPE then
+                self.highRobotIDs[index2] = id
+                index2 = index2 + 1
+            end
+        end
+    end
+    --TODO:放置关卡随机范围
+    self.robotAfkRange = discretecfg[ROBOTAFKDISCRETEID][1]
+end
+---类的析构函数
+function RobotManager:Dispose()
+    self.movePathIDs = nil
+    self.lowRobotNumbers = nil
+    self.highRobotNumbers = nil
+    self.curWorld = nil
+    if self.co then
+        _G.coroutine.stopwaiting(self.co)
+        self.co = nil
+    end
+end
+---初始化机器人
+---@param callback function 初始化完成回调
+function RobotManager:InitRobot(callback)
+    local index = 0
+    self.onInitRobotDoneCall = callback
+    local playerafk = require("AfkModel"):GetInstance():GetLastSection()
+    local afkcfg = _G.ConfigManager.afk_cfg
+    local data = {hell_id = require("HellRoadModel"):GetInstance():GetLastHell(), manager = self}
+    local index = 0
+    local per = discretecfg[ROBOTPERCENTDISCRETEID][1]
+    local floor = _G.Mathf.Floor
+    local percount = per[ROBOTLOWINDEX] + per[ROBOTHIGHINDEX]
+    local finishhandler = _G.handler(self, self.OnCreateRobotDoneCall)
+    local offlinePlayer = _G.WorldManager:GetInstance():GetOfflinePlayerInfo()
+    self.needNums = self.MaxRobotCount - #(_G.WorldManager:GetInstance().otherPlayerInfo or {})
+    self.offlineNums = #offlinePlayer > self.needNums and self.needNums or #offlinePlayer
+    self.lowRobotNumbers = floor((self.needNums - self.offlineNums) * per[ROBOTLOWINDEX] / percount)
+    self.highRobotNumbers = floor((self.needNums - self.offlineNums) * per[ROBOTHIGHINDEX] / percount)
+
+    self:RandomTable(self.lowRobotNumbers, self.lowRobotIDs, index)
+    self:RandomTable(self.highRobotNumbers, self.highRobotIDs, index)
+    self.createRobotCount = self.lowRobotNumbers + self.highRobotNumbers + self.offlineNums
+
+    ---如果没有机器人就直接返回
+    if self.createRobotCount <= 0 then
+        if self.onInitRobotDoneCall then
+            self.onInitRobotDoneCall()
+            self.onInitRobotDoneCall = nil
+        end
+        return
+    end
+
+    self:RandomTable(#self.movePathIDs, self.movePathIDs, index)
+
+    for i = 1, self.offlineNums do
+        self:CreateOfflinePlayer(offlinePlayer[i], self.movePathIDs[i], finishhandler)
+    end
+    for i = 1, self.lowRobotNumbers do
+        if self.lowRobotIDs[i] then
+            self:CreateRobot(
+                self.lowRobotIDs[i],
+                self.movePathIDs[self.offlineNums + i],
+                finishhandler,
+                playerafk,
+                afkcfg,
+                data
+            )
+        end
+    end
+    for i = 1, self.highRobotNumbers do
+        if self.highRobotIDs[i] then
+            self:CreateRobot(
+                self.highRobotIDs[i],
+                self.movePathIDs[i + self.lowRobotNumbers + self.offlineNums],
+                finishhandler,
+                playerafk,
+                afkcfg,
+                data
+            )
+        elseif self.lowRobotIDs[self.lowRobotNumbers + i] then
+            self:CreateRobot(
+                self.lowRobotIDs[self.lowRobotNumbers + i],
+                self.movePathIDs[self.offlineNums + i],
+                finishhandler,
+                playerafk,
+                afkcfg,
+                data
+            )
+        end
+    end
+end
+---展示机器人信息
+---@param robot WorldRobotsPlayerItem 机器人
+function RobotManager:ShowRobotShowData(robot)
+    if not self.curShowRobotInfo then
+        local playermodelins = _G.PlayerModel:GetInstance()
+        local level = require("CardResonanceModel"):GetInstance():GetAverageLevel()
+        self.curShowRobotInfo = {
+            name = "",
+            level = playermodelins:GetLevel(),
+            style = 0,
+            frame = 0,
+            union = "",
+            sign = "",
+            afk = 0,
+            uid = 0,
+            array = {
+                {sid = 0, level = level, star = 0},
+                {sid = 0, level = level, star = 0},
+                {sid = 0, level = level, star = 0},
+                {sid = 0, level = level, star = 0},
+                {sid = 0, level = level, star = 0}
+            },
+            skill_index = {0, 0, 0},
+            power = 0
+        }
+    end
+    --TODO:数据赋值
+    local cfg = _G.ConfigManager.scene_robot_cfg[robot.Uid]
+    self.curShowRobotInfo.uid = cfg.uid or 0
+    self.curShowRobotInfo.name = robot.Cfg.name
+    self.curShowRobotInfo.style = cfg.portrait
+    self.curShowRobotInfo.frame = cfg.frame
+    self.curShowRobotInfo.afk_sid = robot.AfkID
+    self.curShowRobotInfo.power = cfg.power
+    self.curShowRobotInfo.halo = {sid = robot.Cfg.halo_effect}
+    self.curShowRobotInfo.title = {sid = robot.Cfg.title_effect}
+    self.curShowRobotInfo.model_path = cfg.model_path
+    for i = 1, #cfg.combine do
+        self.curShowRobotInfo.skill_index[i] = cfg.combine[i]
+    end
+    local array = self.curShowRobotInfo.array
+    local mcfg
+    local monstercfg = _G.ConfigManager.monster_cfg
+    for i = 1, #cfg.monsters_id do
+        if cfg.monsters_id[i] > 0 then
+            mcfg = monstercfg[cfg.monsters_id[i]]
+            if mcfg then
+                array[i].sid = mcfg.CardID
+                array[i].star = mcfg.Stars
+            else
+                array[i].sid = 0
+            end
+        else
+            array[i].sid = 0
+        end
+    end
+    _G.SystemSettingManager:GetInstance():OpenRobotPlayInfo(
+        self.curShowRobotInfo.uid,
+        nil,
+        _G.RobotType.Other,
+        self.curShowRobotInfo
+    )
+end
+---创建机器人
+---@param id number 机器人ID
+---@param path number 路径ID
+---@param callback function 初始化完成回调
+---@param afklv number 放置关卡数据
+---@param afkcfg afk_cfg 放置关卡配置
+---@param data table 展示额外数据
+function RobotManager:CreateRobot(id, path, callback, afklv, afkcfg, data)
+    if self.allRobots[id] then
+        return
+    end
+    self.userPathIds[path] = true
+    --TODO:计算放置关卡数据
+    local random = _G.Mathf.Random
+    local range = random(self.robotAfkRange[1], self.robotAfkRange[2])
+    local add, cfg
+    if afklv == 0 then
+        add = true
+        --放置关卡第一关ID
+        afklv = 101001
+        range = range - 1
+    else
+        cfg = afkcfg[afklv]
+        if cfg.next_section == 0 then
+            add = false
+        else
+            --随机增加还是减少
+            add = random(1, 2) == 1
+        end
+    end
+    if add then
+        for i = 1, range do
+            cfg = afkcfg[afklv]
+            if cfg.next_section == 0 then
+                break
+            end
+            afklv = cfg.next_section
+        end
+    else
+        for i = 1, range do
+            cfg = afkcfg[afklv]
+            if cfg.pre_section == 0 then
+                break
+            end
+            afklv = cfg.pre_section
+        end
+    end
+    local robot =
+        WorldRobotsPlayerItem.New({id = id, path = path, callback = callback, afklv = afklv}, data, self.curWorld)
+    robot:SetDisplayParams({IsHideShadow = true})
+    robot:Init()
+end
+---创建离线玩家
+---@param data scene.i_scene_user 离线玩家数据
+function RobotManager:CreateOfflinePlayer(data, path, callback)
+    self.userPathIds[path] = true
+    local playerData = require "WorldPlayerData".New()
+    playerData:ResolvPlayerData(data)
+    local info = self.curWorld:CreatePlayerBaseData(playerData, callback)
+    info.path = path
+    local player = WorldRobotsOfflinePlayerItem.New(info, playerData, self.curWorld)
+    player:SetDisplayParams({IsHideShadow = true})
+    player:Init()
+end
+
+---创建机器人完成回调
+---@param item WorldRobotsPlayerItem 机器人对象
+function RobotManager:OnCreateRobotDoneCall(item)
+    local isExit = false
+    ---防止登录过程中人物已经被顶
+    local other = _G.WorldManager:GetInstance().otherPlayerInfo
+    if other then
+        for _, v in ipairs(other) do
+            if v.role_uid == item.Uid then
+                item:OnExitWorld()
+                item:DisWorldItem()
+                isExit = true
+                break
+            end
+        end
+    end
+    if not isExit and self.curWorld.AllWorldItems[item.Uid] then
+        item:OnExitWorld()
+        item:DisWorldItem()
+        isExit = true
+    end
+    if not isExit then
+        self.allRobots[item.Uid] = item
+        self.curWorld.AllWorldItems[item.Uid] = item
+    end
+
+    if self.createRobotCount > 0 then
+        self.createRobotCount = self.createRobotCount - 1
+        if self.createRobotCount <= 0 then
+            --TODO:创建完成
+            if self.onInitRobotDoneCall then
+                self.onInitRobotDoneCall()
+                self.onInitRobotDoneCall = nil
+            end
+        end
+    elseif not isExit then
+        if item then
+            item:OnEnterWorld()
+        end
+    end
+end
+---从tab中随机不重复取值，将值赋值在数组的头部
+---@param count number 随机的数量
+---@param tab table 随机数组
+---@param index number 记录随机到的下标
+function RobotManager:RandomTable(count, tab, index)
+    if count <= 0 then
+        return
+    end
+    local len = 0
+    for i = 1, #tab do
+        if tab[i] then
+            len = len + 1
+        end
+    end
+    if count > len then
+        count = len
+    end
+    local random = _G.Mathf.Random
+    index = index or 0
+    for i = 1, count do
+        index = random(i, len)
+        if index ~= i then
+            tab[i] = tab[index] + tab[i]
+            tab[index] = tab[i] - tab[index]
+            tab[i] = tab[i] - tab[index]
+        end
+    end
+end
+
+---移除离线玩家机器人
+function RobotManager:RemoveOfflinePlayer(uid)
+    if not self.curWorld or not self.curWorld.AllWorldItems then
+        return
+    end
+    ---@type WorldRobotsBasePlayerItem
+    local player = self.allRobots[uid]
+    if not player then
+        for k, v in pairs(self.allRobots) do
+            if v.Uid then
+                if v.Uid < 1000000000 then
+                    player = v
+                    break
+                elseif not player then
+                    player = v
+                end
+            else
+                self.allRobots[k] = nil
+                if _G.AppSetting.DEBUG then
+                    _G.LogError("机器人中有uid为0的player")
+                end
+            end
+        end
+        if not player then
+            return
+        end
+    end
+    if not player.Uid then
+        return 
+    end
+    self.allRobots[player.Uid]= nil
+    self.userPathIds[player.PathCfg.id] = nil
+    self.RemoveUid = player.Uid
+    self.curWorld:RemoveWorldItems(player.Uid)
+    self.RemoveUid = nil
+end
+
+---添加离线玩家
+---@param uid number 角色uid
+function RobotManager:AddOfflinePlayer(uid)
+    if self.RemoveUid == uid then
+        return
+    end
+    local offlinePlayer = _G.WorldManager:GetInstance().otherPlayerInfo
+    local data
+    for _, v in ipairs(offlinePlayer) do
+        if v.role_uid == uid then
+            data = v
+            break
+        end
+    end
+    if not data then
+        return
+    end
+    local path = 0
+    for i = 1, #self.movePathIDs do
+        if not self.userPathIds[self.movePathIDs[i]] then
+            path = self.movePathIDs[i]
+            break
+        end
+    end
+    if path <= 0 then
+        return
+    end
+    self.co =
+        _G.DelayFrameDo(
+        function()
+            self:CreateOfflinePlayer(data, path, _G.handler(self, self.OnCreateRobotDoneCall))
+        end
+    )
+end
+
+return RobotManager

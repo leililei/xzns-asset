@@ -1,0 +1,1224 @@
+-----------------------------------------------------------------------
+-- G:.zhenhunjie.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.GuessGame.GuessGameManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2022/07/13
+-- Description 此处填写描述
+-----------------------------------------------------------------------
+local base = require("ActivitySynTypeBase")
+local GuessGameNet = require("GuessGameNet")
+---@class GuessGameManager : Singleton	中文描述
+local GuessGameManager = _G.BaseClass("GuessGameManager", base)
+local ActivitySynManager = require "ActivitySynManager":GetInstance()
+local RedPointManager = require("RedPointManager"):GetInstance()
+---竞猜单场状态枚举
+local sessionState = {
+    ---未开放
+    notOpen = 1,
+    ---竞猜
+    guess = 2,
+    ---结算
+    settlement = 3,
+    ---结束
+    over = 4
+}
+local opentime
+---@class missionState 任务类型
+local missionState = {
+    [1] = "times",---竞猜次数
+    [2] = "coin",---获得硬币数量
+    [3] = "barrage",---手动发送弹幕数量
+    [4] = "winningStreak",---连胜次数
+    [5] = "winTimes"---猜中次数
+}
+
+local table = _G.table
+
+GuessGameManager.sessionState = sessionState
+---创建对象时,入口构造函数
+function GuessGameManager:__init()
+    self.curActivityState = false
+    --opentime =21900
+    self.chip_own = _G.StorageManager:GetInstance():GetItemCountBySid(35)
+    local EventsIns = _G.Events:GetInstance()
+    self.storePoint = 0
+    self.exchangePoint = 0
+    opentime = _G.ConfigManager.discrete_cfg[105726][1][1] + _G.TimeUtil.GAME_DAY_TIME or 21900
+    EventsIns:AddListener(_G.ConfigManager.net_map.guess_result.Cmd, self.HandleResultData, self)
+    EventsIns:AddListener(_G.ConfigManager.net_map.guess_award.Cmd, self.HandleAwardData, self)
+    EventsIns:AddListener(_G.eItemUpdata.Updata, self.RefreshCoin, self)
+    RedPointManager:AddListener(_G.eRedPoint.RedPointRefresh, self.UpdateExtraRedPoint, self)
+    -- local self_info = self.curActivityClass.cfg.self_info
+    -- if self_info and self_info.guess then
+    --     self:ParseData(self_info)
+    -- end
+end
+---销毁对象时,析构函数
+function GuessGameManager:Dispose()
+    self.curActivityState = nil
+    self.curOpenSessionIndex = nil
+    self.curAllAwardCount = nil
+    self.curContinuouslyWinTimes = nil
+    local EventsIns = _G.Events:GetInstance()
+    EventsIns:RemoveListener(_G.ConfigManager.net_map.guess_result.Cmd, self.HandleResultData, self)
+    EventsIns:RemoveListener(_G.ConfigManager.net_map.guess_award.Cmd, self.HandleAwardData, self)
+    RedPointManager:RemoveListener(_G.eRedPoint.RedPointRefresh, self.UpdateExtraRedPoint, self)
+    EventsIns:RemoveListener(_G.eItemUpdata.Updata, self.RefreshCoin, self)
+    self:StopTipsTimer()
+    self:StopRedPointBetTimer()
+end
+
+--region 重写方法
+function GuessGameManager:OnHandleGMData(info)
+    if info and info.guess then
+        self:ParseData(info)
+    end
+end
+
+---从服务器拉取数据
+function GuessGameManager:GetDataFormServer()
+    --GuessGameNet:GetInstance():Init(_G.handler(self, self.ParseData))
+end
+
+---解析数据
+---@param data table 服务器返回数据
+function GuessGameManager:ParseData(data, reconnect)
+    data = data.guess
+    self.curActivityState = true
+    self:HandleCfg()
+    self:HandleInfoData(data)
+    base.ParseData(self)
+    if self.OnSixUpdateTag then
+        if self.onSixUpdateCall then
+            for key, call in pairs(self.onSixUpdateCall) do
+                call()
+            end
+        end
+    end
+    if reconnect then
+        if self.onResultSendCall then
+            for key, call in pairs(self.onResultSendCall) do
+                call()
+            end
+        end
+    end
+end
+---初始化功能逻辑
+function GuessGameManager:InitFunction()
+    ---啥也没改，写行注释装装样子
+    if not self.curActivityState then
+        return
+    end
+    if self.curActivityClass:GetCurActivityState() == ActivitySynManager.State.Settlement then
+        self.isSettlement = true
+        self.curActivityClass:ChangeState(ActivitySynManager.State.Close)
+    end
+    --TODO:初始化当前场次以及状态
+    local t = _G.TimeUtil.GetServerUnixTime()
+    local dayTime = _G.TimeUtil.GetSecondsOfDay()
+    if dayTime > opentime then
+        if not self.isSettlement then
+            self:StopZeroFresh()
+            local times = _G.TimeUtil.GetClockTimer(24)
+            times  = times >= 86400 and times - 86400 or times
+            self.zeroFreshTimer = _G.TimerManager:GetInstance():GetTimer(
+                times + 1,
+                self.ZeroFresh,
+                self,
+                true)
+            self.zeroFreshTimer:Start()
+        end
+    else
+        if not self.isSettlement then
+            self:StopOpenFresh()
+            self.openFreshTimer =_G.TimerManager:GetInstance():GetTimer(
+            opentime - dayTime + 1,
+            self.OpenFresh,
+            self,
+            true)
+            self.openFreshTimer:Start()
+            self.curActivityClass:ChangeState(ActivitySynManager.State.Close)
+        end
+    end
+    if t < self.sessionInfo[1].time_start then --第一场开始之前
+        if not self.isSettlement then
+            self:StopRedPointBetTimer()
+            self.redpointBetTimer =
+                _G.TimerManager:GetInstance():GetTimer(
+                self.sessionInfo[1].time_start - t + 1,
+                self.RefreshRedPointBet,
+                self,
+                true
+            )
+            self.redpointBetTimer:Start()
+        end
+        self.curOpenSessionIndex = 1
+        self.curSessionState = sessionState.notOpen
+        self.tipsTimer =
+            _G.TimerManager:GetInstance():GetTimer(self.sessionInfo[1].time_start - t, self.HandleTips, self, true)
+        self.tipsTimer:Start()
+    else
+        local len = #self.sessionInfo
+        if t > self.sessionInfo[len].time_end then --最后一场结束后
+            self.curOpenSessionIndex = len
+            self.curSessionState = sessionState.over
+        else
+            for i = 1, len do
+                if t > self.sessionInfo[i].time_start and t < self.sessionInfo[i].time_end then --场次时间范围内
+                    self.curOpenSessionIndex = i
+                    self:StopRedPointBetTimer()
+                    if self.sessionInfo[i].time_end - t - self:GetSettlementSecond() > 0 then
+                        self.redpointBetTimer =
+                            _G.TimerManager:GetInstance():GetTimer(
+                            self.sessionInfo[i].time_end - t - self:GetSettlementSecond(),
+                            self.RefreshRedPointBet,
+                            self,
+                            true
+                        )
+                        self.redpointBetTimer:Start()
+                    end
+                    break
+                end
+            end
+            t = t - self.sessionInfo[1].time_start
+            while t > self.tipsTime do
+                t = t - self.tipsTime
+            end
+            self.tipsTimer = _G.TimerManager:GetInstance():GetTimer(t, self.HandleTips, self, true)
+            self.tipsTimer:Start()
+        end
+    end
+end
+
+function GuessGameManager:LaterInitFunction()
+    self.exchange = ActivitySynManager:GetChildAcitivity(10005, self.curActivityClass:GetJumpType())
+    if self.exchange then
+        self.exchangeRedPoint = self.exchange.typeClass:GetRedpointIDByIndex(1)
+        self.exchangePoint = self.exchange.typeClass:CheckHaveExchangeItem()
+    end
+    self.store = ActivitySynManager:GetChildAcitivity(10014, self.curActivityClass:GetJumpType())
+    if self.store then
+        self.storeRedPoint = self.store.typeClass:GetRedpointIDByIndex(1)
+        self.storePoint = self.store.typeClass:CheckFreeGift()
+    end
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(4))
+end
+
+---进入活动主体
+function GuessGameManager:OnEnterActivity()
+    local enter, tipsid, content = self.curActivityClass:CheckConditionExtra()
+    if enter then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GuessGameView.Name, nil, self)
+        --TODO:进入到具体活动内容
+        if self.onEnterDoneCall then
+            self.onEnterDoneCall()
+            self.onEnterDoneCall = nil
+        end
+    else
+        _G.GlobalInterface.JumpActivityByGM(10005, self.curActivityClass:GetJumpType())
+        --_G.PopWindowManager:GetInstance():ShowAllTips(4016)
+    end
+end
+---初始化红点树结构 1默认代表根节点 不允许用作其他表示序列
+function GuessGameManager:InitRedPointTree()
+    self.checkRedPointFunc = {self.CheckRedPointBet,self.CheckRedPointAward,self.CheckRedPointMission,self.CheckStoreAndExchange}
+    self.redpointTree = {{2,3,4},false,false,false}
+end
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function GuessGameManager:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+--endregion
+---刷新任务红点
+function GuessGameManager:RefreshRedPointMission()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(3))
+end
+---刷新奖励红点
+function GuessGameManager:RefreshRedPointAward()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(2))
+end
+---刷新竞猜红点
+function GuessGameManager:RefreshRedPointBet()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+---检测下注红点
+function GuessGameManager:CheckRedPointBet()
+    local curSessionIndex = self:GetCurFactSessionIndex()
+    local info = self:GetSessionData(curSessionIndex)
+    if info.bet and info.bet > 0 then
+        return 0
+    end
+    local t = _G.TimeUtil.GetServerUnixTime()
+    if t > info.time_start and t < info.time_end - self:GetSettlementSecond() then --在竞猜时间范围内
+        return 1
+    end
+    return 0
+end
+---检测奖励红点
+function GuessGameManager:CheckRedPointAward()
+    local info = self:GetAllSessionInfo()
+    for i = 1, #info do
+        local session = info[i]
+        if session.award == 0 and session.bet > 0 and session.win > 0 then
+            return 1
+        end
+    end
+    return 0
+end
+---检测任务状态红点
+function GuessGameManager:CheckRedPointMission()
+    for _, v in pairs(self.missionList[1]) do
+        if self:CheckCanTake(v, 1) then
+            return 1
+        end
+    end
+    for _, v in pairs(self.missionList[2]) do
+        if self:CheckCanTake(v, 2) then
+            return 1
+        end
+    end
+    return 0
+end
+
+function GuessGameManager:UpdateExtraRedPoint(id, num)
+    if id == self.storeRedPoint then
+        self.storePoint = num
+        require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(4))
+    elseif id == self.exchangeRedPoint then
+        self.exchangePoint = num
+        require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(4))
+    end
+end
+
+function GuessGameManager:CheckStoreAndExchange()
+    if self.storePoint == 1 then
+        return 1
+    elseif self.exchangePoint == 1 then
+        return 1
+    else
+        return 0
+    end
+end
+
+--region 内部方法
+---处理配置信息
+function GuessGameManager:HandleCfg()
+    if self.weakAward then
+        return
+    end
+    local discrete_cfg = _G.ConfigManager.discrete_cfg
+    ---竞猜停止时间（倒计时时间）
+    self.settlementSecond = discrete_cfg[105703][1][1]
+    ---下注消耗道具和数量
+    self.betCost = discrete_cfg[105705][1]
+    ---连胜利获得道具和数量（每日;第2；3；4；5次）
+    self.winExtraAward = discrete_cfg[105708]
+    ---跑马灯间隔时间
+    self.tipsTime = 300
+    ---翻盘奖励
+    self.weakAward = discrete_cfg[105709][1]
+    self.hotValue = discrete_cfg[105713][1]
+end
+---处理跑马灯信息
+function GuessGameManager:HandleTips()
+    --TODO:跑马灯提示
+    _G.PopWindowManager:GetInstance():ShowAllTips(440208)
+    self:StopTipsTimer()
+    if _G.TimeUtil.GetServerUnixTime() >= self.sessionInfo[#self.sessionInfo].time_end then --最后一场竞猜结束后
+        return
+    end
+    self.tipsTimer = _G.TimerManager:GetInstance():GetTimer(self.tipsTime, self.HandleTips, self, true)
+    self.tipsTimer:Start()
+end
+---停止跑马灯计时器
+function GuessGameManager:StopTipsTimer()
+    if self.tipsTimer then
+        self.tipsTimer:Stop()
+        self.tipsTimer = nil
+    end
+end
+---停止下注红点计时器
+function GuessGameManager:StopRedPointBetTimer()
+    if self.redpointBetTimer then
+        self.redpointBetTimer:Stop()
+        self.redpointBetTimer = nil
+    end
+end
+
+--region 数据解析
+--[[初始化竞猜信息
+    required uint64 time_start=1;//竞猜开始时间
+    required uint64 time_end=2;//竞猜开始时间
+    required uint32 times=3;//竞猜序列号
+    repeated uint32 array = 4;// 对战双方阵容sid,第一位进攻方
+    required uint32 bet = 5;//本场下注情况 0，未下注，1，进攻方，2，防守方
+    required uint32 win=6;//胜利方 0 未开始,1，进攻方，2，防守方
+    required uint32 award=7;//是否领取宝箱 0 ,未领取，1，已领取
+    repeated uint32 combine_1 = 8;//进攻方合击技
+    repeated uint32 combine_2 = 9;//防守方合击技
+    optional uint64 playback_uid=10;//战报详细项uid
+]]
+function GuessGameManager:HandleInfoData(msg)
+    self.curAllAwardCount = msg.coin
+    require("GuessGameModel"):GetInstance():SetCoin(self.curAllAwardCount)
+    self.sessionInfo = msg.session_info
+    self.missionData = msg.task
+    self.missionProgress = msg.task_curr
+    self.finshDatas = msg.task_finish
+    _G.table.sort(
+        self.sessionInfo,
+        function(a, b)
+            return a.times < b.times
+        end
+    )
+    self.dailyTasks = {}
+    self.challengeTasks = {}
+    self.progressList = {}
+    self.progressList[1] = {}
+    self.progressList[2] = {}
+    local insert = _G.table.insert
+    if self.missionData ~= nil then
+        for _, v in pairs(self.missionData) do
+            local coin = {}
+            coin.type = {[1] = 104, [2] = v.coin}
+            insert(v.award, coin)
+            if v.type == 1 then
+                insert(self.dailyTasks, v)
+            elseif v.type == 2 then
+                insert(self.challengeTasks, v)
+            end
+        end
+    end
+    self.progressList[1].times = 0
+    self.progressList[1].coin = 0
+    self.progressList[1].barrage = 0
+    self.progressList[1].winTimes = 0
+    self.progressList[1].winningStreak = 0
+    self.progressList[2].times = 0
+    self.progressList[2].coin = 0
+    self.progressList[2].barrage = 0
+    self.progressList[2].winTimes = 0
+    self.progressList[2].winningStreak = 0
+    if self.missionProgress ~= nil then
+        for _, v in pairs(self.missionProgress) do
+            local type
+            if v.con_type == 1 then
+                type = "times"
+            elseif v.con_type == 2 then
+                type = "coin"
+            elseif v.con_type == 3 then
+                type = "barrage"
+            elseif v.con_type == 4 then
+                type = "winningStreak"
+            elseif v.con_type == 5 then
+                type = "winTimes"
+            end
+            if v.task_type == 1 then
+                self.progressList[1][type] = self.progressList[1][type] + v.num
+            elseif v.task_type == 2 then
+                self.progressList[2][type] = self.progressList[2][type] + v.num
+            end
+        end
+    end
+    self.finshedMissionList = {}
+    self.finshedMissionList[1] = {}
+    self.finshedMissionList[1].sid = {}
+    self.finshedMissionList[2] = {}
+    self.finshedMissionList[2].sid = {}
+    if not _G.table.isEmptyOrNil(self.finshDatas) then
+        for _, v in pairs(self.finshDatas) do
+            self.finshedMissionList[v.task_type].sid = v.sid
+        end
+    end
+    self.missionList = {}
+    insert(self.missionList, self.dailyTasks)
+    insert(self.missionList, self.challengeTasks)
+    self:SortTask(1)
+    self:SortTask(2)
+end
+--[[获取下注比例
+    required uint32 percentage = 1;//进攻方下注比例
+]]
+function GuessGameManager:HandleBetPer(msg)
+    if msg.ack == 1 then
+        if self.onMessageCall then
+            self.onMessageCall(msg.att, msg.def)
+        end
+    else
+        if self.onMessageCall then
+            self.onMessageCall(0, 0)
+        end
+    end
+    self.onMessageCall = nil
+end
+--[[阵容详细数据
+  required uint32 ack = 1;
+  repeated fight.i_fight_team attacker_team = 2;//进攻方队伍数据
+  repeated fight.i_fight_team defender_team = 3;//防守方队伍数据
+  ]]
+function GuessGameManager:HandleArrayData(msg)
+    if msg.ack ~= 1 then
+        if self.onMessageCall then
+            self.onMessageCall(false)
+            self.onMessageCall = nil
+        end
+    end
+    self.sessionEmbattleData[self.curMessageSessionIndex] = msg
+    if self.onMessageCall then
+        self.onMessageCall(msg)
+        self.onMessageCall = nil
+    end
+end
+--[[竞猜结果 推送
+  required uint32 times=1;//竞猜序列号
+  required uint32 win=2;//胜利方 1，进攻方，2，防守方
+  required uint64 playback_uid=3;//战报详细项uid
+  required uint64 id = 4;  //活动sid
+  required uint32 win_times=5; //玩家连胜次数
+   ]]
+function GuessGameManager:HandleResultData(msg)
+    if not self.sessionInfo then
+        return
+    end
+    self.curSuccessGuessTimes = nil
+    self.sessionInfo[msg.times].win = msg.win
+    self.sessionInfo[msg.times].playback_uid = msg.playback_uid
+    --TODO:数据更新 界面刷新
+    if self.onResultSendCall then
+        for key, call in pairs(self.onResultSendCall) do
+            call(msg.times)
+        end
+    end
+    if self.progressList[2].winTimes < msg.win_times then
+        self:RefreshMission(missionState[4], 1)
+    end
+    if self.sessionInfo[msg.times].bet == msg.win then
+        self:RefreshMission(missionState[5], 1)
+    end
+    --TODO:刷新红点 奖励+竞猜
+    if msg.times < #self.sessionInfo then
+        self.curOpenSessionIndex = msg.times + 1
+        self:StopRedPointBetTimer()
+        local time =
+            self.sessionInfo[self.curOpenSessionIndex].time_end - _G.TimeUtil.GetServerUnixTime() -
+            self:GetSettlementSecond()
+        if time > 0 then
+            self.redpointBetTimer = _G.TimerManager:GetInstance():GetTimer(time, self.RefreshRedPointBet, self, true)
+            self.redpointBetTimer:Start()
+        end
+    end
+    self:RefreshRedPointBet()
+    self:RefreshRedPointAward()
+end
+--[[邮件补发奖励推送
+  required uint64 id = 1; //活动sid
+  repeated uint32 times=2;//竞猜序列号
+]]
+function GuessGameManager:HandleAwardData(msg)
+    _G.Events:GetInstance():Broadcast(_G.eArena.SetGuessCoin, msg.add_coin)
+end
+
+---零点刷新
+function GuessGameManager:ZeroFresh()
+    if self.curActivityClass:GetCurActivityState() == ActivitySynManager.State.Settlement then
+        self.isSettlement = true
+        self.curActivityClass:ChangeState(ActivitySynManager.State.Close)
+    end
+    if not self.isSettlement then
+        if self.sessionInfo then
+            for i = 1, #self.sessionInfo do
+                self.sessionInfo[i].award = 1
+            end
+        end
+        self:RefreshRedPointAward()
+        --TODO:刷新界面
+        self.curActivityClass:ChangeState(ActivitySynManager.State.Close)
+        self:ZeroClose()
+        self:StopOpenFresh()
+        self.openFreshTimer =
+        _G.TimerManager:GetInstance():GetTimer(
+            opentime + 1,
+            self.OpenFresh,
+            self,
+            true)
+        self.openFreshTimer:Start()
+        if self.onMailAwardCall then
+            self.onMailAwardCall()
+        end
+    end
+end
+
+---零点强制关闭界面和入口
+function GuessGameManager:ZeroClose()
+    if self.rePlay then
+        self.closeAll = true
+        return
+    end
+    local mainview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GuessGameView.Name)
+    if mainview then
+        mainview.View:Close()
+    end
+    local detailview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GuessBattleDetail.Name)
+    if detailview then
+        detailview.View:Close()
+    end
+    local missionview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GuessGameMissionView.Name)
+    if missionview then
+        missionview.View:Close()
+    end
+    local rankview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GuessQuizzesListView.Name)
+    if rankview then
+        rankview.View:Close()
+    end
+    local embattleview = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GuessSessionView.Name)
+    if embattleview then
+        local BattleStatisticsPVEView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name)
+        embattleview.View:Close()
+        if BattleStatisticsPVEView then
+            BattleStatisticsPVEView.View:EscClose()
+        end
+    end
+    self.rePlay = false
+end
+
+---每日活动开启刷新入口
+function GuessGameManager:OpenFresh()
+    if self.curActivityClass:GetCurActivityState() == ActivitySynManager.State.Settlement then
+        self.isSettlement = true
+        self.curActivityClass:ChangeState(ActivitySynManager.State.Close)
+    end
+    if not self.isSettlement then
+        self.curActivityClass:ChangeState(ActivitySynManager.State.Open)
+        local time = _G.TimeUtil.GetClockTimer(24)
+        self:StopZeroFresh()
+        self.zeroFreshTimer = _G.TimerManager:GetInstance():GetTimer(
+            time,
+            self.ZeroFresh,
+            self,
+            true
+            )
+        self.zeroFreshTimer:Start()
+    end
+end
+
+function GuessGameManager:StopZeroFresh()
+    if self.zeroFreshTimer then
+        self.zeroFreshTimer:Stop()
+        self.zeroFreshTimer = nil
+    end
+end
+
+function GuessGameManager:StopOpenFresh()
+    if self.openFreshTimer then
+        self.openFreshTimer:Stop()
+        self.openFreshTimer = nil
+    end
+end
+
+---下注回调
+---@param msg public.s2c_common_ack 回调信息
+function GuessGameManager:OnBetCall(msg)
+    if msg.ack ~= 1 then
+        self.onMessageCall(false)
+        self.onMessageCall = nil
+        return
+    end
+    --TODO:刷新红点 竞猜
+    --TODO:下注成功 修改本地数据
+    self.sessionInfo[self.curMessageSessionIndex].bet = self.curBetSessionSide
+    _G.StorageManager:GetInstance():ConsumeItem(self.betCost[1], 0, self.betCost[2])
+    self:RefreshRedPointBet()
+    local call = self.onMessageCall
+    self.onMessageCall = nil
+    call(true)
+end
+--[[领取奖励回调
+public.s2c_common_ack
+]]
+function GuessGameManager:OnGetAwardCall(msg)
+    if msg.ack ~= 1 then
+        if self.onMessageCall then
+            self.onMessageCall(false)
+            self.onMessageCall = nil
+        end
+        return
+    end
+    --TODO:刷新红点 奖励
+    --TODO:修改本地总奖励数据
+    local data = {}
+    data.award = {}
+    data.award.item = {{type = {[1] = 104, [2] = msg.coin}}}
+    _G.Events:GetInstance():Broadcast(_G.eArena.SetGuessCoin, msg.coin)
+    _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+    self.sessionInfo[self.curMessageSessionIndex].award = 1
+    self:RefreshRedPointAward()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, data,
+    function()
+        if self.onMessageCall then
+            self.onMessageCall(true)
+            self.onMessageCall = nil
+        end
+    end)
+end
+function GuessGameManager:OnChatMsgCall(msg)
+    if msg.ack == 1 then
+        self.chatMsgTable = msg.info
+        if self.onChatMsgCall then
+            self.onChatMsgCall(self.chatMsgTable)
+        end
+    end
+end
+--endregion
+--region 战斗回放
+function GuessGameManager:OnReplayReportCall(msg)
+    if msg.ack == 1 then
+        self.fight_arg = msg.data
+        self:UpdateData(_G.BattleManager:GetInstance():GetStatisticsRecord(msg.data))
+    end
+end
+
+---回放开始回调
+function GuessGameManager:ReplayCall()
+    self.rePlay = true
+    _G.Events:GetInstance():AddListener(_G.eBattleState.RecordEnd, self.ReplayEndCall, self)
+end
+
+---回放结束回调
+function GuessGameManager:ReplayEndCall()
+    self.rePlay = false
+    if self.closeAll then
+        self.closeAll = false
+        self:ZeroClose()
+    end
+    _G.Events:GetInstance():RemoveListener(_G.eBattleState.RecordEnd, self.ReplayEndCall, self)
+end
+
+---@param data table 伤害数据
+function GuessGameManager:UpdateData(data)
+    if not data then
+        _G.PopWindowManager:GetInstance():ShowAllTips(540302)
+        return
+    end
+    self.maxCount = _G.table.count(data.FighterInfo)
+    self.PveData = self:InitReportData(data)
+    _G.Events:GetInstance():AddListener(_G.eBattleState.RecordStart, self.ReplayCall, self)
+    _G.UIManager:GetInstance():OpenWindow(
+        _G.ConfigManager.ui_cfg.BattleStatisticsPVEView.Name,
+        self.PveData,
+        {self.sessionInfo[self.curMessageSessionIndex].win == 1 and 0 or 1},
+        nil,
+        function()
+            _G.Events:GetInstance():RemoveListener(_G.eBattleState.RecordStart, self.ReplayCall, self)
+        end,
+        self.otherPlayer,
+        1,
+        true,
+        self.fight_arg
+    )
+end
+
+function GuessGameManager:InitReportData(data)
+    local tb = {}
+    for i = 1, self.maxCount do
+        local tempData = data.FighterInfo[i]
+        local temp = {}
+        temp.AtkUid = data.AtkUid
+        temp.DefUid = data.DefUid
+        temp.statisticsMax = {DmgOut = 1, DmgIn = 1, HpRecover = 1, CreateGuard = 1}
+        temp.statisticsData = tempData
+        for j = 1, #tempData.Attacker do
+            if temp.statisticsMax.DmgOut < tempData.Attacker[j].DmgOut then
+                temp.statisticsMax.DmgOut = tempData.Attacker[j].DmgOut
+            end
+
+            if temp.statisticsMax.DmgIn < tempData.Attacker[j].DmgIn then
+                temp.statisticsMax.DmgIn = tempData.Attacker[j].DmgIn
+            end
+
+            if temp.statisticsMax.HpRecover < tempData.Attacker[j].HpRecover then
+                temp.statisticsMax.HpRecover = tempData.Attacker[j].HpRecover
+            end
+            if temp.statisticsMax.CreateGuard < tempData.Attacker[j].CreateGuard then
+                temp.statisticsMax.CreateGuard = tempData.Attacker[j].CreateGuard
+            end
+        end
+        for j = 1, #tempData.Defender do
+            if temp.statisticsMax.DmgOut < tempData.Defender[j].DmgOut then
+                temp.statisticsMax.DmgOut = tempData.Defender[j].DmgOut
+            end
+
+            if temp.statisticsMax.DmgIn < tempData.Defender[j].DmgIn then
+                temp.statisticsMax.DmgIn = tempData.Defender[j].DmgIn
+            end
+
+            if temp.statisticsMax.HpRecover < tempData.Defender[j].HpRecover then
+                temp.statisticsMax.HpRecover = tempData.Defender[j].HpRecover
+            end
+            if temp.statisticsMax.CreateGuard < tempData.Defender[j].CreateGuard then
+                temp.statisticsMax.CreateGuard = tempData.Defender[j].CreateGuard
+            end
+        end
+        temp.CombMax = {DmgOut = 1, CreateGuard = 1, HpRecover = 1}
+        for j = 1, #tempData.AtkCombineSkills[1] do
+            if temp.CombMax.DmgOut < tempData.AtkCombineSkills[1][j].DmgOut then
+                temp.CombMax.DmgOut = tempData.AtkCombineSkills[1][j].DmgOut
+            end
+
+            if temp.CombMax.CreateGuard < tempData.AtkCombineSkills[1][j].CreateGuard then
+                temp.CombMax.CreateGuard = tempData.AtkCombineSkills[1][j].CreateGuard
+            end
+
+            if temp.CombMax.HpRecover < tempData.AtkCombineSkills[1][j].HpRecover then
+                temp.CombMax.HpRecover = tempData.AtkCombineSkills[1][j].HpRecover
+            end
+        end
+        for j = 1, #tempData.DefCombineSkills[1] do
+            if temp.CombMax.DmgOut < tempData.DefCombineSkills[1][j].DmgOut then
+                temp.CombMax.DmgOut = tempData.DefCombineSkills[1][j].DmgOut
+            end
+
+            if temp.CombMax.CreateGuard < tempData.DefCombineSkills[1][j].CreateGuard then
+                temp.CombMax.CreateGuard = tempData.DefCombineSkills[1][j].CreateGuard
+            end
+
+            if temp.CombMax.HpRecover < tempData.DefCombineSkills[1][j].HpRecover then
+                temp.CombMax.HpRecover = tempData.DefCombineSkills[1][j].HpRecover
+            end
+        end
+        temp.PetMax = {DmgOut = 1, CreateGuard = 1, HpRecover = 1}
+        for j = 1, #tempData.AtkPetSkills[1] do
+            if temp.PetMax.DmgOut < tempData.AtkPetSkills[1][j].DmgOut then
+                temp.PetMax.DmgOut = tempData.AtkPetSkills[1][j].DmgOut
+            end
+
+            if temp.PetMax.CreateGuard < tempData.AtkPetSkills[1][j].CreateGuard then
+                temp.PetMax.CreateGuard = tempData.AtkPetSkills[1][j].CreateGuard
+            end
+
+            if temp.PetMax.HpRecover < tempData.AtkPetSkills[1][j].HpRecover then
+                temp.PetMax.HpRecover = tempData.AtkPetSkills[1][j].HpRecover
+            end
+        end
+        for j = 1, #tempData.DefPetSkills[1] do
+            if temp.PetMax.DmgOut < tempData.DefPetSkills[1][j].DmgOut then
+                temp.PetMax.DmgOut = tempData.DefPetSkills[1][j].DmgOut
+            end
+
+            if temp.PetMax.CreateGuard < tempData.DefPetSkills[1][j].CreateGuard then
+                temp.PetMax.CreateGuard = tempData.DefPetSkills[1][j].CreateGuard
+            end
+
+            if temp.PetMax.HpRecover < tempData.DefPetSkills[1][j].HpRecover then
+                temp.PetMax.HpRecover = tempData.DefPetSkills[1][j].HpRecover
+            end
+        end
+        temp.TeamIndex = tempData.TeamIndex
+        _G.table.insert(tb, temp)
+    end
+    return tb
+end
+--endregion
+--endregion
+
+--region 对外接口
+---获取当前活动状态
+---@return boolean 是否开放
+function GuessGameManager:GetCurState()
+    return self.curActivityState
+end
+---获取当期活动累计获得的奖励数量
+---@return number 奖励数量
+function GuessGameManager:GetCurAllAwardCount()
+    return self.curAllAwardCount
+end
+
+function GuessGameManager:GetGuessTimes()
+    return self.progressList[2].times, self.progressList[2].winTimes
+end
+
+---获取连续竞猜成功场次和额外的奖励
+---@return number|number 场次|奖励数量
+function GuessGameManager:GetContinuouslyWinTimes()
+    if self.curSuccessGuessTimes then
+        if self.curSuccessGuessTimes > 0 then --连续竞猜
+            return self.curSuccessGuessTimes, self.winExtraAward[self.curSuccessGuessTimes][2]
+        else
+            return 0, 0
+        end
+    else
+        self.curSuccessGuessTimes = 0
+        for i = self.curOpenSessionIndex - 1, 1, -1 do
+            local info = self.sessionInfo[i]
+            if info.bet == 0 then --未竞猜
+                break
+            end
+            if info.bet == info.win then
+                self.curSuccessGuessTimes = self.curSuccessGuessTimes + 1
+            else
+                break
+            end
+        end
+    end
+    return self:GetContinuouslyWinTimes()
+end
+---获取竞猜场次数据
+---@param index number 场次序列号
+---@return table 场次数据
+function GuessGameManager:GetSessionData(index)
+    return self.sessionInfo[index]
+end
+---获取当前展示的场次序列号
+---@return 变量类型 中文描述
+function GuessGameManager:GetShowSessionInfo()
+    if self.curOpenSessionIndex > 1 then
+        for i = 1, self.curOpenSessionIndex do
+            if self.sessionInfo[i].award == 0 and self.sessionInfo[i].bet > 0 then
+                return i
+            end
+        end
+    end
+    return self.curOpenSessionIndex
+end
+---获取当前正在竞猜的场次
+---@return 变量类型 中文描述
+function GuessGameManager:GetCurFactSessionIndex()
+    return self.curOpenSessionIndex
+end
+---获取竞猜场次的队伍详细数据
+---@param index number 场次序列号
+---@param callback function 获取回调
+function GuessGameManager:GetSessionCardDetail(index, callback)
+    if self.sessionEmbattleData and self.sessionEmbattleData[index] then
+        callback(self.sessionEmbattleData[index])
+        return
+    end
+    if not self.sessionEmbattleData then
+        self.sessionEmbattleData = {}
+    end
+    self.curMessageSessionIndex = index
+    self.onMessageCall = callback
+    GuessGameNet:GetInstance():GetEmbattleData(
+        index,
+        _G.handler(self, self.HandleArrayData),
+        self.curActivityClass:GetActivityID()
+    )
+end
+---获取竞猜场次的剩余时间
+---@param index number 竞猜场次
+---@return number 剩余时间
+function GuessGameManager:GetSessionEndTime(index)
+    local t = _G.TimeUtil.GetServerUnixTime()
+    t = self.sessionInfo[index].time_end - t
+    if t < 0 then
+        t = 0
+    end
+    return t
+end
+---获取下注公告信息
+---@param callback function 竞猜信息
+function GuessGameManager:GetGuessInfo(callback)
+    if self.curActivityClass:GetCurActivityState() == require("ActivitySynManager").State.Notice then
+        callback({})
+        return
+    end
+    GuessGameNet:GetInstance():BetInfo(callback, self.curActivityClass:GetActivityID())
+end
+---获取赛程信息
+function GuessGameManager:GetAllSessionInfo()
+    return self.sessionInfo
+end
+---获取排行榜信息
+---@param callback function 排行榜信息
+function GuessGameManager:GetRankInfo(callback)
+    GuessGameNet:GetInstance():Rank(callback, self.curActivityClass:GetActivityID())
+end
+---获取个人排行榜信息
+---@param callback function 排行榜信息
+function GuessGameManager:GetSelfRankInfo(callback)
+    GuessGameNet:GetInstance():SelfRank(callback, self.curActivityClass:GetActivityID())
+end
+---下注
+---@param index number 场次序列号
+---@param bet number 下注方 1进攻方 2防守方
+function GuessGameManager:Bet(index, bet, callback)
+    if not _G.StorageManager:GetInstance():CheckItem(self.betCost[1], self.betCost[2]) then --道具不足
+        --TODO:提示道具不足
+        _G.PopWindowManager:GetInstance():ShowAllTips(630106)
+        return
+    end
+    self.onMessageCall = callback
+    self.curMessageSessionIndex = index
+    self.curBetSessionSide = bet
+    GuessGameNet:GetInstance():Bet(index, bet, _G.handler(self, self.OnBetCall), self.curActivityClass:GetActivityID())
+end
+
+---领取奖励
+---@param index number 场次序列号
+---@param callback function 回调
+function GuessGameManager:GetAward(index, callback)
+    self.curMessageSessionIndex = index
+    self.onMessageCall = callback
+    GuessGameNet:GetInstance():GetBetAward(self.curActivityClass:GetActivityID(),index, _G.handler(self, self.OnGetAwardCall))
+end
+---获取弱势翻盘奖励
+---@param per number 进攻方下注倍率
+---@return number|number 显示状态 0无1红方2蓝方|奖励数量
+function GuessGameManager:GetShowWeakWinAward(per)
+    if per < self.weakAward[3] then --进攻方弱势
+        return 1, self.weakAward[2] * _G.Mathf.Round((self.weakAward[3] - per) / self.weakAward[4])
+    elseif 100 - per < self.weakAward[3] then --防守方弱势
+        per = 100 - per
+        return 2, self.weakAward[2] * _G.Mathf.Round((self.weakAward[3] - per) / self.weakAward[4])
+    end
+    return 0
+end
+---计算热度值
+---@param num number 支持的人数
+---@return number 热度值
+function GuessGameManager:CalculateHotValue(num)
+    if num <= 0 then
+        return 0
+    end
+    local value = 0
+    local sum = 0
+    for i = 1, num do
+        value = self.hotValue[1] + _G.Mathf.Floor(i / self.hotValue[2]) * self.hotValue[3]
+        if value < 1 then
+            value = 1
+        end
+        sum = sum + value
+    end
+    return sum
+end
+---获取下注倍率
+---@param index number 场次序列号
+---@param callback function 回调
+function GuessGameManager:GetPercentage(index, callback)
+    if self.curActivityClass:GetCurActivityState() == require("ActivitySynManager").State.Notice then
+        callback(0, 0)
+        return
+    end
+    self.onMessageCall = callback
+    GuessGameNet:GetInstance():GetPercentage(
+        index,
+        _G.handler(self, self.HandleBetPer),
+        self.curActivityClass:GetActivityID()
+    )
+end
+---回放战斗
+---@param index number 赛程序列号
+---@param sessionView boolean 是否是赛程界面
+function GuessGameManager:ReplayBattle(index, sessionView)
+    self.curReplayTag = sessionView
+    self.curMessageSessionIndex = index
+    GuessGameNet:GetInstance():PlayReport(
+        self.sessionInfo[index].playback_uid,
+        _G.handler(self, self.OnReplayReportCall),
+        self.curActivityClass:GetActivityID()
+    )
+end
+---获取消耗
+---@return number 消耗
+function GuessGameManager:GetBetCost()
+    return self.betCost[2], self.betCost[1]
+end
+---获取停止下注时间
+---@return number 时间
+function GuessGameManager:GetSettlementSecond()
+    return self.settlementSecond
+end
+function GuessGameManager:SetResultSendCall(name, callback)
+    if not self.onResultSendCall then
+        self.onResultSendCall = {}
+    end
+    self.onResultSendCall[name] = callback
+end
+function GuessGameManager:SetOnSixUpdateCall(name, callback)
+    if not self.onSixUpdateCall then
+        self.onSixUpdateCall = {}
+    end
+    self.onSixUpdateCall[name] = callback
+end
+function GuessGameManager:SetOnMailAwardCall(callback)
+    self.onMailAwardCall = callback
+end
+---获取聊天弹幕信息
+---@param callback number 获取数量
+function GuessGameManager:GetChatData(callback)
+    -- if self.chatMsgTable then
+    --     callback(self.chatMsgTable)
+    -- else
+    -- self.onChatMsgCall = callback
+    GuessGameNet:GetInstance():GetChatData(
+        self.curActivityClass:GetActivityID(),
+        function(msg)
+            if msg.ack == 1 then
+                callback(msg.info)
+            end
+        end
+    )
+    -- end
+end
+---发送聊天弹幕
+---@param text string 弹幕内容
+---@param callback function 回调
+function GuessGameManager:SendChatInfo(type, content, isAuto, callback)
+    GuessGameNet:GetInstance():SendChatData(self.curActivityClass:GetActivityID(), type, content, isAuto, callback)
+end
+---检测弹幕是否开启(ZHJ-21241【客户端】竞猜弹幕优化)默认一直开启
+---@return boolean 是否开启
+function GuessGameManager:CheckChatOpened()
+    -- if self.onChatWindowOpenTag == nil then
+    --     self.onChatWindowOpenTag = _G.PlayerPrefsManager.GetInt("GuessGameSaveChatTag", 0)
+    --     if self.onChatWindowOpenTag ~= 0 then
+    --         self.onChatWindowOpenTag =
+    --             _G.TimeUtil.GetInterValDayByGame(self.onChatWindowOpenTag, _G.TimeUtil.GetServerUnixTime()) > 0
+    --     else
+    --         self.onChatWindowOpenTag = true
+    --     end
+    -- end
+    self.onChatWindowOpenTag = true
+    return self.onChatWindowOpenTag
+end
+---设置弹幕是否开启
+---@param 变量名 变量类型 中文描述
+function GuessGameManager:SetChatOpenedTag(open)
+    self.onChatWindowOpenTag = open
+    --TODO:保存弹幕设置状态
+    if open then
+        _G.PlayerPrefsManager.DeleteKey("GuessGameSaveChatTag")
+    else
+        _G.PlayerPrefsManager.SetInt("GuessGameSaveChatTag", _G.TimeUtil.GetServerUnixTime())
+    end
+end
+function GuessGameManager:CheckActivityOpened()
+    if self.curActivityClass:GetCurActivityState() == require("ActivitySynManager").State.Notice then
+        --TODO:提示活动开启时间
+        return false
+    end
+    return self.curActivityClass:GetCurActivityState() == require("ActivitySynManager").State.Open
+end
+--endregion
+
+function GuessGameManager:SetTaskProgress(condintion)
+end
+
+---判断任务是否领取
+function GuessGameManager:WasTaken(Sid, type)
+    if not _G.table.isEmptyOrNil(self.finshedMissionList[type]) then
+        for _, v in pairs(self.finshedMissionList[type].sid) do
+            if Sid == v then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---判断任务能否领取
+function GuessGameManager:CheckCanTake(data, type)
+    if not self:WasTaken(data.sid, type) then
+        local progressType = missionState[data.condition[1].k]
+        if self.progressList[type][progressType] >= data.condition[1].v then
+            return true
+        end
+    end
+    return false
+end
+
+function GuessGameManager:RefreshCoin(data)
+    for _, v in pairs(data) do
+        if v.type[1] == 104 then
+            self.chip_own = self.chip_own + v.type[2]
+            self:RefreshMission(missionState[2], v.type[2])
+        end
+    end
+end
+
+function GuessGameManager:RefreshMission(missionType, nums)
+    self.progressList[1][missionType] = self.progressList[1][missionType] + nums
+    self.progressList[2][missionType] = self.progressList[2][missionType] + nums
+    self:RefreshRedPointMission()
+    if self.call then
+        self:SortTask(1)
+        self:SortTask(2)
+        self.call()
+        self.call = nil
+    end
+end
+
+function GuessGameManager:GetProgressData()
+    return self.progressList
+end
+
+function GuessGameManager:GetMissionData()
+    return self.missionList
+end
+
+function GuessGameManager:GetMissionAward(sid, type, call)
+    local activity_id = self.curActivityClass:GetActivityID()
+    local coinData = {}
+    local coins = 0
+    for k, v in pairs(self.missionList[type]) do
+        for k1, v1 in pairs(sid) do
+            if v.sid == v1 then
+                coins = coins + v.coin
+            end
+        end
+    end
+    coinData = {[1] = 104,[2] = coins}
+    GuessGameNet:GetInstance():GetMissionAward(activity_id,sid,
+    function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        if coins > 0 then
+           table.insert(msg.award.item,{type = coinData})
+        end
+        _G.Events:GetInstance():Broadcast(_G.eArena.SetGuessCoin, coins)
+         _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+         _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg,call)
+     end)
+    for _,v in pairs(sid) do
+        table.insert(self.finshedMissionList[type].sid,v)
+    end
+    --self:RefreshRedPointMission()
+    if call then
+        self.call = call
+    end
+end
+
+function GuessGameManager:SortTask(type)
+    if not self.missionList then
+        return
+    end
+    _G.SortList(
+        self.missionList[type],
+        function(v)
+            local missionType
+            local iscantake = self:CheckCanTake(v, type)
+            local WasTaken = self:WasTaken(v.sid, type)
+            if WasTaken then
+                missionType = -1
+            else
+                if iscantake then
+                    missionType = 1
+                else
+                    missionType = 0
+                end
+            end
+            return missionType, -v.sid
+        end
+    )
+end
+
+function GuessGameManager:RandomName()
+    return _G.LoginManager:GetInstance():GetRandomName()
+end
+
+return GuessGameManager

@@ -1,0 +1,208 @@
+-----------------------------------------------------------------------
+-- F:.H5.Client.Assets.Resources.LuaScripts.Game.TransitionGuided.Model.TransitionGuidedSynModel	(修改路径必须修正此项!)
+-- Created by
+-- DateTime: 2025/11/05
+-- Description: 转端引导活动
+-----------------------------------------------------------------------
+local base = require "ActivitySynTypeBase"
+local MallManager = require("MallManager")
+---@class TransitionGuidedSynModel    : ActivitySynTypeBase
+local TransitionGuidedSynModel = _G.BaseClass("TransitionGuidedSynModel", base)
+local coinID = 11
+local TransitionGuidedNet = require("TransitionGuidedNet"):GetInstance()
+
+---创建对象时,入口构造函数
+function TransitionGuidedSynModel:__init()
+    self.drawTimes = 0
+    self.ActivityId = self.curActivityClass:GetActivityID()
+    _G.Events:GetInstance():AddListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+end
+
+function TransitionGuidedSynModel:ResUpdata(data)
+    for _, v in pairs(data) do
+        if v.type[1] == coinID then
+            self:RefreshRedPointRecordRecharge()
+        end
+    end
+end
+
+function TransitionGuidedSynModel:OnHandleGMData(msg)
+    self:ParseData(msg)
+end
+
+---@param msg activity_dispatch.i_activity_dispatch_brief
+function TransitionGuidedSynModel:ParseData(msg)
+    self:SetSelfData(msg.guided_transition)
+    base.ParseData(self)
+end
+
+function TransitionGuidedSynModel:SetSelfData(data)
+    self.id = data.pool_sid
+    self.gotIndexT = data.index or {}
+    self.drawTimes = #self.gotIndexT
+    self.consume_list = data.consume_list
+    coinID = self.consume_list[1].key
+    local cfg = _G.ConfigManager.prize_pool_cfg[self.id]
+    self.awardCfg = {}
+    for k, v in pairs(cfg.reward1) do
+        local T = { v[1], v[2] }
+        table.insert(self.awardCfg, T)
+    end
+    self.is_join = data.is_join
+    self.user_code = data.user_code
+    self.officialAccount = data.official_account --公众号名称
+
+    if self:CheckOpen() then
+        local redpointManager = require("RedPointManager"):GetInstance()
+        redpointManager:AddRedPointChild(
+            1021,
+            self:GetRedpointIDByIndex(1)
+        )
+    end
+end
+
+---所有活动解析完成后运行
+function TransitionGuidedSynModel:LaterInitFunction()
+    local redPointId = self:GetRedpointIDByIndex(1)
+    local taskActivity = require "ActivitySynManager":GetInstance():GetChildAcitivity(10007,
+        self.curActivityClass:GetJumpType())
+    if taskActivity then
+        require "RedPointManager":GetInstance():AddRedPointChild(redPointId,
+            taskActivity:GetActivityTypeCls():GetRedpointIDByIndex(1))
+    end
+end
+
+function TransitionGuidedSynModel:OnEnterActivity()
+    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.TransitionGuidedView.Name, self.curActivityClass)
+    if self.onEnterDoneCall then
+        self.onEnterDoneCall()
+        self.onEnterDoneCall = nil
+    end
+end
+
+function TransitionGuidedSynModel:OnGetMainViewName()
+    return _G.ConfigManager.ui_cfg.TransitionGuidedView.Name
+end
+
+function TransitionGuidedSynModel:InitRedPointTree()
+    self.checkRedPointFunc = { self.CheckDrawTime }
+    self.redpointTree = { { 2 }, false }
+end
+
+---检测红点
+---@param index number 红点类型序列号
+---@param param number 红点参数
+---@return number 红点数量
+function TransitionGuidedSynModel:CheckRedPointNumChild(index, param)
+    if self.checkRedPointFunc[index] then
+        return self.checkRedPointFunc[index](self)
+    end
+    return 0
+end
+
+---刷新奖励红点
+function TransitionGuidedSynModel:RefreshRedPointRecordRecharge()
+    require("RedPointManager"):GetInstance():RefreshNode(self:GetRedpointIDByIndex(1))
+end
+
+function TransitionGuidedSynModel:CheckDrawTime()
+    local today = _G.TimeUtil.GetDayBegin(_G.TimeUtil.GetServerUnixTime())
+    if today ~= _G.PlayerPrefsManager.GetInt(_G.PlayerPrefsKey.TransitionGuidedLogin) then
+        return 1
+    end
+    local coinCount = _G.StorageManager:GetInstance():GetItemCountBySid(coinID)
+    local nowNeedCount = self:GetNowNeedCount()
+    return coinCount >= nowNeedCount and 1 or 0
+end
+
+---是否显示按钮(用于功能作为某一界面中的功能使用，建议将该功能设置为独立按钮)
+function TransitionGuidedSynModel:IsShowBtn()
+    return false
+end
+
+--region 对外接口
+
+---获取配置id
+function TransitionGuidedSynModel:Getid()
+    return self.id
+end
+
+function TransitionGuidedSynModel:GetAwardCfg()
+    return self.awardCfg
+end
+
+function TransitionGuidedSynModel:GetIsJoin()
+    return self.is_join
+end
+
+---检查功能是否开启
+function TransitionGuidedSynModel:CheckOpen()
+    if _G.AppSetting.IsArraigned then
+        return false
+    end
+    if self.is_join == 0 then
+        return false
+    end
+    local transfer = _G.SDKManager:GetInstance():GetExtraDataField("open_guided_transfer", 0)
+    return _G.tonumber(transfer) == 1
+end
+
+function TransitionGuidedSynModel:GetOpenIndex()
+    return _G.SDKManager:GetInstance():GetExtraDataField("guided_transfer_pos", 1)
+end
+
+---检查奖励是否被领取
+function TransitionGuidedSynModel:CheckAward(index1)
+    return _G.table.ContainsValue(self.gotIndexT, index1)
+end
+
+function TransitionGuidedSynModel:GetNowNeedCount()
+    return self.consume_list[1].value
+end
+
+---抽奖
+function TransitionGuidedSynModel:Draw(pb, callback)
+    _G.SDKManager:GetInstance():ZDActReport("zp_click")
+    TransitionGuidedNet:Draw(pb, function(msg)
+        if msg.ack ~= 1 then
+            return
+        end
+        _G.StorageManager:GetInstance():ConsumeItem(coinID, nil, self:GetNowNeedCount())
+        _G.StorageManager:GetInstance():ReceiveAwardData(msg)
+        if msg.args[2] then
+            self.gotIndexT = {}
+            self.id = msg.args[2]
+            self.drawTimes = 0
+        else
+            table.insert(self.gotIndexT, msg.args[1])
+            self.drawTimes = self.drawTimes + 1
+        end
+        local bigAward = msg.args[1] == 1
+        if bigAward then
+            _G.SDKManager:GetInstance():ZDActReport("pop_show")
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.TransitionGuidedDiaryView.Name,
+                self.curActivityClass, function()
+                    _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+                end)
+        else
+            _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.CommonAwardView.Name, msg)
+        end
+        if callback then
+            callback { msg }
+        end
+        self:RefreshRedPointRecordRecharge()
+    end)
+end
+
+function TransitionGuidedSynModel:GetOfficialAccount()
+    return self.officialAccount
+end
+
+--endregion
+
+---类的析构函数
+function TransitionGuidedSynModel:Dispose()
+    _G.Events:GetInstance():RemoveListener(_G.eItemUpdata.Updata, self.ResUpdata, self)
+end
+
+return TransitionGuidedSynModel

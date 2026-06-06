@@ -1,0 +1,654 @@
+-----------------------------------------------------------------------
+-- D:.Project.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Cycle.View.CycleBattlePassView	(修改路径必须修正此项!)
+-- Created by sj
+-- DateTime: 2024/05/22
+-- Description: 三环战令通用页面
+-----------------------------------------------------------------------
+local BaseAwardNewItem = require("BaseAwardNewItem")
+
+---@class CycleBattlePassView : UIBaseView    中文描述
+---@field public go_table CycleBattlePassView_GoTable GoTable
+---@field activity ActivitySynCfgActivity
+---@field typeClass CycleBattlePassSynBaseModel
+---@field awardCfgArray store_season_battlecon_cfg[]
+---@field cfg store_season_battle_cfg
+local CycleBattlePassView = _G.BaseClass("CycleBattlePassView", _G.UIBaseView)
+
+local GetLangPackValue = _G.GetLangPackValue
+local ItemState = {
+    Lock = 1, --未解锁
+    Unlock = 2, --可领取
+    Received = 3 --已领取
+}
+local LanguageID = {
+    --- %s级
+    Level = 90025500012
+}
+
+function CycleBattlePassView:Awake()
+    _G.AddViewBtnClick(self.go_table.gameObject, _G.handler(self, self.OnClickBtn))
+end
+
+---界面的入口函数
+---@param activity ActivitySynCfgActivity
+function CycleBattlePassView:OnCreate(activity)
+    self.activity = activity
+    self.typeClass = self.activity.typeClass
+    self.cfg = self.activity.typeClass:GetCfg()
+    --self:AddRest()
+    self.ResLoadCompleteCall = _G.handlerbind(self, self.SetData)
+    local key = "CycleBattlePassPath" .. self.typeClass.bId .. _G.PlayerModel:GetInstance():GetPlayerUid()
+    local time = _G.TimeUtil.GetDayBySix(_G.TimeUtil.GetServerUnixTime())
+    self.itemList = {}
+    --if self.typeClass:GetHelpId() and self.typeClass:GetHelpId() ~= 0 then
+    --    self.go_table.aorbtn_help:SetActiveE(1)
+    --else
+    --    self.go_table.aorbtn_help:SetActiveE(0)
+    --end
+    _G.PlayerPrefsManager.SetInt(key, time)
+    _G.Events:GetInstance():AddListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+
+    self.CycleBattlePassModel = require "CycleBattlePassModel":GetInstance()
+    local curViewName = self.CycleBattlePassModel.ViewEnum[self.typeClass.bId]
+    local res = _G.ConfigManager.ui_cfg[curViewName].resources
+    self:AddComponent(self.go_table.obj_playerInfo, require("PlayerComponent").New(self.go_table.obj_playerInfo))
+    self:AddComponent(self.go_table.obj_resource, require("ResourceCompont").New(self.go_table.obj_resource, res))
+    --更新视图
+    self:InitView()
+end
+
+---初始化窗口，涉及特效，需要activity设置完根节点OrderInLayer后再执行，否则特效层级概率计算错误
+function CycleBattlePassView:InitView()
+    if self.isInit then
+        return
+    end
+    self.isInit = true
+    self.go_table.obj_ItemNum:SetActiveE(0)
+    local obj, tb
+    ---@type store_battle_theme_cfg
+    local cfg
+    self.pathItem = {}
+    local paths = self.typeClass:GetAllPath()
+    for _, v in pairs(paths) do
+        cfg = _G.ConfigManager.store_battle_theme_cfg[v]
+        if cfg then
+            obj = _G.InstantiateObject(self.go_table.obj_pathItem, self.go_table.obj_path)
+            obj:SetActiveE(1)
+            tb = _G.GetAutoGoTable(obj, _G.handlerbind(self, self.OnClickPath, v, cfg.reward_theme[1]))
+            self.pathItem[v] = tb
+            tb.item = BaseAwardNewItem.New(tb.obj_item, nil, 88, tb.obj_item)
+            tb.item:ShowWithID(
+                    cfg.reward_theme,
+                    nil,
+            ---@param item BaseAwardNewItem
+                    function(item)
+                        item:ShowEffect(true, 1)
+                    end
+            )
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError("未配置战令路线" .. v)
+            end
+        end
+    end
+    self.countDown = self.typeClass:GetEndTime() - _G.TimeUtil.GetServerUnixTime()
+    self:UpdateTime(0)
+    self.timer = _G.TimerManager:GetInstance():GetTimer(1, self.UpdateTime, self, false, false, true)
+    self.timer:Start()
+    self:UpdateView()
+end
+
+---刷新界面
+function CycleBattlePassView:UpdateView()
+    --if self.lua_AddExp then
+    --    self.lua_AddExp:Hide()
+    --end
+    self.path = self.typeClass:GetChossePath()
+    self.canSwitch = self.typeClass:CheckCanSwitchPath()
+    self:UpdateLevel()
+    if self.path == 0 and not self.canSwitch then
+        ---只有一条线路
+        self.path = self.typeClass:GetCfg().content[1]
+        self.pathCfg = _G.ConfigManager.store_battle_theme_cfg[self.path]
+        self.typeClass:ChoosePath(self.path, _G.handler(self, self.OnChoosePathEnd))
+    else
+        self:ShowByPath()
+        self:UpdateChoosePath()
+        if self.path ~= 0 then
+            self:UpdateBattlePass()
+            --self:UpdateBattlePassSenior()
+        end
+    end
+    local awardSid = 202100100
+    if self.typeClass.bId == self.CycleBattlePassModel.BattlePassIDEnum[2] then
+        awardSid = 20201010001
+    end
+
+    local cfg = _G.ConfigManager.item_cfg[awardSid]
+    if not string.IsNullOrEmpty(cfg.icon) then
+        self.go_table.aorimage_awardIcon:LoadImage(cfg.icon)
+    end
+    local itemValue = _G.StorageManager:GetInstance():GetItemCountByID(cfg.field, awardSid)
+    self.go_table.aortext_awardCount.text = itemValue
+end
+
+---显示选线or战令
+function CycleBattlePassView:ShowByPath()
+    self.go_table.obj_choosePath:SetActiveE(self.path == 0 and 1 or 0)
+    self.go_table.obj_battlePass:SetActiveE(self.path == 0 and 0 or 1)
+    self:UpdateAddBtnShow()
+end
+
+---刷新加速按钮
+function CycleBattlePassView:UpdateAddBtnShow()
+    --self.go_table.aorbtn_add:SetActiveE((self.path ~= 0 and self.typeClass:IsAddBtnShow()) and 1 or 0)
+end
+
+---刷新等级区显示
+function CycleBattlePassView:UpdateLevel()
+    local lv, curExp, curMaxExp = self.typeClass:GetLvAndCurLvExp()
+    self.lv = lv
+    self.curExp = curExp
+    self.go_table.aortext_lv.text = lv
+    self.go_table.slider_jdtdi.value = curMaxExp == 0 and 1 or curExp / curMaxExp
+    self.go_table.aortext_exp.text = curMaxExp == 0 and "" or curExp .. "/" .. curMaxExp
+    local maxDayExp = self.typeClass:GetMaxDayExp()
+    if maxDayExp == 0 then
+        self.go_table.aortext_limit.text = ""
+    else
+        local curDayExp = self.typeClass:GetDayExp()
+        self.go_table.aortext_limit.text = GetLangPackValue(90031100007, curDayExp, maxDayExp)
+    end
+    self.go_table.aortext_funTips.text = self.typeClass:GetExpTipStr()
+    local id = self.typeClass.bId
+    self.go_table["obj_title" .. id]:SetActiveE(1)
+    if id == 1 then
+        self.go_table.aortext_nums1.text = GetLangPackValue(90031100024) .. "%"
+        self.go_table.aorrawimage_Icon1:LoadImage(_G.StorageManager:GetInstance():GetItemIcon(202010100))
+        self.go_table.aorrawimage_Icon2:LoadImage(_G.StorageManager:GetInstance():GetItemIcon(203010502))
+        self.go_table.aortext_num1.text = "×" .. GetLangPackValue(90031100028)
+    elseif id == 2 then
+        self.go_table.aortext_nums2.text = GetLangPackValue(90031100029) .. "%"
+    end
+end
+
+---刷新选线
+function CycleBattlePassView:UpdateChoosePath()
+    for k, v in pairs(self.pathItem) do
+        v.obj_gou:SetActiveE(k == self.path and 1 or 0)
+    end
+    if self.path ~= 0 then
+        self.go_table.obj_setItem:SetActiveE(1)
+        self.go_table.obj_add:SetActiveE(0)
+        self.pathCfg = _G.ConfigManager.store_battle_theme_cfg[self.path]
+        local icon = _G.ConfigManager.item_cfg[self.pathCfg.reward_theme[1]].Icon
+        self.go_table.aorrawimage_icon:LoadImage(icon)
+    end
+end
+
+---刷新战令
+function CycleBattlePassView:UpdateBattlePass()
+    self.go_table.obj_switchPath:SetActiveE(self.canSwitch and 1 or 0)
+    self.isBuy = self.typeClass:GetIsBuy()
+    local rect = self.go_table.scrollloopvectical_items.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.RectTransform))
+    self.go_table.aorbtn_buy:GetComponentE(_G.typeof(_G.CS.AorImage)).color =
+        require("CardInfoManager").GetColorFromRGB(not self.isBuy and "FFFFFF" or "A9A9A9")
+    self.go_table.aortext_money.color =
+    require("CardInfoManager").GetColorFromRGB(not self.isBuy and "8C2D14" or "434343")
+    if self.isBuy then
+        self.go_table.aorbtn_buy:SetGray(true)
+        -- self.go_table.aortext_money.color = _G.Color.New(65 / 255, 65 / 255, 65 / 255, 1)
+        self.go_table.aortext_money.text = GetLangPackValue(90022500421)
+        --self.go_table.obj_senior:SetActiveE(0)
+        --self.go_table.obj_bought:SetActiveE(1)
+    else
+        self.go_table.aorbtn_buy:SetGray(false)
+        _G.GameUtil.SetPriceByChannel(self.cfg.price_id, self.go_table.aortext_money)
+        --self.go_table.obj_senior:SetActiveE(1)
+        --self.go_table.obj_bought:SetActiveE(0)
+    end
+
+    local array = self.pathCfg.content[1]
+    local store_season_battlecon_cfg = _G.ConfigManager.store_season_battlecon_cfg
+    local cfg
+    self.awardCfgArray = {}
+    for _, v in pairs(array) do
+        cfg = store_season_battlecon_cfg[v]
+        _G.table.insert(self.awardCfgArray, cfg)
+    end
+    self.awardLis = self.typeClass:GetAllUnlockAwards(self.lv)
+    self.go_table.aorbtn_oneKey:SetActiveE(#self.awardLis > 1 and 1 or 0)
+    if not self.bpInit then
+        self.go_table.scrollloopvectical_items:InitItemData(#self.awardCfgArray, _G.handler(self, self.RefreshList))
+        self.bpInit = true
+        self.go_table.scrollloopvectical_items:ScrollToIndex(self:FindFirstAwardIndex())
+    else
+        self.go_table.scrollloopvectical_items:UpdateAllItem()
+    end
+    --self:UpdateBattlePassSenior()
+end
+
+function CycleBattlePassView:RefreshList(index, obj)
+    if index < 0 then
+        return
+    end
+    index = index + 1
+    local cfg = self.awardCfgArray[index]
+    local id = cfg.id
+    local tb = _G.GetAutoGoTable(obj, _G.handlerbind(self, self.OnClickItem, id))
+    obj:SetName(index)
+    if not table.ContainsValue(self.itemList, obj) then
+        self.itemList[index] = obj
+    end
+    for i = 1, #self.itemList do
+        _G.SortList(
+                self.itemList,
+                function(a)
+                    return -a:GetName()
+                end
+        )
+        self.itemList[i]:SetSiblingIndexE(i)
+    end
+
+    local freeState, payState
+    local lvEnough = self.lv >= cfg.level
+    freeState = lvEnough and ItemState.Unlock or ItemState.Lock
+    payState = (lvEnough and self.isBuy) and ItemState.Unlock or ItemState.Lock
+    tb.freeState = self.typeClass:CheckAwardIsGet(id, true) and ItemState.Received or freeState
+    tb.payState = self.typeClass:CheckAwardIsGet(id, false) and ItemState.Received or payState
+
+    local rewards = cfg.rewards_normal
+    if not tb.item1 then
+        tb.item1 = BaseAwardNewItem.New(tb.obj_item1, nil, 88, tb.obj_item1)
+    end
+    tb.item1:ShowWithID(rewards[1], nil, _G.handlerbind(self, self.itemLoadedCall, tb, false, 1))
+
+    rewards = cfg.rewards_pay[1]
+    if not tb.item2 then
+        tb.item2 = BaseAwardNewItem.New(tb.obj_item21, nil, 88, tb.obj_item21)
+    end
+    tb.item2:ShowWithID(rewards, nil, _G.handlerbind(self, self.itemLoadedCall, tb, true, 21))
+
+    rewards = cfg.rewards_pay[2]
+    tb.obj_item22:SetActiveE(rewards and 1 or 0)
+    if rewards then
+        if not tb.item3 then
+            tb.item3 = BaseAwardNewItem.New(tb.obj_item22, nil, 88, tb.obj_item22)
+        end
+        tb.item3:ShowWithID(rewards, nil, _G.handlerbind(self, self.itemLoadedCall, tb, true, 22))
+    end
+
+    ---是否显示第二个
+    tb.obj_gou22:SetActiveE(rewards and 1 or 0)
+    --tb.obj_suo22:SetActiveE(rewards and 1 or 0)
+
+    ---已领打勾
+    tb.obj_gou1:SetActiveE(tb.freeState == ItemState.Received and 1 or 0)
+    tb.obj_gou2:SetActiveE(tb.payState == ItemState.Received and 1 or 0)
+    ---可领
+    tb.aorbtn_get:SetActiveE((tb.freeState == ItemState.Unlock or tb.payState == ItemState.Unlock) and 1 or 0)
+    ---未解锁上锁
+    --tb.obj_suo1:SetActiveE(tb.freeState == ItemState.Lock and 1 or 0)
+    --tb.obj_suo2:SetActiveE(tb.payState == ItemState.Lock and 1 or 0)
+
+    tb.aortext_lv.text = GetLangPackValue(LanguageID.Level, cfg.level)
+    --等级经验
+    local exp = self.typeClass:GetLvExpByLv(cfg.level)
+    tb.aortext_exp.text = exp
+
+    --进度条
+    tb.aorimage_DayBar:SetActiveE(BoolToNumber(index ~= 1))
+    local lv, curExp, curMaxExp = self.typeClass:GetLvAndCurLvExp()
+    if cfg.level - 1 < lv then
+        tb.aorimage_dayBar:SetLocalScale(1, 1, 1)
+    elseif cfg.level - 1 == lv then
+        local scale = curExp / curMaxExp
+        tb.aorimage_dayBar:SetLocalScale(1, scale, 1)
+    else
+        tb.aorimage_dayBar:SetLocalScale(1, 0, 1)
+    end
+    return obj
+end
+
+function CycleBattlePassView:FindFirstAwardIndex()
+    local maxIndex = self.isBuy and #self.awardCfgArray - 5 or #self.awardCfgArray - 3
+    local cfg
+    for i = 1, #self.awardCfgArray do
+        cfg = self.awardCfgArray[i]
+        if self.lv >= cfg.level then
+            if not self.typeClass:CheckAwardIsGet(cfg.id, true) then
+                return i > maxIndex and maxIndex - 1 or i - 1
+            elseif self.isBuy and not self.typeClass:CheckAwardIsGet(cfg.id, false) then
+                return i > maxIndex and maxIndex - 1 or i - 1
+            end
+        end
+    end
+    return 0
+end
+
+---刷新高级战令显示
+function CycleBattlePassView:UpdateBattlePassSenior()
+    local itemDic = {}
+    local itemNowDic = {}
+    local sid
+    for i = 1, #self.awardCfgArray do
+        for j = 1, #self.awardCfgArray[i].rewards_pay do
+            sid = self.awardCfgArray[i].rewards_pay[j][1]
+            if itemDic[sid] == nil then
+                itemDic[sid] = self.awardCfgArray[i].rewards_pay[j][2]
+            else
+                itemDic[sid] = itemDic[sid] + self.awardCfgArray[i].rewards_pay[j][2]
+            end
+            if self.awardCfgArray[i].level <= self.lv then
+                if itemNowDic[sid] == nil then
+                    itemNowDic[sid] = self.awardCfgArray[i].rewards_pay[j][2]
+                else
+                    itemNowDic[sid] = itemNowDic[sid] + self.awardCfgArray[i].rewards_pay[j][2]
+                end
+            end
+        end
+    end
+    for _, v in pairs(self.cfg.goods) do
+        sid = v[1]
+        if itemNowDic[sid] == nil then
+            itemNowDic[sid] = v[2]
+        else
+            itemNowDic[sid] = itemNowDic[sid] + v[2]
+        end
+    end
+    self.allRewards = {}
+    for k, v in pairs(itemDic) do
+        _G.table.insert(self.allRewards, { k, v })
+    end
+    self.nowRewards = {}
+    for k, v in pairs(itemNowDic) do
+        _G.table.insert(self.nowRewards, { k, v })
+    end
+    if not self.allAndNowInit then
+        self.go_table.scrollloophorizontal_seniorAward:InitItemData(
+                #self.allRewards,
+                _G.handler(self, self.RefreshSeniorAllItem)
+        )
+        self.go_table.scrollloophorizontal_nowAward:InitItemData(
+                #self.nowRewards,
+                _G.handler(self, self.RefreshSeniorNowItem)
+        )
+        self.allAndNowInit = true
+    else
+        self.go_table.scrollloophorizontal_seniorAward:UpdateCount(#self.allRewards)
+        self.go_table.scrollloophorizontal_nowAward:UpdateCount(#self.nowRewards)
+    end
+end
+
+---刷新高级战令商品显示
+function CycleBattlePassView:RefreshSeniorAllItem(index, obj)
+    index = index + 1
+    obj:ClearChildren()
+    _G.StorageManager:GetInstance():GetItemBaseViewNew(
+            self.allRewards[index],
+            obj,
+            function(item)
+                item:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+                item:ShowEffect(true, true)
+            end
+    )
+end
+
+---刷新高级战令商品显示
+function CycleBattlePassView:RefreshSeniorNowItem(index, obj)
+    index = index + 1
+    obj:ClearChildren()
+    _G.StorageManager:GetInstance():GetItemBaseViewNew(
+            self.nowRewards[index],
+            obj,
+            function(item)
+                item:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+                item:ShowEffect(true, true)
+            end
+    )
+end
+
+---@param isBuy boolean true是豪华奖励
+---@param itemLua BaseAwardNewItem 奖励脚本
+function CycleBattlePassView:itemLoadedCall(itemLua, tb, isBuy,suf)
+    ---@type ItemViewBase
+    local lua = itemLua.item
+    if itemLua.type ~= _G.StorageType.Card then
+        lua:ShowNumText(true, require("ItemViewBase").NumTextAnchor.RightDown)
+    end
+
+    local state = isBuy and tb.payState or tb.freeState
+    local isShowEffect = state == ItemState.Unlock
+
+    if itemLua.type ~= _G.StorageType.Card then
+        itemLua:ShowEffect(false)
+        if isShowEffect then
+            lua:ShowEffect()
+        else
+            lua:ShowOrHideEffect(false)
+        end
+    else
+        itemLua:ShowEffect(isShowEffect)
+    end
+    tb["obj_Eff" .. suf]:ClearChildren()
+    _G.UIUtils.LoadEffectByCfg(
+        _G.ConfigManager.ui_effect_cfg.ef_kelingqukuang,
+            tb["obj_Eff" .. suf],
+        function(tran)
+            if _G.IsNil(self.go_table.gameObject) then
+                tran:DestroyObject()
+                return
+            end
+            tran:SetActiveE(isShowEffect and 1 or 0)
+        end
+    )
+    -- local effNode = "eff" .. suf
+    -- if tb[effNode] == nil then
+    --     if isShowEffect then
+    --         tb[effNode] = true
+    --         _G.UIUtils.LoadEffectByCfg(
+    --             _G.ConfigManager.ui_effect_cfg.ef_kelingqukuang,
+    --                 tb["obj_Eff" .. suf],
+    --             function(tran)
+    --                 if _G.IsNil(self.go_table.gameObject) then
+    --                     tran:DestroyObject()
+    --                     return
+    --                 end
+    --                 tran:SetActiveE(isShowEffect and 1 or 0)
+    --                 tb[effNode] = tran
+    --             end
+    --         )
+    --     end
+    -- elseif tb[effNode] ~= true then
+    --     tb[effNode]:SetActiveE(isShowEffect and 1 or 0)
+    -- end
+end
+
+---资源加载
+function CycleBattlePassView:AddRest()
+    self.resKey = {
+        AddExp = "UI/SeasonLvView/SeasonLvView_AddExp" --H5目前未使用25/4/21
+    }
+
+    if self.prb_AddExp == nil then
+        self:AddResToList(self.resKey.AddExp, _G.UIResType.pool, self.resKey.AddExp, nil, self.go_table.obj_view)
+    end
+end
+
+function CycleBattlePassView:SetData()
+    --local sc = self.ResList[self.resKey.AddExp]
+    --if sc ~= nil then
+    --    self.prb_AddExp = sc
+    --end
+    --self.lua_AddExp = require("CycleBattlePassView_AddExp").New(self.prb_AddExp, self)
+    --self.lua_AddExp:Hide()
+    self.typeClass:RefreshRedPoint()
+end
+
+function CycleBattlePassView:UpdateTime(elapsed)
+    self.countDown = self.countDown - elapsed
+    if self.countDown < 0 then
+        self.countDown = 0
+    end
+    if self:IsNil() then
+        return
+    end
+    local time = _G.Mathf.RoundToInt(self.countDown)
+    self.go_table.aortext_countDown.text = GetLangPackValue(90025500007, _G.TimeUtil.TransDayHourMineMiao(time))
+    self:UpdateAddBtnShow()
+end
+
+---充值成功监听
+function CycleBattlePassView:OnMallCashListener()
+    self:UpdateView()
+end
+
+---选线后刷新
+function CycleBattlePassView:OnChoosePathEnd()
+    self:ShowByPath()
+    self:UpdateBattlePass()
+    --self:UpdateBattlePassSenior()
+    self.typeClass:RefreshRedPoint()
+end
+
+function CycleBattlePassView:GetAward(awardLis)
+    if self.canSwitch then
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+                5001,
+                nil,
+                function()
+                    self.typeClass:GetAward(awardLis, _G.handler(self, self.OnGetAwardEnd))
+                end
+        )
+    else
+        self.typeClass:GetAward(awardLis, _G.handler(self, self.OnGetAwardEnd))
+    end
+end
+
+function CycleBattlePassView:OnGetAwardEnd()
+    self.canSwitch = false
+    self:UpdateBattlePass()
+end
+
+function CycleBattlePassView:OnClickItem(go, isOn, id)
+    local name = go:GetName()
+    if name == "@_aorbtn_get" then
+        if self.isBuy then
+            if self.typeClass:CheckAwardIsGet(id, true) then
+                local payAwardLis = { { sid = id, type = 2 } }
+                self:GetAward(payAwardLis)
+            else
+                local AllAwardLis = { { sid = id, type = 3 } }
+                self:GetAward(AllAwardLis)
+            end
+        else
+            local freeAwardLis = { { sid = id, type = 1 } }
+            self:GetAward(freeAwardLis)
+        end
+    end
+end
+
+function CycleBattlePassView:OnClickPath(go, isOn, path, sid)
+    if self.path == path then
+        require "CommonTipManager":GetInstance():OpenTip(go, sid)
+        return
+    end
+    self.path = path
+    self:UpdateChoosePath()
+end
+
+---按钮点击事件在这里派发
+function CycleBattlePassView:OnClickBtn(go, isOn)
+    if go == self.go_table.aorbtn_add then
+        if self.path == 0 then
+            return
+        end
+        local content = self.pathCfg.content[1]
+        local maxId = content[#content]
+        local maxLv = _G.ConfigManager.store_season_battlecon_cfg[maxId].level
+        if self.lv == maxLv then
+            _G.PopWindowManager:GetInstance():ShowAllTips(420102)
+        else
+            --self.lua_AddExp:Show(self.lv, maxLv, self.curExp)
+        end
+    elseif go == self.go_table.aorbtn_getExp then
+        self.typeClass:JumpToFunction()
+    elseif go == self.go_table.aorbtn_buy then
+        self:ClickBuy()
+    elseif go == self.go_table.aorbtn_oneKey then
+        self:GetAward(self.awardLis)
+    elseif go == self.go_table.aorbtn_sure then
+        if self.path == 0 then
+            return
+        end
+        if self.path == self.typeClass:GetChossePath() then
+            self:OnChoosePathEnd()
+        end
+        self.typeClass:ChoosePath(self.path, _G.handler(self, self.OnChoosePathEnd))
+    elseif go == self.go_table.aorbtn_switch then
+        if not self.canSwitch then
+            return
+        end
+        self.go_table.obj_choosePath:SetActiveE(1)
+        self.go_table.obj_battlePass:SetActiveE(0)
+        self.go_table.aorbtn_add:SetActiveE(0)
+    elseif go == self.go_table.aorbtn_help then
+        _G.UIManager:GetInstance():OpenWindow(_G.ConfigManager.ui_cfg.GamePlayDescribeView.Name, self.typeClass:GetHelpId())
+    end
+end
+
+function CycleBattlePassView:ClickBuy()
+    if self.isBuy then
+        _G.PopWindowManager:GetInstance():ShowAllTips(870101)
+    else
+        local lv, curExp, curMaxExp = self.typeClass:GetLvAndCurLvExp()
+        if self.nowLevel and self.nowLevel ~= lv then 
+            if self.buyTipLua then 
+                self.buyTipLua:UpdateNowLevel(lv)
+            end
+        end
+        self.nowLevel = lv
+        if not self.buyTipLua then
+            self.buyTipLua = true
+            local params = {}
+            params.okFun = function()
+                self.typeClass:Buy()
+            end
+            params.contentIds = self.pathCfg.content[1]
+            params.goods = self.cfg.goods
+            params.price_id = self.cfg.price_id
+            params.name = self.cfg.name
+            params.nowLevel = lv
+            _G.PoolsManager:GetInstance():Spawn(
+                "UIH5/Task/$_obj_activeBattlePassBuyTips",
+                _G.ePoolType.Temporary,
+                self.go_table.obj_view,
+                function(tran)
+                    if self.go_table == nil then
+                        _G.DestroyObject(tran)
+                        return
+                    end
+                    local sortOrder = self.gameObject:GetComponentE(_G.typeof(_G.CS.UnityEngine.Canvas)).sortingOrder
+                    tran:GetComponentE(_G.typeof(_G.CS.UnityEngine.Canvas)).sortingOrder = sortOrder + 23
+                    self.buyTipLua = self:AddComponent(tran, require("ActiveBattlePassBuyTips").New(tran, params))
+                end
+            )
+        elseif self.buyTipLua ~= true then
+            self.buyTipLua:Show()
+        end
+    end
+end
+
+function CycleBattlePassView:CloseView()
+    self:Close()
+end
+
+function CycleBattlePassView:OnDestroy()
+    _G.Events:GetInstance():RemoveListener(_G.ConfigManager.net_map.store_cash.Cmd, self.OnMallCashListener, self)
+    if self.timer then
+        self.timer:Stop()
+        self.timer = nil
+    end
+end
+
+return CycleBattlePassView

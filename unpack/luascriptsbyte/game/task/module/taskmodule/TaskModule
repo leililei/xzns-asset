@@ -1,0 +1,1873 @@
+-- 包路径:        Game.Task.Module.TaskModule
+-- File Name:    TaskModule.lua
+-- Description:  任务数据模块
+-- Author:       TangHuan
+-- Create Date:  2020/01/04
+require "TaskData"
+require "TaskContentData"
+require "TaskConditionData"
+require "TaskModuleEvent"
+require "TaskUtilities"
+require "BaseTaskEvent"
+require "BaseTaskContentEvent"
+require "BaseTask"
+require "BaseTaskContent"
+require "MainTask"
+require "DailyTask"
+require "TaskEntryCell"
+
+local WorldUtils = require "WorldUtils"
+local WorldData = require "WorldData"
+
+local ETaskClaimWaySource = {"Auto", "Manual"}
+
+---@class ETaskClaimWay @任务领取方式定义
+---@field Auto string @自动领取
+---@field Manual string @手动主动领取
+_G.ETaskClaimWay = _G.CreatEnumTable(ETaskClaimWaySource)
+
+---Note:
+---所有的任务信息TaskInfo都会在下发的时候全部添加进AllTaskInfosMap，
+---任务更新也是更新AllTaskInfosMap里的数据，所有任务数据都从AllTaskInfosMap里实时取
+
+---@class TaskModule : BaseEvent @任务系统Controller+Model层
+---@field public Singleton TaskModule @单例对象
+---@field protected AllTaskInfosMap table<ETaskType, table<number, task.TaskInfo>> @所有的任务数据映射Map，key为任务任务类型，Value为对应的任务ID和任务信息映射Map
+---@field protected AllTasksMap table<ETaskType, table<number, BaseTask>> @所有的任务映射Map，key为任务任务类型，Value为对应的任务ID和任务映射Map---
+---@field protected CurrentDoingTask BaseTask @当前正在做的任务
+---@field public CurrentMainTask MainTask @当前主任务(当前主线任务有且仅有一个)
+---@field public CurrentNoviceTask NoviceTask @当前新手任务(当前新手任务有且仅有一个)
+---@field RootBranchTasks BranchTask[] @所有根分支任务数据列表(最上层任务)
+---@field RootDailyTasks DailyTask[] @所有根日常任务数据列表(最上层任务)
+---@field protected AllTaskContents BaseTaskContent[] @所有的任务内容列表
+---@field protected DialogueTaskContentsMap table<number, BaseTaskContent[]> @对话任务映射Map(Key为对象 UID，Value为对象身上的对话任务内容列表)
+---@field protected CommonTaskContentsMap table<number, BaseTaskContent[]> @通用任务任务映射Map(Key为任务id，Value为对象身上的任务内容列表)
+---@field protected FightTaskContentsMap table<number, BaseTaskContent[]> @战斗任务映射Map(Key为对象 UID，Value为对象身上的战斗任务内容列表)
+---@field protected WaitClaimedTasksMap table<number, BaseTask[]> @等待向指定对象领取任务的映射Map(Key为对象 UID，Value为对象身上的可以领取的任务列表)
+---@field protected WaitSubmitedTasksMap table<number, BaseTask[]> @等待向指定对象提交任务的映射Map(Key为对象 UID，Value为对象身上的需要提交的任务列表)
+local TaskModule = _G.BaseClass("TaskModule", _G.BaseEvent)
+TaskModule.Singleton = nil
+TaskModule.AllTaskInfosMap = nil
+TaskModule.AllTasksMap = nil
+TaskModule.CurrentDoingTask = nil
+TaskModule.CurrentMainTask = nil
+TaskModule.CurrentNoviceTask = nil
+TaskModule.RootBranchTasks = nil
+TaskModule.RootDailyTasks = nil
+TaskModule.AllTaskContents = nil
+TaskModule.DialogueTaskContentsMap = nil
+TaskModule.FightTaskContentsMap = nil
+TaskModule.CommonTaskContentsMap = nil
+TaskModule.WaitClaimedTasksMap = nil
+TaskModule.WaitSubmitedTasksMap = nil
+
+---@return TaskModule @单例获取
+function TaskModule:GetInstance()
+    if self.Singleton == nil then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:GetInstance() self.Singleton == nil")
+        self.Singleton = _G.New(TaskModule)
+    end
+    return self.Singleton
+end
+
+---TaskModule构造函数
+function TaskModule:__init(...)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:__init()")
+    self.AllTaskInfosMap = {}
+    for k, v in pairs(_G.TaskEnum.ETaskType) do
+        self.AllTaskInfosMap[v] = {}
+    end
+    self.AllTasksMap = {}
+    for k, v in pairs(_G.TaskEnum.ETaskType) do
+        self.AllTasksMap[v] = {}
+    end
+
+    ---历史记录房间任务完成情况
+    self.RoomFinishTask = {}
+
+    --- 已完成的房间 任务  真实
+    self.CompletedRoomTaskAllReal = {}
+    --- 所有已完成任务 不显示在主界面
+    self.CompletedTaskAll = {}
+    --- 当前玩家点击任务id
+    self.CurClickTaskId = 0
+    self.CurrentDoingTask = nil
+    self.CurrentMainTask = nil
+    self.CurrentNoviceTask = nil
+
+    self.RootBranchTasks = {}
+    self.RootDailyTasks = {}
+    self.AllTaskContents = {}
+    self.DialogueTaskContentsMap = {}
+    self.CommonTaskContentsMap = {}
+    self.FightTaskContentsMap = {}
+    self.WaitClaimedTasksMap = {}
+    self.WaitSubmitedTasksMap = {}
+
+    --- 是否在副本内  最后一个房间  结算有任务完成(防止结算剧情 或结算界面挡住 任务完成特效)
+    self.isSectionTaskOver = false
+    --- 关卡任务
+    self.SectionTaskidArr = {}
+    --- 关卡内支线任务
+    self.SectionBranchTaskidArr = {}
+    self.SectionTaskidArr, self.SectionBranchTaskidArr = self:GetAllSectionTask()
+end
+function TaskModule:Dispose()
+    for k, v in pairs(_G.TaskEnum.ETaskType) do
+        self:RemoveTaskInfos(self.AllTaskInfosMap[v])
+    end
+    rawset(self._class_type, "Singleton", nil)
+end
+
+---执行指定任务(执行任务统一接口，请勿直接调用BaseTask:ExecuteTask())
+---@param task BaseTask @任务
+---@return boolean @是否成功执行任务
+function TaskModule:ExecuteTask(task)
+    assert(task, "无法执行空任务!")
+    if task:ExecuteTask() then
+        self.CurrentDoingTask = task
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("执行任务ID:%d", self.CurrentDoingTask.TaskID))
+        return true
+    else
+        return false
+    end
+end
+
+---打断当前任务正在做的任务内容(打断当前正在做的任务统一接口，请勿直接调用BaseTask:InterruptTaskExecution())
+---@param task BaseTask @任务
+---@return boolean @是否成功执行任务
+function TaskModule:InterruptDoingTaskExecution()
+    if self.CurrentDoingTask ~= nil and self.CurrentDoingTask:InterruptTaskExecution() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("打断任务ID:%d", self.CurrentDoingTask.TaskID))
+        self.CurrentDoingTask = nil
+        return true
+    else
+        if _G.AppSetting.DEBUG then
+            _G.Log("当前没有在做任务，打断任务失败!")
+        end
+        return false
+    end
+end
+
+---添加指定任务信息列表
+---Note:
+---请先添加所有新任务信息以后再执行任务信息更新相关操作(确保任务信息已经添加全)
+---@param taskinfos task.TaskInfo[] @任务信息列表
+function TaskModule:AddTaskInfos(taskinfos)
+    -- assert(taskinfos, "不允许添加空任务信息列表!")
+    if taskinfos == nil then
+        return
+    end
+    for k, taskinfo in pairs(taskinfos) do
+        self:AddTaskInfo(taskinfo, true)
+    end
+end
+
+---添加指定任务信息
+---Note:
+---请先添加所有新任务信息以后再执行任务信息更新相关操作(确保任务信息已经添加全)
+---@param taskinfo task.i_task @任务信息
+---@param isList boolean @ true当前是多数据添加 不检测前置任务 防止其他完成的任务尚未添加
+function TaskModule:AddTaskInfo(taskinfo, isList)
+    assert(taskinfo, "不允许添加空任务信息!")
+    local TaskCfg = _G.ConfigManager.task_cfg[taskinfo.sid]
+    if _G.IsNil(TaskCfg) then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("该任务id 无效! " .. taskinfo.sid)
+        end
+        return
+    end
+    local result = self:GetTaskInfo(TaskCfg.Type1, taskinfo.sid)
+    --
+    if _G.AppSetting.DEBUG then
+        _G.Log("添加任务信息:")
+    end
+    -- _G.print_table(taskinfo)
+    if result == nil then
+        -- end
+        -- else
+        --     -- 0
+        if _G.AppSetting.DEBUG then
+            _G.Log(string.format("添加任务信息，任务类型:%s,任务ID:%d!", TaskCfg.Type1, taskinfo.sid))
+        end
+        --     self.AllTaskInfosMap[TaskCfg.Type1][taskinfo.sid] = nil
+        -- end
+        --
+        if _G.AppSetting.DEBUG then
+            _G.Log(string.format("添加任务信息，任务类型:%s,任务ID:%d!", TaskCfg.Type1, taskinfo.sid))
+        end
+        self.AllTaskInfosMap[TaskCfg.Type1][taskinfo.sid] = taskinfo
+        -- if taskinfo.state ~= _G.TaskEnum.ETaskState.Completed then
+        -- 添加任务信息时创建对应任务抽象
+        local newtask = _G.TaskUtilities.CreateTask(TaskCfg.Type1, taskinfo.sid)
+
+        ---服务器新增任务 直接添加    本地的话只有能领取的任务才添加
+        -- if taskinfo.time ~= nil or newtask:IsAvalibleClaim() == 1 then
+        self:AddTask(newtask)
+
+        newtask:UpdateTaskContentsInfo()
+        newtask:UpdateStoryTriggerListener()
+    else
+        if taskinfo.time == nil then
+            self.AllTaskInfosMap[TaskCfg.Type1][taskinfo.sid] = taskinfo
+            local task = self:GetTask(TaskCfg.Type1, taskinfo.sid)
+            if task ~= nil then
+                task:UpdateTaskContentsInfo()
+            end
+        end
+
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("任务类型:%s,任务ID:%d的任务信息已添加过,无法再次添加!", TaskCfg.Type1, taskinfo.sid)
+        )
+    end
+end
+
+---移除指定任务信息列表(移除任务信息统一入口，也会负责移除对应的任务抽象)
+---@param taskinfos task.TaskInfo[] @任务信息列表
+function TaskModule:RemoveTaskInfos(taskinfos)
+    assert(taskinfos, "不允许移除空任务信息列表!")
+    for k, taskinfo in pairs(taskinfos) do
+        self:RemoveTaskInfo(taskinfo)
+    end
+
+    _G.TaskModule:GetInstance():DispatchEvent(_G.TaskModuleEvent, _G.TaskModuleEvent.EnumValueTable.TaskNumberUpdate)
+    -- TODO:支持任务内部分信息更新
+end
+
+---移除指定任务信息
+---@param taskinfo task.TaskInfo @任务信息
+---@return boolean @移除任务信息是否成功
+function TaskModule:RemoveTaskInfo(taskinfo)
+    assert(taskinfo, "不允许移除空任务信息!")
+    local TaskCfg = _G.ConfigManager.task_cfg[taskinfo.sid]
+    local result = self:GetTaskInfo(TaskCfg.Type1, taskinfo.sid)
+    if result ~= nil then
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("移除任务类型:%s 任务ID:%s的任务信息", TaskCfg.Type1, taskinfo.sid)
+        )
+
+        self.AllTaskInfosMap[TaskCfg.Type1][taskinfo.sid] = nil
+        self:RemoveTask(TaskCfg.Type1, taskinfo.sid)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("任务类型:%s,任务ID:%d的任务信息不存在,无法移除!", TaskCfg.Type1, taskinfo.id))
+        end
+        return false
+    end
+end
+---更新已有成就的任务数据列表
+function TaskModule:UpdateChengJiu(taskinfos)
+    if taskinfos == nil then
+        return
+    end
+    for key, value in pairs(taskinfos.collector) do
+        require("ActiveTaskManager"):GetInstance():ShuZhiPanDuan(value.key[1], value.value)
+        _G.Events:GetInstance():Broadcast(_G.ePlayAactionEvent.PlayAactionCj, value.key, value.value, nil, true)
+    end
+end
+---更新已有满心计划的任务数据列表
+function TaskModule:UpDatecollector(taskinfos)
+    if taskinfos == nil then
+        return
+    end
+    for key, value in pairs(taskinfos.collector) do
+        local list = require("AcientEvilComesModel"):GetInstance():GetNumcollectors(value.key)
+
+        if list ~= nil then
+            for s, b in pairs(list.mission_group) do
+                local a = _G.ConfigManager.mission_extra_cfg[b]
+                local state = _G.TaskEnum.ETaskState.Claimed
+                if a.count <= value.value then
+                    if require("AcientEvilComesModel"):GetInstance():Getstate(b) == _G.TaskEnum.ETaskState.Completed then
+                        state = _G.TaskEnum.ETaskState.Completed
+                    else
+                        state = _G.TaskEnum.ETaskState.Submited
+                    end
+                end
+
+                local task = {sid = b, state = state, target = {[1] = value.value}, cfg = a}
+                task.id = list
+                require("AcientEvilComesModel"):GetInstance():UpdataTask(task, value.value)
+            end
+        end
+    end
+end
+
+---更新已有任务的任务数据列表
+---@param taskinfos task.TaskInfo @最新的任务数据列表
+function TaskModule:UpdateTaskInfos(taskinfos, activityId)
+    if taskinfos == nil then
+        local var = nil
+        return
+    end
+    assert(taskinfos, "不允许更新空任务信息列表!")
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:UpdateTaskInfos()")
+
+    for _, taskinfo in pairs(taskinfos) do
+        local taskid = taskinfo.sid
+
+        local taskEnum = self:GetTaskCfgEnumByTaskid(taskinfo.sid)
+        require("DragonChessModel"):GetInstance():UpdataTask(taskinfo)
+
+        if taskEnum == _G.TaskCfgEnum.mission then
+            require("ActiveTaskManager"):GetInstance():UpdataTask(taskinfo)
+            require("HeroicIconModel"):GetInstance():UpdataTask(taskinfo)
+            require("GodHaloModel"):GetInstance():UpdataTask(taskinfo)
+        elseif taskEnum == _G.TaskCfgEnum.missionExtra then
+            local _cfg = self:GetTakCfgByTaskid(taskid)
+            if _cfg then
+                if _cfg.type_mission == 1 then
+                    require("HellRoadModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 2 then
+                    require("ActionGoalsModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 3 then
+                    require("ManualModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 4 then
+                    -- 策划将赛季boss和赛季任务的type_mission混用了
+                    --require("SeasonBossModel"):GetInstance():UpdataTask(taskinfo)
+                    require("FirstTestBossModel"):GetInstance():UpdataTask(taskinfo)
+                    require("SeasonTaskModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 6 then
+                    require("SeasonIceGiftModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 7 then
+                    require("AcientEvilComesModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 9 then
+                    require("CollectionModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 11 then
+                    require("TreasureHuntModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 13 then
+                    require("SwornModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 14 then
+                    require("ActionKeynoteModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 15 then
+                    require("TeamUniteTaskModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 16 then
+                    require("CycleBattlePassModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 17 then
+                    require("StorePassModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 18 then
+                    require("ActivitySynManager"):GetInstance():GetActivityClass(1013601).typeClass:UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 19 then
+                    require("CycleBattlePassModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 20 then
+                    require("ActiveSeverMergeModel"):GetInstance():UpdataTask(taskinfo)
+                elseif _cfg.type_mission == 26 then
+                    require("ActivityTournamentModel"):GetInstance():UpdataTask(taskinfo)
+                else
+                    if _G.AppSetting.DEBUG then
+                        _G.Log("", "<color=red>" .. "服务器 推送的id类型 未定义" .. "</color>")
+                    end
+                end
+            end
+        elseif taskEnum == _G.TaskCfgEnum.task then
+            self:UpdateTaskInfo(taskinfo)
+        elseif taskEnum == _G.TaskCfgEnum.gmActivityTask then
+            self:UpdateActivityTaskInfo(taskinfo, activityId)
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" 未找到该任务配置 任务id:" .. tostring(taskid))
+            end
+        end
+    end
+end
+--region --------------------------------------所有任务配置表--------
+
+---- missionExtra 34打头  mission 33打头   task31打头的
+local missionExtra_Min = 340000000
+local missionExtra_Max = 349999999
+local mission_Min = 330000000
+local mission_Max = 339999999
+local task_Min = 310000000
+local task_Max = 319999999
+local gm_Min = 350000000 --GM活动任务
+local gm_Max = 359999999 --GM活动任务
+----根据任务id返回任务配置
+function TaskModule:GetTaskCfgEnumByTaskid(taskid)
+    local enum
+    taskid = tonumber(taskid)
+    if taskid == nil then
+        return
+    end
+    if taskid >= missionExtra_Min and taskid <= missionExtra_Max then
+        enum = _G.TaskCfgEnum.missionExtra
+    elseif taskid >= mission_Min and taskid <= mission_Max then
+        --- 每日 / 成就
+        enum = _G.TaskCfgEnum.mission
+    elseif taskid >= task_Min and taskid <= task_Max then
+        --- 主线任务
+        enum = _G.TaskCfgEnum.task
+    elseif taskid >= gm_Min and taskid <= gm_Max then
+        enum = _G.TaskCfgEnum.gmActivityTask
+    end
+    return enum
+end
+
+----根据任务id返回任务配置
+function TaskModule:GetTakCfgByTaskid(taskid, TaskCfgEnum)
+    taskid = tonumber(taskid)
+    if taskid == nil then
+        return
+    end
+    if TaskCfgEnum == nil then
+        TaskCfgEnum = self:GetTaskCfgEnumByTaskid(taskid)
+    end
+    local cfg
+    if TaskCfgEnum == _G.TaskCfgEnum.missionExtra then
+        --- 七日任务
+        cfg = _G.ConfigManager.mission_extra_cfg
+    elseif TaskCfgEnum == _G.TaskCfgEnum.mission then
+        --- 每日 / 成就
+        cfg = _G.ConfigManager.mission_cfg
+    elseif TaskCfgEnum == _G.TaskCfgEnum.task then
+        --- 主线任务
+        cfg = _G.ConfigManager.mission_cfg
+    end
+    if cfg then
+        return cfg[taskid]
+    end
+end
+
+--endregion------------------------------------所有任务配置表--------
+
+---更新已有任务的任务数据
+---@param taskinfos task.TaskInfo @最新的任务数据列表
+function TaskModule:UpdateTaskInfo(taskinfo)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:UpdateTaskInfo()")
+    if taskinfo ~= nil then
+        -- _G.print_table(taskinfo)
+        local TaskCfg = _G.ConfigManager.task_cfg[taskinfo.sid]
+        if TaskCfg == nil then
+            if _G.AppSetting.DEBUG then
+                _G.LogError(string.format("找不到任务ID:%d的任务配置 ,更新任务数据失败!", taskinfo.sid))
+            end
+            return
+        end
+        local result = self:GetTaskInfo(TaskCfg.Type1, taskinfo.sid)
+        if result ~= nil then
+            --
+            if _G.AppSetting.DEBUG then
+                _G.Log("更新任务信息:")
+            end
+            -- _G.print_table(taskinfo)
+            --
+            if _G.AppSetting.DEBUG then
+                _G.Log(string.format("更新任务类型:%s任务ID:%d的任务数据!", TaskCfg.Type1, taskinfo.sid))
+            end
+            self.AllTaskInfosMap[TaskCfg.Type1][taskinfo.sid] = taskinfo
+            local task = self:GetTask(TaskCfg.Type1, taskinfo.sid)
+            task:UpdateTaskContentsInfo()
+        else
+            if _G.AppSetting.DEBUG then
+                _G.LogError(string.format("找不到任务类型:%s任务ID:%d的任务数据,更新任务数据失败!", TaskCfg.Type1, taskinfo.sid))
+            end
+        end
+    end
+end
+---------------------------------GM任务活动任务-----------------------------
+------更新已有任务的任务数据
+---@param taskinfos task.TaskInfo @最新的任务数据列表
+function TaskModule:UpdateActivityTaskInfo(taskinfo, activityId)
+    if taskinfo ~= nil and activityId > 0 then
+        local activity = require "ActivitySynManager":GetInstance():GetActivityClass(activityId)
+        if activity then
+            activity.typeClass:UpdateTask(taskinfo)
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("找不到任务类型:%s任务ID:%d的任务数据,更新任务数据失败!", taskinfo.sid))
+        end
+    end
+end
+---获取指定任务类型的所有任务数据
+---@return task.TaskInfo[] @对应的所有任务数据
+function TaskModule:GetAllTaskInfo(tasktype)
+    return self.AllTaskInfosMap[tasktype]
+end
+
+---打印所有任务信息(测试用)
+function TaskModule:PrintAllTaskInfo()
+    --
+    if _G.AppSetting.DEBUG then
+        _G.Log("所有任务信息:")
+    end
+    for tasktype, taskinfomap in pairs(self.AllTaskInfosMap) do
+        for tasknumber, taskinfo in pairs(taskinfomap) do
+            --
+            if _G.AppSetting.DEBUG then
+                _G.Log(string.format("任务ID:%s 任务状态:%s 任务目标步骤:%s", tasknumber, taskinfo.state, taskinfo.step))
+            end
+        end
+    end
+    --
+    if _G.AppSetting.DEBUG then
+        _G.Log("========================")
+    end
+    -- _G.print_table(self.AllTaskInfosMap)
+end
+
+---获取指定任务ID的任务数据
+---@param taskid number @任务id
+---@return task.i_task @任务数据
+function TaskModule:GetTaskInfoWithID(taskid)
+    local TaskCfg = _G.ConfigManager.task_cfg[taskid]
+    if TaskCfg ~= nil then
+        return self.AllTaskInfosMap[TaskCfg.Type1][taskid]
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("找不到任务ID:%s的任务信息!", taskid))
+        end
+        return nil
+    end
+end
+
+---获取指定类型指定任务ID的任务数据
+---@param tasktype task.ETaskType @任务类型
+---@param taskid number @任务id
+---@return task.TaskInfo @任务数据
+function TaskModule:GetTaskInfo(tasktype, taskid)
+    return self.AllTaskInfosMap[tasktype][taskid]
+end
+
+---添加指定任务(private)
+---@param task BaseTask @任务数据
+---@return boolean @是否添加任务成功
+function TaskModule:AddTask(task)
+    assert(task, "不允许添加空任务!")
+    if self.AllTasksMap[task.type][task.TaskID] == nil then
+        self.AllTasksMap[task.type][task.TaskID] = task
+
+        if task:IsDone() then
+            return
+        end
+
+        if task.type == _G.TaskEnum.ETaskType.MainTask then
+            self:OnAddMainTask(task)
+        elseif task.type == _G.TaskEnum.ETaskType.NoviceTask then
+            self:OnAddNoviceTask(task)
+        elseif task.type == _G.TaskEnum.ETaskType.BranchTask then
+            self:OnAddBrachTask(task)
+        elseif task.type == _G.TaskEnum.ETaskType.DailyTask then
+            self:OnAddDailyTask(task)
+        end
+
+        -- 监听任务领取
+        if
+            task:HasListener(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskClaimed, self.OnTaskClaimCompleted, self) ==
+                false
+         then
+            task:AddListener(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskClaimed, self.OnTaskClaimCompleted, self)
+        end
+
+        if
+            task:HasListener(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskSubmit, self.OnTaskSubmitCompleted, self) ==
+                false
+         then
+            -- 监听任务提交
+            task:AddListener(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskSubmit, self.OnTaskSubmitCompleted, self)
+        end
+
+        -- 处理任务可领取相关逻辑代码
+        if task:IsAvalibleClaim() == 1 and task.ClaimedNPCUID ~= nil then
+            if self.WaitClaimedTasksMap[task.ClaimedNPCUID] == nil then
+                self.WaitClaimedTasksMap[task.ClaimedNPCUID] = {}
+            end
+            _G.LogUtilities.Log(
+                _G.EModuleName.TaskModule,
+                string.format("添加NPC UID:%d需要领取的任务ID:%d", task.ClaimedNPCUID, task.TaskID)
+            )
+            table.insert(self.WaitClaimedTasksMap[task.ClaimedNPCUID], task)
+            -- 通知头顶提示刷新
+            WorldUtils.UpdateWorldItemTip(task.ClaimedNPCUID)
+        end
+
+        -- 处理任务可提交相关逻辑代码
+        if (task:IsAvalibleExecute() == true or task:IsAvalibleClaim() == 1) and task.SubmitedNPCUID ~= nil then
+            if self.WaitSubmitedTasksMap[task.SubmitedNPCUID] == nil then
+                self.WaitSubmitedTasksMap[task.SubmitedNPCUID] = {}
+            end
+            _G.LogUtilities.Log(
+                _G.EModuleName.TaskModule,
+                string.format("添加NPC UID:%d需要提交的任务ID:%d", task.SubmitedNPCUID, task.TaskID)
+            )
+            table.insert(self.WaitSubmitedTasksMap[task.SubmitedNPCUID], task)
+            -- 通知头顶提示刷新
+            WorldUtils.UpdateWorldItemTip(task.SubmitedNPCUID)
+        end
+
+        -- 处理任务 可执行相关逻辑代码
+        if task:IsAvalibleExecute() == true then
+            -- 处理任务内容的创建响应
+            self:OnAddTaskContents(task)
+        end
+
+        return true
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("已经添加过任务类型:%s,任务ID:%d的任务，无法再次添加!", task.type, task.TaskID))
+        end
+        return false
+    end
+end
+
+---响应任务领取完成
+function TaskModule:OnTaskClaimCompleted(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnTaskClaimCompleted()")
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%d领取完成!", task.TaskID))
+
+    -- 处理任务 可执行相关逻辑代码
+    if task:IsAvalibleExecute() == true then
+        -- 处理任务内容的创建响应
+        self:OnAddTaskContents(task)
+    end
+
+    self:RemoveWaitClaimedTasksMapByNpcID(task)
+    task:RemoveListener(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskClaimed, self.OnTaskClaimCompleted, self)
+end
+
+---响应任务提交完成
+---@param task BaseTask @已提交的任务
+function TaskModule:OnTaskSubmitCompleted(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnTaskSubmitCompleted()")
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("任务ID:%d提交完成!", task.TaskID))
+    self:RemoveWaitSubmitedTasksMapByNpcID(task)
+    task:RemoveListener(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskSubmit, self.OnTaskSubmitCompleted, self)
+    local world = _G.WorldManager:GetInstance():GetCurWorld()
+    -- 触发动态刷新判定
+    if world ~= nil then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, "触发动态刷新!")
+    end
+end
+
+---移除指定任务(private)
+---@param tasktype task.ETaskType @任务类型
+---@param taskid number @任务id
+---@return boolean @是否移除任务成功
+function TaskModule:RemoveTask(tasktype, taskid)
+    local task = self:GetTask(tasktype, taskid)
+    if task ~= nil then
+        self.AllTasksMap[tasktype][taskid] = nil
+        if tasktype == _G.TaskEnum.ETaskType.MainTask then
+            self:OnRemoveMainTask(task)
+        elseif tasktype == _G.TaskEnum.ETaskType.NoviceTask then
+            self:OnRemoveNoviceTask(task)
+        elseif tasktype == _G.TaskEnum.ETaskType.BranchTask then
+            self:OnRemoveBrachTask(task)
+        elseif tasktype == _G.TaskEnum.ETaskType.DailyTask then
+            self:OnRemoveDailyTask(task)
+        end
+
+        ---响应任务内容的移除
+        self:OnRemoveTaskContents(task.AllTaskContents)
+        if self.WaitClaimedTasksMap[task.ClaimedNPCUID] ~= nil then
+            self.WaitClaimedTasksMap[task.ClaimedNPCUID] = nil
+        end
+        if self.WaitSubmitedTasksMap[task.SubmitedNPCUID] ~= nil then
+            self.WaitSubmitedTasksMap[task.SubmitedNPCUID] = nil
+        end
+
+        task:RemoveListener(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskClaimed, self.OnTaskClaimCompleted, self)
+        task:RemoveListener(_G.BaseTaskEvent, _G.BaseTaskEvent.EnumValue.TaskSubmit, self.OnTaskSubmitCompleted, self)
+        return true
+    else
+        return false
+    end
+end
+
+---获取指定任务类型的所有任务
+---@param tasktype TaskEnum.type @任务类型
+---@return BaseTask[] @对应的所有任务
+function TaskModule:GetAllTask(tasktype)
+    if self.AllTasksMap[tasktype] ~= nil then
+        return self.AllTasksMap[tasktype]
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("不支持的任务类型:%s获取指定任务类型所有任务失败!", tasktype))
+        end
+        return nil
+    end
+end
+
+---获取指定任务类型的所有根任务(即最上层任务)
+---@param tasktype TaskEnum.type @任务类型
+---@return BaseTask[] @对应的所有任务
+function TaskModule:GetAllRootTask(tasktype)
+    if self.AllTasksMap[tasktype] ~= nil then
+        local roottasks = {}
+        ---@type BaseTask task
+        for k, task in pairs(self.AllTasksMap[tasktype]) do
+            if task:IsRootTask() then
+                table.insert(roottasks, task)
+            end
+        end
+        return roottasks
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("不支持的任务类型:%s获取指定任务类型所有根任务失败!", tasktype))
+        end
+        return nil
+    end
+end
+
+---获取指定任务ID的任务抽象
+---@param taskid number @任务id
+---@return BaseTask @任务数据
+function TaskModule:GetTaskWithID(taskid)
+    local TaskCfg = _G.ConfigManager.task_cfg[taskid]
+    if TaskCfg ~= nil then
+        return self.AllTasksMap[TaskCfg.Type1][taskid]
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("找不到任务ID:%s的任务抽象!", taskid))
+        end
+        return nil
+    end
+end
+
+---获取指定类型指定任务ID的任务
+---@param tasktype ETaskType @任务类型
+---@param taskid number @任务id
+---@return BaseTask @任务
+function TaskModule:GetTask(tasktype, taskid)
+    local alltask = self:GetAllTask(tasktype)
+    if alltask ~= nil then
+        return alltask[taskid]
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("获取任务类型:%s任务ID:%d的任务失败!", tasktype, taskid))
+        end
+        return nil
+    end
+end
+
+---获取指定任务类型的所有符合条件的任务内容
+---@param tasktype TaskEnum.type @任务类型
+---@param filterfunc funtion(taskcontent:BaseTaskContent):bool @任务内容过滤条件
+---@return BaseTaskContent[] @对应的所有任务内容
+function TaskModule:GetAllTaskContent(tasktype, filterfunc)
+    filterfunc = filterfunc or nil
+    local alltaskcontents = {}
+    local allroottasks = self:GetAllRootTask(tasktype)
+    ---@type BaseTask roottask
+    for k, roottask in pairs(allroottasks) do
+        _G.table.insertto(alltaskcontents, roottask:GetAllTaskContents(filterfunc))
+    end
+    return alltaskcontents
+end
+
+---改变主线任务
+---@param newmaintask MainTask @新的主线任务
+function TaskModule:ChangeMainTask(newmaintask)
+    if newmaintask == nil or newmaintask.type ~= _G.TaskEnum.ETaskType.MainTask then
+        return
+    end
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("切换当前主任务到任务ID:%d", newmaintask.TaskID))
+    if self:IsCompletedTask(newmaintask.TaskID) == true then
+        return
+    end
+    if
+        -- 当前主线任务完成才切换--  临时
+        (not _G.IsNil(self.CurrentMainTask) and
+            self:GetTaskInfoWithID(self.CurrentMainTask.TaskID).state ~= _G.TaskEnum.ETaskState.Completed) and
+            -- 或者该任务已领取
+            (self:GetTaskInfoWithID(newmaintask.TaskID).state ~= _G.TaskEnum.ETaskState.Claimed)
+     then
+        return
+    end
+
+    self.CurrentMainTask = newmaintask
+    -- self:DispatchEvent(_G.TaskModuleEvent, _G.TaskModuleEvent.EnumValueTable.MainTaskUpdate, self.DoingMainTask)
+end
+
+---改变新手任务
+---@param newmaintask NoviceTask @新的主新手任务
+function TaskModule:ChangeNoviceTask(newmaintask)
+    if newmaintask == nil or newmaintask.type ~= _G.TaskEnum.ETaskType.NoviceTask then
+        return
+    end
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("切换当前主任务到任务ID:%d", newmaintask.TaskID))
+
+    if self:IsCompletedTask(newmaintask.TaskID) == true then
+        return
+    end
+
+    if
+        -- 当前主线任务完成才切换--  临时
+        (not _G.IsNil(self.CurrentNoviceTask) and
+            self:GetTaskInfoWithID(self.CurrentNoviceTask.TaskID).state ~= _G.TaskEnum.ETaskState.Completed) and
+            -- 或者该任务已领取
+            (self:GetTaskInfoWithID(newmaintask.TaskID).state ~= _G.TaskEnum.ETaskState.Claimed)
+     then
+        return
+    end
+
+    self.CurrentNoviceTask = newmaintask
+    -- self:DispatchEvent(_G.TaskModuleEvent, _G.TaskModuleEvent.EnumValueTable.MainTaskUpdate, self.DoingMainTask)
+end
+
+---响应添加主任务(private)
+---@param task MainTask @添加的主任务
+function TaskModule:OnAddMainTask(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddMainTask()")
+
+    -- 默认当前做的主任务根任务只有一个
+    if task:IsRootTask() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d是根任务!", task.TaskID))
+        self:ChangeMainTask(task)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d不是根任务!", task.TaskID))
+    end
+end
+
+---响应添加新手任务(private)
+---@param task NoviceTask @添加的新手任务
+function TaskModule:OnAddNoviceTask(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddNoviceTask()")
+
+    -- 默认当前做的主任务根任务只有一个
+    if task:IsRootTask() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d是根任务!", task.TaskID))
+        self:ChangeNoviceTask(task)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d不是根任务!", task.TaskID))
+    end
+end
+
+---响应添加分支任务(private)
+---@param task BranchTask @添加的分支任务
+function TaskModule:OnAddBrachTask(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddBrachTask()")
+    if task:IsRootTask() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d是根任务!", task.TaskID))
+        table.insert(self.RootBranchTasks, task)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d不是根任务!", task.TaskID))
+    end
+end
+
+---响应添加日常任务(private)
+---@param task DailyTask @添加的日常任务
+function TaskModule:OnAddDailyTask(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddDailyTask()")
+    if task:IsRootTask() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d是根任务!", task.TaskID))
+        table.insert(self.RootDailyTasks, task)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d不是根任务!", task.TaskID))
+    end
+end
+
+---响应任务内容列表添加
+---@param task BaseTask
+function TaskModule:OnAddTaskContents(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddTaskContents()")
+    WorldUtils.UpdateWorldItemTip(task.ClaimedNPCUID)
+    local taskcontents = task.AllTaskContents
+    for k, taskcontent in pairs(taskcontents) do
+        table.insert(self.AllTaskContents, taskcontent)
+        if _G.IsClass(taskcontent, _G.NPCDialogueTaskContent) then
+            if self.DialogueTaskContentsMap[taskcontent.NpcUid] == nil then
+                self.DialogueTaskContentsMap[taskcontent.NpcUid] = {}
+            end
+            if not table.ContainsValue(self.DialogueTaskContentsMap[taskcontent.NpcUid], taskcontent) then
+                _G.LogUtilities.Log(
+                    _G.EModuleName.TaskModule,
+                    string.format("添加世界对象 UID:%d的对话任务,任务内容ID:%d", taskcontent.NpcUid, taskcontent.TaskContentID)
+                )
+                table.insert(self.DialogueTaskContentsMap[taskcontent.NpcUid], taskcontent)
+                -- 监听任务内容完成情况，方便移除相关数据
+                taskcontent:AddListener(
+                    _G.BaseTaskContentEvent,
+                    _G.BaseTaskContentEvent.EnumValue.TaskContentComplete,
+                    self.OnTaskContentCompleted,
+                    self
+                )
+                -- 通知头顶提示刷新
+                WorldUtils.UpdateWorldItemTip(taskcontent.NpcUid)
+            else
+                if _G.AppSetting.DEBUG then
+                    _G.LogError(
+                        string.format(
+                            "重复添加世界对象 UID:%d的对话任务,任务内容ID:%d,添加对话任务内容失败!",
+                            taskcontent.NpcUid,
+                            taskcontent.TaskContentID
+                        )
+                    )
+                end
+            end
+        elseif _G.IsClass(taskcontent, _G.MonsterFightTaskContent) then
+            if self.FightTaskContentsMap[taskcontent.MonsterID] == nil then
+                self.FightTaskContentsMap[taskcontent.MonsterID] = {}
+            end
+            if not table.ContainsValue(self.FightTaskContentsMap[taskcontent.MonsterID], taskcontent) then
+                _G.LogUtilities.Log(
+                    _G.EModuleName.TaskModule,
+                    string.format("添加世界对象 UID:%d的战斗任务,任务内容ID:%d", taskcontent.MonsterID, taskcontent.TaskContentID)
+                )
+                table.insert(self.FightTaskContentsMap[taskcontent.MonsterID], taskcontent)
+                -- 监听任务内容完成情况，方便移除相关数据
+                taskcontent:AddListener(
+                    _G.BaseTaskContentEvent,
+                    _G.BaseTaskContentEvent.EnumValue.TaskContentComplete,
+                    self.OnTaskContentCompleted,
+                    self
+                )
+                -- 通知头顶提示刷新
+                WorldUtils.UpdateWorldItemTip(taskcontent.MonsterID)
+            else
+                if _G.AppSetting.DEBUG then
+                    _G.LogError(
+                        string.format(
+                            "重复添加世界对象 UID:%d的战斗任务,任务内容ID:%d,添加战斗任务内容失败!",
+                            taskcontent.MonsterID,
+                            taskcontent.TaskContentID
+                        )
+                    )
+                end
+            end
+        elseif _G.IsClass(taskcontent, _G.CommonTaskContent) then
+            local key = tostring(taskcontent.OwnerTask.TaskID) .. tostring(taskcontent.TaskContentID)
+            if self.CommonTaskContentsMap[key] == nil then
+                self.CommonTaskContentsMap[key] = {}
+            end
+            if not table.ContainsValue(self.CommonTaskContentsMap[key], taskcontent) then
+                table.insert(self.CommonTaskContentsMap[key], taskcontent)
+                -- 监听任务内容完成情况，方便移除相关数据
+                taskcontent:AddListener(
+                    _G.BaseTaskContentEvent,
+                    _G.BaseTaskContentEvent.EnumValue.TaskContentComplete,
+                    self.OnTaskContentCompleted,
+                    self
+                )
+            end
+        end
+    end
+end
+
+---响应任务内容完成
+---@param taskcontent BaseTaskContent @完成的任务内容
+function TaskModule:OnTaskContentCompleted(taskcontent)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnTaskContentCompleted()")
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("响应任务内容ID:%d完成!", taskcontent.TaskContentID))
+    if _G.IsClass(taskcontent, _G.NPCDialogueTaskContent) then
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("移除世界对象 ID:%d的对话任务,任务ID:%d", taskcontent.NpcUid, taskcontent.TaskContentID)
+        )
+        _G.table.removebyvalue(self.DialogueTaskContentsMap[taskcontent.NpcUid], taskcontent)
+        -- 通知头顶提示刷新
+        WorldUtils.UpdateWorldItemTip(taskcontent.NpcUid)
+    elseif _G.IsClass(taskcontent, _G.MonsterFightTaskContent) then
+        _G.LogUtilities.Log(
+            _G.EModuleName.TaskModule,
+            string.format("移除世界对象 ID:%d的战斗任务,任务ID:%d", taskcontent.MonsterID, taskcontent.TaskContentID)
+        )
+        _G.table.removebyvalue(self.FightTaskContentsMap[taskcontent.MonsterID], taskcontent)
+        -- 通知头顶提示刷新
+        WorldUtils.UpdateWorldItemTip(taskcontent.NpcUid)
+    elseif _G.IsClass(taskcontent, _G.CommonTaskContent) then
+        local key = tostring(taskcontent.OwnerTask.TaskID) .. tostring(taskcontent.TaskContentID)
+
+        _G.table.removebyvalue(self.CommonTaskContentsMap[key], taskcontent)
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError(string.format("不支持的任务类型:%s", taskcontent.TaskContentType))
+        end
+    end
+    if taskcontent.OwnerTask.SubmitedNPCUID then
+        WorldUtils.UpdateWorldItemTip(taskcontent.OwnerTask.SubmitedNPCUID)
+    end
+end
+
+---响应移除主任务(private)
+---@param task MainTask @添加的主任务
+function TaskModule:OnRemoveMainTask(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddMainTask()")
+    -- 默认当前做的主任务根任务只有一个
+    if task:IsRootTask() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d是根任务!", task.TaskID))
+        self:ChangeMainTask(nil)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d不是根任务!", task.TaskID))
+    end
+end
+
+---响应移除新手任务(private)
+---@param task MainTask @添加的新手任务
+function TaskModule:OnRemoveNoviceTask(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddNoviceTask()")
+    -- 默认当前做的主任务根任务只有一个
+    if task:IsRootTask() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d是根任务!", task.TaskID))
+        self:ChangeNoviceTask(nil)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d不是根任务!", task.TaskID))
+    end
+end
+
+---响应移除分支任务(private)
+---@param task BranchTask @添加的分支任务
+function TaskModule:OnRemoveBrachTask(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddBrachTask()")
+    if task:IsRootTask() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d是根任务!", task.TaskID))
+        _G.table.removebyvalue(self.RootBranchTasks, task)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d不是根任务!", task.TaskID))
+    end
+end
+
+---响应移除日常任务(private)
+---@param task DailyTask @添加的日常任务
+function TaskModule:OnRemoveDailyTask(task)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnAddDailyTask()")
+    if task:IsRootTask() then
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d是根任务!", task.TaskID))
+        _G.table.removebyvalue(self.RootDailyTasks, task)
+    else
+        _G.LogUtilities.Log(_G.EModuleName.TaskModule, string.format("当前任务ID:%d不是根任务!", task.TaskID))
+    end
+end
+
+---响应任务内容列表移除
+---@param taskcontents BaseTaskContent[] @需要移除的任务内容
+function TaskModule:OnRemoveTaskContents(taskcontents)
+    _G.LogUtilities.Log(_G.EModuleName.TaskModule, "TaskModule:OnRemoveTaskContents()")
+    for k, taskcontent in pairs(taskcontents) do
+        _G.table.removebyvalue(self.AllTaskContents, taskcontent)
+        if _G.IsClass(taskcontent, _G.NPCDialogueTaskContent) then
+            assert(
+                self.DialogueTaskContentsMap[taskcontent.NpcUid] ~= nil,
+                string.format("未添加NPC UID:%d的对话任务,任务内容ID:%d，移除对话任务失败", taskcontent.NpcUid, taskcontent.TaskContentID)
+            )
+            _G.LogUtilities.Log(
+                _G.EModuleName.TaskModule,
+                string.format("移除世界对象 UID:%d的对话任务,任务内容ID:%d", taskcontent.NpcUid, taskcontent.TaskContentID)
+            )
+            self.DialogueTaskContentsMap[taskcontent.NpcUid] = nil
+
+            -- 通知头顶提示刷新
+            WorldUtils.UpdateWorldItemTip(taskcontent.NpcUid)
+        elseif _G.IsClass(taskcontent, _G.MonsterFightTaskContent) then
+            if self.FightTaskContentsMap[taskcontent.MonsterID] ~= nil then
+                self.FightTaskContentsMap[taskcontent.MonsterID] = nil
+            end
+        elseif _G.IsClass(taskcontent, _G.CommonTaskContent) then
+            local key = tostring(taskcontent.OwnerTask.TaskID) .. tostring(taskcontent.TaskContentID)
+            if self.CommonTaskContentsMap[key] ~= nil then
+                self.CommonTaskContentsMap[key] = nil
+            end
+        end
+        -- 监听任务内容完成情况，方便移除相关数据
+        taskcontent:RemoveListener(
+            _G.BaseTaskContentEvent,
+            _G.BaseTaskContentEvent.EnumValue.TaskContentComplete,
+            self.OnTaskContentCompleted,
+            self
+        )
+    end
+end
+
+---指定任务id是否已领取   (可执行就是已领取)
+---@param taskid number @需要判定的任务id
+function TaskModule:IsTaskIdAvalibleExecute(taskid)
+    ---@type TaskConfig_Item
+    local TaskCfg = _G.ConfigManager.task_cfg[taskid]
+    if not TaskCfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到任务配置 id = " .. tostring(taskid), "TaskModule:IsTaskIdAvalibleExecute")
+        end
+        return false
+    end
+    local task = self:GetTask(TaskCfg.Type1, taskid)
+    if task ~= nil then
+        return task:IsAvalibleExecute()
+    else
+        return false
+    end
+end
+
+---指定任务id是否 满足提交条件
+---@param taskid number @需要判定的任务id
+function TaskModule:IsTaskIdSubmited(taskid)
+    --- 已完成不算
+    if self:IsCompletedTask(taskid) then
+        return false
+    end
+    ---@type TaskConfig_Item
+    local TaskCfg = _G.ConfigManager.task_cfg[taskid]
+    if not TaskCfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到任务配置 id = " .. tostring(taskid), "TaskModule:IsTaskIdSubmited")
+        end
+        return false
+    end
+    local task = self:GetTask(TaskCfg.Type1, taskid)
+    if task ~= nil then
+        return task:IsSubmitted()
+    else
+        return false
+    end
+end
+
+---指定任务id是否已完成
+---@param taskid number @需要判定的任务id
+function TaskModule:IsTaskIdDone(taskid)
+    ---@type TaskConfig_Item
+    local TaskCfg = _G.ConfigManager.task_cfg[taskid]
+    if not TaskCfg then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到任务配置 id = " .. tostring(taskid), "TaskModule:IsTaskIdDone")
+        end
+        return false
+    end
+    local task = self:GetTask(TaskCfg.Type1, taskid)
+    if task ~= nil then
+        return task:IsDone()
+    else
+        return false
+    end
+end
+
+---指定分支任务id是否可领取
+---@param branchtaskid number @需要判定的分支任务id
+function TaskModule:IsBranchTaskIdAvalibleClaim(branchtaskid)
+    return false
+end
+
+---指定日常任务id是否可领取
+---@param dailytaskid number @需要判定的日常任务id
+function TaskModule:IsDailyTaskIdAvalibleClaim(dailytaskid)
+    return false
+end
+
+---根据 前置任务id  获取所有任务
+---@param dailytaskid number @需要判定的日常任务id
+function TaskModule:GetAllTask_byPer(persid)
+    local tasks = {}
+    local taskconfig = _G.ConfigManager.task_cfg
+
+    ---@type task_cfg_Item
+    for taskid, taskinfomap in pairs(taskconfig) do
+        local isAdd = false
+
+        if
+            table.find(
+                taskinfomap.per_sid,
+                function(v)
+                    return v == persid
+                end
+            )
+         then
+            isAdd = true
+            for key, perTaskid in pairs(taskinfomap.per_sid) do
+                local perTask = _G.TaskModule:GetInstance():GetTaskInfoWithID(perTaskid)
+                if _G.IsNil(perTask) or perTask.state ~= _G.TaskEnum.ETaskState.Completed then
+                    isAdd = false
+                    break
+                end
+            end
+        end
+
+        if isAdd then
+            table.insert(tasks, taskid)
+        end
+    end
+    return tasks
+end
+
+--- region 任务头顶提示部分
+---获取指定对象的任务提示类型
+---@param uid number @NPC UID
+---@return EWorldItemTipType @任务提示类型
+function TaskModule:GetTaskTipType(worlditem, uid)
+    -- NPC头顶提示优先级:
+    -- 任务可提交 > 对话提示 > 可接受任务 > 可提交但不满足提交条件提示
+    --- 支线 用蓝色问号 感叹号     主线用橙色
+
+    local tipsPath = WorldData.EWorldItemTipType.None
+    -- 任务可提交
+    local isSubmitTask, taskSubmit = self:IsWorldItemHasAvalibleSubmitTask(uid)
+    if isSubmitTask then
+        if
+            taskSubmit ~= nil and
+                (taskSubmit.TaskCfg.Type1 == _G.TaskEnum.ETaskType.MainTask or
+                    taskSubmit.TaskCfg.Type1 == _G.TaskEnum.ETaskType.NoviceTask)
+         then
+            tipsPath = WorldData.EWorldItemTipType.orangeDoubt
+        else
+            tipsPath = WorldData.EWorldItemTipType.blueDoubt
+        end
+        return tipsPath
+    end
+
+    -- 对话提示
+    if self:IsWorldItemHasDialogueTaskLeft(uid) then
+        -- DialogueTip    --临时TaskAvalibleClaimedTip
+        return WorldData.EWorldItemTipType.DialogueTip --  WorldData.EWorldItemTipType.TaskAvalibleClaimedTip
+    end
+
+    -- 任务可领取
+    local isClaimedTask, taskClaimed = self:IsWorldItemHasAvalibleClaimedTask(uid)
+    if isClaimedTask then
+        if
+            taskClaimed ~= nil and
+                (taskClaimed.TaskCfg.Type1 == _G.TaskEnum.ETaskType.MainTask or
+                    taskClaimed.TaskCfg.Type1 == _G.TaskEnum.ETaskType.NoviceTask)
+         then
+            tipsPath = WorldData.EWorldItemTipType.orangeMarvel
+        else
+            tipsPath = WorldData.EWorldItemTipType.blueMarvel
+        end
+        return tipsPath
+    end
+
+    -- 任务不满足提交
+    if self:IsHasUnavalibleSubmitTask(uid) then
+        return WorldData.EWorldItemTipType.TaskUnavalibleSubmitTip
+    end
+    return WorldData.EWorldItemTipType.None
+end
+
+--- 指定对象是否有满足提交条件的可提交任务
+---@param uid number @对象UID
+---@return boolean,BaseTask @指定NPC是否有可提交的任务
+function TaskModule:IsWorldItemHasAvalibleSubmitTask(uid)
+    if self.WaitSubmitedTasksMap[uid] ~= nil and #self.WaitSubmitedTasksMap[uid] > 0 then
+        for key, task in pairs(self.WaitSubmitedTasksMap[uid]) do
+            if task ~= nil and task:IsAvalibleSubmit() then
+                return true, task
+            end
+        end
+    end
+    return false
+end
+
+--- 获取NPC相关的任务数据
+---@param npcid number @NPC ID
+---@return BaseTask[] @NPC相关任务数据
+function TaskModule:GetNPCRelativeDoingTask(npcid)
+    local ishave, task = self:IsWorldItemHasAvalibleSubmitTask(npcid)
+    if ishave == true then
+        return ishave, task
+    end
+    ishave, task = self:IsWorldItemHasDialogueTaskLeft(npcid)
+    if ishave == true then
+        return ishave, task
+    end
+    ishave, task = self:IsWorldItemHasAvalibleClaimedTask(npcid)
+    if ishave == true then
+        return ishave, task
+    end
+
+    -- if self.FightTaskContentsMap[npcid] ~= nil and #self.FightTaskContentsMap[npcid] > 0 then
+    --     local t_task = self.FightTaskContentsMap[npcid]
+    --     for index, value in ipairs(t_task) do
+    --         if checkReturn() then
+    --             return taskDataList
+    --         end
+    --         table.insert(taskDataList, value.OwnerTask)
+    --     end
+    -- end
+
+    return false
+end
+
+--- 指定对象是否还有剩余对话任务
+---@param uid number @对象UID
+---@return boolean,BaseTask @指定NPC是否还有剩余对话任务
+function TaskModule:IsWorldItemHasDialogueTaskLeft(npcid)
+    if self.DialogueTaskContentsMap[npcid] ~= nil and #self.DialogueTaskContentsMap[npcid] > 0 then
+        local t_task = self.DialogueTaskContentsMap[npcid]
+        for npcuid, taskContent in ipairs(t_task) do
+            if _G.TaskUtilities.IsTaskScence(taskContent.TargetSceneID) then
+                return true, taskContent.OwnerTask
+            end
+        end
+    end
+    return false
+end
+
+--- 指定对象是否还有剩余战斗任务
+---@param uid number @对象UID
+---@return boolean @指定对象是否还有剩余战斗任务
+function TaskModule:IsWorldItemHasFightTaskLeft(uid)
+    if self.FightTaskContentsMap[uid] ~= nil and #self.FightTaskContentsMap[uid] > 0 then
+        return true
+    else
+        return false
+    end
+end
+
+--- 指定对象是否有可接受任务
+---@param uid number @对象UID
+---@return boolean,BaseTask @指定对象是否有可接受任务
+function TaskModule:IsWorldItemHasAvalibleClaimedTask(npcid)
+    if self.WaitClaimedTasksMap[npcid] ~= nil and #self.WaitClaimedTasksMap[npcid] > 0 then
+        local t_task = self.WaitClaimedTasksMap[npcid]
+        for _, basetask in ipairs(t_task) do
+            return true, basetask
+        end
+    end
+    return false
+end
+
+--- 指定对象是否有不满足提交条件的可提交任务
+---@param uid number @对象UID
+---@return boolean @指定对象是否有不满足提交条件的可提交任务
+function TaskModule:IsHasUnavalibleSubmitTask(uid)
+    if self.WaitSubmitedTasksMap[uid] ~= nil and #self.WaitSubmitedTasksMap[uid] > 0 then
+        for k, v in pairs(self.WaitSubmitedTasksMap[uid]) do
+            ---@type BaseTask
+            local task = v
+            if task:IsAvalibleSubmit() == false then
+                return true
+            end
+        end
+        return false
+    else
+        return false
+    end
+end
+
+--- 直接提交完成指定任务 前端判断 临时
+---@param taskid number @taskid
+function TaskModule:SubmitTaskbyTaskid(taskid)
+    local mtask = self:GetTaskWithID(taskid)
+    if mtask == nil then
+        return
+    end
+    mtask:SubmitTask(true)
+end
+
+--- 注册任务完成 监听函数
+---@param func function 响应函数
+---@param funLua table 包含响应函数的Lua对象，参数2必须为为参数3的成员方法
+function TaskModule:ListenerAddTaskComplete(fun, funLua)
+    _G.TaskModule:GetInstance():AddListener(
+        _G.TaskModuleEvent,
+        _G.TaskModuleEvent.EnumValueTable.TaskComplete,
+        fun,
+        funLua
+    )
+end
+
+--- 移除任务完成 监听函数
+---@param func function 响应函数
+---@param funLua table 包含响应函数的Lua对象，参数2必须为为参数3的成员方法
+function TaskModule:ListenerRemoveTaskComplete(fun, funLua)
+    _G.TaskModule:GetInstance():RemoveListener(
+        _G.TaskModuleEvent,
+        _G.TaskModuleEvent.EnumValueTable.TaskComplete,
+        fun,
+        funLua
+    )
+end
+
+--- endregion
+
+function TaskModule:ClaimAllTask_byPer(nowTaskSid)
+    --          -- 接取  前置任务id  为该任务的所有任务
+    local tasklist = _G.TaskModule:GetInstance():GetAllTask_byPer(nowTaskSid)
+
+    local nowTask = self:GetTaskWithID(nowTaskSid)
+    if #tasklist == 0 then
+        --- 如果当前任务完成 且无后续任务
+        if self:IsCompletedTask(nowTaskSid) == true then
+            if nowTask.type == _G.TaskEnum.ETaskType.MainTask then
+                self.CurrentMainTask = nil
+            elseif nowTask.type == _G.TaskEnum.ETaskType.NoviceTask then
+                self.CurrentNoviceTask = nil
+            end
+            return
+        end
+    else
+        for index, tasksid in ipairs(tasklist) do
+            local taskInfo = self:GetTaskInfoWithID(tasksid)
+            if taskInfo == nil then
+                ---@type task.i_task
+                local i_task = {}
+                i_task.sid = tasksid
+                i_task.state = _G.TaskEnum.ETaskState.WaitClaim
+                self:AddTaskInfo(i_task)
+                local task = self:GetTaskWithID(tasksid)
+                if task.TaskCfg.is_auto_receive then
+                    self:AcceptTask(tasksid, _G.handler(task, task.OnReplyClaimTask))
+                end
+            else
+                local task = self:GetTaskWithID(tasksid)
+                if task ~= nil then
+                    if task.type == _G.TaskEnum.ETaskType.MainTask then
+                        self:ChangeMainTask(task)
+                    elseif task.type == _G.TaskEnum.ETaskType.NoviceTask then
+                        self:ChangeNoviceTask(task)
+                    end
+                end
+            end
+        end
+    end
+end
+
+function TaskModule:AcceptTask(taskid, funLua)
+    local taskcfg = _G.ConfigManager.task_cfg[taskid]
+    if taskcfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 没有该任务配置 taskid:" .. taskid)
+        end
+        return
+    end
+    --2. 提交任务(需要发送消息)
+    ---@type task.c2s_task_accept
+    local finishpbdata = {}
+    finishpbdata.sid = taskid
+    if taskcfg.Type1 == _G.TaskEnum.ETaskType.MainTask or taskcfg.Type1 == _G.TaskEnum.ETaskType.NoviceTask then
+        require("TaskNet"):GetInstance():Accept(finishpbdata, funLua)
+    elseif taskcfg.Type1 == _G.TaskEnum.ETaskType.BranchTask then
+        if _G.ChapterRoomManager:GetInstance():CheckResetTaskid(taskid) then
+            require("TaskNet"):GetInstance():AcceptSectionTaskSides(finishpbdata, funLua)
+        else
+            require("TaskNet"):GetInstance():AcceptTaskSides(finishpbdata, funLua)
+        end
+    end
+end
+
+function TaskModule:FinishTask(taskid, funLua)
+    ---关卡最后的boss任务不提交 免得关卡重置还提交任务报错
+    -- local ignore = {
+    --     [312010108] = true,
+    --     [312010206] = true,
+    --     [312010310] = true
+    -- }
+    -- if ignore[taskid] then
+    --     return
+    -- end
+
+    --- 缓存提交任务 防止多次提交 服务器推送人物内容完成/前端检测任务内容完成
+    if self.FinishTaskDic == nil then
+        self.FinishTaskDic = {}
+    end
+
+    if self.FinishTaskDic[taskid] ~= nil and os.time() - self.FinishTaskDic[taskid] < 3 then
+        return
+    end
+
+    local taskcfg = _G.ConfigManager.task_cfg[taskid]
+    if taskcfg == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError(" 没有该任务配置 taskid:" .. taskid)
+        end
+        return
+    end
+
+    self.FinishTaskDic[taskid] = os.time()
+
+    local ReFun = function()
+        if funLua ~= nil then
+            funLua()
+            funLua = nil
+        end
+        _G.Events:GetInstance():Broadcast(
+            _G.eIllustrationsToUnlockEvent.Unlock,
+            {
+                taskid
+            }
+        )
+    end
+
+    --2. 提交任务(需要发送消息)
+    ---@type task.c2s_task_accept
+    local finishpbdata = {}
+    finishpbdata.sid = taskid
+    finishpbdata.finish_type = 2
+    if taskcfg.Type1 == _G.TaskEnum.ETaskType.MainTask or taskcfg.Type1 == _G.TaskEnum.ETaskType.NoviceTask then
+        require("TaskNet"):GetInstance():Finish(finishpbdata, ReFun)
+    elseif taskcfg.Type1 == _G.TaskEnum.ETaskType.BranchTask then
+        if _G.ChapterRoomManager:GetInstance():CheckResetTaskid(taskid) then
+            require("TaskNet"):GetInstance():FinishSectionTaskSides(finishpbdata, ReFun)
+        else
+            require("TaskNet"):GetInstance():FinishTaskSides(finishpbdata, ReFun)
+        end
+    else
+        if _G.AppSetting.DEBUG then
+            _G.LogError("没有该任务类型提交")
+        end
+    end
+end
+
+--- 移除并更新 领取NPC标识
+---@param task BaseTask
+function TaskModule:RemoveWaitClaimedTasksMapByNpcID(task)
+    if self.WaitClaimedTasksMap[task.ClaimedNPCUID] ~= nil then
+        local removecount = _G.table.removebyvalue(self.WaitClaimedTasksMap[task.ClaimedNPCUID], task)
+        if removecount ~= 0 then
+            -- 通知头顶提示刷新
+            WorldUtils.UpdateWorldItemTip(task.ClaimedNPCUID)
+        end
+    end
+end
+--- 移除并更新 提交NPC标识
+---@param task BaseTask
+function TaskModule:RemoveWaitSubmitedTasksMapByNpcID(task)
+    if self.WaitSubmitedTasksMap[task.SubmitedNPCUID] ~= nil then
+        local removecount = _G.table.removebyvalue(self.WaitSubmitedTasksMap[task.SubmitedNPCUID], task)
+        if removecount ~= 0 then
+            -- 通知头顶提示刷新
+            WorldUtils.UpdateWorldItemTip(task.SubmitedNPCUID)
+        end
+    end
+end
+
+function TaskModule:SetCompletedRoomTask(taskid)
+    self.CompletedRoomTaskAllReal[taskid] = true
+    self.RoomFinishTask[taskid] = true
+end
+function TaskModule:IsCompletedRoomTask(taskid)
+    return self.CompletedRoomTaskAllReal[taskid] and true or false
+end
+function TaskModule:SetCompletedTask(taskid)
+    self.CompletedTaskAll[taskid] = true
+end
+function TaskModule:IsCompletedTask(taskid)
+    return self.CompletedTaskAll[taskid] and true or false
+end
+---移除完成 (关卡任务重置)
+function TaskModule:DelCompletedTask(taskid)
+    self.CompletedTaskAll[taskid] = nil
+end
+
+function TaskModule:SetCurClickTask(taskid)
+    taskid = tonumber(taskid)
+    if taskid == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("taskid 为空")
+        end
+        return
+    end
+    local task = self:GetTaskWithID(taskid)
+    if task == nil then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("未找到该任务")
+        end
+        return
+    end
+    --- 当前玩家点击任务id
+    self.CurClickTaskId = taskid
+    local taskScenceid = _G.TaskUtilities.GetTaskStateScence(task)
+    -- if taskScenceid > 0 then
+    require("SectionMiniMapManager"):GetInstance():SetTaskRoomID(taskScenceid)
+    -- end
+end
+
+---@param stateType number 领取完成 _G.TaskEnum.ETaskState.Claimed
+---@param taskType number 主线支线  _G.TaskEnum.ETaskType.MainTask
+function TaskModule:PlayTaskEff_01(stateType, taskType, loadcall, finishCall)
+    ---任务文字 默认接受任务
+    local str = ""
+    if stateType == _G.TaskEnum.ETaskState.Claimed then
+        str = _G.LangUtil.GetLangPackValue(90000000065)
+    else
+        str = _G.LangUtil.GetLangPackValue(90000000066)
+    end
+
+    --region --------------------------------------镇魂街ZHJ-8126 屏蔽--------
+
+    -- local loadFun = function(tran)
+    --     if _G.IsNil(tran) then
+    --         return
+    --     end
+    --     local gotable = _G.GetAutoGoTable(tran)
+    --     gotable.aortext_text.text = str
+    --     if loadcall ~= nil then
+    --         loadcall()
+    --     end
+    --     -- body
+    -- end
+
+    -- if taskType == _G.TaskEnum.ETaskType.MainTask or taskType == _G.TaskEnum.ETaskType.NoviceTask then
+    --     --- 主线
+    --     _G.UIUtils.LoadEffectByCfg(
+    --         _G.ConfigManager.ui_effect_cfg.ef_Task_TextZhu,
+    --         _G.UIManager:GetInstance():GetUILayerTrans(_G.UILayers.InfoLayer.Name),
+    --         loadFun,
+    --         finishCall
+    --     )
+    -- else
+    --     ---支线
+    --     _G.UIUtils.LoadEffectByCfg(
+    --         _G.ConfigManager.ui_effect_cfg.ef_Task_TextZhi,
+    --         _G.UIManager:GetInstance():GetUILayerTrans(_G.UILayers.InfoLayer.Name),
+    --         loadFun,
+    --         finishCall
+    --     )
+    -- end
+    if loadcall ~= nil then
+        loadcall()
+    end
+    if finishCall ~= nil then
+        finishCall()
+    end
+    --endregion------------------------------------镇魂街ZHJ-8126--------
+end
+
+function TaskModule:CurClickTaskComplet(taskid)
+    if taskid == nil then
+        return
+    end
+    if taskid ~= self.CurClickTaskId then
+        return
+    end
+    --- 当前玩家点击任务id
+    self.CurClickTaskId = 0
+
+    require("SectionMiniMapManager"):GetInstance():SetTaskRoomID(0)
+end
+
+--region --------------------------------------关卡房间任务--------
+
+---是否存在 可接取的关卡任务 (主城接剧本任务)
+function TaskModule:UnLockSectionTask()
+    local getTask = {}
+    local len = #self.SectionTaskidArr
+    for i = 1, len do
+        local taskid = self.SectionTaskidArr[i]
+        if self:IsCompletedTask(taskid) then
+            -- return
+        else
+            local taskCfg = _G.ConfigManager.task_cfg[taskid]
+            if self.AllTasksMap[taskCfg.Type1][taskid] ~= nil then
+                -- return
+            else
+                local tSectionid = taskCfg.script_type[1]
+                if require("ChapterModel"):GetInstance():CheckSection(tSectionid) then
+                    table.insert(getTask, taskid)
+                    break
+                end
+            end
+        end
+    end
+    return getTask
+end
+
+---是否存在 当前关卡里可接取的任务 (关卡里接可重置的关卡任务 )
+function TaskModule:ReceiveSectionBranchTaskTask(sectionid, roomid)
+    local getTask = {}
+
+    local Addfun = function(taskid)
+        local taskCfg = _G.ConfigManager.task_cfg[taskid]
+        if taskCfg == nil then
+            return
+        end
+        if taskCfg.per_sid ~= nil then
+            ---如果前置任务没完成
+            local DontPerTask =
+                table.find(
+                taskCfg.per_sid,
+                function(per_sid)
+                    return self:IsCompletedTask(per_sid) == false
+                end
+            )
+            if DontPerTask ~= nil then
+                --- 不能显示领取
+                return
+            end
+        end
+
+        if self.AllTasksMap[taskCfg.Type1][taskid] ~= nil then
+            -- return
+        else
+            local tSectionid = taskCfg.script_type[1]
+            local tRoomid = taskCfg.script_type[2]
+            if sectionid == tSectionid and roomid == tRoomid then
+                table.insert(getTask, taskid)
+            end
+        end
+    end
+
+    local len = #self.SectionBranchTaskidArr
+    for i = 1, len do
+        local taskid = self.SectionBranchTaskidArr[i]
+
+        --- 已完成 就不加
+        if self:IsCompletedTask(taskid) then
+            -- return
+        else
+            Addfun(taskid)
+        end
+    end
+    for _, v in pairs(getTask) do
+        local taskid = v
+        ---@type task.i_task
+        local i_task = {}
+        i_task.sid = taskid
+        i_task.state = _G.TaskEnum.ETaskState.WaitClaim
+        _G.TaskModule:GetInstance():AddTaskInfo(i_task)
+        local task = _G.TaskModule:GetInstance():GetTaskWithID(taskid)
+        --- 自动领取 无前置 无场景npc的任务
+        if task.TaskCfg.is_auto_receive and task.TaskCfg.per_sid[1] == nil and task.TaskCfg.rec_npc[1] == nil then
+            _G.TaskModule:GetInstance():AcceptTask(taskid, _G.handler(task, task.OnReplyClaimTask))
+        end
+    end
+end
+
+---获取所有关卡任务
+---@return number[],number[] taskid[]  关卡任务,关卡内支线任务
+function TaskModule:GetAllSectionTask()
+    local SectionTask = {}
+    local SectionBranchTask = {}
+
+    local cfg = _G.ConfigManager.task_cfg
+    ---@param lkey task_cfg_Item
+    ---@param rkey task_cfg_Item
+    ---@param v task_cfg_Item
+    table.walksort(
+        cfg,
+        function(lkey, rkey)
+            local dataL = cfg[lkey]
+            local dataR = cfg[rkey]
+            return dataL.ID < dataR.ID
+        end,
+        function(taskid, v)
+            if v.script_type ~= nil then
+                local tSectionid = v.script_type[1]
+                if tSectionid ~= nil then
+                    local tRoomid = v.script_type[2]
+                    if tRoomid ~= nil then
+                        table.insert(SectionBranchTask, taskid)
+                    else
+                        table.insert(SectionTask, taskid)
+                    end
+                end
+            end
+        end
+    )
+    return SectionTask, SectionBranchTask
+end
+
+---根据关卡id  获得对应的关卡任务id
+function TaskModule:GetTaskIdBySectionId(sectionid)
+    for _, taskid in pairs(self.SectionTaskidArr) do
+        local taskCfg = _G.ConfigManager.task_cfg[taskid]
+        local taskSection = taskCfg.script_type[1]
+        if taskSection ~= nil and taskSection == sectionid then
+            return taskid
+        end
+    end
+    return nil
+end
+
+---根据关卡id  获得对应的所有关卡房间任务id
+function TaskModule:GetRoomTaskIdArrBySectionId(sectionid)
+    local arr = {}
+    for _, taskid in pairs(self.SectionBranchTaskidArr) do
+        local taskCfg = _G.ConfigManager.task_cfg[taskid]
+        local taskSection = taskCfg.script_type[1]
+        if taskSection ~= nil and taskSection == sectionid then
+            table.insert(arr, taskid)
+        end
+    end
+    return arr
+end
+
+---根据关卡id  获得对应的所有关卡房间任务id
+function TaskModule:ResetSectionRoomTask(sectionid)
+    local taskidArr = self:GetRoomTaskIdArrBySectionId(sectionid)
+    local taskinfoArr = {}
+    for i = 1, #taskidArr do
+        local taskid = taskidArr[i]
+        self:DelCompletedTask(taskid)
+        local taskinfo = self:GetTaskInfoWithID(taskid)
+        if taskinfo ~= nil then
+            table.insert(taskinfoArr, taskinfo)
+        end
+    end
+    if #taskinfoArr > 0 then
+        self:RemoveTaskInfos(taskinfoArr)
+    end
+end
+
+---根据关卡id  获得对应的所有关卡房间任务id
+function TaskModule:CheckIsRoomTask(taskid)
+    local taskCfg = _G.ConfigManager.task_cfg[taskid]
+    local taskSection = taskCfg.script_type[1]
+    local roomid = taskCfg.script_type[2]
+    return taskSection ~= nil and roomid ~= nil
+end
+
+--endregion
+
+---根据关卡id  获得对应的所有关卡房间任务id
+function TaskModule:FinishAFkChapterTask(afkstageIdS)
+    local cfg = _G.ConfigManager.task_cfg
+    ---@param a task_cfg
+    ---@type task_cfg[]
+    local taskcfgS =
+        _G.table.chooseToArray(
+        cfg,
+        function(k, v)
+            return v.Type1 == _G.TaskEnum.ETaskType.MainTask and
+                table.find(
+                    afkstageIdS,
+                    function(finv)
+                        return finv == v.chapter
+                    end
+                ) ~= nil
+        end
+    )
+    if taskcfgS ~= nil then
+        local index = 1
+
+        local Finish
+        local addFun
+        addFun = function(taskid)
+            if _G.AppSetting.DEBUG then
+                _G.LogError(" 章节奖励任务   已完成 " .. taskid)
+            end
+            index = index + 1
+            if index > #taskcfgS then
+                return
+            else
+                Finish()
+            end
+        end
+
+        Finish = function()
+            if taskcfgS[index] == nil then
+                return
+            end
+            local taskid = taskcfgS[index].ID
+            if self:IsCompletedTask(taskid) == true then
+                addFun(taskid)
+            elseif self:GetTaskWithID(taskid) == nil then
+                _G.DelayDo(
+                    0.2,
+                    function()
+                        if _G.AppSetting.DEBUG then
+                            _G.LogError(" 章节奖励任务   准备完成 " .. taskid)
+                        end
+                        self:FinishTask(
+                            taskid,
+                            function()
+                                addFun(taskid)
+                            end
+                        )
+                    end
+                )
+            else
+                if _G.AppSetting.DEBUG then
+                    _G.LogError(" 章节奖励任务   准备完成 " .. taskid)
+                end
+                self:FinishTask(
+                    taskid,
+                    function()
+                        addFun(taskid)
+                    end
+                )
+            end
+        end
+        Finish()
+    end
+end
+
+---@type TaskModule @任务数据模块
+_G.TaskModule = TaskModule

@@ -1,0 +1,986 @@
+-----------------------------------------------------------------------
+-- D:.zhenhunjie-s.client.trunk.alpha.Client.Assets.Resources.LuaScripts.Game.Mall.Model.MallManager	(修改路径必须修正此项!)
+-- Created by 此处填写你的名字
+-- DateTime: 2021/01/14
+-- Description: 此处填写描述
+-----------------------------------------------------------------------
+
+local MallNet = require "MallNet"
+local MallMonthModel = require "MallMonthModel"
+local MallWeekModel = require "MallWeekModel"
+local MallDayModel = require "MallDayModel"
+local MallNeverModel = require "MallNeverModel"
+local MallCashModel = require "MallCashModel"
+local ShopPreferenceModel = require("ShopPreferenceModel")
+local base = require "GameDataModelBase"
+local SDKDef = require("SDKDef")
+
+-- local utils = {
+--     ---获取充值价格
+--     ---@param cfg store_recharge_cfg|store_gear_cfg
+--     getCashGear = function(cfg)
+--         local gear
+--         local mallManager = require("MallManager"):GetInstance()
+--         if _G.CS.Launcher.Inst.IsSDK then
+--             --处理特殊渠道
+--             -- local platform = _G.ServerManager:GetInstance().AppInfo.Platform
+--             -- local platformId = _G.tonumber(platform)
+--             -- if platformId and platformId == 77 then
+--             --     return cfg.gear_lenovo
+--             -- end
+--             for i = 1, #cfg.gear do
+--                 if mallManager:GetPayGoodsData(cfg.gear[i]) then
+--                     gear = cfg.gear[i]
+--                     return gear
+--                 end
+--             end
+--         end
+
+--         gear = cfg.gear[1]
+--         return gear
+--     end
+-- }
+
+---@class MallManager:GameDataModelBase    中文描述
+---@field GetInstance fun():MallManager
+local MallManager = _G.BaseClass("MallManager", base)
+local version = _G.ConfigManager.discrete_cfg[100108][1][1]
+local buyAudioID = 2013
+
+---商城类型定义
+MallManager.MallType = {
+    ["never"] = 4,
+    ["day"] = 1,
+    ["week"] = 2,
+    ["month"] = 3,
+    ["cash"] = 5,
+    ["initial"] = 6,
+    ["Preference"] = 7,
+    ["monthCard"] = 8,
+    --- 基金
+    ["storeBattlePass"] = 9,
+    --- 战令
+    ["seasonlv"] = 10,
+    ---碎片礼包
+    ["chip"] = 11,
+    ---每日特惠
+    ["daily"] = 12,
+    ---材料礼包
+    ["MaterialGift"] = 13
+}
+
+---类的构造函数
+function MallManager:__init()
+    self.curFunctionOpenID = 26
+    self.itemList = {}
+    --- first_cash number 首充标记 0：未充值  1：已充值
+    --- first_time number 首充时间
+    --- first_award number[] 首充累计领奖领取过的id
+    self.controllers = {
+        [MallManager.MallType.day] = MallDayModel:GetInstance(),
+        [MallManager.MallType.week] = MallWeekModel:GetInstance(),
+        [MallManager.MallType.month] = MallMonthModel:GetInstance(),
+        [MallManager.MallType.never] = MallNeverModel:GetInstance(),
+        [MallManager.MallType.cash] = MallCashModel:GetInstance(),
+        [MallManager.MallType.Preference] = ShopPreferenceModel:GetInstance()
+    }
+
+    self:AddEvent()
+end
+
+---类的析构函数
+function MallManager:Dispose()
+    self:RemoveEvent()
+    self.itemList = nil
+    self.controllers = nil
+    self.isRecvMallData = nil
+end
+
+--region数据
+function MallManager:GetDataFormServer()
+    MallNet:GetInstance():GetMallInfo(_G.handler(self, self.ParseData))
+end
+
+---提审模式下客户端该功能做了特殊处理，不会拉取数据，所有在切到主城后检测一下状态
+function MallManager:ReqMallData()
+    if _G.AppSetting.IsArraigned and _G.AppSetting.IsIos and not _G.AppSetting.IsWebGl and not self.isRecvMallData then
+        self:GetDataFormServer()
+    end
+end
+
+function MallManager:ParseData(data)
+    self.isRecvMallData = true
+    self.controllers[MallManager.MallType.month]:InitData(data.month_time or {})
+    self.controllers[MallManager.MallType.week]:InitData(data.week_time or {})
+    self.controllers[MallManager.MallType.day]:InitData(data.day_time or {})
+    self.controllers[MallManager.MallType.never]:InitData(data.all_time or {})
+    self.controllers[MallManager.MallType.cash]:InitData(data.all_time or {})
+    ---累计充值金额
+    self.cash_rmb = data.cash_rmb
+    self.cash_base_rmb = data.cash_base_rmb
+    ---充值次数
+    self.cash_times = data.cash_times
+    ---每周免费奖励
+    self.FreeGiftWeek = data.week_award
+    self:InitDataMall(data)
+    base.ParseData(self)
+
+    if self.MallNetCallback then
+        self:UpdataCurView()
+        self.MallNetCallback()
+        self.MallNetCallback = nil
+    end
+
+    if not _G.AppSetting.IsArraigned then
+        --降神特惠(免费)礼包存储在此处
+        local GodSpecialGiftRegularView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.GodSpecialGiftRegularView.Name)
+        if GodSpecialGiftRegularView then
+            GodSpecialGiftRegularView.View:UpdateView(true)
+        end
+        --刷新降神特惠礼包红点
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.GiftofGod.id)
+
+        --饰品招募礼包(免费)礼包存储在此处
+        local SpiritualDrawGiftPackView = _G.UIManager:GetInstance():GetWindow(_G.ConfigManager.ui_cfg.SpiritualDrawGiftPackView.Name)
+        if SpiritualDrawGiftPackView then
+            SpiritualDrawGiftPackView.View:UpdateView(true)
+        end
+        --刷新饰品招募礼包红点
+        require("RedPointManager"):GetInstance():RefreshNode(_G.ConfigManager.redpoint_cfg.SpiritualDrawGiftPack.id)
+
+        require("SevenGiftModel"):GetInstance():ParseData()
+        require("SevenGiftGMSynModel"):GetInstance():ParseData()
+    end
+end
+
+function MallManager:GetPayGoodsList(data)
+    if _G.AppSetting.DEBUG then
+        _G.Log(data, "<color=red>" .. "GetPayGoodsList" .. "</color>")
+    end
+    self.sdkGoodsList = data.product_list
+end
+
+---获取商品数据
+function MallManager:GetPayGoodsData(gear)
+    if not self.sdkGoodsList then
+        if _G.AppSetting.DEBUG then
+            _G.LogError("没有商品数据，检查是否拉起了商品数据！")
+        end
+        _G.SDKManager:GetInstance():SendGetGoodsList()
+        return
+    end
+
+    for _, v in pairs(self.sdkGoodsList) do
+        if v.product_id == gear then
+            return v
+        end
+    end
+end
+
+---初始化商场数据
+---@param month_time table public.i_k_v  k == 物品id , v = 购买次数
+function MallManager:InitDataMall(data)
+    local temp_da = {} --
+    if not _G.table.isEmptyOrNil(data.month_time) then
+        for i = 1, #data.month_time do
+            _G.table.insert(temp_da, data.month_time[i])
+        end
+    end
+    if not _G.table.isEmptyOrNil(data.week_time) then
+        for i = 1, #data.week_time do
+            _G.table.insert(temp_da, data.week_time[i])
+        end
+    end
+    if not _G.table.isEmptyOrNil(data.day_time) then
+        for i = 1, #data.day_time do
+            _G.table.insert(temp_da, data.day_time[i])
+        end
+    end
+    if not _G.table.isEmptyOrNil(data.all_time) then
+        for i = 1, #data.all_time do
+            _G.table.insert(temp_da, data.all_time[i])
+        end
+    end
+    self.controllers[MallManager.MallType.Preference]:InitData(temp_da)
+end
+
+--endregion
+
+function MallManager:ReConnect(endcall)
+    self.MallNetCallback = endcall
+
+    if _G.AppSetting.DEBUG then
+        _G.Log("商城重连了")
+    end
+    MallNet:GetInstance():GetMallInfo(_G.handler(self, self.ParseData))
+end
+
+---添加推送监听
+
+--region 对外接口
+---购买商品
+---@param id number 商品id
+---@param callback function 购买结果回调(success,errMsg)
+function MallManager:BuyItem(id, callback)
+end
+
+---刷新商城
+---@param _type number 商城类型
+---@param callback function 刷新回调(success,errMsg)
+function MallManager:FreshMall(_type, callback)
+end
+
+function MallManager:GetFreeTime()
+    return self.FreeGiftWeek
+end
+
+function MallManager:SetFreeTime()
+    self.FreeGiftWeek = 1
+end
+
+---获取商城列表数据
+---@param _type number 商城类型
+---@return table 物品列表
+function MallManager:GetMallItemList(_type)
+    return self.controllers[_type]:GetItemList()
+end
+
+---获取商城列表数据通过页签
+---@param _type number 商城类型
+---@return table 物品列表
+function MallManager:GetMallItemListByType(_type, type1)
+    return self.controllers[_type]:GetItemListByType(type1)
+end
+
+---获取刷新倒计时
+---@param _type number 商城类型
+---@return number 刷新倒计时
+function MallManager:GetUpdateTime(_type)
+end
+
+---获取商品已购买次数
+---@param id number 商品ID
+---@return 变量类型 中文描述
+function MallManager:GetItemBuyTimes(id, _type)
+    return self.controllers[_type]:GetItemBuyTimes(id)
+end
+
+---@return 变量类型 中文描述
+function MallManager:CheckFreeGoodsIsSellOut(_type)
+    return self.controllers[_type]:CheckFreeGoodsIsSellOut()
+end
+
+---礼包免费物品id购买状态 用于页签红点判定
+---@param id number 物品id
+---@param state boolean 是否已购买
+function MallManager:CacheFreeGoodsInfo(_type, id, state)
+    self.controllers[_type]:CacheFreeGoodsInfo(id, state)
+end
+
+---设置商品购买的次数
+---@param id number 物品id
+---@param controllerEnum number 管理器类型
+---@param number number 购买的次数
+function MallManager:SetItemBuyTimes(id, type, number)
+    self.controllers[type]:SetItemBuyTiems(id, number)
+end
+
+--- 充值礼包点击购买
+---@param price_id number 充值档位id
+---@param activityId number 活动id，如果没有传nil即可
+---@param giftId number 礼包id
+function MallManager:BuyActiveGift(price_id, activityId, giftId, canVoucher)
+    _G.SDKManager:GetInstance():ReportData(SDKDef.DotMsg.OverseasFT.pre_initiated_checkout)
+    if _G.AppSetting.DEBUG then
+        _G.Log("充值礼包购买接口触发>>>>>>>>>>>>>>>")
+    end
+
+    if nil == canVoucher then
+        canVoucher = true
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(price_id, "充值档位配置id")
+    end
+
+    ---@type store_gear_cfg
+    local gearCfg = _G.ConfigManager.store_gear_cfg[price_id]
+    --local gear = utils.getCashGear(gearCfg)
+    local sdkGoodsData
+    local gear = gearCfg.gear
+    for i = 1, #gear do
+        sdkGoodsData = self:GetPayGoodsData(gear[i])
+        if sdkGoodsData then
+            break
+        end
+    end
+    if _G.AppSetting.DEBUG then
+        _G.Log(sdkGoodsData.product_id, "充值档位")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(gearCfg.price, "充值金额")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(activityId, "活动id")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(giftId, "礼包id")
+    end
+
+    local id = tostring(giftId)
+    if activityId then
+        id = activityId .. "ykyk" .. id
+    end
+
+    local function cashByVoucher()
+        local voucherin = _G.StorageManager:GetInstance():GetItemCountBySid(gearCfg.voucher[2][1])
+        MallNet:GetInstance():CashByVoucher(
+            gearCfg,
+            price_id,
+            gearCfg.price,
+            id,
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    return
+                end
+
+                local VoucherDiscount = require("VoucherDiscountModel"):GetInstance():GetVoucherDiscountValue()
+                if voucherin >= (gearCfg.voucher[1][2] * VoucherDiscount) then
+                    _G.StorageManager:GetInstance():ConsumeItem(gearCfg.voucher[2][1], 0,
+                        math.floor(gearCfg.voucher[2][2] * VoucherDiscount))
+                else
+                    if voucherin > 0 then
+                        _G.StorageManager:GetInstance():ConsumeItem(gearCfg.voucher[2][1], 0, voucherin)
+                        _G.StorageManager:GetInstance():ConsumeItem(gearCfg.voucher[1][1], 0,
+                            math.floor(gearCfg.voucher[1][2] * VoucherDiscount) - voucherin)
+                    else
+                        _G.StorageManager:GetInstance():ConsumeItem(gearCfg.voucher[1][1], 0,
+                            math.floor(gearCfg.voucher[1][2] * VoucherDiscount))
+                    end
+                end
+            end
+        )
+    end
+    local function cashByDefault()
+        if _G.GameUtil.CheckVoucherModel() and canVoucher then
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                218,
+                nil,
+                function()
+                    _G.JumpManager:GetInstance():Jump(213001) -- _G.handlerbind(self, self.BuyVoucher, price_id),
+                end,
+                function()
+                end
+            )
+            return
+        end
+        if not sdkGoodsData then
+            if _G.AppSetting.DEBUG then
+                _G.LogError("没有查询到对应档位的商品配置，请检查挂机后台是否配置，否拉取到对应配置：" .. gear)
+            end
+            return
+        end
+        if _G.GameUtil.GetFunctionBlockState(_G.FunctionBlock.rechargeSwitch) then
+            _G.LogError("屏蔽充值")
+            return
+        end
+        _G.SDKManager:GetInstance():SendBuyPro(sdkGoodsData, id)
+    end
+
+    if canVoucher then
+        --外部使用
+        local voucher = _G.StorageManager:GetInstance():GetItemCountBySid(gearCfg.voucher[1][1])
+        self.voucher = voucher
+
+        --内部使用
+        local voucherin = _G.StorageManager:GetInstance():GetItemCountBySid(gearCfg.voucher[2][1])
+        self.voucherin = voucherin
+        local VoucherDiscount = require("VoucherDiscountModel"):GetInstance():GetVoucherDiscountData()
+
+        local discountNum
+        if VoucherDiscount == nil then
+            discountNum = 10000
+        else
+            local value = _G.ConfigManager.item_accumulate_cfg[tonumber(VoucherDiscount.cfg.UseParameter[1][1])]
+            discountNum = value.ratio_recharge
+        end
+
+        if voucher + voucherin >= math.floor(gearCfg.voucher[1][2] * (discountNum / 10000)) then
+            _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OpenDialog, self)
+            if VoucherDiscount == nil then
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                    470104,
+                    nil,
+                    cashByVoucher,
+                    function()
+                        if not _G.GameUtil.CheckVoucherModel() then
+                            cashByDefault()
+                        end
+                    end,
+                    nil,
+                    nil,
+                    gearCfg.voucher[1][2]
+                )
+            else
+                local value = _G.ConfigManager.item_accumulate_cfg[tonumber(VoucherDiscount.cfg.UseParameter[1][1])]
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                    470107,
+                    nil,
+                    cashByVoucher,
+                    function()
+                        if not _G.GameUtil.CheckVoucherModel() then
+                            cashByDefault()
+                        end
+                    end,
+                    nil,
+                    nil,
+                    _G.GetLangPackValue(VoucherDiscount.cfg.Name),
+                    math.floor(gearCfg.voucher[1][2] * (value.ratio_recharge / 10000)),
+                    gearCfg.voucher[1][2],
+                    (value.ratio_recharge / 100) .. "%"
+                )
+            end
+        else
+            cashByDefault()
+        end
+    else
+        cashByDefault()
+    end
+end
+
+function MallManager:BuyVoucher(price_id)
+    local gearCfg = _G.ConfigManager.store_gear_cfg[price_id]
+    local num = gearCfg.voucher[1][2]
+    local dataList = self:GetMallItemListByType(MallManager.MallType.cash, 2)
+    for _, v in pairs(dataList) do
+        if v.goods[1][2] >= num then
+            self:BuyActiveGift(v.price_id, nil, v.id, false)
+            return
+        end
+    end
+    if _G.AppSetting.DEBUG then
+        _G.LogError("未匹配到档位id对应的代金券档位: " .. price_id)
+    end
+end
+
+function MallManager:BuyGiftByDiamond(id, call)
+    MallNet:GetInstance():CashGiftByDiamond(id, call)
+end
+
+---固定充值
+---@param cfg store_recharge_cfg 商城固定充值配置
+function MallManager:BuyFixedGoods(cfg, goodsData, canVoucher)
+    _G.SDKManager:GetInstance():ReportData(SDKDef.DotMsg.OverseasFT.pre_initiated_checkout)
+    if _G.AppSetting.DEBUG then
+        _G.Log("商城固定充值购买接口触发>>>>>>>>>>>>>>>")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(cfg, "固定充值配置信息")
+    end
+
+    if nil == canVoucher then
+        canVoucher = true
+    end
+
+    --local gear = utils.getCashGear(cfg)
+    local sdkGoodsData
+    local gear
+    if cfg.type1 == 1 then
+        gear = cfg.gear
+    else
+        local gearCfg = _G.ConfigManager.store_gear_cfg[cfg.price_id]
+        gear = gearCfg.gear
+    end
+    for i = 1, #gear do
+        sdkGoodsData = self:GetPayGoodsData(gear[i])
+        if sdkGoodsData then
+            break
+        end
+    end
+    if _G.AppSetting.DEBUG then
+        _G.Log(sdkGoodsData.product_id, "充值档位")
+    end
+
+    local function cashByDefault()
+        if _G.AppSetting.DEBUG then
+            _G.Log("sdk充值接口调用")
+        end
+        if _G.GameUtil.CheckVoucherModel() and canVoucher then
+            _G.PopWindowManager:GetInstance():ShowAllTips(
+                218,
+                nil,
+                function()
+                    _G.JumpManager:GetInstance():Jump(213001) -- _G.handlerbind(self, self.BuyVoucher, price_id),
+                end,
+                function()
+                end
+            )
+            return
+        end
+        _G.SDKManager:GetInstance():SendBuy(goodsData)
+    end
+    local function cashByVoucher()
+        local finalPrice = 0
+        local finalCfg
+        local finalId = 0
+        if cfg.price_id > 0 then
+            local gearCfg = _G.ConfigManager.store_gear_cfg[cfg.price_id]
+            finalPrice = gearCfg.price
+            finalCfg = gearCfg
+            finalId = gearCfg.id
+        else
+            finalPrice = cfg.price
+            finalCfg = cfg
+            finalId = cfg.price
+        end
+        --内部使用
+        local voucherin = _G.StorageManager:GetInstance():GetItemCountBySid(cfg.voucher[2][1])
+        MallNet:GetInstance():CashByVoucher(
+            finalCfg,
+            finalId,
+            finalPrice,
+            cfg.id,
+            function(msg)
+                if not msg or msg.ack ~= 1 then
+                    return
+                end
+                local VoucherDiscount = require("VoucherDiscountModel"):GetInstance():GetVoucherDiscountValue()
+                if voucherin >= (cfg.voucher[1][2] * VoucherDiscount) then
+                    _G.StorageManager:GetInstance():ConsumeItem(cfg.voucher[2][1], 0,
+                        math.floor(cfg.voucher[2][2] * VoucherDiscount))
+                else
+                    if voucherin > 0 then
+                        _G.StorageManager:GetInstance():ConsumeItem(cfg.voucher[2][1], 0, voucherin)
+                        _G.StorageManager:GetInstance():ConsumeItem(cfg.voucher[1][1], 0,
+                            math.floor(cfg.voucher[1][2] * VoucherDiscount) - voucherin)
+                    else
+                        _G.StorageManager:GetInstance():ConsumeItem(cfg.voucher[1][1], 0,
+                            math.floor(cfg.voucher[1][2] * VoucherDiscount))
+                    end
+                end
+            end
+        )
+    end
+
+    if canVoucher then
+        --外部使用
+        local voucher = _G.StorageManager:GetInstance():GetItemCountBySid(cfg.voucher[1][1])
+        self.voucher = voucher
+        --内部使用
+        local voucherin = _G.StorageManager:GetInstance():GetItemCountBySid(cfg.voucher[2][1])
+        self.voucherin = voucherin
+        local VoucherDiscount = require("VoucherDiscountModel"):GetInstance():GetVoucherDiscountData()
+
+        local discountNum
+        if VoucherDiscount == nil then
+            discountNum = 10000
+        else
+            local value = _G.ConfigManager.item_accumulate_cfg[tonumber(VoucherDiscount.cfg.UseParameter[1][1])]
+            discountNum = value.ratio_recharge
+        end
+
+        if voucher + voucherin >= math.floor(cfg.voucher[1][2] * (discountNum / 10000)) then
+            _G.Events:GetInstance():AddListener(_G.eUIManagerStatus.OnUIOpened, self.OpenDialog, self)
+            local VoucherDiscount = require("VoucherDiscountModel"):GetInstance():GetVoucherDiscountData()
+            if VoucherDiscount == nil then
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                    470104,
+                    nil,
+                    cashByVoucher,
+                    function()
+                        if not _G.GameUtil.CheckVoucherModel() then
+                            cashByDefault()
+                        end
+                    end,
+                    nil,
+                    nil,
+                    cfg.voucher[1][2]
+                )
+            else
+                local value = _G.ConfigManager.item_accumulate_cfg[tonumber(VoucherDiscount.cfg.UseParameter[1][1])]
+                _G.PopWindowManager:GetInstance():ShowAllTips(
+                    470107,
+                    nil,
+                    cashByVoucher,
+                    function()
+                        if not _G.GameUtil.CheckVoucherModel() then
+                            cashByDefault()
+                        end
+                    end,
+                    nil,
+                    nil,
+                    _G.GetLangPackValue(VoucherDiscount.cfg.Name),
+                    math.floor(cfg.voucher[1][2] * (value.ratio_recharge / 10000)),
+                    cfg.voucher[1][2],
+                    (value.ratio_recharge / 100) .. "%"
+                )
+            end
+        else
+            cashByDefault()
+        end
+    else
+        cashByDefault()
+    end
+end
+
+function MallManager:AddEvent()
+    if _G.CS.Launcher.Inst.IsSDK then
+        _G.SDKManager:GetInstance():AddListener(SDKDef.GetMsg.can_recharge_true, self.can_recharge_true, self)
+        _G.SDKManager:GetInstance():AddListener(SDKDef.GetMsg.can_recharge_false, self.can_recharge_false, self)
+        _G.SDKManager:GetInstance():AddListener(SDKDef.GetMsg.pay_success, self.pay_success, self)
+        _G.SDKManager:GetInstance():AddListener(SDKDef.GetMsg.pay_failed, self.pay_failed, self)
+        _G.SDKManager:GetInstance():AddListener(SDKDef.GetMsg.pay_goods_list, self.GetPayGoodsList, self)
+    end
+
+    _G.Events:GetInstance():AddListener(_G.MallCash.StateChange, self.OnMallCashStateChange, self)
+    _G.Events:GetInstance():AddListener(_G.eYKNetEvent.ReconnectSuccess, self.OnReconnectSuccess, self)
+end
+
+function MallManager:RemoveEvent()
+    if _G.CS.Launcher.Inst.IsSDK then
+        _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.can_recharge_true, self.can_recharge_true, self)
+        _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.can_recharge_false, self.can_recharge_false, self)
+        _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.pay_success, self.pay_success, self)
+        _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.pay_failed, self.pay_failed, self)
+        _G.SDKManager:GetInstance():RemoveListener(SDKDef.GetMsg.pay_goods_list, self.GetPayGoodsList, self)
+    end
+
+    _G.Events:GetInstance():RemoveListener(_G.MallCash.StateChange, self.OnMallCashStateChange, self)
+    _G.Events:GetInstance():RemoveListener(_G.eYKNetEvent.ReconnectSuccess, self.OnReconnectSuccess, self)
+end
+
+function MallManager:can_recharge_true(json)
+    local json_data = _G.Json2Table(json)
+    local fangchenmi_flag = json_data.fangchenmi_flag
+    local total_amount = json_data.total_amount
+
+    local canRealRecharge = true
+
+    local tipsId = 290305
+    if fangchenmi_flag <= 1 then
+        -- 8岁以下或未认证
+        canRealRecharge = false
+        tipsId = 290305
+    elseif fangchenmi_flag == 2 then
+        -- 8-16岁
+        if self.sendCfgNum > 50 then
+            canRealRecharge = false
+            tipsId = 290306
+        elseif self.sendCfgNum + total_amount > 200 then
+            canRealRecharge = false
+            tipsId = 290307
+        end
+    elseif fangchenmi_flag == 3 then
+        -- 16-18岁
+        if self.sendCfgNum > 100 then
+            canRealRecharge = false
+            tipsId = 290308
+        elseif self.sendCfgNum + total_amount > 400 then
+            canRealRecharge = false
+            tipsId = 290309
+        end
+    end
+
+    if canRealRecharge then
+        ---这里是版署的已不适配新接口
+        -- self:Cash(self.sendCfgId, _G.handler(self, self.FreshPage))
+    else
+        _G.PopWindowManager:GetInstance():ShowAllTips(
+            tipsId,
+            nil,
+            function()
+            end
+        )
+    end
+end
+
+function MallManager:can_recharge_false()
+    _G.PopWindowManager:GetInstance():ShowAllTips(
+        290305,
+        nil,
+        function()
+        end
+    )
+end
+
+---免费礼包走这个商城的
+function MallManager:Buy(id, callback)
+    local cfg = _G.ConfigManager.store_active_cfg[id]
+    if cfg then
+        if cfg.price_id > 0 then
+            local gearCfg = _G.ConfigManager.store_gear_cfg[cfg.price_id]
+
+            if gearCfg.price <= 0 then
+                MallNet:GetInstance():BuyItem(id, 1, callback)
+            end
+        else
+            MallNet:GetInstance():BuyItem(id, 1, callback)
+        end
+    end
+end
+
+function MallManager:GetMallWeekFree(callback)
+    MallNet:GetInstance():GetMallWeekFree(callback)
+end
+
+---本地免费购买的礼包要传一个id进来处理
+function MallManager:OnUpMallBuy(data, sid)
+    data.sid = sid
+    self:OnMallCashListener(data)
+end
+
+---支付服务器回调
+---@param data store.p2c_store_cash
+---@param mock boolean 是否是模拟数据(本地模拟事件, 不是真实的服务器推送)
+function MallManager:OnMallCashListener(data, mock)
+    if _G.AppSetting.DEBUG then
+        _G.Log("MallManager服务器提示支付成功")
+    end
+
+    if _G.AppSetting.DEBUG then
+        _G.Log(_G.CS.Launcher.Inst.IsSDK, "是否是sdk")
+    end
+
+    if not mock then
+        _G.StorageManager:GetInstance():ReceiveAwardData(data)
+    end
+
+    if data ~= nil and data.total_cash_bool then
+        if version == 1 then
+            require "MonthlyModel":GetInstance():AddTotalCash(data.cash_rmb)
+        elseif version == 2 then
+            require "MonthlyModel":GetInstance():AddTotalCash(data.base_rmb)
+        end
+
+        local rmb = data.cash_rmb
+        -- if _G.AppSetting.IsOverseas and data.base_rmb and data.base_rmb > 0 then
+        --     rmb = data.base_rmb
+        -- end
+        require "InitialManager":GetInstance():UpdateCashNum(data.sid, rmb)
+    end
+
+    local giftId = data.sid
+    local activityId = data.activity_id
+    if giftId then
+        if _G.AppSetting.DEBUG then
+            _G.Log(giftId, "MallManager活动刷新对应礼包id>>>>>>>>>>>>>")
+        end
+        if _G.AppSetting.DEBUG then
+            _G.Log(activityId, "MallManager活动刷新对应活动id>>>>>>>>>>>>>")
+        end
+        ---@type store_active_cfg
+        local cfg = _G.ConfigManager.store_active_cfg[giftId]
+        if cfg ~= nil then
+            self:SetItemBuyTimes(cfg.id, cfg.type_reset, self:GetItemBuyTimes(cfg.id, cfg.type_reset) + 1)
+        else
+            --local str = _G.string.split(giftId, "ykyk")
+            if activityId > 0 then
+                local ActivitySynManager = require "ActivitySynManager"
+                local activity = ActivitySynManager:GetInstance():GetActivityClass(activityId)
+                activity.typeClass:SetItemBuyTimes(giftId)
+
+                ---代币的 不走仓库
+                local item = activity.typeClass:SetCoin(giftId)
+                if item and item.type[2] > 0 then
+                    _G.table.insert(data.award.item, item)
+                end
+            end
+        end
+
+        require "MallCashModel":GetInstance():SetFirstCash(giftId)
+    end
+    if data.cash_rmb ~= nil then
+        self.cash_base_rmb = self.cash_base_rmb + data.base_rmb
+        if data.total_cash_bool then
+            local start = self.cash_rmb
+            self.cash_rmb = self.cash_rmb + data.cash_rmb
+            self.cash_times = self.cash_times + 1
+            require "PopUpGiftBagModel":GetInstance():IsActiveCash()
+            require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_Recharege, start, self.cash_rmb)
+            require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_Charge, self.cash_times)
+            require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_Purchase, data.cash_rmb)
+            self:RuTrackEvent(start)
+            ---首次充值
+            if start <= 0 and self.cash_rmb > 0 then
+                if _G.SDKManager:GetInstance():CheckRusChannel() then
+                    require("BindAccountModel"):GetInstance():DoAddMainViewQuene()
+                end
+            end
+        end
+    end
+
+    _G.AudioManager.PlayAudio(_G.AudioType.PlaySound, buyAudioID)
+    _G.PopWindowManager:GetInstance():AddAwardPopQuene(data)
+    ---判断是否满足首充
+    if data.is_all_first ~= nil and data.is_first_cash ~= nil and data.is_all_first ~= 0 and data.is_first_cash ~= 0 then
+        --- first_cash number 首充标记 0：未充值  1：已充值
+        --- first_time number 首充时间
+        require "SDKDotManager":GetInstance():OnEvent(_G.SDKDotType.SDKDot_FirstPurchase, data.cash_rmb)
+        _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.recharge_first)
+
+        if _G.SDKManager:GetInstance():CheckRusChannel() then
+            require("BindAccountModel"):GetInstance():DoAddMainViewQuene()
+        end
+    end
+    _G.Events:GetInstance():Broadcast(
+        _G.ePlayAactionEvent.PlayAaction,
+        {
+            _G.ActiveTaskEnum.ConditionEnum.Charge.TotalCharge
+        },
+        self.cash_rmb
+    )
+
+    _G.Events:GetInstance():Broadcast(_G.eRechargeEvent.TotalCash, data)
+    _G.Events:GetInstance():Broadcast(_G.eRechargeEvent.DayCash)
+    _G.Events:GetInstance():Broadcast(_G.eRechargeEvent.OneCash)
+end
+
+---俄罗斯充值上报
+function MallManager:RuTrackEvent(_start)
+    if not _start then
+        _start = 0
+    end
+
+    local start = _start/100
+    local cash_rmb = self.cash_rmb/100
+
+    if start <= 1 and cash_rmb >= 1 then
+        _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.Rev_1)
+    end
+    if start < 3 and cash_rmb >= 3 then
+        _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.Rev_3)
+    end
+    if start < 5 and cash_rmb >= 5 then
+        _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.Rev_5)
+    end
+    if start < 10 and cash_rmb >= 10 then
+        _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.Rev_10)
+    end
+    if start < 20 and cash_rmb >= 20 then
+        _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.Rev_20)
+    end
+    if start < 50 and cash_rmb >= 50 then
+        _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.Rev_50)
+    end
+    if start < 100 and cash_rmb >= 100 then
+        _G.SDKManager:GetInstance():TrackEvent(require "SDKDef".DotMsg.Ru.Rev_100)
+    end
+end
+
+---商城充值状态改变回调
+---@param data store.p2c_store_cash
+function MallManager:OnMallCashStateChange(data)
+    self:GetLastCashInfo(false)
+end
+
+---断线重连成功
+function MallManager:OnReconnectSuccess(data)
+    self:GetLastCashInfo(true)
+end
+
+---获取最后一次的充值信息
+---@param reconnect boolean 是否重连请求
+function MallManager:GetLastCashInfo(reconnect)
+    --拉取订单信息
+    MallNet:GetInstance():GetCashInfo(
+        function(msg)
+            if not msg or not msg.info then
+                return
+            end
+            for _, v in ipairs(msg.info) do
+                self:OnMallCashListener(v, reconnect)
+                _G.Events:GetInstance():PcallBroadcast(_G.ConfigManager.net_map.store_cash.Cmd, v, reconnect)
+            end
+        end
+    )
+end
+
+---清理充值信息
+function MallManager:ClearLastCashInfo()
+    MallNet:GetInstance():GetCashInfo()
+end
+
+---支付成功
+function MallManager:pay_success()
+    if _G.AppSetting.DEBUG then
+        _G.Log("sdk提示支付成功")
+    end
+    local callback = self.sdkCashCallback
+    self.sdkCashCallback = nil
+    if callback then
+        callback(nil) --fill msg parameter
+    end
+end
+
+---支付失败
+function MallManager:pay_failed()
+    if _G.AppSetting.DEBUG then
+        _G.LogError("sdk提示支付失败")
+    end
+    ---ZHJH-4812屏蔽提示
+    -- _G.PopWindowManager:GetInstance():ShowAllTips(470103)
+    self.sdkCashCallback = nil
+end
+
+function MallManager:UpdataCurView()
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MallView.Name)
+    if view ~= nil then
+        view:UpdataCurView()
+    end
+end
+
+--- 刷新界面
+function MallManager:UpdataView(MallViewPage)
+    ---@type MallView
+    local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.MallView.Name)
+    if view ~= nil then
+        view:UpdataView(MallViewPage)
+    end
+end
+
+---获取累计充值金额
+function MallManager:GetCashRmb()
+    if version == 1 then
+        return self.cash_rmb
+    elseif version == 2 then
+        return self.cash_base_rmb
+    end
+end
+
+---代金卷弹窗
+function MallManager:OpenDialog(name)
+    if name == _G.ConfigManager.ui_cfg.OptionDialogView.Name then
+        ---@type OptionDialogView
+        local view = _G.UIManager:GetInstance():GetWindowCtrl(_G.ConfigManager.ui_cfg.OptionDialogView.Name)
+        local str = _G.GetLangPackValue(90000010834, self.voucher + self.voucherin)
+        self.voucher = nil
+        self.voucherin = nil
+        view:ShowDown({ { content = str } })
+        view.notCall = true
+        _G.Events:GetInstance():RemoveListener(_G.eUIManagerStatus.OnUIOpened, self.OpenDialog, self)
+    end
+end
+
+---获取价钱
+function MallManager:GetFinalPrice(price_id, isRechargeCfg)
+    if price_id > 0 then
+        local gearCfg
+        if isRechargeCfg then
+            gearCfg = _G.ConfigManager.store_recharge_cfg[price_id]
+        else
+            gearCfg = _G.ConfigManager.store_gear_cfg[price_id]
+        end
+        if gearCfg then
+            return gearCfg.price
+        else
+            return price_id
+        end
+    end
+    return 0
+end
+
+return MallManager
